@@ -7,7 +7,10 @@
 //!
 //! Scope of this implementation:
 //!
-//! - Single request/response per connection (no multiplexing, no pooling).
+//! - Multiplexed streams within one connection (RFC 9113 §5.1). The public
+//!   `send()` still opens one TLS session per call — connection pooling
+//!   across `send()` calls is task 5 — but a single `Connection` is now
+//!   structurally capable of carrying many concurrent streams.
 //! - ALPN is offered as `h2`. If the server does not select it, we still
 //!   attempt the HTTP/2 preface (a server that didn't agree will close us
 //!   or respond with a GOAWAY, which we surface as `BadResponse`).
@@ -163,13 +166,14 @@ impl PeerSettings {
 // Both endpoints maintain a connection-level window AND a per-stream window;
 // only DATA frames consume window. Defaults are 65,535 octets (§6.9.2).
 //
-// Today we run a single-stream HTTP/2 backend, so the "stream" half of these
-// structs is degenerate — but the types are shaped so task 4 can drop in a
-// `HashMap<u32, StreamWindow>` without churning the call sites. `SendWindow`
-// uses `i64` because the RFC permits a stream's send window to go negative
-// when SETTINGS_INITIAL_WINDOW_SIZE shrinks (§6.9.2). Receive windows stay
-// in `i64` for the same reason on the bookkeeping side, even though we never
-// shrink them ourselves.
+// We split these into four types because the connection-level windows live on
+// the `Connection` and the stream-level windows live on each `Stream`. Mixing
+// the two in one struct (as the single-stream code did) made the boundary
+// fuzzy; splitting it means a `Stream` can't accidentally mutate the conn
+// window and vice versa. All windows use `i64` because §6.9.2 permits a
+// stream's send window to go negative when `SETTINGS_INITIAL_WINDOW_SIZE`
+// shrinks; conn windows can't go negative but the wider type keeps the
+// arithmetic uniform.
 
 /// Hard cap on either window: RFC 9113 §6.9.1.
 const WINDOW_MAX: i64 = 0x7fff_ffff;
@@ -179,149 +183,168 @@ const WINDOW_MAX: i64 = 0x7fff_ffff;
 /// keep this value in sync with whatever we advertise.
 const OUR_INITIAL_WINDOW: i64 = 65_535;
 
-/// Outbound flow-control state: how many DATA bytes we are still allowed to
-/// send before WINDOW_UPDATE replenishes us.
-///
-/// `initial_peer_window` mirrors the peer's last-known
-/// `SETTINGS_INITIAL_WINDOW_SIZE` so that subsequent SETTINGS frames can be
-/// applied as deltas to existing streams (RFC 9113 §6.9.2). The connection
-/// window is NOT affected by INITIAL_WINDOW_SIZE.
+/// Connection-level outbound flow-control window: how many DATA bytes we are
+/// still allowed to send across *any* stream on this connection before the
+/// peer has to grant more with `WINDOW_UPDATE` on stream 0 (§6.9). The
+/// connection window is not affected by `SETTINGS_INITIAL_WINDOW_SIZE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SendWindow {
-    /// Connection-level window. Starts at the RFC default of 65,535.
-    conn: i64,
-    /// Stream-level window. Single-stream world: this is "the request stream".
-    /// In task 4 this becomes a per-stream value keyed by `stream_id`.
-    stream: i64,
-    /// Last applied peer `SETTINGS_INITIAL_WINDOW_SIZE` (the basis for the
-    /// next delta calculation).
-    initial_peer_window: i64,
+struct ConnSendWindow {
+    available: i64,
 }
 
-impl SendWindow {
-    /// Initial send window before the peer's SETTINGS arrives: connection AND
-    /// stream both at the RFC default of 65,535 (§6.9.2).
+impl ConnSendWindow {
     fn new() -> Self {
-        SendWindow {
-            conn: 65_535,
-            stream: 65_535,
-            initial_peer_window: 65_535,
-        }
+        ConnSendWindow { available: 65_535 }
     }
 
-    /// Apply an incoming WINDOW_UPDATE. `stream_id == 0` adjusts the
-    /// connection window, anything else the (only) stream's window.
-    /// Validates per RFC 9113 §6.9.1: zero increment is an error, and the
-    /// running window must not exceed 2^31 - 1.
-    fn apply_window_update(&mut self, stream_id: u32, increment: u32) -> Result<()> {
+    /// Apply a `WINDOW_UPDATE` for stream 0. Zero increment and overflow past
+    /// `2^31-1` are both errors (RFC 9113 §6.9.1).
+    fn apply_window_update(&mut self, increment: u32) -> Result<()> {
         if increment == 0 {
             return Err(Error::BadResponse(
-                "WINDOW_UPDATE with zero increment (PROTOCOL_ERROR/FLOW_CONTROL_ERROR)".into(),
+                "WINDOW_UPDATE with zero increment on connection (FLOW_CONTROL_ERROR)".into(),
             ));
         }
-        let inc = increment as i64;
-        let target = if stream_id == 0 {
-            &mut self.conn
-        } else {
-            &mut self.stream
-        };
-        let new_val = *target + inc;
+        let new_val = self.available + increment as i64;
         if new_val > WINDOW_MAX {
             return Err(Error::BadResponse(format!(
-                "WINDOW_UPDATE pushes send window to {new_val} > 2^31-1 (FLOW_CONTROL_ERROR)"
+                "WINDOW_UPDATE pushes conn send window to {new_val} > 2^31-1 (FLOW_CONTROL_ERROR)"
             )));
         }
-        *target = new_val;
+        self.available = new_val;
         Ok(())
     }
 
-    /// Apply a change to `SETTINGS_INITIAL_WINDOW_SIZE`: each existing stream's
-    /// send window shifts by `(new - old)` (RFC 9113 §6.9.2). The connection
-    /// window is untouched. Result must remain within `[i32::MIN, 2^31-1]`;
-    /// overflow on the high side is a FLOW_CONTROL_ERROR. We only have one
-    /// stream so there's just one window to bump.
+    /// Decrement the connection window by `n` after writing a DATA frame.
+    fn consume(&mut self, n: usize) {
+        self.available -= n as i64;
+    }
+}
+
+/// Per-stream outbound flow-control window. Each stream tracks its own budget
+/// alongside the basis we use to compute future `SETTINGS_INITIAL_WINDOW_SIZE`
+/// deltas (§6.9.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamSendWindow {
+    available: i64,
+    /// Last applied peer `SETTINGS_INITIAL_WINDOW_SIZE` — the basis for the
+    /// next delta calculation. New streams pick this up from the
+    /// `Connection`'s current peer settings at open time.
+    initial_peer_window: i64,
+}
+
+impl StreamSendWindow {
+    fn new(initial: i64) -> Self {
+        StreamSendWindow {
+            available: initial,
+            initial_peer_window: initial,
+        }
+    }
+
+    /// Apply a `WINDOW_UPDATE` targeting this stream. Same validation as the
+    /// connection-level one (§6.9.1).
+    fn apply_window_update(&mut self, increment: u32) -> Result<()> {
+        if increment == 0 {
+            return Err(Error::BadResponse(
+                "WINDOW_UPDATE with zero increment on stream (PROTOCOL_ERROR)".into(),
+            ));
+        }
+        let new_val = self.available + increment as i64;
+        if new_val > WINDOW_MAX {
+            return Err(Error::BadResponse(format!(
+                "WINDOW_UPDATE pushes stream send window to {new_val} > 2^31-1 (FLOW_CONTROL_ERROR)"
+            )));
+        }
+        self.available = new_val;
+        Ok(())
+    }
+
+    /// Apply a `SETTINGS_INITIAL_WINDOW_SIZE` change: shift `available` by
+    /// `(new - old)` (RFC 9113 §6.9.2). Negative results are allowed; only
+    /// the upper bound is enforced.
     fn apply_initial_window_change(&mut self, new_initial: u32) -> Result<()> {
         let new_i = new_initial as i64;
         let delta = new_i - self.initial_peer_window;
-        let new_stream = self.stream + delta;
-        if new_stream > WINDOW_MAX {
+        let new_available = self.available + delta;
+        if new_available > WINDOW_MAX {
             return Err(Error::BadResponse(format!(
-                "SETTINGS_INITIAL_WINDOW_SIZE delta pushes stream send window to {new_stream} > 2^31-1 (FLOW_CONTROL_ERROR)"
+                "SETTINGS_INITIAL_WINDOW_SIZE delta pushes stream send window to {new_available} > 2^31-1 (FLOW_CONTROL_ERROR)"
             )));
         }
-        // A negative result is permitted by §6.9.2; we just keep it.
-        self.stream = new_stream;
+        self.available = new_available;
         self.initial_peer_window = new_i;
         Ok(())
     }
 
-    /// Smallest of the two windows — the actual budget for the next DATA send.
-    fn available(&self) -> i64 {
-        self.conn.min(self.stream)
-    }
-
-    /// Decrement both windows by `n` after a successful DATA send.
     fn consume(&mut self, n: usize) {
-        let n = n as i64;
-        self.conn -= n;
-        self.stream -= n;
+        self.available -= n as i64;
     }
 }
 
-/// Inbound flow-control state: how many DATA bytes the peer is still allowed
-/// to send us before we have to WINDOW_UPDATE them.
-///
-/// We don't currently advertise a non-default `SETTINGS_INITIAL_WINDOW_SIZE`,
-/// so the peer treats every new stream as starting at 65,535. The connection
-/// window is independent of that setting and likewise starts at 65,535.
+/// Connection-level inbound flow-control state: bytes the peer may still send
+/// us on stream 0's behalf (the aggregate of all streams). Like the conn send
+/// window, this is unaffected by `SETTINGS_INITIAL_WINDOW_SIZE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RecvWindow {
-    /// Bytes the peer may still send on the connection (stream 0).
-    conn: i64,
-    /// Bytes the peer may still send on our one stream.
-    stream: i64,
-    /// What both windows were sized to at stream open; the replenish
-    /// threshold is half of this and the WINDOW_UPDATE target is back to
-    /// this value.
+struct ConnRecvWindow {
+    available: i64,
     initial: i64,
 }
 
-impl RecvWindow {
+impl ConnRecvWindow {
     fn new() -> Self {
-        RecvWindow {
-            conn: OUR_INITIAL_WINDOW,
-            stream: OUR_INITIAL_WINDOW,
+        ConnRecvWindow {
+            available: OUR_INITIAL_WINDOW,
             initial: OUR_INITIAL_WINDOW,
         }
     }
 
-    /// Account for an inbound DATA frame: subtract its full payload length
-    /// (padding included — RFC 9113 §6.9.1 says every DATA octet counts) from
-    /// both windows.
     fn consume(&mut self, n: usize) {
-        let n = n as i64;
-        self.conn -= n;
-        self.stream -= n;
+        self.available -= n as i64;
     }
 
-    /// Compute the WINDOW_UPDATE frames to send to top up either window when
-    /// it has fallen below half its initial value. Returns a vector with zero,
-    /// one, or two frames. Each returned frame, when applied, brings the
-    /// corresponding side of `self` back up to `self.initial`.
-    fn replenish(&mut self, stream_id: u32) -> Vec<Frame> {
+    /// Emit a `WINDOW_UPDATE` for stream 0 if the window has fallen below
+    /// half its initial size; returns at most one frame.
+    fn replenish(&mut self) -> Option<Frame> {
         let threshold = self.initial / 2;
-        let mut out = Vec::new();
-        if self.conn < threshold {
-            let inc = (self.initial - self.conn) as u32;
-            out.push(window_update_frame(0, inc));
-            self.conn = self.initial;
+        if self.available < threshold {
+            let inc = (self.initial - self.available) as u32;
+            self.available = self.initial;
+            Some(window_update_frame(0, inc))
+        } else {
+            None
         }
-        if self.stream < threshold {
-            let inc = (self.initial - self.stream) as u32;
-            out.push(window_update_frame(stream_id, inc));
-            self.stream = self.initial;
+    }
+}
+
+/// Per-stream inbound flow-control state. Mirrors `ConnRecvWindow` but the
+/// `replenish` frame targets the specific stream id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamRecvWindow {
+    available: i64,
+    initial: i64,
+}
+
+impl StreamRecvWindow {
+    fn new() -> Self {
+        StreamRecvWindow {
+            available: OUR_INITIAL_WINDOW,
+            initial: OUR_INITIAL_WINDOW,
         }
-        out
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.available -= n as i64;
+    }
+
+    fn replenish(&mut self, stream_id: u32) -> Option<Frame> {
+        let threshold = self.initial / 2;
+        if self.available < threshold {
+            let inc = (self.initial - self.available) as u32;
+            self.available = self.initial;
+            Some(window_update_frame(stream_id, inc))
+        } else {
+            None
+        }
     }
 }
 
@@ -1106,283 +1129,782 @@ fn tcp_connect(req: &Request) -> Result<TcpStream> {
 }
 
 // ---------------------------------------------------------------------------
-// The main send() routine.
+// Per-stream state machine (RFC 9113 §5.1) and the `Stream` it lives on.
 // ---------------------------------------------------------------------------
 
-/// Mutable connection state shared between the body-send loop and the
-/// response-read loop. Carved out so [`process_frame`] can drive a single
-/// inbound frame from either site without duplicating the dispatch ladder.
-///
-/// The single-stream world still bakes `stream_id == 1` into the struct
-/// (via the contents of `send_window`/`recv_window`); task 4 will replace
-/// these with per-stream maps. Until then the struct just bundles globals.
-struct ConnState {
-    peer: PeerSettings,
-    send_window: SendWindow,
-    recv_window: RecvWindow,
-    decoder: Decoder,
+/// Simplified client-side stream lifecycle (RFC 9113 §5.1). We collapse the
+/// `ReservedLocal`/`ReservedRemote` states because we disable server push.
+/// `Idle` is included for completeness but in practice we transition into
+/// `Open` (or `HalfClosedLocal` if the request has no body) the instant we
+/// emit HEADERS, so callers rarely observe it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    Idle,
+    Open,
+    HalfClosedLocal,
+    HalfClosedRemote,
+    Closed,
+}
+
+impl StreamState {
+    /// Validate that we can SEND a DATA frame in the current state. Returns
+    /// the new state if `end_stream` is set, or the same state otherwise.
+    fn send_data(self, end_stream: bool) -> Result<StreamState> {
+        match self {
+            StreamState::Idle => {
+                if end_stream {
+                    Ok(StreamState::HalfClosedLocal)
+                } else {
+                    Ok(StreamState::Open)
+                }
+            }
+            StreamState::Open => Ok(if end_stream {
+                StreamState::HalfClosedLocal
+            } else {
+                StreamState::Open
+            }),
+            StreamState::HalfClosedRemote => Ok(if end_stream {
+                StreamState::Closed
+            } else {
+                StreamState::HalfClosedRemote
+            }),
+            StreamState::HalfClosedLocal | StreamState::Closed => Err(Error::BadResponse(format!(
+                "internal: tried to send DATA in stream state {self:?}"
+            ))),
+        }
+    }
+
+    /// Validate inbound DATA. Returns the (possibly updated) state.
+    fn recv_data(self, end_stream: bool) -> Result<StreamState> {
+        match self {
+            StreamState::Open => Ok(if end_stream {
+                StreamState::HalfClosedRemote
+            } else {
+                StreamState::Open
+            }),
+            StreamState::HalfClosedLocal => Ok(if end_stream {
+                StreamState::Closed
+            } else {
+                StreamState::HalfClosedLocal
+            }),
+            StreamState::Idle | StreamState::HalfClosedRemote | StreamState::Closed => {
+                Err(Error::BadResponse(format!(
+                    "received DATA in stream state {self:?} (RFC 9113 §5.1)"
+                )))
+            }
+        }
+    }
+
+    /// Validate inbound HEADERS / CONTINUATION. Returns the (possibly
+    /// updated) state. `Closed` returns `Closed` (we'll ignore the frame).
+    fn recv_headers(self, end_stream: bool) -> Result<StreamState> {
+        match self {
+            StreamState::Open => Ok(if end_stream {
+                StreamState::HalfClosedRemote
+            } else {
+                StreamState::Open
+            }),
+            StreamState::HalfClosedLocal => Ok(if end_stream {
+                StreamState::Closed
+            } else {
+                StreamState::HalfClosedLocal
+            }),
+            StreamState::Closed => Ok(StreamState::Closed),
+            StreamState::Idle | StreamState::HalfClosedRemote => Err(Error::BadResponse(format!(
+                "received HEADERS in stream state {self:?} (RFC 9113 §5.1)"
+            ))),
+        }
+    }
+
+    /// Inbound RST_STREAM: transition to `Closed` from any state (idle is the
+    /// one true exception per §5.1, but we surface that as an error too).
+    fn recv_rst(self) -> Result<StreamState> {
+        match self {
+            StreamState::Idle => Err(Error::BadResponse(
+                "RST_STREAM on idle stream (RFC 9113 §5.1)".into(),
+            )),
+            _ => Ok(StreamState::Closed),
+        }
+    }
+}
+
+/// One in-flight HTTP/2 stream. Mostly owned mutably by the `Connection` for
+/// the lifetime of the request; on completion the closed stream is moved out
+/// of `Connection::streams` and returned to the caller.
+struct Stream {
+    /// Stream identifier. Stored for debugging and so the type stays
+    /// self-describing when reaped from `Connection::streams`; the public
+    /// `Response` doesn't need it but it's cheap to keep.
+    #[allow(dead_code)]
+    id: u32,
+    state: StreamState,
+    send_window: StreamSendWindow,
+    recv_window: StreamRecvWindow,
     /// Accumulator for the in-progress header block (HEADERS + CONTINUATION
     /// fragments) before HPACK decoding fires at END_HEADERS.
     headers_buf: Vec<u8>,
-    /// True between a HEADERS frame without END_HEADERS and its terminating
-    /// CONTINUATION frame; any other frame type in between is a protocol
-    /// violation per RFC 9113 §6.10.
-    expecting_continuation: bool,
     /// Fully decoded response headers, once the response's END_HEADERS has
     /// been seen. `None` until then.
     response_headers: Option<Vec<(String, String)>>,
     /// Accumulator for response body bytes (DATA payloads, post-padding).
     body: Vec<u8>,
-    /// True once the response stream has hit END_STREAM (set by HEADERS or
-    /// the final DATA frame).
-    end_stream: bool,
+    /// True once the peer's END_STREAM has been observed.
+    end_stream_recv: bool,
 }
 
-impl ConnState {
-    fn new() -> Self {
-        ConnState {
-            peer: PeerSettings::default(),
-            send_window: SendWindow::new(),
-            recv_window: RecvWindow::new(),
-            decoder: Decoder::new(),
+impl Stream {
+    fn new(id: u32, initial_peer_window: i64) -> Self {
+        Stream {
+            id,
+            state: StreamState::Idle,
+            send_window: StreamSendWindow::new(initial_peer_window),
+            recv_window: StreamRecvWindow::new(),
             headers_buf: Vec::new(),
-            expecting_continuation: false,
             response_headers: None,
             body: Vec::new(),
-            end_stream: false,
+            end_stream_recv: false,
         }
+    }
+
+    /// Smallest of conn / stream send windows — the budget for the next DATA
+    /// chunk on this stream.
+    fn send_budget(&self, conn_window: &ConnSendWindow) -> i64 {
+        self.send_window.available.min(conn_window.available)
     }
 }
 
-/// Result of feeding one inbound frame to [`process_frame`].
+// ---------------------------------------------------------------------------
+// The Connection: owns the TLS stream, peer settings, decoder, and all the
+// streams currently in flight. Replaces the single-stream `ConnState` from
+// earlier tasks.
+// ---------------------------------------------------------------------------
+
+/// `Connection` is the multiplexing core. It owns the TLS transport plus the
+/// per-stream state for every request currently in flight, drives the
+/// connection-level state machine (preface, SETTINGS exchange, GOAWAY), and
+/// dispatches inbound frames to the right stream by `stream_id`.
 ///
-/// `Done` means the response stream is fully delivered (END_STREAM seen); the
-/// caller can break out of its read loop. `Continue` means more frames are
-/// expected — keep reading. Errors propagate via `Result`.
+/// One `Connection` per TLS session. Task 5 will introduce pooling so multiple
+/// `send()` calls can reuse the same `Connection`; for now every `send()`
+/// builds a fresh one, opens a single stream, and drops it.
+struct Connection<S: Read + Write> {
+    tls: S,
+    peer: PeerSettings,
+    conn_send_window: ConnSendWindow,
+    conn_recv_window: ConnRecvWindow,
+    decoder: Decoder,
+    streams: std::collections::HashMap<u32, Stream>,
+    /// Next client-initiated stream id to allocate. Per §5.1.1, client
+    /// streams are odd-numbered and strictly increasing: 1, 3, 5, …
+    next_stream_id: u32,
+    /// If the peer sent GOAWAY, the last-stream-id they advertised. We refuse
+    /// to allocate ids strictly greater than this; existing streams with id
+    /// ≤ this can still complete.
+    goaway_received: Option<u32>,
+    /// If we are mid-header-block on some stream — i.e. we processed a
+    /// HEADERS frame without END_HEADERS — this holds the stream id we are
+    /// waiting on. While `Some(_)`, the peer is forbidden from interleaving
+    /// any other frame (RFC 9113 §6.10).
+    expecting_continuation: Option<u32>,
+}
+
+/// Result of dispatching one inbound frame.
+///
+/// `Done(stream_id)` means a stream has hit a terminal condition (Closed or
+/// HalfClosedRemote with response fully received) and should be reaped by the
+/// caller. `Continue` means keep reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DriverOutcome {
+enum DispatchOutcome {
     Continue,
-    Done,
+    Done(u32),
 }
 
-/// Apply a single inbound frame to the shared connection state.
-///
-/// This is the read-loop's per-frame dispatch ladder, hoisted into a helper so
-/// the body-send loop can call it whenever it has to block on flow control
-/// (waiting for a WINDOW_UPDATE). Both call sites share one implementation of
-/// SETTINGS-ACK, PING-PONG, WINDOW_UPDATE, GOAWAY, RST_STREAM, and
-/// HEADERS/CONTINUATION/DATA accumulation.
-///
-/// `tls` is the connection we may need to write replies to (SETTINGS ACK,
-/// PING pong, WINDOW_UPDATE replenishment). It's typed `Read + Write` so unit
-/// tests can substitute a `Cursor`-backed fake without dragging in real TLS.
-fn process_frame<S: Read + Write>(
-    frame: Frame,
-    tls: &mut S,
-    state: &mut ConnState,
-) -> Result<DriverOutcome> {
-    // CONTINUATION must immediately follow HEADERS/CONTINUATION on the same
-    // stream with no interleaving (RFC 9113 §6.10). The check has to happen
-    // before the dispatch ladder because *any* other frame type in this window
-    // is a protocol error, including frames we'd otherwise quietly accept
-    // (PING, SETTINGS, ...).
-    if state.expecting_continuation && frame.typ != F_CONTINUATION {
-        return Err(Error::BadResponse(
-            "expected CONTINUATION between header fragments".into(),
-        ));
+impl<S: Read + Write> Connection<S> {
+    /// Construct a `Connection` from an already-handshaken transport and send
+    /// the client preface + initial SETTINGS frame. We advertise
+    /// `ENABLE_PUSH=0` so the server won't send PUSH_PROMISE frames (we
+    /// don't implement them); other parameters stay at RFC defaults.
+    fn new(mut tls: S) -> Result<Self> {
+        tls.write_all(PREFACE)?;
+        let mut settings_payload = Vec::with_capacity(6);
+        settings_payload.extend_from_slice(&S_ENABLE_PUSH.to_be_bytes());
+        settings_payload.extend_from_slice(&0u32.to_be_bytes());
+        let our_settings = Frame {
+            typ: F_SETTINGS,
+            flags: 0,
+            stream_id: 0,
+            payload: settings_payload,
+        };
+        write_frame(&mut tls, &our_settings)?;
+        tls.flush()?;
+        Ok(Connection {
+            tls,
+            peer: PeerSettings::default(),
+            conn_send_window: ConnSendWindow::new(),
+            conn_recv_window: ConnRecvWindow::new(),
+            decoder: Decoder::new(),
+            streams: std::collections::HashMap::new(),
+            next_stream_id: 1,
+            goaway_received: None,
+            expecting_continuation: None,
+        })
     }
 
-    match frame.typ {
-        F_SETTINGS if frame.flags & FLAG_ACK == 0 => {
-            // Server-sent SETTINGS: parse and update peer state, then ACK.
-            // Validation errors propagate out of the loop.
-            //
-            // If INITIAL_WINDOW_SIZE changed, the delta retroactively adjusts
-            // every existing stream's send window by `(new - old)`
-            // (RFC 9113 §6.9.2). Apply that AFTER the SETTINGS parse succeeds
-            // so we operate on validated values; the connection window is
-            // untouched.
-            state.peer.apply_settings_payload(&frame.payload)?;
-            state
-                .send_window
-                .apply_initial_window_change(state.peer.initial_window_size)?;
-            let ack = Frame {
-                typ: F_SETTINGS,
-                flags: FLAG_ACK,
-                stream_id: 0,
-                payload: Vec::new(),
-            };
-            write_frame(tls, &ack)?;
-            tls.flush()?;
+    /// Allocate the next client-initiated stream id and register an empty
+    /// `Stream` in `self.streams`.
+    ///
+    /// Errors:
+    /// - At `MAX_CONCURRENT_STREAMS`: refuse so the caller can open another
+    ///   connection (task 5 will key the pool on this).
+    /// - Past 2^31: stream ids are bounded by RFC 9113 §5.1.1; the caller
+    ///   must discard this connection.
+    /// - After a GOAWAY that names a last-stream-id below what we'd allocate:
+    ///   refuse so the caller knows to retry on a fresh connection.
+    fn open_stream(&mut self) -> Result<u32> {
+        if (self.streams.len() as u64) >= self.peer.max_concurrent_streams as u64 {
+            return Err(Error::BadResponse("at MAX_CONCURRENT_STREAMS limit".into()));
         }
-        // ACK from the server is silently absorbed.
-        F_SETTINGS => {}
-        F_PING if frame.flags & FLAG_ACK == 0 => {
-            let pong = Frame {
-                typ: F_PING,
-                flags: FLAG_ACK,
-                stream_id: 0,
-                payload: frame.payload.clone(),
-            };
-            write_frame(tls, &pong)?;
-            tls.flush()?;
+        // 2^31 is the boundary; the highest legal client stream id is
+        // 2^31 - 1 (which happens to be odd). RFC 9113 §5.1.1.
+        if self.next_stream_id >= 0x8000_0000 {
+            return Err(Error::BadResponse(
+                "stream id space exhausted (RFC 9113 §5.1.1)".into(),
+            ));
         }
-        F_PING => {}
-        F_WINDOW_UPDATE => {
-            // RFC 9113 §6.9: 4-byte payload, low 31 bits are the increment.
-            // Zero increment is an error; pushing the window past 2^31-1 is a
-            // FLOW_CONTROL_ERROR. `apply_window_update` handles both. A
-            // WINDOW_UPDATE for a stream we don't track (anything other than
-            // 0 or 1 in our single-stream world) is ignored — the RFC permits
-            // us to drop frames for closed/unknown streams.
-            let inc = parse_window_update(&frame.payload)?;
-            if frame.stream_id == 0 || frame.stream_id == 1 {
-                state
-                    .send_window
-                    .apply_window_update(frame.stream_id, inc)?;
+        if let Some(last) = self.goaway_received {
+            if self.next_stream_id > last {
+                return Err(Error::BadResponse(format!(
+                    "GOAWAY received with last-stream-id={last}; cannot allocate id={}",
+                    self.next_stream_id
+                )));
             }
         }
-        F_GOAWAY if state.response_headers.is_none() => {
-            // Even mid-response, GOAWAY just means "no new streams"; if our
-            // stream has finished it can still be OK. If we haven't yet
-            // assembled headers, treat as failure.
-            return Err(Error::BadResponse(format!(
-                "server sent GOAWAY (payload {} bytes)",
-                frame.payload.len()
-            )));
+        let id = self.next_stream_id;
+        self.next_stream_id = self.next_stream_id.saturating_add(2);
+        self.streams
+            .insert(id, Stream::new(id, self.peer.initial_window_size as i64));
+        Ok(id)
+    }
+
+    /// Build and write the HEADERS + CONTINUATION + DATA frames for `req` on
+    /// `stream_id`. Blocks on flow control by reading inbound frames in-place
+    /// when the send window is depleted. The stream's `state` is advanced
+    /// for each outbound transition.
+    fn send_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
+        let header_block = build_header_block(req);
+        let has_body = !req.body.is_empty();
+        let max_frame_size = self.peer.max_frame_size as usize;
+        let header_frames =
+            fragment_header_block(stream_id, &header_block, max_frame_size, !has_body);
+
+        // HEADERS frame(s). RFC 9113 §6.10: no other frames may interleave
+        // between HEADERS and its CONTINUATION fragments — our single-threaded
+        // writer satisfies this automatically.
+        for f in &header_frames {
+            write_frame(&mut self.tls, f)?;
         }
-        // GOAWAY after headers: wait for END_STREAM as usual; if the server
-        // dropped us first we'll hit UnexpectedEof on the next read.
-        F_GOAWAY => {}
-        F_RST_STREAM if frame.stream_id == 1 => {
-            let code = if frame.payload.len() >= 4 {
-                u32::from_be_bytes([
-                    frame.payload[0],
-                    frame.payload[1],
-                    frame.payload[2],
-                    frame.payload[3],
-                ])
+        {
+            let s = self
+                .streams
+                .get_mut(&stream_id)
+                .ok_or_else(|| Error::BadResponse(format!("stream {stream_id} not found")))?;
+            s.state = s.state.send_data(!has_body)?;
+        }
+
+        if has_body {
+            let mut remaining: &[u8] = req.body.as_slice();
+            while !remaining.is_empty() {
+                // Block until both windows have budget.
+                loop {
+                    let budget = {
+                        let s = self.streams.get(&stream_id).ok_or_else(|| {
+                            Error::BadResponse(format!("stream {stream_id} disappeared mid-send"))
+                        })?;
+                        s.send_budget(&self.conn_send_window)
+                    };
+                    if budget > 0 {
+                        break;
+                    }
+                    match self.read_and_dispatch()? {
+                        DispatchOutcome::Continue => {}
+                        DispatchOutcome::Done(done_id) if done_id == stream_id => {
+                            // The peer ended our stream before we finished
+                            // sending the body — protocol error from our side.
+                            return Err(Error::BadResponse(
+                                "server ended stream before request body was fully sent".into(),
+                            ));
+                        }
+                        DispatchOutcome::Done(_) => {
+                            // Some other stream finished while we were
+                            // blocked; that's fine, keep waiting on ours.
+                        }
+                    }
+                }
+
+                let max_frame_size = self.peer.max_frame_size as usize;
+                let budget = self
+                    .streams
+                    .get(&stream_id)
+                    .unwrap()
+                    .send_budget(&self.conn_send_window);
+                let n = next_data_chunk_size(max_frame_size, budget, remaining.len());
+                debug_assert!(n > 0, "loop above guarantees positive budget");
+                let chunk = &remaining[..n];
+                remaining = &remaining[n..];
+                let is_last = remaining.is_empty();
+                let data_frame = Frame {
+                    typ: F_DATA,
+                    flags: if is_last { FLAG_END_STREAM } else { 0 },
+                    stream_id,
+                    payload: chunk.to_vec(),
+                };
+                write_frame(&mut self.tls, &data_frame)?;
+                self.conn_send_window.consume(n);
+                let s = self.streams.get_mut(&stream_id).unwrap();
+                s.send_window.consume(n);
+                s.state = s.state.send_data(is_last)?;
+            }
+        }
+        self.tls.flush()?;
+        Ok(())
+    }
+
+    /// Drive the connection's read side until `stream_id` reaches a terminal
+    /// state, then remove that stream from the map and return it.
+    fn drive_until_stream_done(&mut self, stream_id: u32) -> Result<Stream> {
+        loop {
+            // Has the stream already completed in an earlier dispatch?
+            if let Some(s) = self.streams.get(&stream_id) {
+                if matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
+                    && s.response_headers.is_some()
+                    && s.end_stream_recv
+                {
+                    return Ok(self.streams.remove(&stream_id).unwrap());
+                }
             } else {
-                0
-            };
-            return Err(Error::BadResponse(format!(
-                "stream 1 reset by server, error code {code}"
-            )));
+                return Err(Error::BadResponse(format!(
+                    "stream {stream_id} not registered"
+                )));
+            }
+
+            match self.read_and_dispatch()? {
+                DispatchOutcome::Continue => {}
+                DispatchOutcome::Done(done_id) if done_id == stream_id => {
+                    return Ok(self.streams.remove(&stream_id).unwrap());
+                }
+                DispatchOutcome::Done(_) => {
+                    // Some other stream finished; loop continues.
+                }
+            }
         }
-        F_HEADERS if frame.stream_id == 1 => {
-            let mut payload = frame.payload.as_slice();
-            // PADDED: 1 byte pad length, then payload, then padding bytes.
-            let mut pad_len = 0usize;
-            if frame.flags & FLAG_PADDED != 0 {
-                if payload.is_empty() {
-                    return Err(Error::BadResponse(
-                        "HEADERS PADDED with empty payload".into(),
-                    ));
-                }
-                pad_len = payload[0] as usize;
-                payload = &payload[1..];
+    }
+
+    /// Read one frame from the wire and route it to the right place. The
+    /// connection-scoped frames (SETTINGS / PING / GOAWAY / WINDOW_UPDATE on
+    /// stream 0) are handled here directly; stream-scoped frames are looked
+    /// up in `self.streams` and dispatched.
+    fn read_and_dispatch(&mut self) -> Result<DispatchOutcome> {
+        let frame = match read_frame(&mut self.tls) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(Error::UnexpectedEof);
             }
-            // PRIORITY: skip 5 bytes (stream dep + weight).
-            if frame.flags & FLAG_PRIORITY != 0 {
-                if payload.len() < 5 {
-                    return Err(Error::BadResponse(
-                        "HEADERS PRIORITY with insufficient payload".into(),
-                    ));
-                }
-                payload = &payload[5..];
+            Err(e) => return Err(Error::Io(e)),
+        };
+        self.process_frame(frame)
+    }
+
+    /// Apply one already-read frame. Split out from `read_and_dispatch` so
+    /// tests can drive the dispatch ladder with synthetic frames.
+    fn process_frame(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+        // RFC 9113 §6.10: between HEADERS-without-END_HEADERS and the
+        // matching final CONTINUATION on the same stream, NO other frame
+        // type — and no HEADERS/CONTINUATION on any other stream — may
+        // appear. Enforce that gate up front.
+        if let Some(awaiting) = self.expecting_continuation {
+            let ok = frame.typ == F_CONTINUATION && frame.stream_id == awaiting;
+            if !ok {
+                return Err(Error::BadResponse(format!(
+                    "expected CONTINUATION on stream {awaiting}, got type=0x{:x} stream={}",
+                    frame.typ, frame.stream_id
+                )));
             }
-            if payload.len() < pad_len {
+        }
+
+        if frame.stream_id == 0 {
+            return self.process_conn_frame(frame);
+        }
+        self.process_stream_frame(frame)
+    }
+
+    /// Connection-scoped frames (stream_id == 0): SETTINGS / SETTINGS-ACK,
+    /// PING / PING-ACK, GOAWAY, WINDOW_UPDATE on stream 0. PRIORITY at stream
+    /// 0 would be a protocol error but we just ignore it.
+    fn process_conn_frame(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+        match frame.typ {
+            F_SETTINGS if frame.flags & FLAG_ACK == 0 => {
+                let old_initial = self.peer.initial_window_size;
+                self.peer.apply_settings_payload(&frame.payload)?;
+                let new_initial = self.peer.initial_window_size;
+                if new_initial != old_initial {
+                    // §6.9.2: retroactively shift every existing stream's
+                    // send window by (new - old). The conn window is
+                    // untouched.
+                    for s in self.streams.values_mut() {
+                        s.send_window.apply_initial_window_change(new_initial)?;
+                    }
+                }
+                let ack = Frame {
+                    typ: F_SETTINGS,
+                    flags: FLAG_ACK,
+                    stream_id: 0,
+                    payload: Vec::new(),
+                };
+                write_frame(&mut self.tls, &ack)?;
+                self.tls.flush()?;
+            }
+            F_SETTINGS => { /* ACK from server: silently absorb. */ }
+            F_PING if frame.flags & FLAG_ACK == 0 => {
+                let pong = Frame {
+                    typ: F_PING,
+                    flags: FLAG_ACK,
+                    stream_id: 0,
+                    payload: frame.payload.clone(),
+                };
+                write_frame(&mut self.tls, &pong)?;
+                self.tls.flush()?;
+            }
+            F_PING => {}
+            F_WINDOW_UPDATE => {
+                let inc = parse_window_update(&frame.payload)?;
+                self.conn_send_window.apply_window_update(inc)?;
+            }
+            F_GOAWAY => {
+                // First 4 bytes of payload are the last-stream-id (high bit
+                // reserved). Anything earlier than that the peer promises to
+                // process; ids ≥ this are abandoned. We refuse to allocate
+                // any new id beyond `last` but allow existing streams ≤ last
+                // to keep running.
+                let last = if frame.payload.len() >= 4 {
+                    u32::from_be_bytes([
+                        frame.payload[0],
+                        frame.payload[1],
+                        frame.payload[2],
+                        frame.payload[3],
+                    ]) & 0x7fff_ffff
+                } else {
+                    0
+                };
+                self.goaway_received = Some(last);
+                // If any of our open streams has id > last, the peer will not
+                // process them; mark them closed and let the caller see that.
+                // (For now we just transition state; the body/headers stay
+                // empty so the caller surfaces a BadResponse.)
+                let doomed: Vec<u32> = self
+                    .streams
+                    .iter()
+                    .filter(|(id, _)| **id > last)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in doomed {
+                    if let Some(s) = self.streams.get_mut(&id) {
+                        s.state = StreamState::Closed;
+                    }
+                }
+            }
+            _ => {
+                // PRIORITY on stream 0 is technically a PROTOCOL_ERROR; we
+                // tolerate by ignoring. Unknown frame types are explicitly
+                // ignorable per RFC 9113 §4.1.
+            }
+        }
+        Ok(DispatchOutcome::Continue)
+    }
+
+    /// Stream-scoped frames (stream_id != 0). Validates the per-stream state
+    /// machine and applies the frame.
+    fn process_stream_frame(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+        match frame.typ {
+            F_HEADERS => self.process_headers(frame),
+            F_CONTINUATION => self.process_continuation(frame),
+            F_DATA => self.process_data(frame),
+            F_RST_STREAM => self.process_rst(frame),
+            F_WINDOW_UPDATE => {
+                let inc = parse_window_update(&frame.payload)?;
+                if let Some(s) = self.streams.get_mut(&frame.stream_id) {
+                    s.send_window.apply_window_update(inc)?;
+                }
+                // WINDOW_UPDATE on an unknown / closed stream: silently drop.
+                Ok(DispatchOutcome::Continue)
+            }
+            F_PUSH_PROMISE => {
+                // We disabled push (ENABLE_PUSH=0); any PUSH_PROMISE is a
+                // protocol violation by the peer.
+                Err(Error::BadResponse(
+                    "received PUSH_PROMISE despite SETTINGS_ENABLE_PUSH=0".into(),
+                ))
+            }
+            _ => {
+                // PRIORITY and unknown types — ignore per §4.1.
+                Ok(DispatchOutcome::Continue)
+            }
+        }
+    }
+
+    fn process_headers(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+        // Strip PADDED / PRIORITY framing from the payload to find the actual
+        // header-block fragment.
+        let mut payload = frame.payload.as_slice();
+        let mut pad_len = 0usize;
+        if frame.flags & FLAG_PADDED != 0 {
+            if payload.is_empty() {
                 return Err(Error::BadResponse(
-                    "HEADERS padding overruns payload".into(),
+                    "HEADERS PADDED with empty payload".into(),
                 ));
             }
-            let frag = &payload[..payload.len() - pad_len];
-            state.headers_buf.extend_from_slice(frag);
+            pad_len = payload[0] as usize;
+            payload = &payload[1..];
+        }
+        if frame.flags & FLAG_PRIORITY != 0 {
+            if payload.len() < 5 {
+                return Err(Error::BadResponse(
+                    "HEADERS PRIORITY with insufficient payload".into(),
+                ));
+            }
+            payload = &payload[5..];
+        }
+        if payload.len() < pad_len {
+            return Err(Error::BadResponse(
+                "HEADERS padding overruns payload".into(),
+            ));
+        }
+        let frag = &payload[..payload.len() - pad_len];
+        let end_headers = frame.flags & FLAG_END_HEADERS != 0;
+        let end_stream = frame.flags & FLAG_END_STREAM != 0;
 
-            if frame.flags & FLAG_END_HEADERS != 0 {
-                let decoded = state.decoder.decode_block(&state.headers_buf)?;
-                state.headers_buf.clear();
-                state.response_headers = Some(decoded);
-                state.expecting_continuation = false;
+        let stream_id = frame.stream_id;
+        // Server push: a HEADERS on a stream we never opened with an even id
+        // (or a higher odd id from the peer) violates ENABLE_PUSH=0.
+        let known = self.streams.contains_key(&stream_id);
+        if !known {
+            return Err(Error::BadResponse(format!(
+                "HEADERS on unknown stream {stream_id} (server push disabled)"
+            )));
+        }
+
+        // State check: HEADERS on a Closed stream is ignored (trailers after
+        // close, RFC 9113 §5.1). Any other illegal state is an error.
+        let state = self.streams.get(&stream_id).unwrap().state;
+        if state == StreamState::Closed {
+            // Drain the fragment but do not decode; this keeps the decoder's
+            // dynamic table consistent with the peer's view (HPACK requires
+            // the receiver to process header blocks even if it ignores them
+            // logically — RFC 7541 §2.2). The peer sent end_headers either on
+            // this frame or via CONTINUATION; for simplicity we only honour
+            // it inline (we already require end_headers immediately for
+            // closed-stream trailers since we don't track expecting_continuation
+            // for closed streams in the test surface). Decoding errors propagate.
+            if end_headers {
+                let _ = self.decoder.decode_block(frag)?;
             } else {
-                state.expecting_continuation = true;
+                // Conservatively buffer on the closed stream so the
+                // CONTINUATION still finds its target.
+                self.streams
+                    .get_mut(&stream_id)
+                    .unwrap()
+                    .headers_buf
+                    .extend_from_slice(frag);
+                self.expecting_continuation = Some(stream_id);
             }
+            return Ok(DispatchOutcome::Continue);
+        }
+        let new_state = state.recv_headers(end_stream)?;
 
-            if frame.flags & FLAG_END_STREAM != 0 {
-                state.end_stream = true;
-            }
+        let s = self.streams.get_mut(&stream_id).unwrap();
+        s.headers_buf.extend_from_slice(frag);
+        if end_stream {
+            s.end_stream_recv = true;
         }
-        F_CONTINUATION if frame.stream_id == 1 => {
-            if !state.expecting_continuation {
-                return Err(Error::BadResponse("unexpected CONTINUATION frame".into()));
-            }
-            state.headers_buf.extend_from_slice(&frame.payload);
-            if frame.flags & FLAG_END_HEADERS != 0 {
-                let decoded = state.decoder.decode_block(&state.headers_buf)?;
-                state.headers_buf.clear();
-                state.response_headers = Some(decoded);
-                state.expecting_continuation = false;
-            }
+        if end_headers {
+            // Decode now; clear the buffer.
+            let block = std::mem::take(&mut s.headers_buf);
+            // Drop the &mut borrow before reaching for the decoder.
+            let decoded = self.decoder.decode_block(&block)?;
+            let s = self.streams.get_mut(&stream_id).unwrap();
+            s.response_headers = Some(decoded);
+            s.state = new_state;
+            self.expecting_continuation = None;
+        } else {
+            s.state = new_state;
+            self.expecting_continuation = Some(stream_id);
         }
-        F_DATA if frame.stream_id == 1 => {
-            // RFC 9113 §6.9.1: every octet of a DATA frame counts against
-            // the flow-control windows — *including* the pad-length byte and
-            // padding bytes. Bill `frame.payload.len()` first, then strip
-            // padding to find the application bytes to deliver.
-            let frame_bytes = frame.payload.len();
-            state.recv_window.consume(frame_bytes);
 
-            let mut payload = frame.payload.as_slice();
-            if frame.flags & FLAG_PADDED != 0 {
-                if payload.is_empty() {
-                    return Err(Error::BadResponse("DATA PADDED with empty payload".into()));
-                }
-                let pad_len = payload[0] as usize;
-                payload = &payload[1..];
-                if payload.len() < pad_len {
-                    return Err(Error::BadResponse("DATA padding overruns payload".into()));
-                }
-                payload = &payload[..payload.len() - pad_len];
-            }
-            state.body.extend_from_slice(payload);
-            if frame.flags & FLAG_END_STREAM != 0 {
-                state.end_stream = true;
-            }
-
-            // Replenish either window that has dropped below half its initial
-            // size. With the RFC default (65,535 → threshold 32,767) one
-            // large response can fire one or two WINDOW_UPDATE frames;
-            // otherwise we stay quiet.
-            for upd in state.recv_window.replenish(1) {
-                write_frame(tls, &upd)?;
-            }
-            tls.flush()?;
-        }
-        _ => {
-            // PRIORITY, PUSH_PROMISE, RST_STREAM on other streams, unknown
-            // types — all ignored per RFC 9113 §4.1.
-        }
+        let done = matches!(
+            self.streams.get(&stream_id).unwrap().state,
+            StreamState::Closed | StreamState::HalfClosedRemote
+        ) && self.streams.get(&stream_id).unwrap().end_stream_recv
+            && self
+                .streams
+                .get(&stream_id)
+                .unwrap()
+                .response_headers
+                .is_some();
+        Ok(if done {
+            DispatchOutcome::Done(stream_id)
+        } else {
+            DispatchOutcome::Continue
+        })
     }
 
-    Ok(if state.end_stream {
-        DriverOutcome::Done
-    } else {
-        DriverOutcome::Continue
-    })
-}
-
-/// Read one frame from `tls` and feed it to [`process_frame`]. Maps the I/O
-/// error variants to the crate's `Error` taxonomy. Used by both the body-send
-/// loop (when blocked on flow control) and the main response-read loop.
-fn read_and_process<S: Read + Write>(tls: &mut S, state: &mut ConnState) -> Result<DriverOutcome> {
-    let frame = match read_frame(tls) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(Error::UnexpectedEof);
+    fn process_continuation(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+        let stream_id = frame.stream_id;
+        // §6.10: CONTINUATION must match the stream we set as expecting.
+        match self.expecting_continuation {
+            Some(awaiting) if awaiting == stream_id => {}
+            _ => {
+                return Err(Error::BadResponse(format!(
+                    "unexpected CONTINUATION on stream {stream_id}"
+                )));
+            }
         }
-        Err(e) => return Err(Error::Io(e)),
-    };
-    process_frame(frame, tls, state)
+        let s = self.streams.get_mut(&stream_id).ok_or_else(|| {
+            Error::BadResponse(format!("CONTINUATION on unknown stream {stream_id}"))
+        })?;
+        s.headers_buf.extend_from_slice(&frame.payload);
+        let end_headers = frame.flags & FLAG_END_HEADERS != 0;
+        if end_headers {
+            let block = std::mem::take(&mut s.headers_buf);
+            let decoded = self.decoder.decode_block(&block)?;
+            let s = self.streams.get_mut(&stream_id).unwrap();
+            if s.state != StreamState::Closed {
+                s.response_headers = Some(decoded);
+            }
+            self.expecting_continuation = None;
+        }
+        let done = matches!(
+            self.streams.get(&stream_id).unwrap().state,
+            StreamState::Closed | StreamState::HalfClosedRemote
+        ) && self.streams.get(&stream_id).unwrap().end_stream_recv
+            && self
+                .streams
+                .get(&stream_id)
+                .unwrap()
+                .response_headers
+                .is_some();
+        Ok(if done {
+            DispatchOutcome::Done(stream_id)
+        } else {
+            DispatchOutcome::Continue
+        })
+    }
+
+    fn process_data(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+        let stream_id = frame.stream_id;
+        let frame_bytes = frame.payload.len();
+        // Connection window is billed regardless of whether the stream is
+        // known — that's what the RFC requires.
+        self.conn_recv_window.consume(frame_bytes);
+        let known = self.streams.contains_key(&stream_id);
+        if !known {
+            // DATA for an unknown / already-evicted stream: drop silently per
+            // RFC 9113 §5.1 ("frames for closed streams MAY be ignored").
+            // We still need to replenish the conn window so the peer can keep
+            // sending.
+            if let Some(upd) = self.conn_recv_window.replenish() {
+                write_frame(&mut self.tls, &upd)?;
+                self.tls.flush()?;
+            }
+            return Ok(DispatchOutcome::Continue);
+        }
+        let state = self.streams.get(&stream_id).unwrap().state;
+        if state == StreamState::Closed {
+            // Per §5.1, DATA on a closed stream is a STREAM_CLOSED error;
+            // we surface it as such.
+            return Err(Error::BadResponse(format!(
+                "DATA on closed stream {stream_id}"
+            )));
+        }
+        let end_stream = frame.flags & FLAG_END_STREAM != 0;
+        let new_state = state.recv_data(end_stream)?;
+
+        let s = self.streams.get_mut(&stream_id).unwrap();
+        s.recv_window.consume(frame_bytes);
+
+        // Strip padding to find the application bytes.
+        let mut payload = frame.payload.as_slice();
+        if frame.flags & FLAG_PADDED != 0 {
+            if payload.is_empty() {
+                return Err(Error::BadResponse("DATA PADDED with empty payload".into()));
+            }
+            let pad_len = payload[0] as usize;
+            payload = &payload[1..];
+            if payload.len() < pad_len {
+                return Err(Error::BadResponse("DATA padding overruns payload".into()));
+            }
+            payload = &payload[..payload.len() - pad_len];
+        }
+        s.body.extend_from_slice(payload);
+        if end_stream {
+            s.end_stream_recv = true;
+        }
+        s.state = new_state;
+
+        // Replenish either window if it's dropped below half. Both checks are
+        // independent — a single large DATA frame can fire both.
+        if let Some(upd) = self.conn_recv_window.replenish() {
+            write_frame(&mut self.tls, &upd)?;
+        }
+        if let Some(upd) = self
+            .streams
+            .get_mut(&stream_id)
+            .unwrap()
+            .recv_window
+            .replenish(stream_id)
+        {
+            write_frame(&mut self.tls, &upd)?;
+        }
+        self.tls.flush()?;
+
+        let s = self.streams.get(&stream_id).unwrap();
+        let done = matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
+            && s.end_stream_recv
+            && s.response_headers.is_some();
+        Ok(if done {
+            DispatchOutcome::Done(stream_id)
+        } else {
+            DispatchOutcome::Continue
+        })
+    }
+
+    fn process_rst(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+        let stream_id = frame.stream_id;
+        let code = if frame.payload.len() >= 4 {
+            u32::from_be_bytes([
+                frame.payload[0],
+                frame.payload[1],
+                frame.payload[2],
+                frame.payload[3],
+            ])
+        } else {
+            0
+        };
+        match self.streams.get_mut(&stream_id) {
+            Some(s) => {
+                // RST_STREAM on closed → silently ignore (RFC 9113 §5.1).
+                if s.state == StreamState::Closed {
+                    return Ok(DispatchOutcome::Continue);
+                }
+                s.state = s.state.recv_rst()?;
+                Err(Error::BadResponse(format!(
+                    "stream {stream_id} reset by server, error code {code}"
+                )))
+            }
+            None => {
+                // RST_STREAM on unknown stream: harmless, ignore.
+                Ok(DispatchOutcome::Continue)
+            }
+        }
+    }
 }
 
 /// Split an HPACK-encoded header block into one HEADERS frame followed by
@@ -1391,8 +1913,8 @@ fn read_and_process<S: Read + Write>(tls: &mut S, state: &mut ConnState) -> Resu
 ///
 /// `end_stream` controls FLAG_END_STREAM on the HEADERS frame; FLAG_END_HEADERS
 /// is set automatically on the final fragment (which is the HEADERS frame
-/// itself when one fragment suffices). The stream id is hardcoded to 1 for
-/// the single-stream world (task 4 will generalize this).
+/// itself when one fragment suffices). `stream_id` is the stream the caller
+/// has allocated for this request.
 ///
 /// Edge cases:
 /// - `header_block.len() == max_frame_size` produces one HEADERS frame.
@@ -1404,6 +1926,7 @@ fn read_and_process<S: Read + Write>(tls: &mut S, state: &mut ConnState) -> Resu
 ///   writing them back-to-back with no interleaved frames on the wire, which
 ///   our single-threaded writer guarantees.
 fn fragment_header_block(
+    stream_id: u32,
     header_block: &[u8],
     max_frame_size: usize,
     end_stream: bool,
@@ -1411,9 +1934,6 @@ fn fragment_header_block(
     debug_assert!(max_frame_size > 0, "max_frame_size must be > 0");
     let mut frames = Vec::new();
 
-    // Empty header block: still emit a single (empty) HEADERS frame so the
-    // caller has something to write. END_HEADERS goes on it since it is the
-    // only — and therefore last — fragment.
     if header_block.is_empty() {
         let mut flags = FLAG_END_HEADERS;
         if end_stream {
@@ -1422,7 +1942,7 @@ fn fragment_header_block(
         frames.push(Frame {
             typ: F_HEADERS,
             flags,
-            stream_id: 1,
+            stream_id,
             payload: Vec::new(),
         });
         return frames;
@@ -1432,7 +1952,6 @@ fn fragment_header_block(
     for (i, chunk) in header_block.chunks(max_frame_size).enumerate() {
         let is_last = i + 1 == total_chunks;
         if i == 0 {
-            // HEADERS: END_STREAM (if no body) is independent of END_HEADERS.
             let mut flags = 0u8;
             if end_stream {
                 flags |= FLAG_END_STREAM;
@@ -1443,16 +1962,15 @@ fn fragment_header_block(
             frames.push(Frame {
                 typ: F_HEADERS,
                 flags,
-                stream_id: 1,
+                stream_id,
                 payload: chunk.to_vec(),
             });
         } else {
-            // CONTINUATION: no flags except END_HEADERS on the final fragment.
             let flags = if is_last { FLAG_END_HEADERS } else { 0 };
             frames.push(Frame {
                 typ: F_CONTINUATION,
                 flags,
-                stream_id: 1,
+                stream_id,
                 payload: chunk.to_vec(),
             });
         }
@@ -1471,12 +1989,14 @@ fn next_data_chunk_size(max_frame_size: usize, available: i64, remaining: usize)
         return 0;
     }
     let cap_window = available.min(remaining as i64).min(max_frame_size as i64);
-    // available > 0 and the other two are >= 0, so cap_window fits in usize.
     cap_window as usize
 }
 
 /// Send a single request/response over a fresh HTTP/2 connection.
-/// (Connection pooling and multiplexing come later.)
+///
+/// The connection is built, used for one stream, and dropped. Task 5 will
+/// replace this with a pool-aware variant that reuses connections across
+/// `send()` calls.
 pub fn send(req: Request) -> Result<Response> {
     if req.url.scheme != "https" {
         // h2c (cleartext HTTP/2 with upgrade) is out of scope for v1.
@@ -1487,119 +2007,29 @@ pub fn send(req: Request) -> Result<Response> {
     }
     let tcp = tcp_connect(&req)?;
     let opts = crate::http::tls_opts_from(&req, &[b"h2"])?;
-    let mut tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+    let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
     let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
     if !negotiated_h2 {
-        // Server did not accept ALPN "h2". Signal upward so callers (e.g.
-        // `http::send_https` in Auto mode) can fall back to HTTP/1.1 over
-        // a new connection. This connection is dropped at end of scope.
         return Err(Error::H2NotNegotiated);
     }
 
-    // 1. Client preface + initial SETTINGS frame.
-    //    We advertise ENABLE_PUSH=0 so the server won't send PUSH_PROMISE
-    //    frames (we don't implement them). Other parameters are left at
-    //    their RFC 9113 §6.5.2 defaults.
-    tls.write_all(PREFACE)?;
-    let mut settings_payload = Vec::with_capacity(6);
-    settings_payload.extend_from_slice(&S_ENABLE_PUSH.to_be_bytes());
-    settings_payload.extend_from_slice(&0u32.to_be_bytes());
-    let our_settings = Frame {
-        typ: F_SETTINGS,
-        flags: 0,
-        stream_id: 0,
-        payload: settings_payload,
-    };
-    write_frame(&mut tls, &our_settings)?;
-    tls.flush()?;
+    let mut conn = Connection::new(tls)?;
+    let stream_id = conn.open_stream()?;
+    conn.send_request_on(stream_id, &req)?;
+    let stream = conn.drive_until_stream_done(stream_id)?;
+    drop(conn);
+    build_response_from_stream(stream)
+}
 
-    // 2. Build and send HEADERS (+ CONTINUATION fragments) for the request,
-    //    then stream the body as one or more DATA frames driven by
-    //    flow-control. `state.peer` starts at RFC defaults; the server's
-    //    SETTINGS frame will refine it during the body loop (read inline
-    //    when we have to block on a WINDOW_UPDATE) or during the response
-    //    loop below.
-    let mut state = ConnState::new();
-    let header_block = build_header_block(&req);
-    let has_body = !req.body.is_empty();
-
-    // Header-block fragmentation (RFC 9113 §6.10). The writer is
-    // single-threaded so the HEADERS + CONTINUATION sequence is emitted
-    // back-to-back with no interleaved frames, satisfying the "no other
-    // frames between header fragments" rule automatically.
-    let header_frames =
-        fragment_header_block(&header_block, state.peer.max_frame_size as usize, !has_body);
-    for f in &header_frames {
-        write_frame(&mut tls, f)?;
-    }
-
-    if has_body {
-        // Body fragmentation (RFC 9113 §6.1) with flow-control gating
-        // (§6.9). The body is split into chunks no larger than
-        // `peer.max_frame_size` AND no larger than the smaller of the two
-        // send windows (connection + stream). If the windows are exhausted
-        // we read inbound frames in-place until a WINDOW_UPDATE replenishes
-        // us — `process_frame` may legitimately stash early response bytes
-        // (HEADERS/DATA from the server) along the way; we keep going until
-        // the request body is fully transmitted, otherwise the server would
-        // see a truncated request.
-        let mut remaining: &[u8] = req.body.as_slice();
-        while !remaining.is_empty() {
-            // Block until the send window has any budget. `peer.max_frame_size`
-            // is re-read each iteration so a mid-upload SETTINGS update takes
-            // effect on the next chunk.
-            while state.send_window.available() <= 0 {
-                match read_and_process(&mut tls, &mut state)? {
-                    DriverOutcome::Continue => {}
-                    DriverOutcome::Done => {
-                        // The peer signalled END_STREAM on our request stream
-                        // before we finished uploading. That contradicts the
-                        // request: surface as a protocol error.
-                        return Err(Error::BadResponse(
-                            "server ended stream before request body was fully sent".into(),
-                        ));
-                    }
-                }
-            }
-
-            let n = next_data_chunk_size(
-                state.peer.max_frame_size as usize,
-                state.send_window.available(),
-                remaining.len(),
-            );
-            debug_assert!(n > 0, "loop above guarantees positive budget");
-            let chunk = &remaining[..n];
-            remaining = &remaining[n..];
-            let is_last = remaining.is_empty();
-            let data_frame = Frame {
-                typ: F_DATA,
-                flags: if is_last { FLAG_END_STREAM } else { 0 },
-                stream_id: 1,
-                payload: chunk.to_vec(),
-            };
-            write_frame(&mut tls, &data_frame)?;
-            state.send_window.consume(n);
-        }
-    }
-    tls.flush()?;
-
-    // 3. Drive the connection: ACK server SETTINGS, answer PINGs, accumulate
-    //    HEADERS/CONTINUATION/DATA for stream 1, stop on END_STREAM or GOAWAY.
-    //    `process_frame` may have already filled in some of `state` if the
-    //    server raced response bytes against our body upload — that's fine,
-    //    we just keep reading until END_STREAM lands.
-    while !state.end_stream {
-        match read_and_process(&mut tls, &mut state)? {
-            DriverOutcome::Continue => {}
-            DriverOutcome::Done => break,
-        }
-    }
-
-    let headers = state
+/// Translate a fully-received `Stream` into the public `Response` type.
+/// Extracts the `:status` pseudo-header, drops any other pseudo-headers
+/// (none are defined for responses but be conservative), and inherits the
+/// accumulated body.
+fn build_response_from_stream(stream: Stream) -> Result<Response> {
+    let headers = stream
         .response_headers
         .ok_or_else(|| Error::BadResponse("response ended before any HEADERS frame".into()))?;
 
-    // Extract :status pseudo-header, drop pseudo-headers from the returned set.
     let mut status: Option<u16> = None;
     let mut clean_headers: Vec<(String, String)> = Vec::with_capacity(headers.len());
     for (k, v) in headers {
@@ -1621,7 +2051,7 @@ pub fn send(req: Request) -> Result<Response> {
         reason: String::new(), // HTTP/2 has no reason phrase (RFC 9113 §8.3.1).
         version: "HTTP/2".to_string(),
         headers: clean_headers,
-        body: state.body,
+        body: stream.body,
     })
 }
 
@@ -2138,43 +2568,44 @@ mod tests {
 
     #[test]
     fn send_window_defaults_match_rfc() {
-        let w = SendWindow::new();
-        assert_eq!(w.conn, 65_535);
-        assert_eq!(w.stream, 65_535);
-        assert_eq!(w.initial_peer_window, 65_535);
-        assert_eq!(w.available(), 65_535);
+        // Conn and stream send windows both start at 65_535 (RFC 9113 §6.9.2).
+        let c = ConnSendWindow::new();
+        assert_eq!(c.available, 65_535);
+        let s = StreamSendWindow::new(65_535);
+        assert_eq!(s.available, 65_535);
+        assert_eq!(s.initial_peer_window, 65_535);
     }
 
     #[test]
     fn send_window_decrements_after_data() {
-        // The transmit path calls `consume(n)` after writing a DATA frame;
-        // verify both halves drop by exactly `n`.
-        let mut w = SendWindow::new();
-        w.consume(1000);
-        assert_eq!(w.conn, 64_535);
-        assert_eq!(w.stream, 64_535);
-        assert_eq!(w.available(), 64_535);
-        w.consume(64_535);
-        assert_eq!(w.conn, 0);
-        assert_eq!(w.stream, 0);
-        assert_eq!(w.available(), 0);
+        // Both halves drop independently by exactly `n` on `consume`.
+        let mut c = ConnSendWindow::new();
+        let mut s = StreamSendWindow::new(65_535);
+        c.consume(1000);
+        s.consume(1000);
+        assert_eq!(c.available, 64_535);
+        assert_eq!(s.available, 64_535);
+        c.consume(64_535);
+        s.consume(64_535);
+        assert_eq!(c.available, 0);
+        assert_eq!(s.available, 0);
     }
 
     #[test]
     fn window_update_zero_increment_is_error() {
         // RFC 9113 §6.9.1: zero increment is PROTOCOL_ERROR on a stream and
-        // FLOW_CONTROL_ERROR on the connection. We parse first then validate;
-        // verify both code paths reject it.
+        // FLOW_CONTROL_ERROR on the connection. Both reject it.
         let zero_payload = [0u8; 4];
         let inc = parse_window_update(&zero_payload).unwrap();
         assert_eq!(inc, 0);
-        let mut w = SendWindow::new();
+        let mut c = ConnSendWindow::new();
         assert!(matches!(
-            w.apply_window_update(0, inc),
+            c.apply_window_update(inc),
             Err(Error::BadResponse(_))
         ));
+        let mut s = StreamSendWindow::new(65_535);
         assert!(matches!(
-            w.apply_window_update(1, inc),
+            s.apply_window_update(inc),
             Err(Error::BadResponse(_))
         ));
     }
@@ -2183,17 +2614,16 @@ mod tests {
     fn window_update_overflow_is_error() {
         // Current window = 2^31 - 1, increment 1 → would push to 2^31; that's
         // a FLOW_CONTROL_ERROR (RFC 9113 §6.9.1).
-        let mut w = SendWindow::new();
-        w.conn = WINDOW_MAX;
+        let mut c = ConnSendWindow::new();
+        c.available = WINDOW_MAX;
         assert!(matches!(
-            w.apply_window_update(0, 1),
+            c.apply_window_update(1),
             Err(Error::BadResponse(_))
         ));
-        // Stream half independently.
-        let mut w = SendWindow::new();
-        w.stream = WINDOW_MAX;
+        let mut s = StreamSendWindow::new(65_535);
+        s.available = WINDOW_MAX;
         assert!(matches!(
-            w.apply_window_update(1, 1),
+            s.apply_window_update(1),
             Err(Error::BadResponse(_))
         ));
     }
@@ -2223,20 +2653,17 @@ mod tests {
     #[test]
     fn initial_window_size_delta_adjusts_stream_send_window() {
         // Peer doubles INITIAL_WINDOW_SIZE: 65535 → 131072. Existing stream's
-        // send window must grow by exactly that delta. Connection window is
-        // untouched (RFC 9113 §6.9.2).
-        let mut w = SendWindow::new();
-        let conn_before = w.conn;
-        w.apply_initial_window_change(131_072).unwrap();
-        assert_eq!(w.stream, 65_535 + (131_072 - 65_535));
-        assert_eq!(w.conn, conn_before);
-        assert_eq!(w.initial_peer_window, 131_072);
+        // send window grows by exactly that delta. Conn window is independent.
+        let mut s = StreamSendWindow::new(65_535);
+        s.apply_initial_window_change(131_072).unwrap();
+        assert_eq!(s.available, 65_535 + (131_072 - 65_535));
+        assert_eq!(s.initial_peer_window, 131_072);
         // A subsequent shrink applies relative to the new initial, not the
         // RFC default.
-        w.apply_initial_window_change(0).unwrap();
+        s.apply_initial_window_change(0).unwrap();
         // delta = 0 - 131072 = -131072; stream was 131072, becomes 0.
-        assert_eq!(w.stream, 0);
-        assert_eq!(w.initial_peer_window, 0);
+        assert_eq!(s.available, 0);
+        assert_eq!(s.initial_peer_window, 0);
     }
 
     #[test]
@@ -2244,10 +2671,9 @@ mod tests {
         // Stream send window already at 2^31-1, then SETTINGS announces a
         // positive INITIAL_WINDOW_SIZE delta → result exceeds 2^31-1, which
         // is a FLOW_CONTROL_ERROR (RFC 9113 §6.9.2).
-        let mut w = SendWindow::new();
-        w.stream = WINDOW_MAX;
-        // initial_peer_window is still 65535; bump to 65536 to add +1 delta.
-        let err = w.apply_initial_window_change(65_536).unwrap_err();
+        let mut s = StreamSendWindow::new(65_535);
+        s.available = WINDOW_MAX;
+        let err = s.apply_initial_window_change(65_536).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
     }
 
@@ -2255,63 +2681,64 @@ mod tests {
     fn initial_window_size_delta_allows_negative_window() {
         // §6.9.2 explicitly permits the window to go negative when the peer
         // shrinks INITIAL_WINDOW_SIZE below the bytes already in flight.
-        let mut w = SendWindow::new();
-        w.stream = 100;
-        w.apply_initial_window_change(0).unwrap();
+        let mut s = StreamSendWindow::new(65_535);
+        s.available = 100;
+        s.apply_initial_window_change(0).unwrap();
         // delta = 0 - 65535 = -65535; 100 + (-65535) = -65435.
-        assert_eq!(w.stream, -65_435);
+        assert_eq!(s.available, -65_435);
     }
 
     #[test]
     fn recv_window_defaults_match_rfc() {
-        let w = RecvWindow::new();
-        assert_eq!(w.conn, OUR_INITIAL_WINDOW);
-        assert_eq!(w.stream, OUR_INITIAL_WINDOW);
-        assert_eq!(w.initial, OUR_INITIAL_WINDOW);
+        let c = ConnRecvWindow::new();
+        assert_eq!(c.available, OUR_INITIAL_WINDOW);
+        assert_eq!(c.initial, OUR_INITIAL_WINDOW);
+        let s = StreamRecvWindow::new();
+        assert_eq!(s.available, OUR_INITIAL_WINDOW);
+        assert_eq!(s.initial, OUR_INITIAL_WINDOW);
     }
 
     #[test]
     fn recv_window_no_replenish_above_half() {
-        // Consume slightly less than half the initial window — neither side
-        // crosses the threshold, so no WINDOW_UPDATE should be produced.
-        let mut w = RecvWindow::new();
-        w.consume(1000);
-        let frames = w.replenish(1);
-        assert!(frames.is_empty());
-        assert_eq!(w.conn, OUR_INITIAL_WINDOW - 1000);
-        assert_eq!(w.stream, OUR_INITIAL_WINDOW - 1000);
+        // Consume slightly less than half the initial window — no
+        // WINDOW_UPDATE should be produced.
+        let mut c = ConnRecvWindow::new();
+        c.consume(1000);
+        assert!(c.replenish().is_none());
+        assert_eq!(c.available, OUR_INITIAL_WINDOW - 1000);
+
+        let mut s = StreamRecvWindow::new();
+        s.consume(1000);
+        assert!(s.replenish(1).is_none());
+        assert_eq!(s.available, OUR_INITIAL_WINDOW - 1000);
     }
 
     #[test]
     fn recv_window_replenishes_when_below_half() {
-        // Two DATA-sized consumes (20_000 each) bring both windows to
-        // 25_535 — below the 32_767 threshold. Replenish must emit two
-        // WINDOW_UPDATE frames (one for stream 0, one for stream 1), each
-        // restoring the corresponding side to `initial`.
-        let mut w = RecvWindow::new();
-        w.consume(20_000);
-        w.consume(20_000);
-        assert_eq!(w.conn, 25_535);
-        assert_eq!(w.stream, 25_535);
+        // Two DATA-sized consumes (20_000 each) bring the window to 25_535 —
+        // below the 32_767 threshold. Replenish must emit one WINDOW_UPDATE
+        // restoring the running window to `initial`.
+        let mut c = ConnRecvWindow::new();
+        c.consume(20_000);
+        c.consume(20_000);
+        assert_eq!(c.available, 25_535);
+        let f = c.replenish().expect("conn window expected replenish");
+        assert_eq!(f.typ, F_WINDOW_UPDATE);
+        assert_eq!(f.stream_id, 0);
+        let inc = parse_window_update(&f.payload).unwrap();
+        assert_eq!(inc, (OUR_INITIAL_WINDOW - 25_535) as u32);
+        assert_eq!(c.available, OUR_INITIAL_WINDOW);
+        // Idempotent: subsequent replenish at full is a no-op.
+        assert!(c.replenish().is_none());
 
-        let frames = w.replenish(1);
-        assert_eq!(frames.len(), 2);
-        // Frame ordering is connection-first by construction.
-        assert_eq!(frames[0].typ, F_WINDOW_UPDATE);
-        assert_eq!(frames[0].stream_id, 0);
-        assert_eq!(frames[1].typ, F_WINDOW_UPDATE);
-        assert_eq!(frames[1].stream_id, 1);
-        // Each increment is `initial - current` so that the running window
-        // returns to `initial`.
-        let inc_conn = parse_window_update(&frames[0].payload).unwrap();
-        let inc_stream = parse_window_update(&frames[1].payload).unwrap();
-        assert_eq!(inc_conn, (OUR_INITIAL_WINDOW - 25_535) as u32);
-        assert_eq!(inc_stream, (OUR_INITIAL_WINDOW - 25_535) as u32);
-        assert_eq!(w.conn, OUR_INITIAL_WINDOW);
-        assert_eq!(w.stream, OUR_INITIAL_WINDOW);
-
-        // A subsequent replenish with both windows at initial is a no-op.
-        assert!(w.replenish(1).is_empty());
+        let mut s = StreamRecvWindow::new();
+        s.consume(40_000);
+        let f = s.replenish(7).expect("stream window expected replenish");
+        assert_eq!(f.typ, F_WINDOW_UPDATE);
+        assert_eq!(f.stream_id, 7);
+        let inc = parse_window_update(&f.payload).unwrap();
+        assert_eq!(inc, 40_000);
+        assert_eq!(s.available, OUR_INITIAL_WINDOW);
     }
 
     #[test]
@@ -2339,7 +2766,7 @@ mod tests {
         let payload_len = max * 2 + 7;
         let block: Vec<u8> = (0..payload_len).map(|i| (i & 0xff) as u8).collect();
 
-        let frames = fragment_header_block(&block, max, /*end_stream=*/ false);
+        let frames = fragment_header_block(1, &block, max, /*end_stream=*/ false);
         assert_eq!(frames.len(), 3, "expected HEADERS + 2 CONTINUATION");
 
         // Frame 0: HEADERS, full chunk, no END_HEADERS, no END_STREAM.
@@ -2370,7 +2797,7 @@ mod tests {
 
         // Now flip end_stream=true (no body); END_STREAM lands on the
         // HEADERS frame, not on the final CONTINUATION (per RFC 9113 §6.10).
-        let frames = fragment_header_block(&block, max, /*end_stream=*/ true);
+        let frames = fragment_header_block(1, &block, max, /*end_stream=*/ true);
         assert_eq!(frames[0].flags & FLAG_END_STREAM, FLAG_END_STREAM);
         assert_eq!(frames[2].flags & FLAG_END_STREAM, 0);
         assert_eq!(frames[2].flags & FLAG_END_HEADERS, FLAG_END_HEADERS);
@@ -2384,7 +2811,7 @@ mod tests {
         let block: Vec<u8> = vec![0xab; max];
 
         // Case 1: has body → no END_STREAM on the HEADERS frame.
-        let frames = fragment_header_block(&block, max, /*end_stream=*/ false);
+        let frames = fragment_header_block(1, &block, max, /*end_stream=*/ false);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].typ, F_HEADERS);
         assert_eq!(frames[0].stream_id, 1);
@@ -2393,7 +2820,7 @@ mod tests {
         assert_eq!(frames[0].flags & FLAG_END_STREAM, 0);
 
         // Case 2: no body → END_STREAM on the HEADERS frame.
-        let frames = fragment_header_block(&block, max, /*end_stream=*/ true);
+        let frames = fragment_header_block(1, &block, max, /*end_stream=*/ true);
         assert_eq!(frames.len(), 1);
         assert_eq!(
             frames[0].flags,
@@ -2406,7 +2833,7 @@ mod tests {
     fn fragment_header_block_empty() {
         // Empty header block → single HEADERS frame with empty payload and
         // END_HEADERS set (and END_STREAM if there's no body).
-        let frames = fragment_header_block(&[], 16_384, /*end_stream=*/ true);
+        let frames = fragment_header_block(1, &[], 16_384, /*end_stream=*/ true);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].typ, F_HEADERS);
         assert!(frames[0].payload.is_empty());
@@ -2418,7 +2845,7 @@ mod tests {
         // A small block (well under the cap) → single HEADERS frame holding
         // the whole block; END_HEADERS set.
         let block = vec![0x82, 0x86, 0x84]; // three indexed headers
-        let frames = fragment_header_block(&block, 16_384, /*end_stream=*/ false);
+        let frames = fragment_header_block(1, &block, 16_384, /*end_stream=*/ false);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].typ, F_HEADERS);
         assert_eq!(frames[0].payload, block);
@@ -2516,12 +2943,67 @@ mod tests {
         assert!(frames.is_empty());
     }
 
+    // -----------------------------------------------------------------
+    // Connection / stream dispatch (RFC 9113 §5.1, §6.10).
+    // -----------------------------------------------------------------
+
+    /// In-memory Read+Write impl. `wire_in` is what the test feeds *to* the
+    /// `Connection` (frames the peer would send), `wire_out` is what the
+    /// `Connection` wrote *to* the peer.
+    struct FakeTls {
+        wire_in: Cursor<Vec<u8>>,
+        wire_out: Vec<u8>,
+    }
+
+    impl FakeTls {
+        fn new() -> Self {
+            FakeTls {
+                wire_in: Cursor::new(Vec::new()),
+                wire_out: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for FakeTls {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.wire_in.read(buf)
+        }
+    }
+    impl Write for FakeTls {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.wire_out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a `Connection` over a fresh `FakeTls` without going through the
+    /// real `new()` path (we don't want to consume the preface bytes from
+    /// `wire_out` in every test). All defaults match the `Connection::new`
+    /// post-state on a clean handshake.
+    fn fake_conn() -> Connection<FakeTls> {
+        Connection {
+            tls: FakeTls::new(),
+            peer: PeerSettings::default(),
+            conn_send_window: ConnSendWindow::new(),
+            conn_recv_window: ConnRecvWindow::new(),
+            decoder: Decoder::new(),
+            streams: std::collections::HashMap::new(),
+            next_stream_id: 1,
+            goaway_received: None,
+            expecting_continuation: None,
+        }
+    }
+
     #[test]
-    fn process_frame_settings_acks_and_applies() {
+    fn connection_process_settings_acks_and_applies() {
         // Synthetic SETTINGS frame: bump MAX_FRAME_SIZE to 32 KiB and
-        // INITIAL_WINDOW_SIZE to 131_072. process_frame should:
-        // 1. update state.peer to reflect the new values,
-        // 2. shift state.send_window.stream by the INITIAL_WINDOW_SIZE delta,
+        // INITIAL_WINDOW_SIZE to 131_072. process_frame must:
+        // 1. update conn.peer to reflect the new values,
+        // 2. shift every existing stream's send window by the
+        //    INITIAL_WINDOW_SIZE delta (here, none exist),
         // 3. write a SETTINGS ACK frame back to the (fake) TLS sink.
         let payload =
             settings_payload(&[(S_MAX_FRAME_SIZE, 32_768), (S_INITIAL_WINDOW_SIZE, 131_072)]);
@@ -2531,41 +3013,16 @@ mod tests {
             stream_id: 0,
             payload,
         };
+        let mut conn = fake_conn();
+        let outcome = conn.process_frame(frame).unwrap();
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(conn.peer.max_frame_size, 32_768);
+        assert_eq!(conn.peer.initial_window_size, 131_072);
+        assert_eq!(conn.conn_send_window.available, 65_535); // untouched
 
-        // FakeTls: in-memory Read+Write sink. We don't feed it any input;
-        // process_frame's only Read paths are inside other branches.
-        struct FakeTls {
-            out: Vec<u8>,
-        }
-        impl Read for FakeTls {
-            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-                Ok(0)
-            }
-        }
-        impl Write for FakeTls {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.out.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut tls = FakeTls { out: Vec::new() };
-        let mut state = ConnState::new();
-
-        let outcome = process_frame(frame, &mut tls, &mut state).unwrap();
-        assert_eq!(outcome, DriverOutcome::Continue);
-        assert_eq!(state.peer.max_frame_size, 32_768);
-        assert_eq!(state.peer.initial_window_size, 131_072);
-        // Stream send window grew by (131_072 - 65_535) = 65_537.
-        assert_eq!(state.send_window.stream, 65_535 + (131_072 - 65_535));
-        assert_eq!(state.send_window.conn, 65_535); // untouched
-
-        // The ACK frame must be on the wire: 9-byte header, no payload,
-        // type = F_SETTINGS, flags = FLAG_ACK, stream_id = 0.
-        assert_eq!(tls.out.len(), 9);
-        let mut cur = Cursor::new(tls.out);
+        // The ACK frame must be on the wire.
+        assert_eq!(conn.tls.wire_out.len(), 9);
+        let mut cur = Cursor::new(conn.tls.wire_out.clone());
         let ack = read_frame(&mut cur).unwrap();
         assert_eq!(ack.typ, F_SETTINGS);
         assert_eq!(ack.flags, FLAG_ACK);
@@ -2574,28 +3031,218 @@ mod tests {
     }
 
     #[test]
-    fn process_frame_window_update_replenishes_send_window() {
-        // A WINDOW_UPDATE for stream 1 with increment 10_000 should grow the
-        // stream send window from the default 65_535 to 75_535.
-        let frame = window_update_frame(1, 10_000);
-        struct DevNull;
-        impl Read for DevNull {
-            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-                Ok(0)
-            }
+    fn connection_process_window_update_replenishes_send_window() {
+        // A WINDOW_UPDATE for an open stream grows the stream send window;
+        // a WINDOW_UPDATE on stream 0 grows the conn window.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.process_frame(window_update_frame(id, 10_000)).unwrap();
+        assert_eq!(
+            conn.streams.get(&id).unwrap().send_window.available,
+            65_535 + 10_000
+        );
+        assert_eq!(conn.conn_send_window.available, 65_535);
+
+        conn.process_frame(window_update_frame(0, 5_000)).unwrap();
+        assert_eq!(conn.conn_send_window.available, 65_535 + 5_000);
+    }
+
+    // ---- stream state machine -----
+
+    #[test]
+    fn stream_state_open_to_half_closed_local_on_end_stream_send() {
+        // From Open, sending DATA with end_stream advances to HalfClosedLocal.
+        let s = StreamState::Open;
+        assert_eq!(
+            s.send_data(/*end_stream=*/ true).unwrap(),
+            StreamState::HalfClosedLocal
+        );
+        // Without END_STREAM the state stays Open.
+        assert_eq!(
+            StreamState::Open.send_data(false).unwrap(),
+            StreamState::Open
+        );
+    }
+
+    #[test]
+    fn stream_state_recv_data_in_idle_is_error() {
+        // Idle streams cannot receive DATA — that's a §5.1 violation.
+        let err = StreamState::Idle.recv_data(false).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn stream_state_recv_headers_on_closed_stream_is_ignored() {
+        // Closed → Closed; no panic, no error. The peer is allowed to send a
+        // late trailer block; the decoder will still process it for HPACK
+        // dynamic-table consistency but we won't surface the headers.
+        assert_eq!(
+            StreamState::Closed.recv_headers(true).unwrap(),
+            StreamState::Closed
+        );
+    }
+
+    // ---- stream id allocation -----
+
+    #[test]
+    fn next_stream_id_allocates_odd_only() {
+        // §5.1.1: client-initiated streams are odd-numbered and strictly
+        // increasing. Open four; ids must be 1, 3, 5, 7.
+        let mut conn = fake_conn();
+        let ids: Vec<u32> = (0..4).map(|_| conn.open_stream().unwrap()).collect();
+        assert_eq!(ids, vec![1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn open_stream_refuses_at_max_concurrent() {
+        let mut conn = fake_conn();
+        conn.peer.max_concurrent_streams = 2;
+        assert!(conn.open_stream().is_ok());
+        assert!(conn.open_stream().is_ok());
+        let err = conn.open_stream().unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn open_stream_refuses_after_goaway() {
+        // GOAWAY with last-stream-id=3: ids 1 and 3 can still be allocated,
+        // but the id=5 attempt errors.
+        let mut conn = fake_conn();
+        conn.goaway_received = Some(3);
+        assert_eq!(conn.open_stream().unwrap(), 1);
+        assert_eq!(conn.open_stream().unwrap(), 3);
+        let err = conn.open_stream().unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    // ---- per-frame dispatch / multiplexing -----
+
+    /// Synthesize a HEADERS frame for stream `id` carrying just `:status 200`.
+    fn synth_status_200_headers(id: u32, end_stream: bool) -> Frame {
+        // 0x88 = indexed header field, static index 8 = (":status", "200").
+        let payload = vec![0x88];
+        let mut flags = FLAG_END_HEADERS;
+        if end_stream {
+            flags |= FLAG_END_STREAM;
         }
-        impl Write for DevNull {
-            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
+        Frame {
+            typ: F_HEADERS,
+            flags,
+            stream_id: id,
+            payload,
         }
-        let mut tls = DevNull;
-        let mut state = ConnState::new();
-        process_frame(frame, &mut tls, &mut state).unwrap();
-        assert_eq!(state.send_window.stream, 65_535 + 10_000);
-        assert_eq!(state.send_window.conn, 65_535);
+    }
+
+    fn synth_data(id: u32, body: &[u8], end_stream: bool) -> Frame {
+        Frame {
+            typ: F_DATA,
+            flags: if end_stream { FLAG_END_STREAM } else { 0 },
+            stream_id: id,
+            payload: body.to_vec(),
+        }
+    }
+
+    #[test]
+    fn dispatch_frame_routes_to_correct_stream() {
+        // Open two streams; feed interleaved HEADERS + DATA for each;
+        // each stream's body must accumulate only its own bytes.
+        let mut conn = fake_conn();
+        let id_a = conn.open_stream().unwrap();
+        let id_b = conn.open_stream().unwrap();
+        // Manually move both streams into Open (as if we'd just sent HEADERS).
+        conn.streams.get_mut(&id_a).unwrap().state = StreamState::Open;
+        conn.streams.get_mut(&id_b).unwrap().state = StreamState::Open;
+
+        conn.process_frame(synth_status_200_headers(id_a, false))
+            .unwrap();
+        conn.process_frame(synth_status_200_headers(id_b, false))
+            .unwrap();
+        conn.process_frame(synth_data(id_a, b"aaa", false)).unwrap();
+        conn.process_frame(synth_data(id_b, b"bbbb", false))
+            .unwrap();
+        conn.process_frame(synth_data(id_a, b"AAA", true)).unwrap();
+        conn.process_frame(synth_data(id_b, b"BBBB", true)).unwrap();
+
+        assert_eq!(conn.streams.get(&id_a).unwrap().body, b"aaaAAA");
+        assert_eq!(conn.streams.get(&id_b).unwrap().body, b"bbbbBBBB");
+    }
+
+    #[test]
+    fn dispatch_data_on_unknown_stream_is_silently_dropped() {
+        // DATA on a stream id we never opened: per RFC 9113 §5.1 we may
+        // ignore. No error surfaces and nothing is accumulated.
+        let mut conn = fake_conn();
+        let outcome = conn
+            .process_frame(synth_data(7, b"orphaned", false))
+            .unwrap();
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        // No stream was registered, so no body anywhere.
+        assert!(conn.streams.is_empty());
+        // Conn recv window has still been charged (the bytes did cross the
+        // shared budget), then possibly replenished — verify the latter holds.
+        assert!(conn.conn_recv_window.available <= OUR_INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn dispatch_continuation_on_wrong_stream_is_protocol_error() {
+        // Stream 1 mid-headers (no END_HEADERS), then CONTINUATION on stream 3
+        // → §6.10 violation, surfaced as BadResponse.
+        let mut conn = fake_conn();
+        let id1 = conn.open_stream().unwrap();
+        let id3 = conn.open_stream().unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id3, 3);
+        conn.streams.get_mut(&id1).unwrap().state = StreamState::Open;
+        conn.streams.get_mut(&id3).unwrap().state = StreamState::Open;
+
+        // HEADERS on 1 without END_HEADERS.
+        let frame = Frame {
+            typ: F_HEADERS,
+            flags: 0, // no END_HEADERS, no END_STREAM
+            stream_id: id1,
+            payload: vec![0x88], // partial — but the gate triggers before HPACK
+        };
+        conn.process_frame(frame).unwrap();
+        assert_eq!(conn.expecting_continuation, Some(id1));
+
+        // CONTINUATION on stream 3 must error.
+        let bad = Frame {
+            typ: F_CONTINUATION,
+            flags: FLAG_END_HEADERS,
+            stream_id: id3,
+            payload: vec![],
+        };
+        let err = conn.process_frame(bad).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn initial_window_size_delta_applies_to_all_streams() {
+        // Open two streams (both at the default 65_535 send window).
+        // A SETTINGS bump to INITIAL_WINDOW_SIZE = 131_072 must shift both
+        // stream send windows by +65_537; the conn send window is unchanged.
+        let mut conn = fake_conn();
+        let id1 = conn.open_stream().unwrap();
+        let id2 = conn.open_stream().unwrap();
+
+        let payload = settings_payload(&[(S_INITIAL_WINDOW_SIZE, 131_072)]);
+        let frame = Frame {
+            typ: F_SETTINGS,
+            flags: 0,
+            stream_id: 0,
+            payload,
+        };
+        conn.process_frame(frame).unwrap();
+
+        let expect = 65_535 + (131_072 - 65_535);
+        assert_eq!(
+            conn.streams.get(&id1).unwrap().send_window.available,
+            expect
+        );
+        assert_eq!(
+            conn.streams.get(&id2).unwrap().send_window.available,
+            expect
+        );
+        assert_eq!(conn.conn_send_window.available, 65_535);
     }
 }
