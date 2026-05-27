@@ -17,6 +17,11 @@ pub enum Error {
     BadResponse(String),
     /// Server closed the connection before sending a complete response.
     UnexpectedEof,
+    /// The HTTP/2 backend tried to negotiate ALPN "h2" but the server
+    /// selected a different protocol (or none). Used as an internal
+    /// signal so the HTTPS dispatcher can fall back to HTTP/1.1 in Auto
+    /// mode; surfaced to callers only under `--http2`.
+    H2NotNegotiated,
 }
 
 impl fmt::Display for Error {
@@ -27,6 +32,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "io error: {e}"),
             Error::BadResponse(m) => write!(f, "bad response: {m}"),
             Error::UnexpectedEof => write!(f, "unexpected end of response"),
+            Error::H2NotNegotiated => write!(f, "server did not select ALPN \"h2\""),
         }
     }
 }

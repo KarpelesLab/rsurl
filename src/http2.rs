@@ -26,10 +26,7 @@
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
-use purecrypto::tls::{Config, Connection, HandshakeStatus, RootCertStore};
-
 use crate::error::{Error, Result};
-use crate::tls::load_system_roots;
 use crate::{Request, Response};
 
 // ---------------------------------------------------------------------------
@@ -790,156 +787,8 @@ fn encode_literal_string(out: &mut Vec<u8>, s: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// TLS with ALPN = h2. We can't reuse `crate::tls::connect_over` because it
-// doesn't expose the ALPN knob, so we duplicate the handshake driver here.
+// TLS with ALPN = h2 — uses the shared driver in `crate::tls`.
 // ---------------------------------------------------------------------------
-
-struct H2Tls<S: Read + Write> {
-    conn: Connection,
-    sock: S,
-    plaintext: Vec<u8>,
-    pending_wire: Vec<u8>,
-    seen_eof: bool,
-}
-
-fn tls_err(e: purecrypto::tls::Error) -> Error {
-    Error::BadResponse(format!("tls: {e:?}"))
-}
-
-fn io_tls(e: purecrypto::tls::Error) -> io::Error {
-    io::Error::other(format!("tls: {e:?}"))
-}
-
-fn connect_tls_h2<S: Read + Write>(
-    transport: S,
-    sni: &str,
-    roots: RootCertStore,
-) -> Result<(H2Tls<S>, bool)> {
-    let cfg = Config::builder()
-        .tls_only()
-        .roots(roots)
-        .server_name(sni.to_string())
-        .alpn(vec![b"h2".to_vec()])
-        .verify_certificates(true)
-        .build();
-    let conn = Connection::client(&cfg).map_err(tls_err)?;
-    let mut s = H2Tls {
-        conn,
-        sock: transport,
-        plaintext: Vec::new(),
-        pending_wire: Vec::new(),
-        seen_eof: false,
-    };
-    s.run_handshake()?;
-    let negotiated_h2 = s.conn.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
-    Ok((s, negotiated_h2))
-}
-
-impl<S: Read + Write> H2Tls<S> {
-    fn run_handshake(&mut self) -> Result<()> {
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            self.drain_outgoing().map_err(Error::Io)?;
-            match self.conn.handshake().map_err(tls_err)? {
-                HandshakeStatus::Complete => return Ok(()),
-                HandshakeStatus::WantWrite => continue,
-                HandshakeStatus::WantRead => {
-                    let n = self.sock.read(&mut buf)?;
-                    if n == 0 {
-                        return Err(Error::UnexpectedEof);
-                    }
-                    self.feed_all(&buf[..n]).map_err(Error::Io)?;
-                }
-            }
-        }
-    }
-
-    fn drain_outgoing(&mut self) -> io::Result<()> {
-        loop {
-            let out = self.conn.pop().map_err(io_tls)?;
-            if out.is_empty() {
-                return Ok(());
-            }
-            self.sock.write_all(&out)?;
-        }
-    }
-
-    fn feed_all(&mut self, wire: &[u8]) -> io::Result<()> {
-        if !self.pending_wire.is_empty() {
-            self.pending_wire.extend_from_slice(wire);
-            let mut taken = 0;
-            while taken < self.pending_wire.len() {
-                let n = self
-                    .conn
-                    .feed(&self.pending_wire[taken..])
-                    .map_err(io_tls)?;
-                if n == 0 {
-                    break;
-                }
-                taken += n;
-            }
-            self.pending_wire.drain(..taken);
-            return Ok(());
-        }
-        let mut taken = 0;
-        while taken < wire.len() {
-            let n = self.conn.feed(&wire[taken..]).map_err(io_tls)?;
-            if n == 0 {
-                self.pending_wire.extend_from_slice(&wire[taken..]);
-                return Ok(());
-            }
-            taken += n;
-        }
-        Ok(())
-    }
-}
-
-impl<S: Read + Write> Write for H2Tls<S> {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.conn.send(data).map_err(io_tls)?;
-        self.drain_outgoing()?;
-        Ok(data.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.drain_outgoing()?;
-        self.sock.flush()
-    }
-}
-
-impl<S: Read + Write> Read for H2Tls<S> {
-    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        if dst.is_empty() {
-            return Ok(0);
-        }
-        let mut buf = [0u8; 16 * 1024];
-        while self.plaintext.is_empty() {
-            if self.seen_eof {
-                return Ok(0);
-            }
-            let app = self.conn.recv().map_err(io_tls)?;
-            if !app.is_empty() {
-                self.plaintext = app;
-                break;
-            }
-            let n = self.sock.read(&mut buf)?;
-            if n == 0 {
-                self.seen_eof = true;
-                let app = self.conn.recv().map_err(io_tls)?;
-                if app.is_empty() {
-                    return Ok(0);
-                }
-                self.plaintext = app;
-                break;
-            }
-            self.feed_all(&buf[..n])?;
-            self.drain_outgoing()?;
-        }
-        let take = dst.len().min(self.plaintext.len());
-        dst[..take].copy_from_slice(&self.plaintext[..take]);
-        self.plaintext.drain(..take);
-        Ok(take)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // TCP setup, mirroring crate::http::tcp_connect.
@@ -976,12 +825,13 @@ pub fn send(req: Request) -> Result<Response> {
         )));
     }
     let tcp = tcp_connect(&req)?;
-    let roots = load_system_roots()?;
-    let (mut tls, negotiated_h2) = connect_tls_h2(tcp, &req.url.host, roots)?;
+    let mut tls = crate::tls::connect_over_with_alpn(tcp, &req.url.host, &[b"h2"])?;
+    let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
     if !negotiated_h2 {
-        // Some servers will still accept the preface; others (most modern
-        // ones) won't. We try anyway and let the first frame exchange tell us.
-        // Strict mode would `return Err(Error::BadResponse("h2 not negotiated"))`.
+        // Server did not accept ALPN "h2". Signal upward so callers (e.g.
+        // `http::send_https` in Auto mode) can fall back to HTTP/1.1 over
+        // a new connection. This connection is dropped at end of scope.
+        return Err(Error::H2NotNegotiated);
     }
 
     // 1. Client preface + initial SETTINGS frame.

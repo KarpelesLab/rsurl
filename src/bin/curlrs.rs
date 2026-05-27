@@ -12,6 +12,8 @@
 //!     -d, --data <body>        send body and switch method to POST
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
+//!         --http2              require HTTP/2 (ALPN h2); error if unavailable
+//!         --http1.1            force HTTP/1.1 (alias: --http1)
 //!     -h, --help               print help
 //!     -V, --version            print version
 
@@ -19,7 +21,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use curlrs::{Request, Response, Url};
+use curlrs::{HttpVersionPref, Request, Response, Url};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -36,6 +38,10 @@ struct Args {
     data: Option<String>,
     user_agent: Option<String>,
     referer: Option<String>,
+    /// Most recent HTTP version flag (--http2, --http1.1) seen on the CLI.
+    /// `None` means "Auto" — the library decides via ALPN. Last one wins,
+    /// matching curl.
+    http_version: Option<HttpVersionPref>,
 }
 
 fn main() -> ExitCode {
@@ -113,6 +119,11 @@ fn main() -> ExitCode {
         }
         req = req.body(body_bytes);
     }
+    match args.http_version {
+        Some(HttpVersionPref::Http2Only) => req = req.http2_only(),
+        Some(HttpVersionPref::Http11Only) => req = req.http11_only(),
+        Some(HttpVersionPref::Auto) | None => {}
+    }
 
     let send_result = if args.verbose {
         let mut err = io::stderr().lock();
@@ -180,6 +191,9 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "-d" | "--data" | "--data-raw" => a.data = Some(next_val(&mut it, arg)?),
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
             "-e" | "--referer" => a.referer = Some(next_val(&mut it, arg)?),
+            "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
+            // curl also accepts `--http1` as a shorthand for `--http1.1`.
+            "--http1.1" | "--http1" => a.http_version = Some(HttpVersionPref::Http11Only),
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => {
@@ -264,6 +278,8 @@ Options:
   -d, --data <body>        send body and switch method to POST
   -A, --user-agent <ua>    set User-Agent
   -e, --referer <ref>      set Referer
+      --http2              require HTTP/2 (ALPN h2); error if unavailable
+      --http1.1            force HTTP/1.1 (alias: --http1)
   -h, --help               print this help
   -V, --version            print version
 "

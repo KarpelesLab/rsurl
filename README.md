@@ -32,7 +32,7 @@ Early, in active development.
 | WS / WSS (RFC 6455) | working | reads one data frame then closes |
 
 \* HTTP/2 verified live against nghttp2.org and cloudflare.com from the implementation
-worktree. Not yet wired into the CLI; call `curlrs::http2::send(req)` directly.
+worktree. Available via `--http2` (force) or auto-negotiated via ALPN.
 
 System CA bundle paths searched, in order: `/etc/ssl/certs/ca-certificates.crt`,
 `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem`,

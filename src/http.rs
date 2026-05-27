@@ -9,6 +9,22 @@ const DEFAULT_USER_AGENT: &str = concat!("curlrs/", env!("CARGO_PKG_VERSION"));
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Preference for which HTTP version to use over HTTPS. The HTTPS dispatcher
+/// picks this up. HTTP/2 is selected via ALPN at TLS-handshake time; if the
+/// server doesn't agree (Auto) we transparently fall back to HTTP/1.1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HttpVersionPref {
+    /// Offer ALPN `["h2", "http/1.1"]` and let the server pick. If h2 is
+    /// negotiated, dispatch to the HTTP/2 backend; otherwise speak HTTP/1.1.
+    #[default]
+    Auto,
+    /// Speak HTTP/1.1 only; don't offer ALPN. Matches `curl --http1.1`.
+    Http11Only,
+    /// Require HTTP/2; abort the request if the server doesn't select it.
+    /// Matches `curl --http2-prior-knowledge` semantics.
+    Http2Only,
+}
+
 /// An HTTP request being constructed.
 ///
 /// Fields are `pub(crate)` so that protocol-variant modules (`http2`, `http3`)
@@ -21,6 +37,7 @@ pub struct Request {
     pub(crate) body: Vec<u8>,
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) read_timeout: Option<Duration>,
+    pub(crate) http_version_pref: HttpVersionPref,
 }
 
 impl Request {
@@ -32,6 +49,7 @@ impl Request {
             body: Vec::new(),
             connect_timeout: Some(Duration::from_secs(30)),
             read_timeout: Some(Duration::from_secs(60)),
+            http_version_pref: HttpVersionPref::Auto,
         })
     }
 
@@ -51,6 +69,26 @@ impl Request {
 
     pub fn url(&self) -> &Url {
         &self.url
+    }
+
+    /// Set the HTTP version preference for HTTPS requests. See
+    /// [`HttpVersionPref`].
+    pub fn http_version(mut self, pref: HttpVersionPref) -> Self {
+        self.http_version_pref = pref;
+        self
+    }
+
+    /// Force HTTP/2; the request fails if the server does not select ALPN
+    /// "h2". Equivalent to `curl --http2` for an `https://` URL.
+    pub fn http2_only(mut self) -> Self {
+        self.http_version_pref = HttpVersionPref::Http2Only;
+        self
+    }
+
+    /// Force HTTP/1.1; ALPN is not offered. Equivalent to `curl --http1.1`.
+    pub fn http11_only(mut self) -> Self {
+        self.http_version_pref = HttpVersionPref::Http11Only;
+        self
     }
 
     pub fn send(self) -> Result<Response> {
@@ -105,6 +143,42 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
 }
 
 fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    // HTTP version routing:
+    //
+    // * `Http2Only`: dispatch to the HTTP/2 backend; its `Error::H2NotNegotiated`
+    //   bubbles up unchanged so the caller sees the hard failure.
+    // * `Auto`: try HTTP/2 first (it offers ALPN "h2"); if the server didn't
+    //   select h2, [`crate::http2::send`] returns `Error::H2NotNegotiated`,
+    //   which we intercept and retry over HTTP/1.1 on a fresh connection.
+    //   This is the same behaviour curl gives you by default — h2 if both
+    //   ends support it, http/1.1 otherwise.
+    // * `Http11Only`: skip h2 entirely and do not offer ALPN.
+    match req.http_version_pref {
+        HttpVersionPref::Http2Only => {
+            let _ = writeln!(trace, "* HTTP/2 required (--http2)");
+            return crate::http2::send(req);
+        }
+        HttpVersionPref::Auto => {
+            let _ = writeln!(trace, "* Trying HTTP/2 via ALPN (h2)");
+            match crate::http2::send(req.clone()) {
+                Ok(resp) => return Ok(resp),
+                Err(Error::H2NotNegotiated) => {
+                    let _ = writeln!(
+                        trace,
+                        "* ALPN: server did not select h2, falling back to HTTP/1.1"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        HttpVersionPref::Http11Only => {
+            let _ = writeln!(trace, "* HTTP/1.1 forced (--http1.1)");
+        }
+    }
+
+    // HTTP/1.1 path (Auto fallback or Http11Only). ALPN is not offered so
+    // the cert-only handshake doesn't change behaviour for h2-only servers
+    // (those would have been satisfied by the h2 attempt above).
     let tcp = tcp_connect(&req, trace)?;
     let mut tls = crate::tls::connect_over(tcp, &req.url.host)?;
     write_tls_info(&tls, trace);

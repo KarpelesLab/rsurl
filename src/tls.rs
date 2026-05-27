@@ -86,15 +86,31 @@ pub struct TlsStream<S: Read + Write> {
 }
 
 /// Establish a TLS 1.2/1.3 connection over an existing transport. The peer
-/// name is verified against `sni`.
+/// name is verified against `sni`. ALPN is not offered; use
+/// [`connect_over_with_alpn`] to negotiate a specific application protocol.
 pub fn connect_over<S: Read + Write>(transport: S, sni: &str) -> Result<TlsStream<S>> {
+    connect_over_with_alpn(transport, sni, &[])
+}
+
+/// Like [`connect_over`], but offers `alpn` as the ALPN protocol list. The
+/// server's selection (if any) is available afterward via
+/// [`TlsStream::alpn_selected`]. Passing an empty `alpn` slice is equivalent
+/// to [`connect_over`].
+pub fn connect_over_with_alpn<S: Read + Write>(
+    transport: S,
+    sni: &str,
+    alpn: &[&[u8]],
+) -> Result<TlsStream<S>> {
     let roots = load_system_roots()?;
-    let cfg = Config::builder()
+    let mut builder = Config::builder()
         .tls_only()
         .roots(roots)
         .server_name(sni.to_string())
-        .verify_certificates(true)
-        .build();
+        .verify_certificates(true);
+    if !alpn.is_empty() {
+        builder = builder.alpn(alpn.iter().map(|p| p.to_vec()).collect());
+    }
+    let cfg = builder.build();
     let conn = Connection::client(&cfg).map_err(tls_err)?;
     let mut s = TlsStream {
         conn,

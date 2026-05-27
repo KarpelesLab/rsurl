@@ -273,7 +273,9 @@ pub extern "C" fn curlrs_easy_perform(handle: *mut CURLRS) -> CurlrsCode {
         }
         Err(crate::Error::UnsupportedScheme(_)) => CurlrsCode::Unsupported,
         Err(crate::Error::Io(_)) | Err(crate::Error::UnexpectedEof) => CurlrsCode::Network,
-        Err(crate::Error::BadResponse(_)) => CurlrsCode::BadResponse,
+        Err(crate::Error::BadResponse(_)) | Err(crate::Error::H2NotNegotiated) => {
+            CurlrsCode::BadResponse
+        }
         Err(crate::Error::InvalidUrl(_)) => CurlrsCode::InvalidArg,
     }
 }
