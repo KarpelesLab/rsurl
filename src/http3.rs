@@ -12,8 +12,9 @@
 //! * RFC 9000 §16 variable-length integer codec (`varint`).
 //! * RFC 9114 §7.1 frame-header codec (`Frame`).
 //! * RFC 9204 Appendix A QPACK static table (`qpack::STATIC_TABLE`)
-//!   with a literal-only encoder and a decoder that handles literal
-//!   (non-Huffman) field lines plus indexed static-name lines.
+//!   with a literal-only encoder and a decoder that handles both
+//!   plain-literal and Huffman-coded (RFC 7541 Appendix B) literal
+//!   field lines plus indexed static-name lines.
 //! * A [`send`] function that wires a [`purecrypto::quic::QuicConnection`]
 //!   client to a [`std::net::UdpSocket`], runs the QUIC handshake to
 //!   completion, opens the HTTP/3 control stream (with a SETTINGS frame),
@@ -23,14 +24,13 @@
 //! What's deliberately incomplete (precise TODOs called out at the
 //! relevant sites):
 //!
-//! * **QPACK Huffman**: not implemented. If a response uses Huffman-coded
-//!   literal names or values, the decoder bails with [`Error::BadResponse`].
-//!   Real-world servers (h2o, nginx, quiche, lsquic) all use Huffman by
-//!   default, so this scaffold will reach the response-parsing stage and
-//!   then almost certainly fail there. Closing this gap means landing
-//!   RFC 7541 §5.2 — a static prefix code, the table is in RFC 7541
-//!   Appendix B — and using it for both the 5-bit and 7-bit-prefix string
-//!   types QPACK uses.
+//! * **QPACK Huffman**: implemented for the decoder. Both Huffman-coded
+//!   literal names (3-bit-prefix H bit) and literal values (7-bit-prefix
+//!   H bit) are decoded against the RFC 7541 Appendix B static prefix
+//!   code. The encoder still emits non-Huffman literals for simplicity —
+//!   that's wire-legal because the H bit is per-string. The Huffman table
+//!   is duplicated from the HPACK decoder in [`crate::http2`]; see the
+//!   note inside `qpack::HUFFMAN` for the rationale.
 //! * **QPACK dynamic table**: not implemented. We send a zero-length
 //!   QPACK encoder stream and silently drop the peer's encoder stream
 //!   bytes. Indexed references into the dynamic table in a response will
@@ -204,9 +204,10 @@ pub(crate) mod qpack {
     //! are emitted *without* Huffman coding (`H` bit clear) for simplicity.
     //!
     //! The decoder accepts indexed-static and the two literal-name variants
-    //! (with static-name reference, with literal name); it explicitly
-    //! rejects Huffman-coded literals (`H` bit set) and dynamic-table
-    //! references with [`Error::BadResponse`] so the failure is observable.
+    //! (with static-name reference, with literal name), Huffman-coded or
+    //! not (the H bit selects RFC 7541 Appendix B prefix decoding). It
+    //! still rejects dynamic-table references with [`Error::BadResponse`]
+    //! so the failure is observable.
 
     use crate::error::{Error, Result};
 
@@ -451,9 +452,9 @@ pub(crate) mod qpack {
     /// Decoded field section.
     pub type Fields = Vec<(String, String)>;
 
-    /// Decode a complete QPACK field section. Rejects Huffman literals and
-    /// dynamic-table references with `Error::BadResponse` — see the module
-    /// header for why this scaffold doesn't ship Huffman yet.
+    /// Decode a complete QPACK field section. Handles indexed-static
+    /// references and both plain and Huffman-coded literals. Rejects any
+    /// reference to the dynamic table with `Error::BadResponse`.
     pub fn decode_field_section(buf: &[u8]) -> Result<Fields> {
         if buf.is_empty() {
             return Err(Error::BadResponse("qpack: empty field section".into()));
@@ -510,20 +511,23 @@ pub(crate) mod qpack {
             } else if b & 0b0010_0000 != 0 {
                 // Literal Field Line With Literal Name: 0b001NHXXX
                 let huffman = b & 0b0000_1000 != 0;
-                if huffman {
-                    return Err(Error::BadResponse(
-                        "qpack: Huffman-coded literal name (not implemented)".into(),
-                    ));
-                }
                 let (nlen, used) = decode_int(b, 3, &buf[p + 1..])?;
                 p += 1 + used;
-                if p + (nlen as usize) > buf.len() {
+                let nlen = nlen as usize;
+                if p + nlen > buf.len() {
                     return Err(Error::BadResponse("qpack: truncated literal name".into()));
                 }
-                let name = std::str::from_utf8(&buf[p..p + nlen as usize])
-                    .map_err(|_| Error::BadResponse("qpack: literal name not utf-8".into()))?
-                    .to_string();
-                p += nlen as usize;
+                let raw = &buf[p..p + nlen];
+                let name = if huffman {
+                    let bytes = huffman_decode(raw)?;
+                    String::from_utf8(bytes)
+                        .map_err(|_| Error::BadResponse("qpack: literal name not utf-8".into()))?
+                } else {
+                    std::str::from_utf8(raw)
+                        .map_err(|_| Error::BadResponse("qpack: literal name not utf-8".into()))?
+                        .to_string()
+                };
+                p += nlen;
                 let value = decode_literal_string_7bit(&buf[p..])?;
                 p += value.1;
                 out.push((name, value.0));
@@ -540,29 +544,380 @@ pub(crate) mod qpack {
     }
 
     /// Decode a 7-bit-prefix literal string (H + 7-bit length). Returns
-    /// `(string, total_bytes_consumed_including_the_prefix_byte)`. Refuses
-    /// Huffman.
-    fn decode_literal_string_7bit(buf: &[u8]) -> Result<(String, usize)> {
+    /// `(string, total_bytes_consumed_including_the_prefix_byte)`.
+    /// Honors the H bit: if set, the raw bytes are Huffman-decoded per
+    /// RFC 7541 Appendix B before the UTF-8 check.
+    pub(crate) fn decode_literal_string_7bit(buf: &[u8]) -> Result<(String, usize)> {
         if buf.is_empty() {
             return Err(Error::BadResponse("qpack: missing literal string".into()));
         }
         let b = buf[0];
         let huffman = b & 0b1000_0000 != 0;
-        if huffman {
-            return Err(Error::BadResponse(
-                "qpack: Huffman-coded literal value (not implemented)".into(),
-            ));
-        }
         let (slen, used) = decode_int(b, 7, &buf[1..])?;
         let start = 1 + used;
         let end = start + slen as usize;
         if end > buf.len() {
             return Err(Error::BadResponse("qpack: truncated literal value".into()));
         }
-        let s = std::str::from_utf8(&buf[start..end])
-            .map_err(|_| Error::BadResponse("qpack: literal value not utf-8".into()))?
-            .to_string();
+        let raw = &buf[start..end];
+        let s = if huffman {
+            let bytes = huffman_decode(raw)?;
+            String::from_utf8(bytes)
+                .map_err(|_| Error::BadResponse("qpack: literal value not utf-8".into()))?
+        } else {
+            std::str::from_utf8(raw)
+                .map_err(|_| Error::BadResponse("qpack: literal value not utf-8".into()))?
+                .to_string()
+        };
         Ok((s, end))
+    }
+
+    // ------------------------------------------------------------------
+    // QPACK Huffman decoder (RFC 9204 §4.1.2 → RFC 7541 §5.2 / Appendix B).
+    // ------------------------------------------------------------------
+    //
+    // QPACK reuses the HPACK Huffman code verbatim. The 257-entry
+    // `(code, bit_length)` table below is a byte-for-byte copy of the
+    // one in `crate::http2`. We duplicate it here rather than exposing
+    // `http2::HUFFMAN` as `pub(crate)` so the two modules remain
+    // independent (an in-flight refactor on the HTTP/2 side touches
+    // the surrounding code). The table is RFC-defined and immutable, so
+    // duplication has no maintenance cost: if RFC 7541 Appendix B ever
+    // changed (it won't), both copies would need updating in lockstep.
+    //
+    // The decoder is a straight bit-by-bit linear scan over the 257
+    // entries — small, predictable, and easy to audit. With at most
+    // 30 bits per symbol it stays well within budget for header
+    // sections bounded by SETTINGS_MAX_FIELD_SECTION_SIZE.
+
+    /// `(code, bit_length)` for each Huffman symbol, from RFC 7541
+    /// Appendix B. Duplicated from `crate::http2::HUFFMAN`; see the
+    /// section comment above for the rationale.
+    const HUFFMAN: [(u32, u8); 257] = [
+        (0x1ff8, 13),
+        (0x7fffd8, 23),
+        (0xfffffe2, 28),
+        (0xfffffe3, 28),
+        (0xfffffe4, 28),
+        (0xfffffe5, 28),
+        (0xfffffe6, 28),
+        (0xfffffe7, 28),
+        (0xfffffe8, 28),
+        (0xffffea, 24),
+        (0x3ffffffc, 30),
+        (0xfffffe9, 28),
+        (0xfffffea, 28),
+        (0x3ffffffd, 30),
+        (0xfffffeb, 28),
+        (0xfffffec, 28),
+        (0xfffffed, 28),
+        (0xfffffee, 28),
+        (0xfffffef, 28),
+        (0xffffff0, 28),
+        (0xffffff1, 28),
+        (0xffffff2, 28),
+        (0x3ffffffe, 30),
+        (0xffffff3, 28),
+        (0xffffff4, 28),
+        (0xffffff5, 28),
+        (0xffffff6, 28),
+        (0xffffff7, 28),
+        (0xffffff8, 28),
+        (0xffffff9, 28),
+        (0xffffffa, 28),
+        (0xffffffb, 28),
+        (0x14, 6),
+        (0x3f8, 10),
+        (0x3f9, 10),
+        (0xffa, 12),
+        (0x1ff9, 13),
+        (0x15, 6),
+        (0xf8, 8),
+        (0x7fa, 11),
+        (0x3fa, 10),
+        (0x3fb, 10),
+        (0xf9, 8),
+        (0x7fb, 11),
+        (0xfa, 8),
+        (0x16, 6),
+        (0x17, 6),
+        (0x18, 6),
+        (0x0, 5),
+        (0x1, 5),
+        (0x2, 5),
+        (0x19, 6),
+        (0x1a, 6),
+        (0x1b, 6),
+        (0x1c, 6),
+        (0x1d, 6),
+        (0x1e, 6),
+        (0x1f, 6),
+        (0x5c, 7),
+        (0xfb, 8),
+        (0x7ffc, 15),
+        (0x20, 6),
+        (0xffb, 12),
+        (0x3fc, 10),
+        (0x1ffa, 13),
+        (0x21, 6),
+        (0x5d, 7),
+        (0x5e, 7),
+        (0x5f, 7),
+        (0x60, 7),
+        (0x61, 7),
+        (0x62, 7),
+        (0x63, 7),
+        (0x64, 7),
+        (0x65, 7),
+        (0x66, 7),
+        (0x67, 7),
+        (0x68, 7),
+        (0x69, 7),
+        (0x6a, 7),
+        (0x6b, 7),
+        (0x6c, 7),
+        (0x6d, 7),
+        (0x6e, 7),
+        (0x6f, 7),
+        (0x70, 7),
+        (0x71, 7),
+        (0x72, 7),
+        (0xfc, 8),
+        (0x73, 7),
+        (0xfd, 8),
+        (0x1ffb, 13),
+        (0x7fff0, 19),
+        (0x1ffc, 13),
+        (0x3ffc, 14),
+        (0x22, 6),
+        (0x7ffd, 15),
+        (0x3, 5),
+        (0x23, 6),
+        (0x4, 5),
+        (0x24, 6),
+        (0x5, 5),
+        (0x25, 6),
+        (0x26, 6),
+        (0x27, 6),
+        (0x6, 5),
+        (0x74, 7),
+        (0x75, 7),
+        (0x28, 6),
+        (0x29, 6),
+        (0x2a, 6),
+        (0x7, 5),
+        (0x2b, 6),
+        (0x76, 7),
+        (0x2c, 6),
+        (0x8, 5),
+        (0x9, 5),
+        (0x2d, 6),
+        (0x77, 7),
+        (0x78, 7),
+        (0x79, 7),
+        (0x7a, 7),
+        (0x7b, 7),
+        (0x7ffe, 15),
+        (0x7fc, 11),
+        (0x3ffd, 14),
+        (0x1ffd, 13),
+        (0xffffffc, 28),
+        (0xfffe6, 20),
+        (0x3fffd2, 22),
+        (0xfffe7, 20),
+        (0xfffe8, 20),
+        (0x3fffd3, 22),
+        (0x3fffd4, 22),
+        (0x3fffd5, 22),
+        (0x7fffd9, 23),
+        (0x3fffd6, 22),
+        (0x7fffda, 23),
+        (0x7fffdb, 23),
+        (0x7fffdc, 23),
+        (0x7fffdd, 23),
+        (0x7fffde, 23),
+        (0xffffeb, 24),
+        (0x7fffdf, 23),
+        (0xffffec, 24),
+        (0xffffed, 24),
+        (0x3fffd7, 22),
+        (0x7fffe0, 23),
+        (0xffffee, 24),
+        (0x7fffe1, 23),
+        (0x7fffe2, 23),
+        (0x7fffe3, 23),
+        (0x7fffe4, 23),
+        (0x1fffdc, 21),
+        (0x3fffd8, 22),
+        (0x7fffe5, 23),
+        (0x3fffd9, 22),
+        (0x7fffe6, 23),
+        (0x7fffe7, 23),
+        (0xffffef, 24),
+        (0x3fffda, 22),
+        (0x1fffdd, 21),
+        (0xfffe9, 20),
+        (0x3fffdb, 22),
+        (0x3fffdc, 22),
+        (0x7fffe8, 23),
+        (0x7fffe9, 23),
+        (0x1fffde, 21),
+        (0x7fffea, 23),
+        (0x3fffdd, 22),
+        (0x3fffde, 22),
+        (0xfffff0, 24),
+        (0x1fffdf, 21),
+        (0x3fffdf, 22),
+        (0x7fffeb, 23),
+        (0x7fffec, 23),
+        (0x1fffe0, 21),
+        (0x1fffe1, 21),
+        (0x3fffe0, 22),
+        (0x1fffe2, 21),
+        (0x7fffed, 23),
+        (0x3fffe1, 22),
+        (0x7fffee, 23),
+        (0x7fffef, 23),
+        (0xfffea, 20),
+        (0x3fffe2, 22),
+        (0x3fffe3, 22),
+        (0x3fffe4, 22),
+        (0x7ffff0, 23),
+        (0x3fffe5, 22),
+        (0x3fffe6, 22),
+        (0x7ffff1, 23),
+        (0x3ffffe0, 26),
+        (0x3ffffe1, 26),
+        (0xfffeb, 20),
+        (0x7fff1, 19),
+        (0x3fffe7, 22),
+        (0x7ffff2, 23),
+        (0x3fffe8, 22),
+        (0x1ffffec, 25),
+        (0x3ffffe2, 26),
+        (0x3ffffe3, 26),
+        (0x3ffffe4, 26),
+        (0x7ffffde, 27),
+        (0x7ffffdf, 27),
+        (0x3ffffe5, 26),
+        (0xfffff1, 24),
+        (0x1ffffed, 25),
+        (0x7fff2, 19),
+        (0x1fffe3, 21),
+        (0x3ffffe6, 26),
+        (0x7ffffe0, 27),
+        (0x7ffffe1, 27),
+        (0x3ffffe7, 26),
+        (0x7ffffe2, 27),
+        (0xfffff2, 24),
+        (0x1fffe4, 21),
+        (0x1fffe5, 21),
+        (0x3ffffe8, 26),
+        (0x3ffffe9, 26),
+        (0xffffffd, 28),
+        (0x7ffffe3, 27),
+        (0x7ffffe4, 27),
+        (0x7ffffe5, 27),
+        (0xfffec, 20),
+        (0xfffff3, 24),
+        (0xfffed, 20),
+        (0x1fffe6, 21),
+        (0x3fffe9, 22),
+        (0x1fffe7, 21),
+        (0x1fffe8, 21),
+        (0x7ffff3, 23),
+        (0x3fffea, 22),
+        (0x3fffeb, 22),
+        (0x1ffffee, 25),
+        (0x1ffffef, 25),
+        (0xfffff4, 24),
+        (0xfffff5, 24),
+        (0x3ffffea, 26),
+        (0x7ffff4, 23),
+        (0x3ffffeb, 26),
+        (0x7ffffe6, 27),
+        (0x3ffffec, 26),
+        (0x3ffffed, 26),
+        (0x7ffffe7, 27),
+        (0x7ffffe8, 27),
+        (0x7ffffe9, 27),
+        (0x7ffffea, 27),
+        (0x7ffffeb, 27),
+        (0xffffffe, 28),
+        (0x7ffffec, 27),
+        (0x7ffffed, 27),
+        (0x7ffffee, 27),
+        (0x7ffffef, 27),
+        (0x7fffff0, 27),
+        (0x3ffffee, 26),
+        (0x3fffffff, 30), // EOS, index 256
+    ];
+
+    /// Decode a Huffman-coded literal. We walk bit-by-bit over the
+    /// input, OR each bit into an accumulator, and check after every bit
+    /// whether the accumulator (left-aligned for that length) matches
+    /// any code of that length. With 257 symbols this is small enough
+    /// to scan linearly.
+    pub(crate) fn huffman_decode(input: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(input.len() * 2);
+        let mut acc: u64 = 0;
+        let mut acc_len: u8 = 0;
+
+        for &byte in input {
+            acc = (acc << 8) | (byte as u64);
+            acc_len += 8;
+            // Pull as many symbols as possible from the accumulator.
+            while acc_len >= 5 {
+                let mut matched = false;
+                // Try lengths 5..=30 (no symbol shorter than 5 bits).
+                let max_len = acc_len.min(30);
+                for try_len in 5..=max_len {
+                    let code = (acc >> (acc_len - try_len)) & ((1u64 << try_len) - 1);
+                    if let Some(sym) = lookup_huffman(code as u32, try_len) {
+                        if sym == 256 {
+                            // EOS in a literal is a decoder error per
+                            // RFC 7541 §5.2.
+                            return Err(Error::BadResponse(
+                                "qpack: EOS symbol in Huffman literal".into(),
+                            ));
+                        }
+                        out.push(sym as u8);
+                        acc_len -= try_len;
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    break;
+                }
+            }
+        }
+
+        // Tail: remaining bits must be the most-significant bits of the
+        // EOS code (all-ones), and there must be fewer than 8 of them
+        // (RFC 7541 §5.2).
+        if acc_len >= 8 {
+            return Err(Error::BadResponse(
+                "qpack: trailing Huffman bits >= 8".into(),
+            ));
+        }
+        if acc_len > 0 {
+            let pad_mask = (1u64 << acc_len) - 1;
+            let tail = acc & pad_mask;
+            if tail != pad_mask {
+                return Err(Error::BadResponse("qpack: bad Huffman padding".into()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn lookup_huffman(code: u32, len: u8) -> Option<u16> {
+        for (i, (c, l)) in HUFFMAN.iter().enumerate() {
+            if *l == len && *c == code {
+                return Some(i as u16);
+            }
+        }
+        None
     }
 }
 
@@ -581,9 +936,11 @@ const MAX_DATAGRAM: usize = 65_535;
 /// Send a single request/response over a fresh HTTP/3 (QUIC) connection.
 ///
 /// This is a scaffold. See the module-level docs for the precise list of
-/// known gaps; the most user-visible one is the absence of QPACK Huffman,
-/// which means responses from most real servers will fail with
-/// `Error::BadResponse("qpack: Huffman-coded ...")`.
+/// known gaps; the most user-visible one is the absence of QPACK
+/// dynamic-table support — most servers degrade gracefully when the
+/// client advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY=0`, but a
+/// non-conforming peer can still emit dynamic references which we will
+/// reject with `Error::BadResponse`.
 pub fn send(req: Request) -> Result<Response> {
     if req.url.scheme != "https" {
         // HTTP/3 only runs over QUIC, which only runs encrypted.
@@ -1158,25 +1515,149 @@ mod tests {
         assert_eq!(decoded, fields);
     }
 
+    // ---- QPACK Huffman decoder tests --------------------------------------
+
     #[test]
-    fn qpack_decoder_rejects_huffman_literal_value() {
-        // Manually craft a field section with one indexed-name field whose
-        // value uses Huffman (H bit set). Decoder must bail.
+    fn qpack_huffman_decodes_rfc7541_c4_www_example_com() {
+        // RFC 7541 §C.4.1 — the Huffman-encoded form of the :authority
+        // value "www.example.com" (the encoded representation used in
+        // the HPACK example, which QPACK inherits byte-for-byte).
+        let encoded = [
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
+        let out = qpack::huffman_decode(&encoded).expect("decode");
+        assert_eq!(out, b"www.example.com");
+    }
+
+    #[test]
+    fn qpack_huffman_decodes_rfc7541_c4_no_cache() {
+        // RFC 7541 §C.4.2 — Huffman-encoded "no-cache" (the cache-control
+        // value in the second request of the §C.4 example).
+        let encoded = [0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf];
+        let out = qpack::huffman_decode(&encoded).expect("decode");
+        assert_eq!(out, b"no-cache");
+    }
+
+    #[test]
+    fn qpack_huffman_decodes_rfc7541_c4_custom_key_and_value() {
+        // RFC 7541 §C.4.3 — Huffman-encoded "custom-key" and
+        // "custom-value" (the literal-name + literal-value header in
+        // the third request of the §C.4 example).
+        let key_encoded = [0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xa9, 0x7d, 0x7f];
+        let key = qpack::huffman_decode(&key_encoded).expect("decode key");
+        assert_eq!(key, b"custom-key");
+
+        let val_encoded = [0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf];
+        let val = qpack::huffman_decode(&val_encoded).expect("decode value");
+        assert_eq!(val, b"custom-value");
+    }
+
+    #[test]
+    fn qpack_huffman_decodes_hand_built_get() {
+        // Hand-built encoding of "GET" per RFC 7541 Appendix B:
+        //   G (sym 71) = 0x62 = 0b1100010   (7 bits)
+        //   E (sym 69) = 0x60 = 0b1100000   (7 bits)
+        //   T (sym 84) = 0x6f = 0b1101111   (7 bits)
+        // Concatenated: 1100010 1100000 1101111 = 21 bits.
+        // Pad with 3 high bits of the EOS code (all-ones) to reach 24
+        // bits → 11000101 10000011 01111111 → 0xC5, 0x83, 0x7F.
+        let encoded = [0xC5, 0x83, 0x7F];
+        let out = qpack::huffman_decode(&encoded).expect("decode");
+        assert_eq!(out, b"GET");
+    }
+
+    #[test]
+    fn qpack_huffman_decoder_rejects_eos_in_literal() {
+        // The EOS marker (symbol 256, 30 bits, all-ones) MUST NOT appear
+        // as a decoded symbol in a literal — RFC 7541 §5.2. Build a
+        // 32-bit input that starts with the 30-bit EOS code followed by
+        // 2 padding bits.
+        // 30 ones + 2 ones = 32 bits = 4 bytes of 0xFF.
+        let encoded = [0xFF, 0xFF, 0xFF, 0xFF];
+        let err = qpack::huffman_decode(&encoded).unwrap_err();
+        match err {
+            Error::BadResponse(m) => {
+                // Either the EOS check fires or the trailing-bits
+                // guard fires; both are spec-compliant rejections.
+                assert!(
+                    m.contains("EOS") || m.contains("Huffman"),
+                    "unexpected message: {m}"
+                );
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qpack_huffman_decoder_rejects_bad_padding() {
+        // Tail bits must be the high bits of the EOS code (all ones).
+        // Build "G" (7 bits = 0b1100011) then pad with a single 0 bit.
+        // Resulting byte: 0b11000110 = 0xC6. Decoder must reject the
+        // zero-bit tail.
+        let encoded = [0xC6];
+        let err = qpack::huffman_decode(&encoded).unwrap_err();
+        match err {
+            Error::BadResponse(m) => assert!(m.contains("padding"), "msg: {m}"),
+            other => panic!("expected BadResponse(padding), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qpack_decoder_handles_huffman_literal_value_end_to_end() {
+        // Field section: one Literal Field Line With Name Reference,
+        // index=0 (":authority"), value Huffman-coded "www.example.com".
+        // This is exactly the wire form a real server would emit and
+        // the path that previously failed before the Huffman decoder
+        // landed.
+        let www_huffman: [u8; 12] = [
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
         let mut buf = Vec::new();
         // Field-section prefix: RIC=0, Base=0.
         qpack::encode_int(0, 8, 0x00, &mut buf);
         qpack::encode_int(0, 7, 0x00, &mut buf);
-        // Literal Field Line With Name Reference, T=1 (static), index=17
-        // (":method").  4-bit prefix: 0b0101_0000 base.
-        qpack::encode_int(17, 4, 0b0101_0000, &mut buf);
-        // Literal value with H=1, length=3, then 3 garbage bytes.
-        buf.push(0b1000_0011);
-        buf.extend_from_slice(b"abc");
-        let err = qpack::decode_field_section(&buf).unwrap_err();
-        match err {
-            Error::BadResponse(m) => assert!(m.contains("Huffman"), "got: {m}"),
-            other => panic!("expected BadResponse(Huffman), got {other:?}"),
-        }
+        // Literal Field Line With Name Reference (T=1 static), idx=0
+        // (":authority"). 4-bit prefix base = 0b0101_0000.
+        qpack::encode_int(0, 4, 0b0101_0000, &mut buf);
+        // Value: 7-bit prefix byte = H(1) | length(12) = 0x80 | 12 = 0x8C.
+        buf.push(0x80 | 12);
+        buf.extend_from_slice(&www_huffman);
+
+        let fields = qpack::decode_field_section(&buf).expect("decode");
+        assert_eq!(
+            fields,
+            vec![(":authority".to_string(), "www.example.com".to_string())]
+        );
+    }
+
+    #[test]
+    fn qpack_decoder_handles_huffman_literal_name_end_to_end() {
+        // Field section: one Literal Field Line With Literal Name where
+        // BOTH the name and value are Huffman-coded. Uses
+        // "custom-key" / "custom-value" from RFC 7541 §C.4.3.
+        let key_huffman: [u8; 8] = [0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xa9, 0x7d, 0x7f];
+        let val_huffman: [u8; 9] = [0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf];
+
+        let mut buf = Vec::new();
+        // Field-section prefix.
+        qpack::encode_int(0, 8, 0x00, &mut buf);
+        qpack::encode_int(0, 7, 0x00, &mut buf);
+        // Literal Field Line With Literal Name. Pattern 0b001NHXXX with
+        // N=0 and H=1 → 0b0010_1000. 3-bit length prefix for name
+        // length 8.  Compose the first byte by hand: 0b0010_1000 | 8 =
+        // 0b0011_0000.  (Since 8 spills out of the 3-bit prefix max 7,
+        // encode_int will use the continuation form, so just call it.)
+        qpack::encode_int(key_huffman.len() as u64, 3, 0b0010_1000, &mut buf);
+        buf.extend_from_slice(&key_huffman);
+        // Value: 7-bit prefix with H=1.
+        qpack::encode_int(val_huffman.len() as u64, 7, 0x80, &mut buf);
+        buf.extend_from_slice(&val_huffman);
+
+        let fields = qpack::decode_field_section(&buf).expect("decode");
+        assert_eq!(
+            fields,
+            vec![("custom-key".to_string(), "custom-value".to_string())]
+        );
     }
 
     #[test]
