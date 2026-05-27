@@ -14,10 +14,13 @@
 //! - ALPN is offered as `h2`. If the server does not select it, we still
 //!   attempt the HTTP/2 preface (a server that didn't agree will close us
 //!   or respond with a GOAWAY, which we surface as `BadResponse`).
-//! - HPACK encoder uses only "literal header field without indexing"
-//!   (0x00 prefix) with full literal name+value, plus indexed lookups in
-//!   the static table when the (name, value) pair matches an entry. No
-//!   dynamic-table insertion on the encode side, no Huffman on encode.
+//! - HPACK encoder uses indexed references against the static AND dynamic
+//!   tables, literal-with-incremental-indexing for new headers (so repeats
+//!   collapse to one byte on subsequent requests), Huffman literal strings
+//!   when shorter than the raw form, and emits dynamic-table-size-update
+//!   signals when the peer changes `SETTINGS_HEADER_TABLE_SIZE`. Volatile
+//!   headers (cookies, authorization) are currently still added to the
+//!   dynamic table — see the §6.2.3 "never-indexed" note as future work.
 //! - HPACK decoder handles the static table, indexed-name+literal-value,
 //!   full literal, dynamic table insertions (capped, no resize signals
 //!   beyond the default 4096), and Huffman-coded literals (RFC 7541
@@ -26,7 +29,7 @@
 //!   WINDOW_UPDATE, GOAWAY, RST_STREAM. We auto-ACK SETTINGS, auto-PONG
 //!   PING; everything else on a non-target stream is ignored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1072,39 +1075,227 @@ impl Decoder {
     }
 }
 
-/// Encode one header into `out` as either an indexed reference (when both
-/// name and value match the static table) or a literal-without-indexing entry
-/// with literal name and literal value. Lowercased names are required by
-/// RFC 9113 §8.2.1 for HTTP/2.
-fn hpack_encode_header(out: &mut Vec<u8>, name: &str, value: &str) {
-    if let Some(idx) = static_full_index(name, value) {
-        // Indexed: high bit set, 7-bit integer index.
-        let mut bytes = encode_int(idx as u64, 7);
-        bytes[0] |= 0x80;
-        out.extend_from_slice(&bytes);
-        return;
+/// Huffman-encode `input` per RFC 7541 §5.2: concatenate the per-symbol
+/// codes (MSB-first within each code), then pad the trailing partial byte
+/// with the high bits of the EOS code (all-ones).
+fn huffman_encode(input: &[u8]) -> Vec<u8> {
+    // Total bit length first so we can size the output exactly.
+    let total_bits: usize = input.iter().map(|b| HUFFMAN[*b as usize].1 as usize).sum();
+    let out_len = total_bits.div_ceil(8);
+    let mut out = vec![0u8; out_len];
+
+    // Shift each symbol's `bit_len`-bit code into the buffer MSB-first. We
+    // keep a bit cursor (`bit_pos`) tracking the next free bit position
+    // measured from the MSB of byte 0.
+    let mut bit_pos: usize = 0;
+    for &b in input {
+        let (code, len) = HUFFMAN[b as usize];
+        let len = len as usize;
+        // Place the code so its MSB lands at `bit_pos`.
+        let mut remaining = len;
+        let mut code_left = code as u64;
+        while remaining > 0 {
+            let byte_index = bit_pos / 8;
+            let bit_in_byte = bit_pos % 8; // 0 = MSB.
+            let space_in_byte = 8 - bit_in_byte;
+            let take = remaining.min(space_in_byte);
+            // Top `take` bits of the still-unwritten part of the code.
+            let shift = (remaining - take) as u32;
+            let chunk = ((code_left >> shift) & ((1u64 << take) - 1)) as u8;
+            // Place those bits into the byte, left-justified within the
+            // remaining space.
+            out[byte_index] |= chunk << (space_in_byte - take);
+            // Mask the bits we just wrote out of `code_left`.
+            if shift > 0 {
+                code_left &= (1u64 << shift) - 1;
+            } else {
+                code_left = 0;
+            }
+            remaining -= take;
+            bit_pos += take;
+        }
     }
-    if let Some(idx) = static_name_index(name) {
-        // Literal without indexing, indexed name: 0000xxxx prefix, 4-bit name index.
-        let mut bytes = encode_int(idx as u64, 4);
-        bytes[0] |= 0x00; // explicit: top 4 bits already zero from 4-bit encode.
-        out.extend_from_slice(&bytes);
-        encode_literal_string(out, value);
-        return;
+
+    // Pad trailing bits (if any) with 1s — the most-significant bits of the
+    // EOS code (`0x3fffffff`, 30 bits, top bits all 1).
+    let trailing = (8 - (total_bits % 8)) % 8;
+    if trailing > 0 {
+        let last = out.len() - 1;
+        out[last] |= (1u8 << trailing) - 1;
     }
-    // Literal without indexing, literal name: 0x00 marker byte, then two strings.
-    out.push(0x00);
-    encode_literal_string(out, name);
-    encode_literal_string(out, value);
+    out
 }
 
+/// Encode one length-prefixed string literal (RFC 7541 §5.2). The high bit
+/// of the length-prefix byte is the Huffman flag: 1 = Huffman, 0 = raw.
+/// We pick whichever encoding is shorter on the wire (ties go to raw,
+/// which slightly favours decoder speed and avoids a needless Huffman pass).
 fn encode_literal_string(out: &mut Vec<u8>, s: &str) {
-    // Huffman flag = 0, length in 7-bit prefix.
-    let bytes = s.as_bytes();
-    let mut len_bytes = encode_int(bytes.len() as u64, 7);
-    len_bytes[0] &= 0x7f; // clear Huffman bit.
-    out.extend_from_slice(&len_bytes);
-    out.extend_from_slice(bytes);
+    let raw = s.as_bytes();
+    let huff = huffman_encode(raw);
+    if huff.len() < raw.len() {
+        let mut len_bytes = encode_int(huff.len() as u64, 7);
+        len_bytes[0] |= 0x80; // Huffman bit set.
+        out.extend_from_slice(&len_bytes);
+        out.extend_from_slice(&huff);
+    } else {
+        let mut len_bytes = encode_int(raw.len() as u64, 7);
+        len_bytes[0] &= 0x7f; // Huffman bit cleared.
+        out.extend_from_slice(&len_bytes);
+        out.extend_from_slice(raw);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HPACK encoder with dynamic-table insertion (RFC 7541 §6.2.1 / §6.3).
+// ---------------------------------------------------------------------------
+//
+// The encoder mirrors the decoder's dynamic table: every header we emit with
+// "incremental indexing" (§6.2.1) MUST be appended to our local dynamic
+// table because the receiver will do the same on its side. The two tables
+// must stay byte-for-byte identical or the indices we emit on the next
+// header block will misreference entries on the receiver.
+//
+// Indexing policy: we always use incremental indexing for headers not
+// already in either table. This maximises compression on repeated headers
+// across requests on the same connection (e.g. cookies, user-agent, etc.)
+// FUTURE: per RFC 7541 §7.1.3, secrets like `cookie` and `authorization`
+// SHOULD use the "never-indexed" representation (§6.2.3) to avoid leaking
+// via compression-side-channel attacks. We don't do that today — see the
+// out-of-scope note in the module-level docs.
+
+/// Per-connection HPACK encoder. The dynamic table here mirrors what we
+/// tell the peer to insert; the newest entry sits at `dyn_table[0]` and
+/// corresponds to HPACK index `STATIC_TABLE.len() + 1` (62 today).
+struct Encoder {
+    dyn_table: VecDeque<(String, String)>,
+    dyn_table_size: usize,
+    max_dyn_table_size: usize,
+    /// Pending "Dynamic Table Size Update" signal (§6.3). Set whenever the
+    /// peer changes `SETTINGS_HEADER_TABLE_SIZE`; consumed (and cleared)
+    /// at the head of the next header block we emit. The signal MUST
+    /// precede any header field representation in that block.
+    pending_max_table_size_signal: Option<usize>,
+}
+
+impl Encoder {
+    fn new() -> Self {
+        Encoder {
+            dyn_table: VecDeque::new(),
+            dyn_table_size: 0,
+            max_dyn_table_size: DYN_TABLE_CAP,
+            pending_max_table_size_signal: None,
+        }
+    }
+
+    fn entry_size(name: &str, value: &str) -> usize {
+        name.len() + value.len() + 32
+    }
+
+    /// Apply a new `SETTINGS_HEADER_TABLE_SIZE` cap from the peer. The
+    /// encoder MUST emit a §6.3 size-update signal in the next header
+    /// block to acknowledge the change, and MUST evict entries
+    /// immediately so the table never exceeds the new cap.
+    fn set_peer_max_table_size(&mut self, n: usize) {
+        self.max_dyn_table_size = n;
+        self.evict_to_fit(0);
+        self.pending_max_table_size_signal = Some(n);
+    }
+
+    fn evict_to_fit(&mut self, incoming: usize) {
+        while self.dyn_table_size + incoming > self.max_dyn_table_size && !self.dyn_table.is_empty()
+        {
+            // Oldest entry lives at the back of the deque.
+            let (n, v) = self.dyn_table.pop_back().unwrap();
+            self.dyn_table_size = self.dyn_table_size.saturating_sub(Self::entry_size(&n, &v));
+        }
+    }
+
+    fn insert(&mut self, name: &str, value: &str) {
+        let sz = Self::entry_size(name, value);
+        if sz > self.max_dyn_table_size {
+            // Entry larger than the entire table: clear and skip (§4.4).
+            self.dyn_table.clear();
+            self.dyn_table_size = 0;
+            return;
+        }
+        self.evict_to_fit(sz);
+        self.dyn_table
+            .push_front((name.to_string(), value.to_string()));
+        self.dyn_table_size += sz;
+    }
+
+    /// 1-based combined HPACK index for an exact (name, value) match.
+    /// Checks the static table first (indices 1..=61), then the dynamic
+    /// table (index 62 = newest, the front of the deque).
+    fn combined_full_index(&self, name: &str, value: &str) -> Option<u32> {
+        if let Some(i) = static_full_index(name, value) {
+            return Some(i as u32);
+        }
+        for (i, (n, v)) in self.dyn_table.iter().enumerate() {
+            if n == name && v == value {
+                return Some((STATIC_TABLE.len() + 1 + i) as u32);
+            }
+        }
+        None
+    }
+
+    /// 1-based combined HPACK index for the first entry matching `name`.
+    fn combined_name_index(&self, name: &str) -> Option<u32> {
+        if let Some(i) = static_name_index(name) {
+            return Some(i as u32);
+        }
+        for (i, (n, _)) in self.dyn_table.iter().enumerate() {
+            if n == name {
+                return Some((STATIC_TABLE.len() + 1 + i) as u32);
+            }
+        }
+        None
+    }
+
+    /// Encode one header field. Names MUST already be lowercased by the
+    /// caller (RFC 9113 §8.2.1). On the wire we emit, in order:
+    ///
+    /// 1. Any pending §6.3 dynamic-table-size-update signal.
+    /// 2. If both name and value are in the combined table: an indexed
+    ///    field representation (high bit 1, §6.1).
+    /// 3. Else if the name alone is in the combined table: a literal
+    ///    with incremental indexing + indexed name (`01xxxxxx`, 6-bit
+    ///    name index, §6.2.1). The entry is inserted into our table.
+    /// 4. Else: literal with incremental indexing + literal name
+    ///    (`0x40` marker, §6.2.1). The entry is inserted into our table.
+    fn encode_header(&mut self, out: &mut Vec<u8>, name: &str, value: &str) {
+        // (1) Pending size-update signal: 5-bit prefix, top three bits `001`.
+        if let Some(n) = self.pending_max_table_size_signal.take() {
+            let mut bytes = encode_int(n as u64, 5);
+            bytes[0] |= 0x20;
+            out.extend_from_slice(&bytes);
+        }
+
+        // (2) Indexed field representation.
+        if let Some(idx) = self.combined_full_index(name, value) {
+            let mut bytes = encode_int(idx as u64, 7);
+            bytes[0] |= 0x80;
+            out.extend_from_slice(&bytes);
+            return;
+        }
+
+        // (3) Literal with incremental indexing, indexed name.
+        if let Some(idx) = self.combined_name_index(name) {
+            let mut bytes = encode_int(idx as u64, 6);
+            bytes[0] |= 0x40;
+            out.extend_from_slice(&bytes);
+            encode_literal_string(out, value);
+            self.insert(name, value);
+            return;
+        }
+
+        // (4) Literal with incremental indexing, literal name.
+        out.push(0x40);
+        encode_literal_string(out, name);
+        encode_literal_string(out, value);
+        self.insert(name, value);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,6 +1487,7 @@ struct Connection<S: Read + Write> {
     conn_send_window: ConnSendWindow,
     conn_recv_window: ConnRecvWindow,
     decoder: Decoder,
+    encoder: Encoder,
     streams: HashMap<u32, Stream>,
     /// Next client-initiated stream id to allocate. Per §5.1.1, client
     /// streams are odd-numbered and strictly increasing: 1, 3, 5, …
@@ -1346,6 +1538,7 @@ impl<S: Read + Write> Connection<S> {
             conn_send_window: ConnSendWindow::new(),
             conn_recv_window: ConnRecvWindow::new(),
             decoder: Decoder::new(),
+            encoder: Encoder::new(),
             streams: HashMap::new(),
             next_stream_id: 1,
             goaway_received: None,
@@ -1422,7 +1615,7 @@ impl<S: Read + Write> Connection<S> {
     /// when the send window is depleted. The stream's `state` is advanced
     /// for each outbound transition.
     fn send_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
-        let header_block = build_header_block(req);
+        let header_block = build_header_block(&mut self.encoder, req);
         let has_body = !req.body.is_empty();
         let max_frame_size = self.peer.max_frame_size as usize;
         let header_frames =
@@ -1575,6 +1768,7 @@ impl<S: Read + Write> Connection<S> {
         match frame.typ {
             F_SETTINGS if frame.flags & FLAG_ACK == 0 => {
                 let old_initial = self.peer.initial_window_size;
+                let old_header_table_size = self.peer.header_table_size;
                 self.peer.apply_settings_payload(&frame.payload)?;
                 let new_initial = self.peer.initial_window_size;
                 if new_initial != old_initial {
@@ -1584,6 +1778,14 @@ impl<S: Read + Write> Connection<S> {
                     for s in self.streams.values_mut() {
                         s.send_window.apply_initial_window_change(new_initial)?;
                     }
+                }
+                if self.peer.header_table_size != old_header_table_size {
+                    // RFC 7541 §6.3: the encoder MUST emit a dynamic-table-
+                    // size-update signal in the next header block to
+                    // acknowledge the new cap. `set_peer_max_table_size`
+                    // also evicts entries immediately so we never exceed it.
+                    self.encoder
+                        .set_peer_max_table_size(self.peer.header_table_size as usize);
                 }
                 let ack = Frame {
                     typ: F_SETTINGS,
@@ -2278,21 +2480,23 @@ fn build_response_from_stream(stream: Stream) -> Result<Response> {
 
 /// Build the HPACK-encoded header block for the request: pseudo-headers in the
 /// required order (RFC 9113 §8.3.1), then lowercased user headers (skipping
-/// the connection-specific ones HTTP/2 forbids per §8.2.2).
-fn build_header_block(req: &Request) -> Vec<u8> {
+/// the connection-specific ones HTTP/2 forbids per §8.2.2). The `encoder`
+/// is borrowed mutably so its dynamic table tracks every header we emit
+/// with incremental indexing — keeping our table aligned with the peer's.
+fn build_header_block(encoder: &mut Encoder, req: &Request) -> Vec<u8> {
     let mut out = Vec::new();
 
     // Pseudo-headers must come first, in this order: :method, :scheme,
     // :authority, :path.
-    hpack_encode_header(&mut out, ":method", &req.method);
-    hpack_encode_header(&mut out, ":scheme", &req.url.scheme);
+    encoder.encode_header(&mut out, ":method", &req.method);
+    encoder.encode_header(&mut out, ":scheme", &req.url.scheme);
     let authority = if req.url.port == 443 && req.url.scheme == "https" {
         req.url.host.clone()
     } else {
         format!("{}:{}", req.url.host, req.url.port)
     };
-    hpack_encode_header(&mut out, ":authority", &authority);
-    hpack_encode_header(&mut out, ":path", &req.url.path);
+    encoder.encode_header(&mut out, ":authority", &authority);
+    encoder.encode_header(&mut out, ":path", &req.url.path);
 
     // Regular headers: lowercased name, skip any banned ones.
     let mut have_ua = false;
@@ -2312,27 +2516,27 @@ fn build_header_block(req: &Request) -> Vec<u8> {
         if lk == "authorization" {
             have_auth = true;
         }
-        hpack_encode_header(&mut out, &lk, v);
+        encoder.encode_header(&mut out, &lk, v);
     }
     if !have_auth {
         if let Some(creds) = crate::http::effective_basic_auth(req) {
             let value = format!("Basic {creds}");
-            hpack_encode_header(&mut out, "authorization", &value);
+            encoder.encode_header(&mut out, "authorization", &value);
         }
     }
     if !have_ua {
-        hpack_encode_header(
+        encoder.encode_header(
             &mut out,
             "user-agent",
             concat!("rsurl/", env!("CARGO_PKG_VERSION")),
         );
     }
     if !have_accept {
-        hpack_encode_header(&mut out, "accept", "*/*");
+        encoder.encode_header(&mut out, "accept", "*/*");
     }
     if !req.body.is_empty() {
         let len = req.body.len().to_string();
-        hpack_encode_header(&mut out, "content-length", &len);
+        encoder.encode_header(&mut out, "content-length", &len);
     }
     out
 }
@@ -2466,43 +2670,55 @@ mod tests {
 
     #[test]
     fn hpack_encode_indexed_method() {
+        // Static index 2 = (":method", "GET") — high bit set + index = 0x82.
+        // The indexed-field form (§6.1) doesn't touch the dynamic table.
+        let mut enc = Encoder::new();
         let mut out = Vec::new();
-        hpack_encode_header(&mut out, ":method", "GET");
-        // Indexed header field, index 2 → 0x82.
+        enc.encode_header(&mut out, ":method", "GET");
         assert_eq!(out, vec![0x82]);
+        assert!(enc.dyn_table.is_empty());
     }
 
     #[test]
     fn hpack_encode_literal_with_indexed_name() {
+        // ":path" is static name index 4. The encoder uses literal-with-
+        // incremental-indexing + indexed name (`01xxxxxx` = 0x40 + idx), so
+        // the first byte is 0x44. The value "/foo" picks whichever is
+        // shorter between raw and Huffman; we just verify the decoder
+        // round-trips and the entry landed in the dynamic table.
+        let mut enc = Encoder::new();
         let mut out = Vec::new();
-        hpack_encode_header(&mut out, ":path", "/foo");
-        // Literal w/o indexing, indexed name :path = 4 → 0x04.
-        // Then literal length 4, Huffman flag 0 → 0x04, then "/foo".
-        assert_eq!(out, vec![0x04, 0x04, b'/', b'f', b'o', b'o']);
+        enc.encode_header(&mut out, ":path", "/foo");
+        assert_eq!(out[0], 0x44);
+        let mut dec = Decoder::new();
+        let got = dec.decode_block(&out).unwrap();
+        assert_eq!(got, vec![(":path".into(), "/foo".into())]);
+        assert_eq!(enc.dyn_table.len(), 1);
+        assert_eq!(enc.dyn_table[0], (":path".to_string(), "/foo".to_string()));
     }
 
     #[test]
     fn hpack_encode_literal_full() {
+        // "x-custom" is in neither table → literal-with-incremental-indexing
+        // + literal name (0x40 marker), then two length-prefixed strings.
+        let mut enc = Encoder::new();
         let mut out = Vec::new();
-        hpack_encode_header(&mut out, "x-custom", "yes");
-        // Literal w/o indexing, new name → 0x00, then "x-custom" (len 8), then "yes" (len 3).
-        let expected = {
-            let mut v = vec![0x00, 0x08];
-            v.extend_from_slice(b"x-custom");
-            v.push(0x03);
-            v.extend_from_slice(b"yes");
-            v
-        };
-        assert_eq!(out, expected);
+        enc.encode_header(&mut out, "x-custom", "yes");
+        assert_eq!(out[0], 0x40);
+        let mut dec = Decoder::new();
+        let got = dec.decode_block(&out).unwrap();
+        assert_eq!(got, vec![("x-custom".into(), "yes".into())]);
+        assert_eq!(enc.dyn_table[0], ("x-custom".into(), "yes".into()));
     }
 
     #[test]
     fn hpack_decode_round_trip_pseudo_headers() {
+        let mut enc = Encoder::new();
         let mut block = Vec::new();
-        hpack_encode_header(&mut block, ":method", "GET");
-        hpack_encode_header(&mut block, ":scheme", "https");
-        hpack_encode_header(&mut block, ":authority", "example.com");
-        hpack_encode_header(&mut block, ":path", "/");
+        enc.encode_header(&mut block, ":method", "GET");
+        enc.encode_header(&mut block, ":scheme", "https");
+        enc.encode_header(&mut block, ":authority", "example.com");
+        enc.encode_header(&mut block, ":path", "/");
         let mut dec = Decoder::new();
         let got = dec.decode_block(&block).unwrap();
         assert_eq!(got.len(), 4);
@@ -2568,6 +2784,242 @@ mod tests {
         assert!(huffman_decode(&[0x00]).is_err());
     }
 
+    // -----------------------------------------------------------------
+    // Huffman encoder (RFC 7541 §5.2).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn huffman_encode_padding_bits() {
+        // 'a' (Huffman index 97) encodes to (code=0x3, len=5). Left-shifted
+        // into the top 5 bits of a byte: 0b00011_000 = 0x18. Padded with 3
+        // trailing 1-bits: 0b00011_111 = 0x1f.
+        let out = huffman_encode(b"a");
+        assert_eq!(out, vec![0x1f]);
+    }
+
+    #[test]
+    fn huffman_encode_appendix_c_www_example_com() {
+        // RFC 7541 §C.4.1: "www.example.com".
+        let out = huffman_encode(b"www.example.com");
+        assert_eq!(
+            out,
+            vec![0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,]
+        );
+    }
+
+    #[test]
+    fn huffman_encode_appendix_c_no_cache() {
+        // RFC 7541 §C.4.2: "no-cache".
+        let out = huffman_encode(b"no-cache");
+        assert_eq!(out, vec![0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf]);
+    }
+
+    #[test]
+    fn huffman_encode_appendix_c_custom_key() {
+        // RFC 7541 §C.4.3: "custom-key".
+        let out = huffman_encode(b"custom-key");
+        assert_eq!(out, vec![0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xa9, 0x7d, 0x7f]);
+    }
+
+    #[test]
+    fn huffman_encode_appendix_c_custom_value() {
+        // RFC 7541 §C.4.3: "custom-value".
+        let out = huffman_encode(b"custom-value");
+        assert_eq!(
+            out,
+            vec![0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf]
+        );
+    }
+
+    #[test]
+    fn huffman_encode_round_trips_through_decoder() {
+        // Defensive: any byte sequence we Huffman-encode must decode back
+        // to itself. Catches bit-cursor / padding bugs.
+        for s in &[
+            "",
+            "a",
+            "ab",
+            "abc",
+            "Hello, world!",
+            "the quick brown fox jumps",
+            "/foo/bar/baz",
+        ] {
+            let bytes = s.as_bytes();
+            if bytes.is_empty() {
+                // huffman_decode rejects empty input only when padding is
+                // nonzero; empty in / empty out trivially round-trips.
+                let enc = huffman_encode(bytes);
+                assert!(enc.is_empty());
+                continue;
+            }
+            let enc = huffman_encode(bytes);
+            let dec = huffman_decode(&enc).unwrap();
+            assert_eq!(dec, bytes, "round-trip mismatch for {s:?}");
+        }
+    }
+
+    #[test]
+    fn encode_literal_chooses_huffman_when_shorter() {
+        // 100 'a' bytes: each 'a' is 5 bits → 500 bits = 63 bytes Huffman.
+        // Raw is 100 bytes. Huffman wins; high bit of length prefix is set.
+        let mut out = Vec::new();
+        let s: String = "a".repeat(100);
+        encode_literal_string(&mut out, &s);
+        assert_eq!(out[0] & 0x80, 0x80, "Huffman bit should be set");
+    }
+
+    #[test]
+    fn encode_literal_chooses_raw_when_huffman_longer() {
+        // 0xff Huffman-encodes to 27 bits. 100 copies = 2700 bits ≈ 338
+        // bytes — far worse than the raw 100. We pick raw; high bit cleared.
+        let mut out = Vec::new();
+        // Hold the string in a Vec<u8> so we don't have to construct an
+        // invalid UTF-8 &str. encode_literal_string takes &str so we cheat
+        // through Latin-1 by passing characters that round-trip to bytes.
+        // Actually `as_bytes()` is called inside the function, so we use a
+        // helper that operates on bytes directly.
+        let bytes: Vec<u8> = vec![0xff; 100];
+        // encode_literal_string takes &str; we construct a String of the
+        // same length via Latin-1 chars. Char `\u{00FF}` is two bytes in
+        // UTF-8, so use printable ASCII whose Huffman is also worse than
+        // raw: '|' (0x7c) is 28 bits each.
+        // Easier: call the underlying primitives directly.
+        let huff = huffman_encode(&bytes);
+        assert!(
+            huff.len() > bytes.len(),
+            "0xff Huffman should be longer than raw"
+        );
+        // Now drive `encode_literal_string` via a printable ASCII string
+        // whose Huffman code is also wider than 8 bits per symbol. '|'
+        // (Huffman entry: 28 bits) qualifies.
+        let s: String = "|".repeat(50);
+        out.clear();
+        encode_literal_string(&mut out, &s);
+        assert_eq!(out[0] & 0x80, 0x00, "Huffman bit should be cleared");
+        assert_eq!(out[0] as usize & 0x7f, 50);
+        assert_eq!(&out[1..], s.as_bytes());
+    }
+
+    // -----------------------------------------------------------------
+    // HPACK encoder dynamic-table insertion (RFC 7541 §6.2.1).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn encoder_inserts_into_dyn_table_on_incremental_indexing() {
+        let mut enc = Encoder::new();
+        let mut out = Vec::new();
+        enc.encode_header(&mut out, "x-custom", "value1");
+        assert_eq!(enc.dyn_table.len(), 1);
+        assert_eq!(
+            enc.dyn_table[0],
+            ("x-custom".to_string(), "value1".to_string())
+        );
+        assert_eq!(enc.dyn_table_size, "x-custom".len() + "value1".len() + 32);
+    }
+
+    #[test]
+    fn encoder_evicts_to_fit_max_size() {
+        // Each entry has overhead 32 + name + value. Two entries of length
+        // (name=4, value=4) cost 40 bytes each = 80 total. Cap at 64 forces
+        // the older one out when the second arrives.
+        let mut enc = Encoder::new();
+        enc.max_dyn_table_size = 64;
+        let mut out = Vec::new();
+        enc.encode_header(&mut out, "n1aa", "v1aa");
+        enc.encode_header(&mut out, "n2aa", "v2aa");
+        assert_eq!(enc.dyn_table.len(), 1, "only the newest should remain");
+        assert_eq!(enc.dyn_table[0], ("n2aa".to_string(), "v2aa".to_string()));
+        assert_eq!(enc.dyn_table_size, 40);
+    }
+
+    #[test]
+    fn encoder_emits_size_update_signal_on_next_encode_after_setting_change() {
+        let mut enc = Encoder::new();
+        enc.set_peer_max_table_size(1024);
+        let mut out = Vec::new();
+        enc.encode_header(&mut out, ":method", "GET");
+        // 0x20 prefix + 5-bit integer encoding of 1024.
+        // 1024 >= 31 → first byte = 0x20 | 0x1f = 0x3f; remainder 993 =
+        // 0xe1, 0x07 (varint). Then `:method GET` is indexed = 0x82.
+        assert_eq!(out, vec![0x3f, 0xe1, 0x07, 0x82]);
+        // Signal is consumed; a subsequent call MUST NOT re-emit it.
+        out.clear();
+        enc.encode_header(&mut out, ":method", "GET");
+        assert_eq!(out, vec![0x82]);
+    }
+
+    #[test]
+    fn encoder_uses_dynamic_index_for_repeat() {
+        let mut enc = Encoder::new();
+        let mut out = Vec::new();
+        enc.encode_header(&mut out, "x", "y");
+        out.clear();
+        enc.encode_header(&mut out, "x", "y");
+        // index = static (61) + 1 = 62, high bit set → 0x80 | 62 = 0xbe.
+        assert_eq!(out, vec![0xbe]);
+    }
+
+    #[test]
+    fn encoder_uses_indexed_name_from_dyn_table() {
+        let mut enc = Encoder::new();
+        let mut out = Vec::new();
+        enc.encode_header(&mut out, "x-foo", "v1");
+        // After insertion: dyn_table[0] = ("x-foo", "v1") at HPACK index 62.
+        out.clear();
+        enc.encode_header(&mut out, "x-foo", "v2");
+        // Literal-with-incremental-indexing, indexed name (6-bit): 0x40 | 62 = 0x7e.
+        assert_eq!(out[0], 0x7e);
+        // And both entries should be in the dyn table now (newest first).
+        assert_eq!(enc.dyn_table.len(), 2);
+        assert_eq!(enc.dyn_table[0].1, "v2");
+        assert_eq!(enc.dyn_table[1].1, "v1");
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        // A handful of mixed headers — static-table hits, repeats (which
+        // collapse to indexed dynamic refs), and new entries — must
+        // round-trip exactly through the decoder.
+        let mut enc = Encoder::new();
+        let mut dec = Decoder::new();
+        let inputs: Vec<(&str, &str)> = vec![
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            (":path", "/foo"),
+            ("user-agent", "rsurl/test"),
+            ("accept", "*/*"),
+            ("x-custom", "hello world"),
+            ("user-agent", "rsurl/test"), // repeat → indexed dyn ref
+            ("x-custom", "different"),    // same name, new value
+        ];
+        let mut buf = Vec::new();
+        for (n, v) in &inputs {
+            enc.encode_header(&mut buf, n, v);
+        }
+        let got = dec.decode_block(&buf).unwrap();
+        let expected: Vec<(String, String)> = inputs
+            .into_iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn encoder_size_update_evicts_oversize_entries_immediately() {
+        // Insert two entries (total ~80 bytes), then shrink the cap to 50.
+        // The older one must be evicted right away, even before the next
+        // encode_header call.
+        let mut enc = Encoder::new();
+        let mut out = Vec::new();
+        enc.encode_header(&mut out, "n1aa", "v1aa"); // 40 bytes
+        enc.encode_header(&mut out, "n2aa", "v2aa"); // 40 bytes
+        assert_eq!(enc.dyn_table.len(), 2);
+        enc.set_peer_max_table_size(50);
+        assert_eq!(enc.dyn_table.len(), 1);
+        assert_eq!(enc.dyn_table[0].0, "n2aa");
+    }
+
     #[test]
     fn hpack_decode_huffman_literal_value() {
         // RFC 7541 §C.4.1 second header: (":path", "/sample/path") with
@@ -2597,7 +3049,8 @@ mod tests {
     #[test]
     fn build_header_block_includes_pseudo() {
         let req = Request::new("GET", "https://example.com/foo").unwrap();
-        let block = build_header_block(&req);
+        let mut enc = Encoder::new();
+        let block = build_header_block(&mut enc, &req);
         let mut dec = Decoder::new();
         let headers = dec.decode_block(&block).unwrap();
         let kv: Vec<(&str, &str)> = headers
@@ -2619,7 +3072,8 @@ mod tests {
             .header("Connection", "close")
             .header("Host", "evil.example")
             .header("X-Allowed", "yes");
-        let block = build_header_block(&req);
+        let mut enc = Encoder::new();
+        let block = build_header_block(&mut enc, &req);
         let mut dec = Decoder::new();
         let headers = dec.decode_block(&block).unwrap();
         let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
@@ -2631,7 +3085,8 @@ mod tests {
     #[test]
     fn build_header_block_authority_includes_nonstandard_port() {
         let req = Request::new("GET", "https://example.com:8443/").unwrap();
-        let block = build_header_block(&req);
+        let mut enc = Encoder::new();
+        let block = build_header_block(&mut enc, &req);
         let mut dec = Decoder::new();
         let headers = dec.decode_block(&block).unwrap();
         let auth = headers.iter().find(|(k, _)| k == ":authority").unwrap();
@@ -3211,6 +3666,7 @@ mod tests {
             conn_send_window: ConnSendWindow::new(),
             conn_recv_window: ConnRecvWindow::new(),
             decoder: Decoder::new(),
+            encoder: Encoder::new(),
             streams: HashMap::new(),
             next_stream_id: 1,
             goaway_received: None,
