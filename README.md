@@ -3,7 +3,7 @@
 [![CI](https://github.com/KarpelesLab/rsurl/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/rsurl/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/rsurl.svg)](https://crates.io/crates/rsurl)
 [![Docs.rs](https://docs.rs/rsurl/badge.svg)](https://docs.rs/rsurl)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A pure-Rust implementation of curl, built on top of [purecrypto](https://crates.io/crates/purecrypto)
 for TLS — no OpenSSL, no system libcurl, no C dependencies.
