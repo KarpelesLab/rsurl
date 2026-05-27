@@ -1109,6 +1109,372 @@ fn tcp_connect(req: &Request) -> Result<TcpStream> {
 // The main send() routine.
 // ---------------------------------------------------------------------------
 
+/// Mutable connection state shared between the body-send loop and the
+/// response-read loop. Carved out so [`process_frame`] can drive a single
+/// inbound frame from either site without duplicating the dispatch ladder.
+///
+/// The single-stream world still bakes `stream_id == 1` into the struct
+/// (via the contents of `send_window`/`recv_window`); task 4 will replace
+/// these with per-stream maps. Until then the struct just bundles globals.
+struct ConnState {
+    peer: PeerSettings,
+    send_window: SendWindow,
+    recv_window: RecvWindow,
+    decoder: Decoder,
+    /// Accumulator for the in-progress header block (HEADERS + CONTINUATION
+    /// fragments) before HPACK decoding fires at END_HEADERS.
+    headers_buf: Vec<u8>,
+    /// True between a HEADERS frame without END_HEADERS and its terminating
+    /// CONTINUATION frame; any other frame type in between is a protocol
+    /// violation per RFC 9113 §6.10.
+    expecting_continuation: bool,
+    /// Fully decoded response headers, once the response's END_HEADERS has
+    /// been seen. `None` until then.
+    response_headers: Option<Vec<(String, String)>>,
+    /// Accumulator for response body bytes (DATA payloads, post-padding).
+    body: Vec<u8>,
+    /// True once the response stream has hit END_STREAM (set by HEADERS or
+    /// the final DATA frame).
+    end_stream: bool,
+}
+
+impl ConnState {
+    fn new() -> Self {
+        ConnState {
+            peer: PeerSettings::default(),
+            send_window: SendWindow::new(),
+            recv_window: RecvWindow::new(),
+            decoder: Decoder::new(),
+            headers_buf: Vec::new(),
+            expecting_continuation: false,
+            response_headers: None,
+            body: Vec::new(),
+            end_stream: false,
+        }
+    }
+}
+
+/// Result of feeding one inbound frame to [`process_frame`].
+///
+/// `Done` means the response stream is fully delivered (END_STREAM seen); the
+/// caller can break out of its read loop. `Continue` means more frames are
+/// expected — keep reading. Errors propagate via `Result`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverOutcome {
+    Continue,
+    Done,
+}
+
+/// Apply a single inbound frame to the shared connection state.
+///
+/// This is the read-loop's per-frame dispatch ladder, hoisted into a helper so
+/// the body-send loop can call it whenever it has to block on flow control
+/// (waiting for a WINDOW_UPDATE). Both call sites share one implementation of
+/// SETTINGS-ACK, PING-PONG, WINDOW_UPDATE, GOAWAY, RST_STREAM, and
+/// HEADERS/CONTINUATION/DATA accumulation.
+///
+/// `tls` is the connection we may need to write replies to (SETTINGS ACK,
+/// PING pong, WINDOW_UPDATE replenishment). It's typed `Read + Write` so unit
+/// tests can substitute a `Cursor`-backed fake without dragging in real TLS.
+fn process_frame<S: Read + Write>(
+    frame: Frame,
+    tls: &mut S,
+    state: &mut ConnState,
+) -> Result<DriverOutcome> {
+    // CONTINUATION must immediately follow HEADERS/CONTINUATION on the same
+    // stream with no interleaving (RFC 9113 §6.10). The check has to happen
+    // before the dispatch ladder because *any* other frame type in this window
+    // is a protocol error, including frames we'd otherwise quietly accept
+    // (PING, SETTINGS, ...).
+    if state.expecting_continuation && frame.typ != F_CONTINUATION {
+        return Err(Error::BadResponse(
+            "expected CONTINUATION between header fragments".into(),
+        ));
+    }
+
+    match frame.typ {
+        F_SETTINGS if frame.flags & FLAG_ACK == 0 => {
+            // Server-sent SETTINGS: parse and update peer state, then ACK.
+            // Validation errors propagate out of the loop.
+            //
+            // If INITIAL_WINDOW_SIZE changed, the delta retroactively adjusts
+            // every existing stream's send window by `(new - old)`
+            // (RFC 9113 §6.9.2). Apply that AFTER the SETTINGS parse succeeds
+            // so we operate on validated values; the connection window is
+            // untouched.
+            state.peer.apply_settings_payload(&frame.payload)?;
+            state
+                .send_window
+                .apply_initial_window_change(state.peer.initial_window_size)?;
+            let ack = Frame {
+                typ: F_SETTINGS,
+                flags: FLAG_ACK,
+                stream_id: 0,
+                payload: Vec::new(),
+            };
+            write_frame(tls, &ack)?;
+            tls.flush()?;
+        }
+        // ACK from the server is silently absorbed.
+        F_SETTINGS => {}
+        F_PING if frame.flags & FLAG_ACK == 0 => {
+            let pong = Frame {
+                typ: F_PING,
+                flags: FLAG_ACK,
+                stream_id: 0,
+                payload: frame.payload.clone(),
+            };
+            write_frame(tls, &pong)?;
+            tls.flush()?;
+        }
+        F_PING => {}
+        F_WINDOW_UPDATE => {
+            // RFC 9113 §6.9: 4-byte payload, low 31 bits are the increment.
+            // Zero increment is an error; pushing the window past 2^31-1 is a
+            // FLOW_CONTROL_ERROR. `apply_window_update` handles both. A
+            // WINDOW_UPDATE for a stream we don't track (anything other than
+            // 0 or 1 in our single-stream world) is ignored — the RFC permits
+            // us to drop frames for closed/unknown streams.
+            let inc = parse_window_update(&frame.payload)?;
+            if frame.stream_id == 0 || frame.stream_id == 1 {
+                state
+                    .send_window
+                    .apply_window_update(frame.stream_id, inc)?;
+            }
+        }
+        F_GOAWAY if state.response_headers.is_none() => {
+            // Even mid-response, GOAWAY just means "no new streams"; if our
+            // stream has finished it can still be OK. If we haven't yet
+            // assembled headers, treat as failure.
+            return Err(Error::BadResponse(format!(
+                "server sent GOAWAY (payload {} bytes)",
+                frame.payload.len()
+            )));
+        }
+        // GOAWAY after headers: wait for END_STREAM as usual; if the server
+        // dropped us first we'll hit UnexpectedEof on the next read.
+        F_GOAWAY => {}
+        F_RST_STREAM if frame.stream_id == 1 => {
+            let code = if frame.payload.len() >= 4 {
+                u32::from_be_bytes([
+                    frame.payload[0],
+                    frame.payload[1],
+                    frame.payload[2],
+                    frame.payload[3],
+                ])
+            } else {
+                0
+            };
+            return Err(Error::BadResponse(format!(
+                "stream 1 reset by server, error code {code}"
+            )));
+        }
+        F_HEADERS if frame.stream_id == 1 => {
+            let mut payload = frame.payload.as_slice();
+            // PADDED: 1 byte pad length, then payload, then padding bytes.
+            let mut pad_len = 0usize;
+            if frame.flags & FLAG_PADDED != 0 {
+                if payload.is_empty() {
+                    return Err(Error::BadResponse(
+                        "HEADERS PADDED with empty payload".into(),
+                    ));
+                }
+                pad_len = payload[0] as usize;
+                payload = &payload[1..];
+            }
+            // PRIORITY: skip 5 bytes (stream dep + weight).
+            if frame.flags & FLAG_PRIORITY != 0 {
+                if payload.len() < 5 {
+                    return Err(Error::BadResponse(
+                        "HEADERS PRIORITY with insufficient payload".into(),
+                    ));
+                }
+                payload = &payload[5..];
+            }
+            if payload.len() < pad_len {
+                return Err(Error::BadResponse(
+                    "HEADERS padding overruns payload".into(),
+                ));
+            }
+            let frag = &payload[..payload.len() - pad_len];
+            state.headers_buf.extend_from_slice(frag);
+
+            if frame.flags & FLAG_END_HEADERS != 0 {
+                let decoded = state.decoder.decode_block(&state.headers_buf)?;
+                state.headers_buf.clear();
+                state.response_headers = Some(decoded);
+                state.expecting_continuation = false;
+            } else {
+                state.expecting_continuation = true;
+            }
+
+            if frame.flags & FLAG_END_STREAM != 0 {
+                state.end_stream = true;
+            }
+        }
+        F_CONTINUATION if frame.stream_id == 1 => {
+            if !state.expecting_continuation {
+                return Err(Error::BadResponse("unexpected CONTINUATION frame".into()));
+            }
+            state.headers_buf.extend_from_slice(&frame.payload);
+            if frame.flags & FLAG_END_HEADERS != 0 {
+                let decoded = state.decoder.decode_block(&state.headers_buf)?;
+                state.headers_buf.clear();
+                state.response_headers = Some(decoded);
+                state.expecting_continuation = false;
+            }
+        }
+        F_DATA if frame.stream_id == 1 => {
+            // RFC 9113 §6.9.1: every octet of a DATA frame counts against
+            // the flow-control windows — *including* the pad-length byte and
+            // padding bytes. Bill `frame.payload.len()` first, then strip
+            // padding to find the application bytes to deliver.
+            let frame_bytes = frame.payload.len();
+            state.recv_window.consume(frame_bytes);
+
+            let mut payload = frame.payload.as_slice();
+            if frame.flags & FLAG_PADDED != 0 {
+                if payload.is_empty() {
+                    return Err(Error::BadResponse("DATA PADDED with empty payload".into()));
+                }
+                let pad_len = payload[0] as usize;
+                payload = &payload[1..];
+                if payload.len() < pad_len {
+                    return Err(Error::BadResponse("DATA padding overruns payload".into()));
+                }
+                payload = &payload[..payload.len() - pad_len];
+            }
+            state.body.extend_from_slice(payload);
+            if frame.flags & FLAG_END_STREAM != 0 {
+                state.end_stream = true;
+            }
+
+            // Replenish either window that has dropped below half its initial
+            // size. With the RFC default (65,535 → threshold 32,767) one
+            // large response can fire one or two WINDOW_UPDATE frames;
+            // otherwise we stay quiet.
+            for upd in state.recv_window.replenish(1) {
+                write_frame(tls, &upd)?;
+            }
+            tls.flush()?;
+        }
+        _ => {
+            // PRIORITY, PUSH_PROMISE, RST_STREAM on other streams, unknown
+            // types — all ignored per RFC 9113 §4.1.
+        }
+    }
+
+    Ok(if state.end_stream {
+        DriverOutcome::Done
+    } else {
+        DriverOutcome::Continue
+    })
+}
+
+/// Read one frame from `tls` and feed it to [`process_frame`]. Maps the I/O
+/// error variants to the crate's `Error` taxonomy. Used by both the body-send
+/// loop (when blocked on flow control) and the main response-read loop.
+fn read_and_process<S: Read + Write>(tls: &mut S, state: &mut ConnState) -> Result<DriverOutcome> {
+    let frame = match read_frame(tls) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(Error::UnexpectedEof);
+        }
+        Err(e) => return Err(Error::Io(e)),
+    };
+    process_frame(frame, tls, state)
+}
+
+/// Split an HPACK-encoded header block into one HEADERS frame followed by
+/// zero or more CONTINUATION frames, each ≤ `max_frame_size` octets
+/// (RFC 9113 §6.10).
+///
+/// `end_stream` controls FLAG_END_STREAM on the HEADERS frame; FLAG_END_HEADERS
+/// is set automatically on the final fragment (which is the HEADERS frame
+/// itself when one fragment suffices). The stream id is hardcoded to 1 for
+/// the single-stream world (task 4 will generalize this).
+///
+/// Edge cases:
+/// - `header_block.len() == max_frame_size` produces one HEADERS frame.
+/// - `header_block.is_empty()` produces one HEADERS frame with empty payload
+///   (impossible in practice — we always emit at least the four pseudo-headers
+///   — but the function still handles it cleanly).
+/// - Any combination of CONTINUATION fragments is emitted with no flags set
+///   except FLAG_END_HEADERS on the last one. The caller is responsible for
+///   writing them back-to-back with no interleaved frames on the wire, which
+///   our single-threaded writer guarantees.
+fn fragment_header_block(
+    header_block: &[u8],
+    max_frame_size: usize,
+    end_stream: bool,
+) -> Vec<Frame> {
+    debug_assert!(max_frame_size > 0, "max_frame_size must be > 0");
+    let mut frames = Vec::new();
+
+    // Empty header block: still emit a single (empty) HEADERS frame so the
+    // caller has something to write. END_HEADERS goes on it since it is the
+    // only — and therefore last — fragment.
+    if header_block.is_empty() {
+        let mut flags = FLAG_END_HEADERS;
+        if end_stream {
+            flags |= FLAG_END_STREAM;
+        }
+        frames.push(Frame {
+            typ: F_HEADERS,
+            flags,
+            stream_id: 1,
+            payload: Vec::new(),
+        });
+        return frames;
+    }
+
+    let total_chunks = header_block.len().div_ceil(max_frame_size);
+    for (i, chunk) in header_block.chunks(max_frame_size).enumerate() {
+        let is_last = i + 1 == total_chunks;
+        if i == 0 {
+            // HEADERS: END_STREAM (if no body) is independent of END_HEADERS.
+            let mut flags = 0u8;
+            if end_stream {
+                flags |= FLAG_END_STREAM;
+            }
+            if is_last {
+                flags |= FLAG_END_HEADERS;
+            }
+            frames.push(Frame {
+                typ: F_HEADERS,
+                flags,
+                stream_id: 1,
+                payload: chunk.to_vec(),
+            });
+        } else {
+            // CONTINUATION: no flags except END_HEADERS on the final fragment.
+            let flags = if is_last { FLAG_END_HEADERS } else { 0 };
+            frames.push(Frame {
+                typ: F_CONTINUATION,
+                flags,
+                stream_id: 1,
+                payload: chunk.to_vec(),
+            });
+        }
+    }
+    frames
+}
+
+/// Clamp the next DATA chunk size to the smallest of: `max_frame_size`, the
+/// remaining bytes to send, and the currently available send window.
+///
+/// Extracted so the chunking logic can be unit-tested in isolation from the
+/// I/O loop. Returns 0 only when the send window is depleted; callers must
+/// then wait for a WINDOW_UPDATE before retrying.
+fn next_data_chunk_size(max_frame_size: usize, available: i64, remaining: usize) -> usize {
+    if available <= 0 {
+        return 0;
+    }
+    let cap_window = available.min(remaining as i64).min(max_frame_size as i64);
+    // available > 0 and the other two are >= 0, so cap_window fits in usize.
+    cap_window as usize
+}
+
 /// Send a single request/response over a fresh HTTP/2 connection.
 /// (Connection pooling and multiplexing come later.)
 pub fn send(req: Request) -> Result<Response> {
@@ -1147,276 +1513,90 @@ pub fn send(req: Request) -> Result<Response> {
     write_frame(&mut tls, &our_settings)?;
     tls.flush()?;
 
-    // 2. Build and send the HEADERS frame (plus DATA if there's a body).
-    //    `peer` starts at RFC defaults; we'll refine it as the server's
-    //    SETTINGS frame arrives during the read loop below. The size checks
-    //    here are a coarse pre-check using the current cap — fine because
-    //    the default (16 KiB) is the floor of SETTINGS_MAX_FRAME_SIZE, so
-    //    any value the server later announces only loosens the cap.
-    //    Proper fragmentation lives in a later task.
-    //
-    //    `send_window` and `recv_window` track flow control (RFC 9113 §6.9).
-    //    Connection + stream both start at the RFC default of 65,535 octets.
-    //    The peer's SETTINGS frame may bump `send_window.stream` shortly via
-    //    INITIAL_WINDOW_SIZE; the connection halves are only ever moved by
-    //    WINDOW_UPDATE.
-    let mut peer = PeerSettings::default();
-    let mut send_window = SendWindow::new();
-    let mut recv_window = RecvWindow::new();
+    // 2. Build and send HEADERS (+ CONTINUATION fragments) for the request,
+    //    then stream the body as one or more DATA frames driven by
+    //    flow-control. `state.peer` starts at RFC defaults; the server's
+    //    SETTINGS frame will refine it during the body loop (read inline
+    //    when we have to block on a WINDOW_UPDATE) or during the response
+    //    loop below.
+    let mut state = ConnState::new();
     let header_block = build_header_block(&req);
-    let mut headers_flags = FLAG_END_HEADERS;
     let has_body = !req.body.is_empty();
-    if !has_body {
-        headers_flags |= FLAG_END_STREAM;
+
+    // Header-block fragmentation (RFC 9113 §6.10). The writer is
+    // single-threaded so the HEADERS + CONTINUATION sequence is emitted
+    // back-to-back with no interleaved frames, satisfying the "no other
+    // frames between header fragments" rule automatically.
+    let header_frames =
+        fragment_header_block(&header_block, state.peer.max_frame_size as usize, !has_body);
+    for f in &header_frames {
+        write_frame(&mut tls, f)?;
     }
-    // For brevity we don't fragment large header blocks into CONTINUATION; the
-    // total stays well under SETTINGS_MAX_FRAME_SIZE for any realistic request.
-    // If headers exceed the cap we surface an error.
-    if header_block.len() > peer.max_frame_size as usize {
-        return Err(Error::BadResponse(
-            "request headers exceed MAX_FRAME_SIZE; CONTINUATION on encode not implemented".into(),
-        ));
-    }
-    let headers_frame = Frame {
-        typ: F_HEADERS,
-        flags: headers_flags,
-        stream_id: 1,
-        payload: header_block,
-    };
-    write_frame(&mut tls, &headers_frame)?;
 
     if has_body {
-        // Single DATA frame with END_STREAM. Limited to MAX_FRAME_SIZE; the
-        // server's announcement only ever loosens this default.
-        if req.body.len() > peer.max_frame_size as usize {
-            return Err(Error::BadResponse(
-                "request body exceeds MAX_FRAME_SIZE; DATA fragmentation not implemented".into(),
-            ));
+        // Body fragmentation (RFC 9113 §6.1) with flow-control gating
+        // (§6.9). The body is split into chunks no larger than
+        // `peer.max_frame_size` AND no larger than the smaller of the two
+        // send windows (connection + stream). If the windows are exhausted
+        // we read inbound frames in-place until a WINDOW_UPDATE replenishes
+        // us — `process_frame` may legitimately stash early response bytes
+        // (HEADERS/DATA from the server) along the way; we keep going until
+        // the request body is fully transmitted, otherwise the server would
+        // see a truncated request.
+        let mut remaining: &[u8] = req.body.as_slice();
+        while !remaining.is_empty() {
+            // Block until the send window has any budget. `peer.max_frame_size`
+            // is re-read each iteration so a mid-upload SETTINGS update takes
+            // effect on the next chunk.
+            while state.send_window.available() <= 0 {
+                match read_and_process(&mut tls, &mut state)? {
+                    DriverOutcome::Continue => {}
+                    DriverOutcome::Done => {
+                        // The peer signalled END_STREAM on our request stream
+                        // before we finished uploading. That contradicts the
+                        // request: surface as a protocol error.
+                        return Err(Error::BadResponse(
+                            "server ended stream before request body was fully sent".into(),
+                        ));
+                    }
+                }
+            }
+
+            let n = next_data_chunk_size(
+                state.peer.max_frame_size as usize,
+                state.send_window.available(),
+                remaining.len(),
+            );
+            debug_assert!(n > 0, "loop above guarantees positive budget");
+            let chunk = &remaining[..n];
+            remaining = &remaining[n..];
+            let is_last = remaining.is_empty();
+            let data_frame = Frame {
+                typ: F_DATA,
+                flags: if is_last { FLAG_END_STREAM } else { 0 },
+                stream_id: 1,
+                payload: chunk.to_vec(),
+            };
+            write_frame(&mut tls, &data_frame)?;
+            state.send_window.consume(n);
         }
-        // Flow-control pre-check: the body must fit inside the smaller of the
-        // connection and stream send windows (RFC 9113 §6.9). Both are at the
-        // 64 KiB default, so request bodies under that pass unconditionally;
-        // we only fail here when the application sends something larger and
-        // we haven't yet built the WINDOW_UPDATE-driven chunking loop.
-        // TODO(task 3): when we fragment the body into multiple DATA frames,
-        // interleave a `read_frame` loop here so WINDOW_UPDATE replenishment
-        // can unblock the next chunk instead of failing the request.
-        let available = send_window.available();
-        if (req.body.len() as i64) > available {
-            return Err(Error::BadResponse(format!(
-                "request body {} bytes exceeds available send window {available}; \
-                 flow control not yet driven beyond single-frame check",
-                req.body.len()
-            )));
-        }
-        let data_frame = Frame {
-            typ: F_DATA,
-            flags: FLAG_END_STREAM,
-            stream_id: 1,
-            payload: req.body.clone(),
-        };
-        write_frame(&mut tls, &data_frame)?;
-        send_window.consume(req.body.len());
     }
     tls.flush()?;
 
     // 3. Drive the connection: ACK server SETTINGS, answer PINGs, accumulate
     //    HEADERS/CONTINUATION/DATA for stream 1, stop on END_STREAM or GOAWAY.
-    let mut decoder = Decoder::new();
-    let mut headers_buf: Vec<u8> = Vec::new();
-    let mut expecting_continuation = false;
-    let mut response_headers: Option<Vec<(String, String)>> = None;
-    let mut body: Vec<u8> = Vec::new();
-    let mut end_stream = false;
-
-    while !end_stream {
-        let frame = match read_frame(&mut tls) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(Error::UnexpectedEof);
-            }
-            Err(e) => return Err(Error::Io(e)),
-        };
-
-        // CONTINUATION must immediately follow HEADERS/CONTINUATION on the
-        // same stream with no interleaving (RFC 9113 §6.10).
-        if expecting_continuation && frame.typ != F_CONTINUATION {
-            return Err(Error::BadResponse(
-                "expected CONTINUATION between header fragments".into(),
-            ));
-        }
-
-        match frame.typ {
-            F_SETTINGS
-                if frame.flags & FLAG_ACK == 0 => {
-                    // Server-sent SETTINGS: parse and update peer state,
-                    // then ACK. Validation errors propagate out of the loop.
-                    //
-                    // If INITIAL_WINDOW_SIZE changed, the delta retroactively
-                    // adjusts every existing stream's send window by
-                    // `(new - old)` (RFC 9113 §6.9.2). Apply that AFTER the
-                    // SETTINGS parse succeeds so we operate on validated
-                    // values; the connection window is untouched.
-                    peer.apply_settings_payload(&frame.payload)?;
-                    send_window.apply_initial_window_change(peer.initial_window_size)?;
-                    let ack = Frame {
-                        typ: F_SETTINGS,
-                        flags: FLAG_ACK,
-                        stream_id: 0,
-                        payload: Vec::new(),
-                    };
-                    write_frame(&mut tls, &ack)?;
-                    tls.flush()?;
-                }
-                // ACK from the server is silently absorbed.
-            F_PING
-                if frame.flags & FLAG_ACK == 0 => {
-                    let pong = Frame {
-                        typ: F_PING,
-                        flags: FLAG_ACK,
-                        stream_id: 0,
-                        payload: frame.payload.clone(),
-                    };
-                    write_frame(&mut tls, &pong)?;
-                    tls.flush()?;
-                }
-            F_WINDOW_UPDATE => {
-                // RFC 9113 §6.9: 4-byte payload, low 31 bits are the
-                // increment. Zero increment is an error; pushing the window
-                // past 2^31-1 is a FLOW_CONTROL_ERROR. `apply_window_update`
-                // handles both. A WINDOW_UPDATE for a stream we don't track
-                // (anything other than 0 or 1 in our single-stream world)
-                // is ignored — the RFC permits us to drop frames for
-                // closed/unknown streams.
-                let inc = parse_window_update(&frame.payload)?;
-                if frame.stream_id == 0 || frame.stream_id == 1 {
-                    send_window.apply_window_update(frame.stream_id, inc)?;
-                }
-            }
-            F_GOAWAY
-                // Even mid-response, GOAWAY just means "no new streams"; if our
-                // stream has finished it can still be OK. If we haven't yet
-                // assembled headers, treat as failure.
-                if response_headers.is_none() => {
-                    return Err(Error::BadResponse(format!(
-                        "server sent GOAWAY (payload {} bytes)",
-                        frame.payload.len()
-                    )));
-                }
-                // Otherwise wait for END_STREAM as usual; if the server
-                // dropped us first we'll hit UnexpectedEof on the next read.
-            F_RST_STREAM if frame.stream_id == 1 => {
-                let code = if frame.payload.len() >= 4 {
-                    u32::from_be_bytes([
-                        frame.payload[0],
-                        frame.payload[1],
-                        frame.payload[2],
-                        frame.payload[3],
-                    ])
-                } else {
-                    0
-                };
-                return Err(Error::BadResponse(format!(
-                    "stream 1 reset by server, error code {code}"
-                )));
-            }
-            F_HEADERS if frame.stream_id == 1 => {
-                let mut payload = frame.payload.as_slice();
-                // PADDED: 1 byte pad length, then payload, then padding bytes.
-                let mut pad_len = 0usize;
-                if frame.flags & FLAG_PADDED != 0 {
-                    if payload.is_empty() {
-                        return Err(Error::BadResponse(
-                            "HEADERS PADDED with empty payload".into(),
-                        ));
-                    }
-                    pad_len = payload[0] as usize;
-                    payload = &payload[1..];
-                }
-                // PRIORITY: skip 5 bytes (stream dep + weight).
-                if frame.flags & FLAG_PRIORITY != 0 {
-                    if payload.len() < 5 {
-                        return Err(Error::BadResponse(
-                            "HEADERS PRIORITY with insufficient payload".into(),
-                        ));
-                    }
-                    payload = &payload[5..];
-                }
-                if payload.len() < pad_len {
-                    return Err(Error::BadResponse(
-                        "HEADERS padding overruns payload".into(),
-                    ));
-                }
-                let frag = &payload[..payload.len() - pad_len];
-                headers_buf.extend_from_slice(frag);
-
-                if frame.flags & FLAG_END_HEADERS != 0 {
-                    let decoded = decoder.decode_block(&headers_buf)?;
-                    headers_buf.clear();
-                    response_headers = Some(decoded);
-                    expecting_continuation = false;
-                } else {
-                    expecting_continuation = true;
-                }
-
-                if frame.flags & FLAG_END_STREAM != 0 {
-                    end_stream = true;
-                }
-            }
-            F_CONTINUATION if frame.stream_id == 1 => {
-                if !expecting_continuation {
-                    return Err(Error::BadResponse("unexpected CONTINUATION frame".into()));
-                }
-                headers_buf.extend_from_slice(&frame.payload);
-                if frame.flags & FLAG_END_HEADERS != 0 {
-                    let decoded = decoder.decode_block(&headers_buf)?;
-                    headers_buf.clear();
-                    response_headers = Some(decoded);
-                    expecting_continuation = false;
-                }
-            }
-            F_DATA if frame.stream_id == 1 => {
-                // RFC 9113 §6.9.1: every octet of a DATA frame counts against
-                // the flow-control windows — *including* the pad-length byte
-                // and padding bytes. Bill `frame.payload.len()` first, then
-                // strip padding to find the application bytes to deliver.
-                let frame_bytes = frame.payload.len();
-                recv_window.consume(frame_bytes);
-
-                let mut payload = frame.payload.as_slice();
-                if frame.flags & FLAG_PADDED != 0 {
-                    if payload.is_empty() {
-                        return Err(Error::BadResponse("DATA PADDED with empty payload".into()));
-                    }
-                    let pad_len = payload[0] as usize;
-                    payload = &payload[1..];
-                    if payload.len() < pad_len {
-                        return Err(Error::BadResponse("DATA padding overruns payload".into()));
-                    }
-                    payload = &payload[..payload.len() - pad_len];
-                }
-                body.extend_from_slice(payload);
-                if frame.flags & FLAG_END_STREAM != 0 {
-                    end_stream = true;
-                }
-
-                // Replenish either window that has dropped below half its
-                // initial size. With the RFC default (65,535 → threshold
-                // 32,767) one large response can fire one or two
-                // WINDOW_UPDATE frames; otherwise we stay quiet.
-                for upd in recv_window.replenish(1) {
-                    write_frame(&mut tls, &upd)?;
-                }
-                tls.flush()?;
-            }
-            _ => {
-                // PRIORITY, PUSH_PROMISE, RST_STREAM on other streams, unknown
-                // types — all ignored per RFC 9113 §4.1.
-            }
+    //    `process_frame` may have already filled in some of `state` if the
+    //    server raced response bytes against our body upload — that's fine,
+    //    we just keep reading until END_STREAM lands.
+    while !state.end_stream {
+        match read_and_process(&mut tls, &mut state)? {
+            DriverOutcome::Continue => {}
+            DriverOutcome::Done => break,
         }
     }
 
-    let headers = response_headers
+    let headers = state
+        .response_headers
         .ok_or_else(|| Error::BadResponse("response ended before any HEADERS frame".into()))?;
 
     // Extract :status pseudo-header, drop pseudo-headers from the returned set.
@@ -1441,7 +1621,7 @@ pub fn send(req: Request) -> Result<Response> {
         reason: String::new(), // HTTP/2 has no reason phrase (RFC 9113 §8.3.1).
         version: "HTTP/2".to_string(),
         headers: clean_headers,
-        body,
+        body: state.body,
     })
 }
 
@@ -2143,5 +2323,279 @@ mod tests {
         assert_eq!(f.flags, 0);
         assert_eq!(f.stream_id, 7);
         assert_eq!(f.payload, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    // -----------------------------------------------------------------
+    // CONTINUATION + DATA fragmentation on send (RFC 9113 §6.1 / §6.10).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn fragment_header_block_into_continuation() {
+        // Build a synthetic header block of `max * 2 + 7` bytes and split it
+        // with end_stream=false (i.e. we will follow up with a DATA body).
+        // Expected: HEADERS + CONTINUATION + CONTINUATION; END_HEADERS only
+        // on the last; END_STREAM nowhere (because has_body == true).
+        let max: usize = 16_384;
+        let payload_len = max * 2 + 7;
+        let block: Vec<u8> = (0..payload_len).map(|i| (i & 0xff) as u8).collect();
+
+        let frames = fragment_header_block(&block, max, /*end_stream=*/ false);
+        assert_eq!(frames.len(), 3, "expected HEADERS + 2 CONTINUATION");
+
+        // Frame 0: HEADERS, full chunk, no END_HEADERS, no END_STREAM.
+        assert_eq!(frames[0].typ, F_HEADERS);
+        assert_eq!(frames[0].stream_id, 1);
+        assert_eq!(frames[0].payload.len(), max);
+        assert_eq!(frames[0].flags & FLAG_END_HEADERS, 0);
+        assert_eq!(frames[0].flags & FLAG_END_STREAM, 0);
+
+        // Frame 1: CONTINUATION, full chunk, no flags.
+        assert_eq!(frames[1].typ, F_CONTINUATION);
+        assert_eq!(frames[1].stream_id, 1);
+        assert_eq!(frames[1].payload.len(), max);
+        assert_eq!(frames[1].flags, 0);
+
+        // Frame 2: CONTINUATION, tail (7 bytes), END_HEADERS set.
+        assert_eq!(frames[2].typ, F_CONTINUATION);
+        assert_eq!(frames[2].stream_id, 1);
+        assert_eq!(frames[2].payload.len(), 7);
+        assert_eq!(frames[2].flags, FLAG_END_HEADERS);
+
+        // Reassembling all three payloads must reproduce the original block.
+        let mut reassembled = Vec::with_capacity(payload_len);
+        for f in &frames {
+            reassembled.extend_from_slice(&f.payload);
+        }
+        assert_eq!(reassembled, block);
+
+        // Now flip end_stream=true (no body); END_STREAM lands on the
+        // HEADERS frame, not on the final CONTINUATION (per RFC 9113 §6.10).
+        let frames = fragment_header_block(&block, max, /*end_stream=*/ true);
+        assert_eq!(frames[0].flags & FLAG_END_STREAM, FLAG_END_STREAM);
+        assert_eq!(frames[2].flags & FLAG_END_STREAM, 0);
+        assert_eq!(frames[2].flags & FLAG_END_HEADERS, FLAG_END_HEADERS);
+    }
+
+    #[test]
+    fn fragment_header_block_exact_fit() {
+        // A block of exactly max_frame_size bytes is a single HEADERS frame
+        // with END_HEADERS set and no CONTINUATION needed.
+        let max: usize = 16_384;
+        let block: Vec<u8> = vec![0xab; max];
+
+        // Case 1: has body → no END_STREAM on the HEADERS frame.
+        let frames = fragment_header_block(&block, max, /*end_stream=*/ false);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].typ, F_HEADERS);
+        assert_eq!(frames[0].stream_id, 1);
+        assert_eq!(frames[0].payload.len(), max);
+        assert_eq!(frames[0].flags & FLAG_END_HEADERS, FLAG_END_HEADERS);
+        assert_eq!(frames[0].flags & FLAG_END_STREAM, 0);
+
+        // Case 2: no body → END_STREAM on the HEADERS frame.
+        let frames = fragment_header_block(&block, max, /*end_stream=*/ true);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].flags,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            "exact-fit HEADERS with no body should have END_HEADERS|END_STREAM"
+        );
+    }
+
+    #[test]
+    fn fragment_header_block_empty() {
+        // Empty header block → single HEADERS frame with empty payload and
+        // END_HEADERS set (and END_STREAM if there's no body).
+        let frames = fragment_header_block(&[], 16_384, /*end_stream=*/ true);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].typ, F_HEADERS);
+        assert!(frames[0].payload.is_empty());
+        assert_eq!(frames[0].flags, FLAG_END_HEADERS | FLAG_END_STREAM);
+    }
+
+    #[test]
+    fn fragment_header_block_small_under_cap() {
+        // A small block (well under the cap) → single HEADERS frame holding
+        // the whole block; END_HEADERS set.
+        let block = vec![0x82, 0x86, 0x84]; // three indexed headers
+        let frames = fragment_header_block(&block, 16_384, /*end_stream=*/ false);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].typ, F_HEADERS);
+        assert_eq!(frames[0].payload, block);
+        assert_eq!(frames[0].flags, FLAG_END_HEADERS);
+    }
+
+    #[test]
+    fn next_data_chunk_size_clamps_to_min_of_three() {
+        // Returns the smallest of (max_frame_size, available, remaining).
+        assert_eq!(next_data_chunk_size(16_384, 65_535, 100), 100);
+        assert_eq!(next_data_chunk_size(16_384, 65_535, 1_000_000), 16_384);
+        assert_eq!(next_data_chunk_size(16_384, 1_000, 1_000_000), 1_000);
+        assert_eq!(next_data_chunk_size(16_384, 5_000, 8_000), 5_000);
+    }
+
+    #[test]
+    fn next_data_chunk_size_zero_when_window_depleted() {
+        // available <= 0 must yield 0 so the caller knows to block on a
+        // WINDOW_UPDATE before issuing the next DATA chunk.
+        assert_eq!(next_data_chunk_size(16_384, 0, 100), 0);
+        assert_eq!(next_data_chunk_size(16_384, -1, 100), 0);
+        assert_eq!(next_data_chunk_size(16_384, -65_535, 100), 0);
+    }
+
+    #[test]
+    fn fragment_data_into_chunks() {
+        // Synthetic body fragmentation mirroring the body-send loop's
+        // chunking logic, but without I/O: split a body using `available` as
+        // an unchanging window (no WINDOW_UPDATE replenishment in this test).
+        // We assert: every chunk is ≤ max_frame_size, ≤ available, the chunks
+        // reassemble to the original body, and only the final frame has
+        // FLAG_END_STREAM set.
+        fn fragment(body: &[u8], max_frame_size: usize, mut available: i64) -> Vec<Frame> {
+            let mut out = Vec::new();
+            let mut remaining = body;
+            while !remaining.is_empty() {
+                let n = next_data_chunk_size(max_frame_size, available, remaining.len());
+                if n == 0 {
+                    break; // stalled — caller would have to wait for WINDOW_UPDATE
+                }
+                let chunk = &remaining[..n];
+                remaining = &remaining[n..];
+                let is_last = remaining.is_empty();
+                out.push(Frame {
+                    typ: F_DATA,
+                    flags: if is_last { FLAG_END_STREAM } else { 0 },
+                    stream_id: 1,
+                    payload: chunk.to_vec(),
+                });
+                available -= n as i64;
+            }
+            out
+        }
+
+        // Case 1: body fits well within window, just exceeds max_frame_size.
+        let body: Vec<u8> = (0..50_000u32).map(|i| (i & 0xff) as u8).collect();
+        let frames = fragment(&body, 16_384, 65_535);
+        // 50_000 / 16_384 = 3 full + 1 partial = 4 frames.
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[0].payload.len(), 16_384);
+        assert_eq!(frames[1].payload.len(), 16_384);
+        assert_eq!(frames[2].payload.len(), 16_384);
+        assert_eq!(frames[3].payload.len(), 50_000 - 3 * 16_384);
+        // END_STREAM only on the final frame.
+        assert_eq!(frames[0].flags, 0);
+        assert_eq!(frames[1].flags, 0);
+        assert_eq!(frames[2].flags, 0);
+        assert_eq!(frames[3].flags, FLAG_END_STREAM);
+        // Reassembly matches the original body.
+        let mut roundtrip = Vec::with_capacity(body.len());
+        for f in &frames {
+            roundtrip.extend_from_slice(&f.payload);
+        }
+        assert_eq!(roundtrip, body);
+
+        // Case 2: window smaller than max_frame_size — chunks shrink to fit.
+        let frames = fragment(&body, 16_384, 4_000);
+        // First chunk capped to 4_000; available depletes after; loop stalls.
+        // (Real code would WINDOW_UPDATE-wait, but this in-test fragmenter
+        // mimics that with `available -= n` and `n == 0 → break`.)
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.len(), 4_000);
+        // Not the last chunk in absolute terms — only one was emitted.
+        assert_eq!(frames[0].flags, 0);
+
+        // Case 3: body exactly equals max_frame_size — one frame, END_STREAM.
+        let body = vec![0xab; 16_384];
+        let frames = fragment(&body, 16_384, 65_535);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].payload.len(), 16_384);
+        assert_eq!(frames[0].flags, FLAG_END_STREAM);
+
+        // Case 4: empty body — no frames at all (caller skips the loop).
+        let frames = fragment(&[], 16_384, 65_535);
+        assert!(frames.is_empty());
+    }
+
+    #[test]
+    fn process_frame_settings_acks_and_applies() {
+        // Synthetic SETTINGS frame: bump MAX_FRAME_SIZE to 32 KiB and
+        // INITIAL_WINDOW_SIZE to 131_072. process_frame should:
+        // 1. update state.peer to reflect the new values,
+        // 2. shift state.send_window.stream by the INITIAL_WINDOW_SIZE delta,
+        // 3. write a SETTINGS ACK frame back to the (fake) TLS sink.
+        let payload =
+            settings_payload(&[(S_MAX_FRAME_SIZE, 32_768), (S_INITIAL_WINDOW_SIZE, 131_072)]);
+        let frame = Frame {
+            typ: F_SETTINGS,
+            flags: 0,
+            stream_id: 0,
+            payload,
+        };
+
+        // FakeTls: in-memory Read+Write sink. We don't feed it any input;
+        // process_frame's only Read paths are inside other branches.
+        struct FakeTls {
+            out: Vec<u8>,
+        }
+        impl Read for FakeTls {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for FakeTls {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.out.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut tls = FakeTls { out: Vec::new() };
+        let mut state = ConnState::new();
+
+        let outcome = process_frame(frame, &mut tls, &mut state).unwrap();
+        assert_eq!(outcome, DriverOutcome::Continue);
+        assert_eq!(state.peer.max_frame_size, 32_768);
+        assert_eq!(state.peer.initial_window_size, 131_072);
+        // Stream send window grew by (131_072 - 65_535) = 65_537.
+        assert_eq!(state.send_window.stream, 65_535 + (131_072 - 65_535));
+        assert_eq!(state.send_window.conn, 65_535); // untouched
+
+        // The ACK frame must be on the wire: 9-byte header, no payload,
+        // type = F_SETTINGS, flags = FLAG_ACK, stream_id = 0.
+        assert_eq!(tls.out.len(), 9);
+        let mut cur = Cursor::new(tls.out);
+        let ack = read_frame(&mut cur).unwrap();
+        assert_eq!(ack.typ, F_SETTINGS);
+        assert_eq!(ack.flags, FLAG_ACK);
+        assert_eq!(ack.stream_id, 0);
+        assert!(ack.payload.is_empty());
+    }
+
+    #[test]
+    fn process_frame_window_update_replenishes_send_window() {
+        // A WINDOW_UPDATE for stream 1 with increment 10_000 should grow the
+        // stream send window from the default 65_535 to 75_535.
+        let frame = window_update_frame(1, 10_000);
+        struct DevNull;
+        impl Read for DevNull {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for DevNull {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut tls = DevNull;
+        let mut state = ConnState::new();
+        process_frame(frame, &mut tls, &mut state).unwrap();
+        assert_eq!(state.send_window.stream, 65_535 + 10_000);
+        assert_eq!(state.send_window.conn, 65_535);
     }
 }
