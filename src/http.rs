@@ -7,7 +7,7 @@ use crate::url::Url;
 
 const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Preference for which HTTP version to use over HTTPS. The HTTPS dispatcher
 /// picks this up. HTTP/2 is selected via ALPN at TLS-handshake time; if the
@@ -477,6 +477,7 @@ fn write_request<W: Write>(mut w: W, req: &Request, trace: &mut dyn Write) -> Re
 
     let mut have_ua = false;
     let mut have_accept = false;
+    let mut have_accept_enc = false;
     let mut have_clen = false;
     let mut have_auth = false;
     for (k, v) in &req.headers {
@@ -485,6 +486,9 @@ fn write_request<W: Write>(mut w: W, req: &Request, trace: &mut dyn Write) -> Re
         }
         if k.eq_ignore_ascii_case("accept") {
             have_accept = true;
+        }
+        if k.eq_ignore_ascii_case("accept-encoding") {
+            have_accept_enc = true;
         }
         if k.eq_ignore_ascii_case("content-length") {
             have_clen = true;
@@ -504,6 +508,11 @@ fn write_request<W: Write>(mut w: W, req: &Request, trace: &mut dyn Write) -> Re
     }
     if !have_accept {
         write!(&mut buf, "Accept: */*\r\n")?;
+    }
+    if !have_accept_enc {
+        // Default-on equivalent of curl's `--compressed`: we always know
+        // how to decode these on the way back (see `crate::compress`).
+        write!(&mut buf, "Accept-Encoding: gzip, deflate\r\n")?;
     }
     if !req.body.is_empty() && !have_clen {
         write!(&mut buf, "Content-Length: {}\r\n", req.body.len())?;
@@ -565,7 +574,9 @@ fn read_response<R: Read>(stream: R, method: &str, trace: &mut dyn Write) -> Res
     }
 
     let body = read_body(&mut r, &headers, &version, status, method)?;
-    let _ = writeln!(trace, "* Received {} body bytes", body.len());
+    let wire_len = body.len();
+    let _ = writeln!(trace, "* Received {wire_len} body bytes");
+    let (headers, body) = maybe_decode_body(headers, body, trace)?;
 
     Ok(Response {
         status,
@@ -574,6 +585,47 @@ fn read_response<R: Read>(stream: R, method: &str, trace: &mut dyn Write) -> Res
         headers,
         body,
     })
+}
+
+/// Headers + body pair, the shape every HTTP-version backend assembles
+/// before publishing a [`Response`]. Used by [`maybe_decode_body`] so the
+/// signature doesn't trip `clippy::type_complexity`.
+pub(crate) type HeadersAndBody = (Vec<(String, String)>, Vec<u8>);
+
+/// If the response carries `Content-Encoding: gzip|deflate|x-gzip|identity`,
+/// decode the body and strip the now-stale `Content-Encoding` and
+/// `Content-Length` headers. Returns the (possibly-modified) headers + body.
+/// Unknown encodings (brotli, zstd, compress, ...) are left intact so a
+/// caller that knows how to handle them can still try.
+///
+/// Shared by HTTP/1.1, HTTP/2, and HTTP/3 — they all assemble a `(headers,
+/// body)` pair and need identical post-processing.
+pub(crate) fn maybe_decode_body(
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    trace: &mut dyn Write,
+) -> Result<HeadersAndBody> {
+    let Some(enc) = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, v)| v.clone())
+    else {
+        return Ok((headers, body));
+    };
+    let wire_len = body.len();
+    let out = crate::compress::decode_body(body, &enc)?;
+    if out.decoded {
+        let _ = writeln!(
+            trace,
+            "* Decompressed body: {} -> {} bytes ({})",
+            wire_len,
+            out.body.len(),
+            enc
+        );
+        Ok((crate::compress::strip_after_decode(headers), out.body))
+    } else {
+        Ok((headers, out.body))
+    }
 }
 
 fn parse_status_line(line: &str) -> Result<(String, u16, String)> {

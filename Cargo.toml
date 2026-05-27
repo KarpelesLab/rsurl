@@ -42,6 +42,16 @@ purecrypto = "0.2"
 # the purecrypto backend.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12", "logging"] }
 rustls-pemfile = { version = "2", optional = true }
+# gzip/deflate response decoding. `rust_backend` keeps us on miniz_oxide
+# (pure Rust) rather than the C `zlib` or `zlib-ng`, matching the
+# "no C deps" stance of the rest of the crate.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[dev-dependencies]
+# Integration tests need to *produce* gzip/deflate-encoded payloads to
+# verify rsurl's response-side decoder; same crate as in [dependencies]
+# so cargo dedupes the build.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [profile.release]
 lto = "thin"

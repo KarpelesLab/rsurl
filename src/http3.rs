@@ -1174,6 +1174,7 @@ fn write_request(conn: &mut QuicConnection, sid: StreamId, req: &Request) -> Res
     // §4.2). Skip any pseudo-headers / Host / Connection-specific
     // headers the caller may have set.
     let mut have_ua = false;
+    let mut have_accept_enc = false;
     for (k, v) in &req.headers {
         let kl = k.to_ascii_lowercase();
         if kl.starts_with(':')
@@ -1189,6 +1190,9 @@ fn write_request(conn: &mut QuicConnection, sid: StreamId, req: &Request) -> Res
         if kl == "user-agent" {
             have_ua = true;
         }
+        if kl == "accept-encoding" {
+            have_accept_enc = true;
+        }
         fields.push((kl, v.clone()));
     }
     if !have_ua {
@@ -1196,6 +1200,11 @@ fn write_request(conn: &mut QuicConnection, sid: StreamId, req: &Request) -> Res
             "user-agent".into(),
             format!("rsurl/{}", env!("CARGO_PKG_VERSION")),
         ));
+    }
+    if !have_accept_enc {
+        // Match HTTP/1.1 + HTTP/2 default: we decode these on the way back
+        // in `finalize_response` via `crate::compress`.
+        fields.push(("accept-encoding".into(), "gzip, deflate".into()));
     }
     if !req.body.is_empty() {
         fields.push(("content-length".into(), req.body.len().to_string()));
@@ -1368,6 +1377,9 @@ fn finalize_response(fields: qpack::Fields, body: Vec<u8>) -> Result<Response> {
         }
     }
     let status = status.ok_or_else(|| Error::BadResponse("http3: missing :status".into()))?;
+    // Shared with HTTP/1.1 and HTTP/2: strip any Content-Encoding layer we
+    // recognise (gzip / deflate / x-gzip / identity).
+    let (hdrs, body) = crate::http::maybe_decode_body(hdrs, body, &mut std::io::sink())?;
     Ok(Response {
         status,
         // HTTP/3 has no reason phrase on the wire.

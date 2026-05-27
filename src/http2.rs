@@ -2469,12 +2469,17 @@ fn build_response_from_stream(stream: Stream) -> Result<Response> {
     }
     let status = status.ok_or_else(|| Error::BadResponse("response missing :status".into()))?;
 
+    // Shared with HTTP/1.1 and HTTP/3: peel off any `Content-Encoding`
+    // layer rsurl knows how to decode (gzip / deflate / x-gzip / identity).
+    let (clean_headers, body) =
+        crate::http::maybe_decode_body(clean_headers, stream.body, &mut std::io::sink())?;
+
     Ok(Response {
         status,
         reason: String::new(), // HTTP/2 has no reason phrase (RFC 9113 §8.3.1).
         version: "HTTP/2".to_string(),
         headers: clean_headers,
-        body: stream.body,
+        body,
     })
 }
 
@@ -2501,6 +2506,7 @@ fn build_header_block(encoder: &mut Encoder, req: &Request) -> Vec<u8> {
     // Regular headers: lowercased name, skip any banned ones.
     let mut have_ua = false;
     let mut have_accept = false;
+    let mut have_accept_enc = false;
     let mut have_auth = false;
     for (k, v) in &req.headers {
         if is_connection_specific_header(k) || k.eq_ignore_ascii_case("host") {
@@ -2512,6 +2518,9 @@ fn build_header_block(encoder: &mut Encoder, req: &Request) -> Vec<u8> {
         }
         if lk == "accept" {
             have_accept = true;
+        }
+        if lk == "accept-encoding" {
+            have_accept_enc = true;
         }
         if lk == "authorization" {
             have_auth = true;
@@ -2533,6 +2542,12 @@ fn build_header_block(encoder: &mut Encoder, req: &Request) -> Vec<u8> {
     }
     if !have_accept {
         encoder.encode_header(&mut out, "accept", "*/*");
+    }
+    if !have_accept_enc {
+        // Same default as the HTTP/1.1 writer — rsurl always decodes these
+        // on the way back (see `crate::compress`). The full value is HPACK
+        // static index 16, so this round-trips with minimum bytes on wire.
+        encoder.encode_header(&mut out, "accept-encoding", "gzip, deflate");
     }
     if !req.body.is_empty() {
         let len = req.body.len().to_string();

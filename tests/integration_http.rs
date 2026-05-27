@@ -262,6 +262,79 @@ fn verbose_trace_format() {
     );
 }
 
+/// rsurl sends `Accept-Encoding: gzip, deflate` by default and must
+/// transparently decode a `Content-Encoding: gzip` response. The header
+/// is also expected to be **stripped** from the returned `Response`, so
+/// downstream consumers don't think the body is still compressed.
+#[test]
+fn gzip_response_is_decoded() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let plain = b"hello compressed world".to_vec();
+    let gz = {
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&plain).unwrap();
+        e.finish().unwrap()
+    };
+
+    let plain_for_server = plain.clone();
+    let gz_for_server = gz.clone();
+    let server = TestServer::start(move |req: SReq| {
+        // Confirm the client actually advertised compression — we are
+        // exercising the default-on Accept-Encoding writer too.
+        let ae = req.header("Accept-Encoding").unwrap_or("");
+        assert!(ae.contains("gzip"), "Accept-Encoding missing gzip: {ae:?}");
+        let _ = plain_for_server; // captured for clarity; not used here
+        SResp::ok(gz_for_server.clone()).header("Content-Encoding", "gzip")
+    });
+
+    let resp = Request::get(&server.url("/")).unwrap().send().unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, plain, "body should be the decoded plaintext");
+    // Stale framing headers must be gone after decode.
+    assert!(
+        !resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")),
+        "Content-Encoding leaked through: {:?}",
+        resp.headers,
+    );
+    assert!(
+        !resp
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length")),
+        "stale Content-Length leaked through: {:?}",
+        resp.headers,
+    );
+}
+
+/// Same wire shape but with `deflate` (zlib-wrapped, RFC 9110 form).
+#[test]
+fn deflate_response_is_decoded() {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let plain = b"deflate body".to_vec();
+    let z = {
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&plain).unwrap();
+        e.finish().unwrap()
+    };
+
+    let z_for_server = z.clone();
+    let server = TestServer::start(move |_req: SReq| {
+        SResp::ok(z_for_server.clone()).header("Content-Encoding", "deflate")
+    });
+
+    let resp = Request::get(&server.url("/")).unwrap().send().unwrap();
+    assert_eq!(resp.body, plain);
+}
+
 /// Sanity: a request to a closed port surfaces as an I/O error rather
 /// than panicking. Picks a non-privileged port that's almost certainly
 /// closed by getting one from the kernel and immediately releasing it.

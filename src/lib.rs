@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+mod compress;
 mod error;
 mod http;
 mod transfer;

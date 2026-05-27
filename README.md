@@ -21,6 +21,7 @@ Early, in active development.
 | Capability | Status | Notes |
 |---|---|---|
 | HTTP/1.1 (all methods) | working | Content-Length, chunked, read-to-EOF body modes |
+| Response compression | working | `gzip` / `deflate` / `x-gzip` decoded transparently (always-on) |
 | HTTPS via purecrypto | working | TLS 1.2/1.3, system roots, full cert verification |
 | HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; single request/conn, no flow control yet |
 | HTTP/3 over QUIC (RFC 9114) | partial | QUIC + frame layer wired; QPACK Huffman decoder still TODO |
