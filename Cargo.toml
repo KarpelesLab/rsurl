@@ -1,0 +1,28 @@
+[package]
+name = "curlrs"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.74"
+authors = ["Karpelès Lab Inc."]
+description = "A pure-Rust implementation of curl. Library, C FFI, and CLI for HTTP/HTTPS/FTP/FTPS."
+license = "MIT"
+repository = "https://github.com/KarpelesLab/curlrs"
+readme = "README.md"
+keywords = ["http", "https", "curl", "client", "tls"]
+categories = ["network-programming", "web-programming::http-client", "command-line-utilities"]
+
+[lib]
+name = "curlrs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "curlrs"
+path = "src/bin/curlrs.rs"
+
+[dependencies]
+purecrypto = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
