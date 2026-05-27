@@ -156,6 +156,202 @@ impl PeerSettings {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Flow control (RFC 9113 §5.2 / §6.9).
+// ---------------------------------------------------------------------------
+//
+// Both endpoints maintain a connection-level window AND a per-stream window;
+// only DATA frames consume window. Defaults are 65,535 octets (§6.9.2).
+//
+// Today we run a single-stream HTTP/2 backend, so the "stream" half of these
+// structs is degenerate — but the types are shaped so task 4 can drop in a
+// `HashMap<u32, StreamWindow>` without churning the call sites. `SendWindow`
+// uses `i64` because the RFC permits a stream's send window to go negative
+// when SETTINGS_INITIAL_WINDOW_SIZE shrinks (§6.9.2). Receive windows stay
+// in `i64` for the same reason on the bookkeeping side, even though we never
+// shrink them ourselves.
+
+/// Hard cap on either window: RFC 9113 §6.9.1.
+const WINDOW_MAX: i64 = 0x7fff_ffff;
+
+/// Our advertised receive window for new streams. We don't currently send
+/// `SETTINGS_INITIAL_WINDOW_SIZE`, so the peer sees the RFC default of 65,535;
+/// keep this value in sync with whatever we advertise.
+const OUR_INITIAL_WINDOW: i64 = 65_535;
+
+/// Outbound flow-control state: how many DATA bytes we are still allowed to
+/// send before WINDOW_UPDATE replenishes us.
+///
+/// `initial_peer_window` mirrors the peer's last-known
+/// `SETTINGS_INITIAL_WINDOW_SIZE` so that subsequent SETTINGS frames can be
+/// applied as deltas to existing streams (RFC 9113 §6.9.2). The connection
+/// window is NOT affected by INITIAL_WINDOW_SIZE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SendWindow {
+    /// Connection-level window. Starts at the RFC default of 65,535.
+    conn: i64,
+    /// Stream-level window. Single-stream world: this is "the request stream".
+    /// In task 4 this becomes a per-stream value keyed by `stream_id`.
+    stream: i64,
+    /// Last applied peer `SETTINGS_INITIAL_WINDOW_SIZE` (the basis for the
+    /// next delta calculation).
+    initial_peer_window: i64,
+}
+
+impl SendWindow {
+    /// Initial send window before the peer's SETTINGS arrives: connection AND
+    /// stream both at the RFC default of 65,535 (§6.9.2).
+    fn new() -> Self {
+        SendWindow {
+            conn: 65_535,
+            stream: 65_535,
+            initial_peer_window: 65_535,
+        }
+    }
+
+    /// Apply an incoming WINDOW_UPDATE. `stream_id == 0` adjusts the
+    /// connection window, anything else the (only) stream's window.
+    /// Validates per RFC 9113 §6.9.1: zero increment is an error, and the
+    /// running window must not exceed 2^31 - 1.
+    fn apply_window_update(&mut self, stream_id: u32, increment: u32) -> Result<()> {
+        if increment == 0 {
+            return Err(Error::BadResponse(
+                "WINDOW_UPDATE with zero increment (PROTOCOL_ERROR/FLOW_CONTROL_ERROR)".into(),
+            ));
+        }
+        let inc = increment as i64;
+        let target = if stream_id == 0 {
+            &mut self.conn
+        } else {
+            &mut self.stream
+        };
+        let new_val = *target + inc;
+        if new_val > WINDOW_MAX {
+            return Err(Error::BadResponse(format!(
+                "WINDOW_UPDATE pushes send window to {new_val} > 2^31-1 (FLOW_CONTROL_ERROR)"
+            )));
+        }
+        *target = new_val;
+        Ok(())
+    }
+
+    /// Apply a change to `SETTINGS_INITIAL_WINDOW_SIZE`: each existing stream's
+    /// send window shifts by `(new - old)` (RFC 9113 §6.9.2). The connection
+    /// window is untouched. Result must remain within `[i32::MIN, 2^31-1]`;
+    /// overflow on the high side is a FLOW_CONTROL_ERROR. We only have one
+    /// stream so there's just one window to bump.
+    fn apply_initial_window_change(&mut self, new_initial: u32) -> Result<()> {
+        let new_i = new_initial as i64;
+        let delta = new_i - self.initial_peer_window;
+        let new_stream = self.stream + delta;
+        if new_stream > WINDOW_MAX {
+            return Err(Error::BadResponse(format!(
+                "SETTINGS_INITIAL_WINDOW_SIZE delta pushes stream send window to {new_stream} > 2^31-1 (FLOW_CONTROL_ERROR)"
+            )));
+        }
+        // A negative result is permitted by §6.9.2; we just keep it.
+        self.stream = new_stream;
+        self.initial_peer_window = new_i;
+        Ok(())
+    }
+
+    /// Smallest of the two windows — the actual budget for the next DATA send.
+    fn available(&self) -> i64 {
+        self.conn.min(self.stream)
+    }
+
+    /// Decrement both windows by `n` after a successful DATA send.
+    fn consume(&mut self, n: usize) {
+        let n = n as i64;
+        self.conn -= n;
+        self.stream -= n;
+    }
+}
+
+/// Inbound flow-control state: how many DATA bytes the peer is still allowed
+/// to send us before we have to WINDOW_UPDATE them.
+///
+/// We don't currently advertise a non-default `SETTINGS_INITIAL_WINDOW_SIZE`,
+/// so the peer treats every new stream as starting at 65,535. The connection
+/// window is independent of that setting and likewise starts at 65,535.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecvWindow {
+    /// Bytes the peer may still send on the connection (stream 0).
+    conn: i64,
+    /// Bytes the peer may still send on our one stream.
+    stream: i64,
+    /// What both windows were sized to at stream open; the replenish
+    /// threshold is half of this and the WINDOW_UPDATE target is back to
+    /// this value.
+    initial: i64,
+}
+
+impl RecvWindow {
+    fn new() -> Self {
+        RecvWindow {
+            conn: OUR_INITIAL_WINDOW,
+            stream: OUR_INITIAL_WINDOW,
+            initial: OUR_INITIAL_WINDOW,
+        }
+    }
+
+    /// Account for an inbound DATA frame: subtract its full payload length
+    /// (padding included — RFC 9113 §6.9.1 says every DATA octet counts) from
+    /// both windows.
+    fn consume(&mut self, n: usize) {
+        let n = n as i64;
+        self.conn -= n;
+        self.stream -= n;
+    }
+
+    /// Compute the WINDOW_UPDATE frames to send to top up either window when
+    /// it has fallen below half its initial value. Returns a vector with zero,
+    /// one, or two frames. Each returned frame, when applied, brings the
+    /// corresponding side of `self` back up to `self.initial`.
+    fn replenish(&mut self, stream_id: u32) -> Vec<Frame> {
+        let threshold = self.initial / 2;
+        let mut out = Vec::new();
+        if self.conn < threshold {
+            let inc = (self.initial - self.conn) as u32;
+            out.push(window_update_frame(0, inc));
+            self.conn = self.initial;
+        }
+        if self.stream < threshold {
+            let inc = (self.initial - self.stream) as u32;
+            out.push(window_update_frame(stream_id, inc));
+            self.stream = self.initial;
+        }
+        out
+    }
+}
+
+/// Build a 4-byte-payload WINDOW_UPDATE frame (RFC 9113 §6.9). Caller is
+/// responsible for ensuring `increment` is non-zero and within `2^31 - 1`.
+fn window_update_frame(stream_id: u32, increment: u32) -> Frame {
+    let mut payload = Vec::with_capacity(4);
+    payload.extend_from_slice(&(increment & 0x7fff_ffff).to_be_bytes());
+    Frame {
+        typ: F_WINDOW_UPDATE,
+        flags: 0,
+        stream_id,
+        payload,
+    }
+}
+
+/// Parse a WINDOW_UPDATE payload: 4 bytes, high bit reserved, low 31 bits are
+/// the increment. Returns the increment as a `u32`. Length errors are mapped
+/// to `BadResponse` here (RFC calls them FRAME_SIZE_ERROR).
+fn parse_window_update(payload: &[u8]) -> Result<u32> {
+    if payload.len() != 4 {
+        return Err(Error::BadResponse(format!(
+            "WINDOW_UPDATE payload length {} (expected 4) (FRAME_SIZE_ERROR)",
+            payload.len()
+        )));
+    }
+    let raw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    Ok(raw & 0x7fff_ffff)
+}
+
 /// One HTTP/2 frame on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Frame {
@@ -958,7 +1154,15 @@ pub fn send(req: Request) -> Result<Response> {
     //    the default (16 KiB) is the floor of SETTINGS_MAX_FRAME_SIZE, so
     //    any value the server later announces only loosens the cap.
     //    Proper fragmentation lives in a later task.
+    //
+    //    `send_window` and `recv_window` track flow control (RFC 9113 §6.9).
+    //    Connection + stream both start at the RFC default of 65,535 octets.
+    //    The peer's SETTINGS frame may bump `send_window.stream` shortly via
+    //    INITIAL_WINDOW_SIZE; the connection halves are only ever moved by
+    //    WINDOW_UPDATE.
     let mut peer = PeerSettings::default();
+    let mut send_window = SendWindow::new();
+    let mut recv_window = RecvWindow::new();
     let header_block = build_header_block(&req);
     let mut headers_flags = FLAG_END_HEADERS;
     let has_body = !req.body.is_empty();
@@ -989,6 +1193,22 @@ pub fn send(req: Request) -> Result<Response> {
                 "request body exceeds MAX_FRAME_SIZE; DATA fragmentation not implemented".into(),
             ));
         }
+        // Flow-control pre-check: the body must fit inside the smaller of the
+        // connection and stream send windows (RFC 9113 §6.9). Both are at the
+        // 64 KiB default, so request bodies under that pass unconditionally;
+        // we only fail here when the application sends something larger and
+        // we haven't yet built the WINDOW_UPDATE-driven chunking loop.
+        // TODO(task 3): when we fragment the body into multiple DATA frames,
+        // interleave a `read_frame` loop here so WINDOW_UPDATE replenishment
+        // can unblock the next chunk instead of failing the request.
+        let available = send_window.available();
+        if (req.body.len() as i64) > available {
+            return Err(Error::BadResponse(format!(
+                "request body {} bytes exceeds available send window {available}; \
+                 flow control not yet driven beyond single-frame check",
+                req.body.len()
+            )));
+        }
         let data_frame = Frame {
             typ: F_DATA,
             flags: FLAG_END_STREAM,
@@ -996,6 +1216,7 @@ pub fn send(req: Request) -> Result<Response> {
             payload: req.body.clone(),
         };
         write_frame(&mut tls, &data_frame)?;
+        send_window.consume(req.body.len());
     }
     tls.flush()?;
 
@@ -1030,7 +1251,14 @@ pub fn send(req: Request) -> Result<Response> {
                 if frame.flags & FLAG_ACK == 0 => {
                     // Server-sent SETTINGS: parse and update peer state,
                     // then ACK. Validation errors propagate out of the loop.
+                    //
+                    // If INITIAL_WINDOW_SIZE changed, the delta retroactively
+                    // adjusts every existing stream's send window by
+                    // `(new - old)` (RFC 9113 §6.9.2). Apply that AFTER the
+                    // SETTINGS parse succeeds so we operate on validated
+                    // values; the connection window is untouched.
                     peer.apply_settings_payload(&frame.payload)?;
+                    send_window.apply_initial_window_change(peer.initial_window_size)?;
                     let ack = Frame {
                         typ: F_SETTINGS,
                         flags: FLAG_ACK,
@@ -1052,7 +1280,19 @@ pub fn send(req: Request) -> Result<Response> {
                     write_frame(&mut tls, &pong)?;
                     tls.flush()?;
                 }
-            F_WINDOW_UPDATE => { /* flow control noise, ignore */ }
+            F_WINDOW_UPDATE => {
+                // RFC 9113 §6.9: 4-byte payload, low 31 bits are the
+                // increment. Zero increment is an error; pushing the window
+                // past 2^31-1 is a FLOW_CONTROL_ERROR. `apply_window_update`
+                // handles both. A WINDOW_UPDATE for a stream we don't track
+                // (anything other than 0 or 1 in our single-stream world)
+                // is ignored — the RFC permits us to drop frames for
+                // closed/unknown streams.
+                let inc = parse_window_update(&frame.payload)?;
+                if frame.stream_id == 0 || frame.stream_id == 1 {
+                    send_window.apply_window_update(frame.stream_id, inc)?;
+                }
+            }
             F_GOAWAY
                 // Even mid-response, GOAWAY just means "no new streams"; if our
                 // stream has finished it can still be OK. If we haven't yet
@@ -1136,6 +1376,13 @@ pub fn send(req: Request) -> Result<Response> {
                 }
             }
             F_DATA if frame.stream_id == 1 => {
+                // RFC 9113 §6.9.1: every octet of a DATA frame counts against
+                // the flow-control windows — *including* the pad-length byte
+                // and padding bytes. Bill `frame.payload.len()` first, then
+                // strip padding to find the application bytes to deliver.
+                let frame_bytes = frame.payload.len();
+                recv_window.consume(frame_bytes);
+
                 let mut payload = frame.payload.as_slice();
                 if frame.flags & FLAG_PADDED != 0 {
                     if payload.is_empty() {
@@ -1152,9 +1399,15 @@ pub fn send(req: Request) -> Result<Response> {
                 if frame.flags & FLAG_END_STREAM != 0 {
                     end_stream = true;
                 }
-                // We should send WINDOW_UPDATE here for large responses; for v1
-                // we rely on the default 64 KiB window being enough for small
-                // payloads. Larger responses may stall — documented limitation.
+
+                // Replenish either window that has dropped below half its
+                // initial size. With the RFC default (65,535 → threshold
+                // 32,767) one large response can fire one or two
+                // WINDOW_UPDATE frames; otherwise we stay quiet.
+                for upd in recv_window.replenish(1) {
+                    write_frame(&mut tls, &upd)?;
+                }
+                tls.flush()?;
             }
             _ => {
                 // PRIORITY, PUSH_PROMISE, RST_STREAM on other streams, unknown
@@ -1697,5 +1950,198 @@ mod tests {
             .apply_settings_payload(&settings_payload(&[(S_MAX_FRAME_SIZE, 16_777_216)]))
             .unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Flow control (RFC 9113 §6.9).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn send_window_defaults_match_rfc() {
+        let w = SendWindow::new();
+        assert_eq!(w.conn, 65_535);
+        assert_eq!(w.stream, 65_535);
+        assert_eq!(w.initial_peer_window, 65_535);
+        assert_eq!(w.available(), 65_535);
+    }
+
+    #[test]
+    fn send_window_decrements_after_data() {
+        // The transmit path calls `consume(n)` after writing a DATA frame;
+        // verify both halves drop by exactly `n`.
+        let mut w = SendWindow::new();
+        w.consume(1000);
+        assert_eq!(w.conn, 64_535);
+        assert_eq!(w.stream, 64_535);
+        assert_eq!(w.available(), 64_535);
+        w.consume(64_535);
+        assert_eq!(w.conn, 0);
+        assert_eq!(w.stream, 0);
+        assert_eq!(w.available(), 0);
+    }
+
+    #[test]
+    fn window_update_zero_increment_is_error() {
+        // RFC 9113 §6.9.1: zero increment is PROTOCOL_ERROR on a stream and
+        // FLOW_CONTROL_ERROR on the connection. We parse first then validate;
+        // verify both code paths reject it.
+        let zero_payload = [0u8; 4];
+        let inc = parse_window_update(&zero_payload).unwrap();
+        assert_eq!(inc, 0);
+        let mut w = SendWindow::new();
+        assert!(matches!(
+            w.apply_window_update(0, inc),
+            Err(Error::BadResponse(_))
+        ));
+        assert!(matches!(
+            w.apply_window_update(1, inc),
+            Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn window_update_overflow_is_error() {
+        // Current window = 2^31 - 1, increment 1 → would push to 2^31; that's
+        // a FLOW_CONTROL_ERROR (RFC 9113 §6.9.1).
+        let mut w = SendWindow::new();
+        w.conn = WINDOW_MAX;
+        assert!(matches!(
+            w.apply_window_update(0, 1),
+            Err(Error::BadResponse(_))
+        ));
+        // Stream half independently.
+        let mut w = SendWindow::new();
+        w.stream = WINDOW_MAX;
+        assert!(matches!(
+            w.apply_window_update(1, 1),
+            Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn window_update_high_bit_ignored_on_parse() {
+        // The high bit of the 4-byte payload is reserved (R bit) and MUST be
+        // ignored on receipt. Pass a payload with R=1 and increment=1.
+        let payload = [0x80, 0x00, 0x00, 0x01];
+        let inc = parse_window_update(&payload).unwrap();
+        assert_eq!(inc, 1);
+    }
+
+    #[test]
+    fn window_update_wrong_length_is_error() {
+        // Payload must be exactly 4 bytes (FRAME_SIZE_ERROR per RFC 9113 §6.9).
+        assert!(matches!(
+            parse_window_update(&[0u8; 3]),
+            Err(Error::BadResponse(_))
+        ));
+        assert!(matches!(
+            parse_window_update(&[0u8; 5]),
+            Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn initial_window_size_delta_adjusts_stream_send_window() {
+        // Peer doubles INITIAL_WINDOW_SIZE: 65535 → 131072. Existing stream's
+        // send window must grow by exactly that delta. Connection window is
+        // untouched (RFC 9113 §6.9.2).
+        let mut w = SendWindow::new();
+        let conn_before = w.conn;
+        w.apply_initial_window_change(131_072).unwrap();
+        assert_eq!(w.stream, 65_535 + (131_072 - 65_535));
+        assert_eq!(w.conn, conn_before);
+        assert_eq!(w.initial_peer_window, 131_072);
+        // A subsequent shrink applies relative to the new initial, not the
+        // RFC default.
+        w.apply_initial_window_change(0).unwrap();
+        // delta = 0 - 131072 = -131072; stream was 131072, becomes 0.
+        assert_eq!(w.stream, 0);
+        assert_eq!(w.initial_peer_window, 0);
+    }
+
+    #[test]
+    fn initial_window_size_delta_overflow_is_error() {
+        // Stream send window already at 2^31-1, then SETTINGS announces a
+        // positive INITIAL_WINDOW_SIZE delta → result exceeds 2^31-1, which
+        // is a FLOW_CONTROL_ERROR (RFC 9113 §6.9.2).
+        let mut w = SendWindow::new();
+        w.stream = WINDOW_MAX;
+        // initial_peer_window is still 65535; bump to 65536 to add +1 delta.
+        let err = w.apply_initial_window_change(65_536).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn initial_window_size_delta_allows_negative_window() {
+        // §6.9.2 explicitly permits the window to go negative when the peer
+        // shrinks INITIAL_WINDOW_SIZE below the bytes already in flight.
+        let mut w = SendWindow::new();
+        w.stream = 100;
+        w.apply_initial_window_change(0).unwrap();
+        // delta = 0 - 65535 = -65535; 100 + (-65535) = -65435.
+        assert_eq!(w.stream, -65_435);
+    }
+
+    #[test]
+    fn recv_window_defaults_match_rfc() {
+        let w = RecvWindow::new();
+        assert_eq!(w.conn, OUR_INITIAL_WINDOW);
+        assert_eq!(w.stream, OUR_INITIAL_WINDOW);
+        assert_eq!(w.initial, OUR_INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn recv_window_no_replenish_above_half() {
+        // Consume slightly less than half the initial window — neither side
+        // crosses the threshold, so no WINDOW_UPDATE should be produced.
+        let mut w = RecvWindow::new();
+        w.consume(1000);
+        let frames = w.replenish(1);
+        assert!(frames.is_empty());
+        assert_eq!(w.conn, OUR_INITIAL_WINDOW - 1000);
+        assert_eq!(w.stream, OUR_INITIAL_WINDOW - 1000);
+    }
+
+    #[test]
+    fn recv_window_replenishes_when_below_half() {
+        // Two DATA-sized consumes (20_000 each) bring both windows to
+        // 25_535 — below the 32_767 threshold. Replenish must emit two
+        // WINDOW_UPDATE frames (one for stream 0, one for stream 1), each
+        // restoring the corresponding side to `initial`.
+        let mut w = RecvWindow::new();
+        w.consume(20_000);
+        w.consume(20_000);
+        assert_eq!(w.conn, 25_535);
+        assert_eq!(w.stream, 25_535);
+
+        let frames = w.replenish(1);
+        assert_eq!(frames.len(), 2);
+        // Frame ordering is connection-first by construction.
+        assert_eq!(frames[0].typ, F_WINDOW_UPDATE);
+        assert_eq!(frames[0].stream_id, 0);
+        assert_eq!(frames[1].typ, F_WINDOW_UPDATE);
+        assert_eq!(frames[1].stream_id, 1);
+        // Each increment is `initial - current` so that the running window
+        // returns to `initial`.
+        let inc_conn = parse_window_update(&frames[0].payload).unwrap();
+        let inc_stream = parse_window_update(&frames[1].payload).unwrap();
+        assert_eq!(inc_conn, (OUR_INITIAL_WINDOW - 25_535) as u32);
+        assert_eq!(inc_stream, (OUR_INITIAL_WINDOW - 25_535) as u32);
+        assert_eq!(w.conn, OUR_INITIAL_WINDOW);
+        assert_eq!(w.stream, OUR_INITIAL_WINDOW);
+
+        // A subsequent replenish with both windows at initial is a no-op.
+        assert!(w.replenish(1).is_empty());
+    }
+
+    #[test]
+    fn window_update_frame_payload_shape() {
+        // The frame helper must produce a 4-byte payload with the R bit
+        // cleared and the increment in network byte order.
+        let f = window_update_frame(7, 0x0102_0304);
+        assert_eq!(f.typ, F_WINDOW_UPDATE);
+        assert_eq!(f.flags, 0);
+        assert_eq!(f.stream_id, 7);
+        assert_eq!(f.payload, vec![0x01, 0x02, 0x03, 0x04]);
     }
 }
