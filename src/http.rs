@@ -441,11 +441,160 @@ impl Response {
 }
 
 fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    // Pool reuse is only safe for direct connections. Via-proxy we'd be
+    // sharing one socket across many origins via absolute-form lines, which
+    // works on paper but mixes badly with `Proxy-Authorization:` per-origin
+    // semantics — out of scope for this milestone.
+    let direct = req.proxy.is_none() || proxy_bypassed(&req);
+    if direct {
+        if let Some(bufrd) = pool_checkout_plain(&req.url) {
+            let _ = writeln!(trace, "* Reusing existing connection from pool");
+            match perform_on_pooled_plain(bufrd, &req, trace) {
+                Ok(resp) => return Ok(resp),
+                Err(PooledError::Stale(why)) => {
+                    let _ = writeln!(trace, "* Pooled connection unusable ({why}); reconnecting");
+                    // fall through to a fresh dial
+                }
+                Err(PooledError::Hard(e)) => return Err(e),
+            }
+        }
+    }
+    send_plain_fresh(req, direct, trace)
+}
+
+fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
     let stream = tcp_connect(&req, trace)?;
-    write_request(&stream, &req, via_plain_http_proxy(&req), trace)?;
-    let resp = read_response(stream, &req.method, trace)?;
-    let _ = writeln!(trace, "* Connection closed");
+    let mut bufrd = BufReader::new(stream);
+    write_request(bufrd.get_mut(), &req, via_plain_http_proxy(&req), trace)?;
+    let resp = read_response(&mut bufrd, &req.method, trace)?;
+    finalize_plain(bufrd, &req, &resp, may_pool, trace);
     Ok(resp)
+}
+
+fn perform_on_pooled_plain(
+    mut bufrd: BufReader<TcpStream>,
+    req: &Request,
+    trace: &mut dyn Write,
+) -> std::result::Result<Response, PooledError> {
+    if let Err(e) = write_request(bufrd.get_mut(), req, via_plain_http_proxy(req), trace) {
+        return Err(stale_or_hard(e));
+    }
+    let resp = match read_response(&mut bufrd, &req.method, trace) {
+        Ok(r) => r,
+        Err(e) => return Err(stale_or_hard(e)),
+    };
+    finalize_plain(bufrd, req, &resp, true, trace);
+    Ok(resp)
+}
+
+fn finalize_plain(
+    bufrd: BufReader<TcpStream>,
+    req: &Request,
+    resp: &Response,
+    may_pool: bool,
+    trace: &mut dyn Write,
+) {
+    if may_pool && response_is_reusable(&req.method, resp) {
+        crate::pool::plain()
+            .lock()
+            .unwrap()
+            .release(pool_key_for(&req.url), bufrd);
+        let _ = writeln!(trace, "* Connection kept alive (pooled)");
+    } else {
+        let _ = writeln!(trace, "* Connection closed");
+    }
+}
+
+/// Why a request attempt over a pooled connection failed. `Stale` means the
+/// peer probably killed it under us, and the caller should silently retry on
+/// a fresh socket. `Hard` is anything else (TLS verification failure, body
+/// too large, malformed response, …) and propagates as-is.
+enum PooledError {
+    Stale(String),
+    Hard(Error),
+}
+
+fn stale_or_hard(e: Error) -> PooledError {
+    // The kinds of failure that mean "the server hung up on the parked
+    // socket": EOF on the first read, a connection-reset, a broken pipe on
+    // write. Everything else (TLS state errors, bad responses, …) is a real
+    // error and the caller must not retry.
+    match &e {
+        Error::UnexpectedEof => PooledError::Stale("connection closed by peer".into()),
+        Error::Io(io_err) => match io_err.kind() {
+            io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected => PooledError::Stale(io_err.to_string()),
+            _ => PooledError::Hard(e),
+        },
+        _ => PooledError::Hard(e),
+    }
+}
+
+pub(crate) fn pool_key_for(u: &Url) -> crate::pool::Key {
+    crate::pool::Key {
+        scheme: u.scheme.clone(),
+        host: u.host.clone(),
+        port: u.port,
+    }
+}
+
+fn pool_checkout_plain(u: &Url) -> Option<BufReader<TcpStream>> {
+    crate::pool::plain()
+        .lock()
+        .unwrap()
+        .checkout(&pool_key_for(u))
+}
+
+fn pool_checkout_tls(u: &Url) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
+    crate::pool::tls()
+        .lock()
+        .unwrap()
+        .checkout(&pool_key_for(u))
+}
+
+/// Server-side keep-alive eligibility. Caller must also have read the body
+/// to completion (true here by construction — `read_response` either returns
+/// the whole body or returns `Err`). HTTP/1.0 servers need an explicit
+/// `Connection: keep-alive`; HTTP/1.1 servers default to keep-alive and need
+/// `Connection: close` to opt out. Close-delimited bodies are never reusable
+/// because by definition the server has already closed the connection. The
+/// request method is needed to disambiguate "no body framing because HEAD"
+/// (reusable) from "no body framing because the server intends to close"
+/// (not reusable).
+fn response_is_reusable(method: &str, resp: &Response) -> bool {
+    let conn_close = resp.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("connection")
+            && v.split(',')
+                .any(|tok| tok.trim().eq_ignore_ascii_case("close"))
+    });
+    if conn_close {
+        return false;
+    }
+    let has_framing = resp.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-length")
+            || (k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked"))
+    });
+    let no_body_allowed = method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&resp.status)
+        || resp.status == 204
+        || resp.status == 304;
+    if !has_framing && !no_body_allowed {
+        // Close-delimited body: server signalled end-of-message by closing.
+        return false;
+    }
+    if resp.version == "HTTP/1.1" {
+        true
+    } else {
+        // HTTP/1.0 — must see explicit keep-alive.
+        resp.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("connection")
+                && v.split(',')
+                    .any(|tok| tok.trim().eq_ignore_ascii_case("keep-alive"))
+        })
+    }
 }
 
 /// True iff this request is going to a plain-`http://` target via a proxy
@@ -551,6 +700,24 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // HTTP/1.1 path (Auto fallback or Http11Only). ALPN is not offered so
     // the cert-only handshake doesn't change behaviour for h2-only servers
     // (those would have been satisfied by the h2 attempt above).
+    let direct = req.proxy.is_none() || proxy_bypassed(&req);
+    if direct {
+        if let Some(bufrd) = pool_checkout_tls(&req.url) {
+            let _ = writeln!(trace, "* Reusing existing connection from pool");
+            match perform_on_pooled_tls(bufrd, &req, trace) {
+                Ok(resp) => return Ok(resp),
+                Err(PooledError::Stale(why)) => {
+                    let _ = writeln!(trace, "* Pooled connection unusable ({why}); reconnecting");
+                    // fall through
+                }
+                Err(PooledError::Hard(e)) => return Err(e),
+            }
+        }
+    }
+    send_https_fresh(req, direct, trace)
+}
+
+fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
     let tcp = tcp_connect(&req, trace)?;
     // HTTPS via proxy means we have to ask the proxy to splice us through
     // to the origin before the TLS handshake — the proxy can't see the
@@ -563,15 +730,50 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
         connect_tunnel(&tcp, &req.url, p, trace)?;
     }
     let opts = tls_opts_from(&req, &[])?;
-    let mut tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+    let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
     write_tls_info(&tls, trace);
+    let mut bufrd = BufReader::new(tls);
     // Always origin-form here: even with a proxy in play we've already
     // tunnelled past it via CONNECT, so the request the origin sees is
     // the normal direct one.
-    write_request(&mut tls, &req, false, trace)?;
-    let resp = read_response(tls, &req.method, trace)?;
-    let _ = writeln!(trace, "* Connection closed");
+    write_request(bufrd.get_mut(), &req, false, trace)?;
+    let resp = read_response(&mut bufrd, &req.method, trace)?;
+    finalize_tls(bufrd, &req, &resp, may_pool, trace);
     Ok(resp)
+}
+
+fn perform_on_pooled_tls(
+    mut bufrd: BufReader<crate::tls::TlsStream<TcpStream>>,
+    req: &Request,
+    trace: &mut dyn Write,
+) -> std::result::Result<Response, PooledError> {
+    if let Err(e) = write_request(bufrd.get_mut(), req, false, trace) {
+        return Err(stale_or_hard(e));
+    }
+    let resp = match read_response(&mut bufrd, &req.method, trace) {
+        Ok(r) => r,
+        Err(e) => return Err(stale_or_hard(e)),
+    };
+    finalize_tls(bufrd, req, &resp, true, trace);
+    Ok(resp)
+}
+
+fn finalize_tls(
+    bufrd: BufReader<crate::tls::TlsStream<TcpStream>>,
+    req: &Request,
+    resp: &Response,
+    may_pool: bool,
+    trace: &mut dyn Write,
+) {
+    if may_pool && response_is_reusable(&req.method, resp) {
+        crate::pool::tls()
+            .lock()
+            .unwrap()
+            .release(pool_key_for(&req.url), bufrd);
+        let _ = writeln!(trace, "* Connection kept alive (pooled)");
+    } else {
+        let _ = writeln!(trace, "* Connection closed");
+    }
 }
 
 /// Open a TCP socket pointed at whatever the next-hop endpoint actually
@@ -859,7 +1061,11 @@ fn write_request<W: Write>(
     if !req.body.is_empty() && !have_clen {
         write!(&mut buf, "Content-Length: {}\r\n", req.body.len())?;
     }
-    write!(&mut buf, "Connection: close\r\n\r\n")?;
+    // No explicit `Connection:` header: HTTP/1.1's default is keep-alive,
+    // which is what we want for the connection pool. Servers that don't
+    // want to keep alive announce it back via `Connection: close` on the
+    // response, and we'll honour that in the reuse decision.
+    write!(&mut buf, "\r\n")?;
 
     // Trace what we're about to put on the wire — read straight from `buf`
     // so the trace can't lie about what was sent. Stripping just one trailing
@@ -880,9 +1086,15 @@ fn write_request<W: Write>(
     Ok(())
 }
 
-fn read_response<R: Read>(stream: R, method: &str, trace: &mut dyn Write) -> Result<Response> {
-    let mut r = BufReader::new(stream);
-
+/// Read one HTTP/1.1 response from a buffered stream. The buffer is held by
+/// the caller (rather than created inline) because connection-reuse hands
+/// the same `BufReader` to back-to-back requests, and the buffer's leftover
+/// bytes — even if empty in practice — must travel with the connection.
+fn read_response<R: Read>(
+    r: &mut BufReader<R>,
+    method: &str,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     let mut status_line = String::new();
     let n = r.read_line(&mut status_line)?;
     if n == 0 {
@@ -915,7 +1127,7 @@ fn read_response<R: Read>(stream: R, method: &str, trace: &mut dyn Write) -> Res
         headers.push((k.trim().to_string(), v.trim().to_string()));
     }
 
-    let body = read_body(&mut r, &headers, &version, status, method)?;
+    let body = read_body(r, &headers, &version, status, method)?;
     let wire_len = body.len();
     let _ = writeln!(trace, "* Received {wire_len} body bytes");
     let (headers, body) = maybe_decode_body(headers, body, trace)?;

@@ -3,9 +3,10 @@
 //! Design notes:
 //!
 //! * **Threading.** One acceptor thread, one worker thread per accepted
-//!   connection. Workers run synchronously and close the socket when done
-//!   (the response always advertises `Connection: close`, matching what
-//!   rsurl sends on the request side).
+//!   connection. By default the worker handles a single request and closes;
+//!   tests that exercise the client-side connection pool can opt in to
+//!   keep-alive via [`TestServer::start_keepalive`], which loops on the
+//!   socket until the peer closes it.
 //!
 //! * **Shutdown.** The acceptor sits on a non-blocking [`TcpListener`] with
 //!   a 50 ms poll loop driven by an [`AtomicBool`]. Drop of [`TestServer`]
@@ -35,7 +36,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -158,14 +159,34 @@ type Handler = dyn Fn(Request) -> Response + Send + Sync + 'static;
 /// Single-shot HTTP/1.1 test server. Drop it to shut down.
 pub struct TestServer {
     pub addr: SocketAddr,
+    pub accept_count: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
 }
 
 impl TestServer {
     /// Bind to 127.0.0.1:0 and start the acceptor. `handler` is invoked
-    /// once per accepted connection in a worker thread.
+    /// once per accepted connection in a worker thread; the worker closes
+    /// the socket after writing the response.
     pub fn start<F>(handler: F) -> Self
+    where
+        F: Fn(Request) -> Response + Send + Sync + 'static,
+    {
+        Self::start_inner(handler, false)
+    }
+
+    /// Same as [`Self::start`] but the worker loops on the socket, parsing
+    /// each successive request and invoking the handler again, until the
+    /// peer closes the connection (or sends `Connection: close`). This is
+    /// what's needed to exercise rsurl's client-side connection pool.
+    pub fn start_keepalive<F>(handler: F) -> Self
+    where
+        F: Fn(Request) -> Response + Send + Sync + 'static,
+    {
+        Self::start_inner(handler, true)
+    }
+
+    fn start_inner<F>(handler: F, keep_alive: bool) -> Self
     where
         F: Fn(Request) -> Response + Send + Sync + 'static,
     {
@@ -177,17 +198,26 @@ impl TestServer {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_loop = Arc::clone(&stop);
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let accept_count_for_loop = Arc::clone(&accept_count);
         let handler: Arc<Handler> = Arc::new(handler);
 
         let accept = thread::Builder::new()
             .name("rsurl-testserver-accept".into())
             .spawn(move || {
-                accept_loop(listener, stop_for_loop, handler);
+                accept_loop(
+                    listener,
+                    stop_for_loop,
+                    handler,
+                    keep_alive,
+                    accept_count_for_loop,
+                );
             })
             .expect("spawn acceptor");
 
         TestServer {
             addr,
+            accept_count,
             stop,
             accept: Some(accept),
         }
@@ -218,17 +248,24 @@ impl Drop for TestServer {
     }
 }
 
-fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, handler: Arc<Handler>) {
+fn accept_loop(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    handler: Arc<Handler>,
+    keep_alive: bool,
+    accept_count: Arc<AtomicUsize>,
+) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                accept_count.fetch_add(1, Ordering::SeqCst);
                 let handler = Arc::clone(&handler);
                 // Each connection gets its own worker thread so a slow
                 // handler can't block the acceptor.
                 let _ = thread::Builder::new()
                     .name("rsurl-testserver-worker".into())
                     .spawn(move || {
-                        handle_conn(stream, &*handler);
+                        handle_conn(stream, &*handler, keep_alive);
                     });
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -239,24 +276,39 @@ fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>, handler: Arc<Handle
     }
 }
 
-fn handle_conn(mut stream: TcpStream, handler: &Handler) {
+fn handle_conn(mut stream: TcpStream, handler: &Handler, keep_alive: bool) {
     // Generous-ish timeouts: tests should be fast; if we hit one of these
     // something is genuinely wrong with the client.
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
-    let req = match parse_request(&mut stream) {
-        Ok(r) => r,
-        Err(_) => {
-            let _ = stream.shutdown(Shutdown::Both);
-            return;
+    loop {
+        let req = match parse_request(&mut stream) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
+        };
+
+        let resp = handler(req);
+        let resp_says_close = resp
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close"));
+        let close_delimited = matches!(resp.mode, BodyMode::CloseDelimited);
+
+        if write_response(&mut stream, &resp).is_err() {
+            // Client may have already closed; that's fine.
+            break;
         }
-    };
 
-    let resp = handler(req);
-
-    if write_response(&mut stream, &resp).is_err() {
-        // Client may have already closed; that's fine.
+        if !keep_alive || resp_says_close || close_delimited {
+            break;
+        }
+        // In keep-alive mode the loop falls through to parse the next
+        // request; if the client closes, the next parse_request returns
+        // Err and we exit cleanly.
     }
 
     // Graceful close. Calling `shutdown(Both)` on macOS sends a TCP RST when

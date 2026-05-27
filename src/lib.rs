@@ -11,6 +11,7 @@ mod compress;
 mod cookie;
 mod error;
 mod http;
+mod pool;
 mod transfer;
 mod url;
 

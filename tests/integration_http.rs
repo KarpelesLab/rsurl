@@ -159,7 +159,9 @@ fn status_204_no_body() {
 
 /// The server reflects every received request header back in the body
 /// so the client side can inspect what was actually put on the wire.
-/// Locks in: User-Agent default, Accept: */*, Host, Connection: close.
+/// Locks in: User-Agent default, Accept: */*, Host, and the *absence* of
+/// `Connection: close` (HTTP/1.1's default is keep-alive — see the
+/// connection-pool work in `src/pool.rs`).
 #[test]
 fn request_headers_propagate() {
     let server = TestServer::start(|req: SReq| {
@@ -184,8 +186,8 @@ fn request_headers_propagate() {
         "missing/wrong Host in: {text}",
     );
     assert!(
-        text.contains("Connection: close\n"),
-        "missing Connection: close in: {text}",
+        !text.to_ascii_lowercase().contains("connection: close"),
+        "must not advertise Connection: close (keep-alive is the HTTP/1.1 default): {text}",
     );
 }
 
@@ -235,7 +237,9 @@ fn post_with_body_sets_content_length() {
 
 /// Lock in the curl-style `-v` trace format produced by `send_traced`:
 /// `> ` lines for the request bytes actually put on the wire, `< ` lines
-/// for the response status & headers, and a `* Connection closed` epilogue.
+/// for the response status & headers, and a connection-state epilogue
+/// (either "Connection kept alive (pooled)" when the response is reusable
+/// or "Connection closed" when it isn't).
 #[test]
 fn verbose_trace_format() {
     let server = TestServer::start(|_req: SReq| SResp::ok("hi"));
@@ -257,8 +261,8 @@ fn verbose_trace_format() {
         "missing response status in:\n{t}",
     );
     assert!(
-        t.contains("* Connection closed"),
-        "missing close epilogue in:\n{t}",
+        t.contains("* Connection kept alive (pooled)") || t.contains("* Connection closed"),
+        "missing connection-state epilogue in:\n{t}",
     );
 }
 
@@ -545,4 +549,100 @@ fn noproxy_bypasses_proxy() {
         .unwrap();
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, b"direct");
+}
+
+/// Two consecutive plain-HTTP requests to the same authority share a single
+/// TCP connection via the pool. We assert this with the server's
+/// `accept_count` — the second request must NOT trigger another accept.
+#[test]
+fn pool_reuses_plain_http_connection() {
+    use std::sync::atomic::Ordering;
+    let server = TestServer::start_keepalive(|_req: SReq| SResp::ok("ok"));
+
+    let r1 = Request::get(&server.url("/first")).unwrap().send().unwrap();
+    assert_eq!(r1.status, 200);
+
+    // Give the worker a beat to park the bufreader before the second call.
+    std::thread::sleep(Duration::from_millis(30));
+
+    let r2 = Request::get(&server.url("/second"))
+        .unwrap()
+        .send()
+        .unwrap();
+    assert_eq!(r2.status, 200);
+
+    let accepted = server.accept_count.load(Ordering::SeqCst);
+    assert_eq!(
+        accepted, 1,
+        "second request should have reused the pooled connection, got {accepted} accepts",
+    );
+}
+
+/// If a server sends `Connection: close`, the connection must NOT be parked.
+/// The next request goes out on a fresh socket.
+#[test]
+fn pool_skips_when_response_says_close() {
+    use std::sync::atomic::Ordering;
+    let server =
+        TestServer::start_keepalive(|_req: SReq| SResp::ok("ok").header("Connection", "close"));
+
+    let _ = Request::get(&server.url("/a")).unwrap().send().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let _ = Request::get(&server.url("/b")).unwrap().send().unwrap();
+
+    let accepted = server.accept_count.load(Ordering::SeqCst);
+    assert_eq!(
+        accepted, 2,
+        "Connection: close should disable reuse, got {accepted} accepts",
+    );
+}
+
+/// Close-delimited responses (no Content-Length, no chunked, server closes
+/// the socket to signal end of body) must also NOT be parked: by definition
+/// the connection is gone.
+#[test]
+fn pool_skips_close_delimited_response() {
+    use std::sync::atomic::Ordering;
+    let server = TestServer::start_keepalive(|_req: SReq| {
+        SResp::ok("body-bytes").mode(BodyMode::CloseDelimited)
+    });
+    let _ = Request::get(&server.url("/a")).unwrap().send().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let _ = Request::get(&server.url("/b")).unwrap().send().unwrap();
+    assert_eq!(server.accept_count.load(Ordering::SeqCst), 2);
+}
+
+/// If the server kills a parked connection between requests, the client
+/// must silently dial a fresh socket — not surface a stale-connection EOF.
+/// We simulate this by giving the server a tiny idle timeout and ensuring
+/// the second request still succeeds.
+#[test]
+fn pool_retries_when_pooled_connection_is_stale() {
+    use std::sync::atomic::Ordering;
+    // start_keepalive's worker loops until parse_request fails. We make it
+    // fail by closing our end after the first response — but we control
+    // both endpoints. Trick: have the handler return a body, then the
+    // worker stays in keep-alive loop waiting on read with a 5s timeout.
+    // Instead we use a dedicated server that drops the socket after one
+    // response (the default `start`). The client pools the bufreader,
+    // server has gone away, second request hits EOF → retries fresh.
+    let server = TestServer::start(|_req: SReq| SResp::ok("once"));
+
+    let r1 = Request::get(&server.url("/")).unwrap().send().unwrap();
+    assert_eq!(r1.body, b"once");
+    // The pool has the now-dead bufreader.
+    std::thread::sleep(Duration::from_millis(30));
+
+    // Second request: must NOT fail. The pool entry is stale, the client
+    // detects this on first read and reconnects transparently.
+    let r2 = Request::get(&server.url("/"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(2))
+        .send()
+        .unwrap();
+    assert_eq!(r2.body, b"once");
+    // Two TCP accepts — one per request — because the single-shot server
+    // closes after the first response, so the pool's parked entry was dead
+    // by the time the second request tried to reuse it.
+    assert_eq!(server.accept_count.load(Ordering::SeqCst), 2);
 }
