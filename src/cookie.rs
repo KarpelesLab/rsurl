@@ -173,8 +173,8 @@ impl CookieJar {
         Ok(jar)
     }
 
-    /// Same as [`load_netscape`] but treats `NotFound` as "start with an
-    /// empty jar" — what curl does when `-b` points at a not-yet-created
+    /// Same as [`Self::load_netscape`] but treats `NotFound` as "start with
+    /// an empty jar" — what curl does when `-b` points at a not-yet-created
     /// path that is also the `-c` destination.
     pub fn load_netscape_or_empty(path: &str) -> Result<Self> {
         match Self::load_netscape(path) {
