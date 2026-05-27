@@ -98,7 +98,7 @@ fn send_http(req: Request) -> Result<Response> {
     stream.set_write_timeout(req.read_timeout)?;
 
     write_request(&stream, &req)?;
-    read_response(stream)
+    read_response(stream, &req.method)
 }
 
 fn write_request<W: Write>(mut w: W, req: &Request) -> Result<()> {
@@ -148,7 +148,7 @@ fn write_request<W: Write>(mut w: W, req: &Request) -> Result<()> {
     Ok(())
 }
 
-fn read_response<R: Read>(stream: R) -> Result<Response> {
+fn read_response<R: Read>(stream: R, method: &str) -> Result<Response> {
     let mut r = BufReader::new(stream);
 
     let mut status_line = String::new();
@@ -180,7 +180,7 @@ fn read_response<R: Read>(stream: R) -> Result<Response> {
         headers.push((k.trim().to_string(), v.trim().to_string()));
     }
 
-    let body = read_body(&mut r, &headers, &version, status)?;
+    let body = read_body(&mut r, &headers, &version, status, method)?;
 
     Ok(Response {
         status,
@@ -214,9 +214,14 @@ fn read_body<R: BufRead>(
     headers: &[(String, String)],
     _version: &str,
     status: u16,
+    method: &str,
 ) -> Result<Vec<u8>> {
-    // RFC 9110 §6.4.1 — these statuses MUST NOT have a body.
-    if (100..200).contains(&status) || status == 204 || status == 304 {
+    // RFC 9110: HEAD responses never have a body, nor do these statuses.
+    if method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304
+    {
         return Ok(Vec::new());
     }
 
