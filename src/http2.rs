@@ -57,6 +57,105 @@ const FLAG_END_HEADERS: u8 = 0x04;
 const FLAG_PADDED: u8 = 0x08;
 const FLAG_PRIORITY: u8 = 0x20;
 
+// SETTINGS parameter identifiers (RFC 9113 §6.5.2).
+const S_HEADER_TABLE_SIZE: u16 = 0x1;
+const S_ENABLE_PUSH: u16 = 0x2;
+const S_MAX_CONCURRENT_STREAMS: u16 = 0x3;
+const S_INITIAL_WINDOW_SIZE: u16 = 0x4;
+const S_MAX_FRAME_SIZE: u16 = 0x5;
+const S_MAX_HEADER_LIST_SIZE: u16 = 0x6;
+
+// RFC 9113 §6.5.2 bounds for SETTINGS validation.
+const INITIAL_WINDOW_SIZE_MAX: u32 = 0x7fff_ffff; // 2^31 - 1
+const MAX_FRAME_SIZE_MIN: u32 = 16_384; // 2^14
+const MAX_FRAME_SIZE_MAX: u32 = 16_777_215; // 2^24 - 1
+
+/// Peer (server) SETTINGS values, with RFC 9113 defaults for any parameter
+/// the peer hasn't sent. We track all six standard parameters even if we
+/// don't yet act on each of them; future tasks will consume more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerSettings {
+    header_table_size: u32,
+    enable_push: bool,
+    max_concurrent_streams: u32,
+    initial_window_size: u32,
+    max_frame_size: u32,
+    max_header_list_size: u32,
+}
+
+impl Default for PeerSettings {
+    fn default() -> Self {
+        // Defaults from RFC 9113 §6.5.2. "No limit" parameters are represented
+        // as u32::MAX so callers can compare uniformly without special-casing.
+        PeerSettings {
+            header_table_size: 4096,
+            enable_push: true,
+            max_concurrent_streams: u32::MAX,
+            initial_window_size: 65_535,
+            max_frame_size: 16_384,
+            max_header_list_size: u32::MAX,
+        }
+    }
+}
+
+impl PeerSettings {
+    /// Apply a SETTINGS frame payload to this state, per RFC 9113 §6.5.2.
+    ///
+    /// The payload is a sequence of 6-byte entries (u16 identifier, u32 value,
+    /// both big-endian). Unknown identifiers MUST be ignored. Out-of-range
+    /// values for known identifiers are reported as `Error::BadResponse`
+    /// (the RFC distinguishes PROTOCOL_ERROR vs FLOW_CONTROL_ERROR, but this
+    /// module doesn't surface H2 error codes yet).
+    fn apply_settings_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() % 6 != 0 {
+            return Err(Error::BadResponse(format!(
+                "SETTINGS payload length {} not a multiple of 6",
+                payload.len()
+            )));
+        }
+        for chunk in payload.chunks_exact(6) {
+            let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+            let val = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+            match id {
+                S_HEADER_TABLE_SIZE => self.header_table_size = val,
+                S_ENABLE_PUSH => {
+                    self.enable_push = match val {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(Error::BadResponse(format!(
+                                "SETTINGS_ENABLE_PUSH must be 0 or 1, got {val}"
+                            )));
+                        }
+                    };
+                }
+                S_MAX_CONCURRENT_STREAMS => self.max_concurrent_streams = val,
+                S_INITIAL_WINDOW_SIZE => {
+                    if val > INITIAL_WINDOW_SIZE_MAX {
+                        return Err(Error::BadResponse(format!(
+                            "SETTINGS_INITIAL_WINDOW_SIZE {val} exceeds 2^31-1 (FLOW_CONTROL_ERROR)"
+                        )));
+                    }
+                    self.initial_window_size = val;
+                }
+                S_MAX_FRAME_SIZE => {
+                    if !(MAX_FRAME_SIZE_MIN..=MAX_FRAME_SIZE_MAX).contains(&val) {
+                        return Err(Error::BadResponse(format!(
+                            "SETTINGS_MAX_FRAME_SIZE {val} out of range [16384, 16777215]"
+                        )));
+                    }
+                    self.max_frame_size = val;
+                }
+                S_MAX_HEADER_LIST_SIZE => self.max_header_list_size = val,
+                _ => {
+                    // Unknown identifiers MUST be ignored (RFC 9113 §6.5.2).
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One HTTP/2 frame on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Frame {
@@ -836,17 +935,30 @@ pub fn send(req: Request) -> Result<Response> {
     }
 
     // 1. Client preface + initial SETTINGS frame.
+    //    We advertise ENABLE_PUSH=0 so the server won't send PUSH_PROMISE
+    //    frames (we don't implement them). Other parameters are left at
+    //    their RFC 9113 §6.5.2 defaults.
     tls.write_all(PREFACE)?;
+    let mut settings_payload = Vec::with_capacity(6);
+    settings_payload.extend_from_slice(&S_ENABLE_PUSH.to_be_bytes());
+    settings_payload.extend_from_slice(&0u32.to_be_bytes());
     let our_settings = Frame {
         typ: F_SETTINGS,
         flags: 0,
         stream_id: 0,
-        payload: Vec::new(),
+        payload: settings_payload,
     };
     write_frame(&mut tls, &our_settings)?;
     tls.flush()?;
 
     // 2. Build and send the HEADERS frame (plus DATA if there's a body).
+    //    `peer` starts at RFC defaults; we'll refine it as the server's
+    //    SETTINGS frame arrives during the read loop below. The size checks
+    //    here are a coarse pre-check using the current cap — fine because
+    //    the default (16 KiB) is the floor of SETTINGS_MAX_FRAME_SIZE, so
+    //    any value the server later announces only loosens the cap.
+    //    Proper fragmentation lives in a later task.
+    let mut peer = PeerSettings::default();
     let header_block = build_header_block(&req);
     let mut headers_flags = FLAG_END_HEADERS;
     let has_body = !req.body.is_empty();
@@ -854,11 +966,11 @@ pub fn send(req: Request) -> Result<Response> {
         headers_flags |= FLAG_END_STREAM;
     }
     // For brevity we don't fragment large header blocks into CONTINUATION; the
-    // total stays well under the 16 KiB default SETTINGS_MAX_FRAME_SIZE for
-    // any realistic request. If headers exceed 16 KiB we surface an error.
-    if header_block.len() > 16384 {
+    // total stays well under SETTINGS_MAX_FRAME_SIZE for any realistic request.
+    // If headers exceed the cap we surface an error.
+    if header_block.len() > peer.max_frame_size as usize {
         return Err(Error::BadResponse(
-            "request headers exceed 16 KiB; CONTINUATION on encode not implemented".into(),
+            "request headers exceed MAX_FRAME_SIZE; CONTINUATION on encode not implemented".into(),
         ));
     }
     let headers_frame = Frame {
@@ -870,11 +982,11 @@ pub fn send(req: Request) -> Result<Response> {
     write_frame(&mut tls, &headers_frame)?;
 
     if has_body {
-        // Single DATA frame with END_STREAM. Limited to 16 KiB to fit in the
-        // default SETTINGS_MAX_FRAME_SIZE the server announces.
-        if req.body.len() > 16384 {
+        // Single DATA frame with END_STREAM. Limited to MAX_FRAME_SIZE; the
+        // server's announcement only ever loosens this default.
+        if req.body.len() > peer.max_frame_size as usize {
             return Err(Error::BadResponse(
-                "request body exceeds 16 KiB; DATA fragmentation not implemented".into(),
+                "request body exceeds MAX_FRAME_SIZE; DATA fragmentation not implemented".into(),
             ));
         }
         let data_frame = Frame {
@@ -916,7 +1028,9 @@ pub fn send(req: Request) -> Result<Response> {
         match frame.typ {
             F_SETTINGS
                 if frame.flags & FLAG_ACK == 0 => {
-                    // Server-sent SETTINGS, ack it.
+                    // Server-sent SETTINGS: parse and update peer state,
+                    // then ACK. Validation errors propagate out of the loop.
+                    peer.apply_settings_payload(&frame.payload)?;
                     let ack = Frame {
                         typ: F_SETTINGS,
                         flags: FLAG_ACK,
@@ -1457,5 +1571,131 @@ mod tests {
             Error::BadResponse(_) => {}
             other => panic!("expected BadResponse, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // SETTINGS application (RFC 9113 §6.5).
+    // -----------------------------------------------------------------
+
+    /// Build a SETTINGS payload from a list of (id, value) pairs.
+    fn settings_payload(entries: &[(u16, u32)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(entries.len() * 6);
+        for (id, val) in entries {
+            out.extend_from_slice(&id.to_be_bytes());
+            out.extend_from_slice(&val.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn peer_settings_defaults_match_rfc() {
+        let p = PeerSettings::default();
+        assert_eq!(p.header_table_size, 4096);
+        assert!(p.enable_push);
+        assert_eq!(p.max_concurrent_streams, u32::MAX);
+        assert_eq!(p.initial_window_size, 65_535);
+        assert_eq!(p.max_frame_size, 16_384);
+        assert_eq!(p.max_header_list_size, u32::MAX);
+    }
+
+    #[test]
+    fn peer_settings_apply_updates_known_identifiers() {
+        let mut p = PeerSettings::default();
+        let payload = settings_payload(&[
+            (S_HEADER_TABLE_SIZE, 8192),
+            (S_INITIAL_WINDOW_SIZE, 131_072),
+            (S_MAX_FRAME_SIZE, 32_768),
+        ]);
+        p.apply_settings_payload(&payload).unwrap();
+        assert_eq!(p.header_table_size, 8192);
+        assert_eq!(p.initial_window_size, 131_072);
+        assert_eq!(p.max_frame_size, 32_768);
+        // Untouched parameters stay at defaults.
+        assert!(p.enable_push);
+        assert_eq!(p.max_concurrent_streams, u32::MAX);
+        assert_eq!(p.max_header_list_size, u32::MAX);
+    }
+
+    #[test]
+    fn peer_settings_ignores_unknown_identifier() {
+        let mut p = PeerSettings::default();
+        let before = p.clone();
+        let payload = settings_payload(&[(0xFFFF, 42)]);
+        p.apply_settings_payload(&payload).unwrap();
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn peer_settings_rejects_bad_enable_push() {
+        let mut p = PeerSettings::default();
+        let payload = settings_payload(&[(S_ENABLE_PUSH, 2)]);
+        let err = p.apply_settings_payload(&payload).unwrap_err();
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_settings_rejects_oversize_window() {
+        let mut p = PeerSettings::default();
+        // 2^31 exactly is one past the max.
+        let payload = settings_payload(&[(S_INITIAL_WINDOW_SIZE, 0x8000_0000)]);
+        let err = p.apply_settings_payload(&payload).unwrap_err();
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_settings_rejects_undersize_max_frame() {
+        let mut p = PeerSettings::default();
+        let payload = settings_payload(&[(S_MAX_FRAME_SIZE, 16_383)]);
+        let err = p.apply_settings_payload(&payload).unwrap_err();
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_settings_rejects_truncated_payload() {
+        let mut p = PeerSettings::default();
+        let payload = vec![0u8; 5];
+        let err = p.apply_settings_payload(&payload).unwrap_err();
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_settings_enable_push_zero_disables() {
+        // We send ENABLE_PUSH=0 ourselves; verify the parser handles it both ways.
+        let mut p = PeerSettings::default();
+        p.apply_settings_payload(&settings_payload(&[(S_ENABLE_PUSH, 0)]))
+            .unwrap();
+        assert!(!p.enable_push);
+        p.apply_settings_payload(&settings_payload(&[(S_ENABLE_PUSH, 1)]))
+            .unwrap();
+        assert!(p.enable_push);
+    }
+
+    #[test]
+    fn peer_settings_max_frame_size_boundaries() {
+        // 16384 and 16777215 are inclusive bounds.
+        let mut p = PeerSettings::default();
+        p.apply_settings_payload(&settings_payload(&[(S_MAX_FRAME_SIZE, 16_384)]))
+            .unwrap();
+        assert_eq!(p.max_frame_size, 16_384);
+        p.apply_settings_payload(&settings_payload(&[(S_MAX_FRAME_SIZE, 16_777_215)]))
+            .unwrap();
+        assert_eq!(p.max_frame_size, 16_777_215);
+        // One past the max should fail.
+        let err = p
+            .apply_settings_payload(&settings_payload(&[(S_MAX_FRAME_SIZE, 16_777_216)]))
+            .unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
     }
 }
