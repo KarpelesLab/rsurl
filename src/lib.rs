@@ -10,6 +10,8 @@ mod error;
 mod http;
 mod url;
 
+pub mod ffi;
+
 pub use crate::error::{Error, Result};
 pub use crate::http::{Request, Response};
 pub use crate::url::Url;

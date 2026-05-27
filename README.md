@@ -36,6 +36,25 @@ curlrs http://example.com
 curlrs -o out.html -v http://example.com
 ```
 
+## C usage
+
+```c
+#include "curlrs.h"
+
+CURLRS *h = curlrs_easy_init();
+curlrs_easy_setopt_str(h, CURLRSOPT_URL, "http://example.com");
+curlrs_easy_perform(h);
+
+const uint8_t *body; size_t len;
+curlrs_easy_response_body(h, &body, &len);
+printf("%ld %.*s\n", curlrs_easy_response_status(h), (int)len, body);
+
+curlrs_easy_cleanup(h);
+```
+
+Link with `-lcurlrs`. Function names use a `curlrs_` prefix so the library
+can coexist with libcurl in the same process.
+
 ## Build
 
 ```sh
