@@ -1,10 +1,11 @@
 name: Release-plz
 
-# DISABLED: the `rsurl` name on crates.io is currently held by a discontinued
-# project; ownership transfer is in flight. While we wait, only allow manual
-# dispatch — no auto-runs on push. Restore `push: branches: [master]` below
-# once we can publish.
+# Runs on every push to master plus manual dispatch. release-plz opens a
+# "release PR" that bumps versions + CHANGELOG; merging it runs the release
+# job, which publishes to crates.io and creates the GitHub Release.
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
