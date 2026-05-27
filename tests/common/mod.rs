@@ -258,7 +258,23 @@ fn handle_conn(mut stream: TcpStream, handler: &Handler) {
     if write_response(&mut stream, &resp).is_err() {
         // Client may have already closed; that's fine.
     }
-    let _ = stream.shutdown(Shutdown::Both);
+
+    // Graceful close. Calling `shutdown(Both)` on macOS sends a TCP RST when
+    // there's any data still in the kernel receive buffer (BSD behavior),
+    // and the client's in-flight read of our response then surfaces as
+    // `ECONNRESET`. Instead: half-close the write side (sends FIN), briefly
+    // drain anything the client wrote after the headers (CI hits Linux's
+    // forgiving path and ignores this; macOS does not), and let `stream`
+    // drop to close the read side.
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut sink = [0u8; 256];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
 }
 
 /// Parse one HTTP/1.x request. Returns `Err(())` on any malformed input —
