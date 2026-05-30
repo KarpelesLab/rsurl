@@ -33,6 +33,14 @@ use compcol::Algorithm;
 use crate::error::{Error, Result};
 use crate::http::MAX_BODY_BYTES;
 
+/// Maximum number of `Content-Encoding` layers we will decode for a single
+/// response. Stacked encodings are a decompression-amplification vector: each
+/// layer can expand its input, so N layers multiply both the work performed
+/// and the peak resident memory. Real servers send at most one (occasionally
+/// two) layers; curl and browsers reject deeply-nested chains. Cap at a small
+/// number and surface anything beyond it as a bad response.
+const MAX_ENCODING_LAYERS: usize = 3;
+
 /// Result of trying to decode a body against a `Content-Encoding` header.
 #[derive(Debug)]
 pub(crate) struct Decoded {
@@ -66,8 +74,21 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
         });
     }
 
+    // Bound the number of stacked encodings: a deeply-nested chain is a
+    // decompression-amplification vector with no legitimate use.
+    if layers.len() > MAX_ENCODING_LAYERS {
+        return Err(Error::BadResponse(format!(
+            "too many Content-Encoding layers ({}, max {MAX_ENCODING_LAYERS})",
+            layers.len()
+        )));
+    }
+
     let mut current = body;
     let mut peeled = false;
+    // Single cumulative output budget shared across every layer, so N stacked
+    // encodings can't each claim a fresh MAX_BODY_BYTES allowance. Each layer
+    // may expand the running total only up to what remains.
+    let mut budget = MAX_BODY_BYTES as u64;
     for token in layers.iter().rev() {
         match Layer::parse(token) {
             Some(Layer::Identity) => {
@@ -76,11 +97,13 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
                 peeled = true;
             }
             Some(Layer::Gzip) => {
-                current = gunzip(&current)?;
+                current = gunzip(&current, budget)?;
+                budget = budget.saturating_sub(current.len() as u64);
                 peeled = true;
             }
             Some(Layer::Deflate) => {
-                current = inflate_zlib(&current)?;
+                current = inflate_zlib(&current, budget)?;
+                budget = budget.saturating_sub(current.len() as u64);
                 peeled = true;
             }
             None => {
@@ -123,31 +146,37 @@ impl Layer {
 }
 
 /// One-shot decode of `src` with algorithm `A`, capping the decompressed
-/// output at [`MAX_BODY_BYTES`] via compcol's [`LimitedDecoder`]. The
+/// output at `budget` bytes via compcol's [`LimitedDecoder`]. `budget` is the
+/// portion of the response-wide [`MAX_BODY_BYTES`] allowance still unspent by
+/// earlier layers, so a stack of encodings can't exceed the single cap. The
 /// streaming `DecoderReader` adapter exposes a `std::io::Read` so we can
 /// reuse the standard `read_to_end` machinery.
-fn decode_with<A: Algorithm>(src: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(src.len().saturating_mul(3));
-    let dec = LimitedDecoder::new(A::decoder(), MAX_BODY_BYTES as u64);
+fn decode_with<A: Algorithm>(src: &[u8], budget: u64) -> std::io::Result<Vec<u8>> {
+    // Pre-allocate against the remaining budget, not a blind 3x of the input,
+    // so a tiny highly-compressible frame can't pre-reserve hundreds of MiB.
+    let cap = (src.len() as u64).saturating_mul(3).min(budget) as usize;
+    let mut out = Vec::with_capacity(cap);
+    let dec = LimitedDecoder::new(A::decoder(), budget);
     let mut reader = DecoderReader::new(src, dec);
     reader.read_to_end(&mut out)?;
     Ok(out)
 }
 
-fn gunzip(src: &[u8]) -> Result<Vec<u8>> {
-    decode_with::<Gzip>(src).map_err(|e| Error::BadResponse(format!("gzip decode failed: {e}")))
+fn gunzip(src: &[u8], budget: u64) -> Result<Vec<u8>> {
+    decode_with::<Gzip>(src, budget)
+        .map_err(|e| Error::BadResponse(format!("gzip decode failed: {e}")))
 }
 
 /// Decode a `deflate`-encoded body. RFC 9110 says HTTP `deflate` is **zlib**
 /// (RFC 1950) wrapping raw deflate (RFC 1951), but many real-world servers
 /// emit raw deflate without the zlib header. Try the zlib framing first;
 /// if it fails, retry as raw deflate so we interoperate with both camps.
-fn inflate_zlib(src: &[u8]) -> Result<Vec<u8>> {
-    let zlib_err = match decode_with::<Zlib>(src) {
+fn inflate_zlib(src: &[u8], budget: u64) -> Result<Vec<u8>> {
+    let zlib_err = match decode_with::<Zlib>(src, budget) {
         Ok(out) => return Ok(out),
         Err(e) => e,
     };
-    decode_with::<Deflate>(src)
+    decode_with::<Deflate>(src, budget)
         .map_err(|_| Error::BadResponse(format!("deflate decode failed: {zlib_err}")))
 }
 
@@ -256,6 +285,41 @@ mod tests {
             Error::BadResponse(msg) => assert!(msg.contains("gzip"), "got {msg:?}"),
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_too_many_encoding_layers() {
+        // Four stacked encodings exceed MAX_ENCODING_LAYERS (3). The body
+        // contents don't matter — the chain length is rejected up front.
+        let err = decode_body(gz(b"x"), "gzip, gzip, gzip, gzip").unwrap_err();
+        match err {
+            Error::BadResponse(msg) => {
+                assert!(msg.contains("Content-Encoding layers"), "got {msg:?}")
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_max_encoding_layers() {
+        // Exactly MAX_ENCODING_LAYERS gzip wrappers must still decode. Build
+        // gzip(gzip(gzip(plain))) and label it with three gzip tokens.
+        let inner = gz(b"deep");
+        let mid = gz(&inner);
+        let outer = gz(&mid);
+        let out = decode_body(outer, "gzip, gzip, gzip").unwrap();
+        assert_eq!(out.body, b"deep");
+        assert!(out.decoded);
+    }
+
+    #[test]
+    fn nested_layers_share_one_budget() {
+        // Two stacked layers (within the cap) decode to the original; this
+        // exercises the cumulative-budget path without tripping the limit.
+        let inner = gz(b"payload");
+        let outer = gz(&inner);
+        let out = decode_body(outer, "gzip, gzip").unwrap();
+        assert_eq!(out.body, b"payload");
     }
 
     #[test]
