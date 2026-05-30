@@ -22,7 +22,7 @@
 //!         --form-string <n=v>  like -F but the value is always literal
 //!         --form-escape        percent-encode field names/filenames per
 //!                              RFC 7578 §4.2 instead of backslash-escaping
-//!     -T, --upload-file <f>    upload the file (HTTP PUT, FTP/FTPS STOR, or TFTP WRQ)
+//!     -T, --upload-file <f>    upload the file (HTTP PUT, FTP/FTPS STOR, TFTP WRQ, or MQTT PUBLISH)
 //!     -C, --continue-at <off>  resume at byte <off> (FTP sends REST before STOR)
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
@@ -970,6 +970,14 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         if parsed_url.scheme == "rtsp" {
             return run_rtsp(&parsed_url, args);
         }
+        // MQTT: a request body (`-d`/`--data*` or `-T`) switches from the
+        // default subscribe (`run_transfer`) to publish, matching curl. With
+        // no body we fall through to the subscribe transfer below.
+        if matches!(parsed_url.scheme.as_str(), "mqtt" | "mqtts")
+            && (!args.data_parts.is_empty() || args.upload_file.is_some())
+        {
+            return run_mqtt_publish(&parsed_url, args);
+        }
         if let Some(path) = &args.upload_file {
             // FTP/FTPS upload: -T <file> ftp://host/remote → STOR (with REST
             // resume when -C <offset> is given). Other non-HTTP schemes don't
@@ -1366,6 +1374,55 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     }
 }
 
+/// Publish to an `mqtt://`/`mqtts://` URL. The payload comes from `-T <file>`
+/// (read whole) or from `-d`/`--data*` (assembled like an HTTP form body); the
+/// two are mutually exclusive, matching curl. The topic is the URL path. We
+/// publish at QoS 0 to match curl's default. Exit codes: 0 ok, 7 on transfer
+/// error, 26 on local-read error, 2 on a usage/flag-combination error.
+fn run_mqtt_publish(url: &Url, args: &Args) -> u8 {
+    if args.upload_file.is_some() && !args.data_parts.is_empty() {
+        if !args.silent {
+            eprintln!("rsurl: -d/--data and -T/--upload-file are mutually exclusive");
+        }
+        return 2;
+    }
+
+    let payload: Vec<u8> = if let Some(path) = &args.upload_file {
+        match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                if !args.silent {
+                    eprintln!("rsurl: -T: can't read {path:?}: {e}");
+                }
+                return 26;
+            }
+        }
+    } else {
+        match assemble_form_body(&args.data_parts) {
+            Ok(Some(b)) => b,
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                if !args.silent {
+                    eprintln!("rsurl: {e}");
+                }
+                return 2;
+            }
+        }
+    };
+
+    // curl publishes at QoS 0 by default. The protocol layer supports QoS 1
+    // (PUBLISH then wait for PUBACK); there is no CLI flag to select it yet.
+    match rsurl::mqtt::publish(url, &payload, 0) {
+        Ok(()) => 0,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
+}
+
 /// Drive an RTSP control-channel session. `-X`/`--request` selects the method
 /// (default `DESCRIBE`). `OPTIONS`/`DESCRIBE` are single requests; selecting
 /// `SETUP`/`PLAY`/`TEARDOWN` runs the full handshake on one connection
@@ -1512,7 +1569,8 @@ Options:
       --form-escape        percent-encode names/filenames per RFC 7578 §4.2
                            (default: backslash-escape, curl-historical)
   -T, --upload-file <f>    upload the file: HTTP PUT (default Content-Type:
-                           application/octet-stream), FTP/FTPS STOR, or TFTP WRQ
+                           application/octet-stream), FTP/FTPS STOR, TFTP WRQ,
+                           or MQTT PUBLISH
   -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
                            the automatic form '-C -' is not supported
   -A, --user-agent <ua>    set User-Agent

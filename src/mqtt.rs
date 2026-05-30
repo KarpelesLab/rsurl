@@ -5,11 +5,17 @@
 //!
 //! Use [`crate::tls::connect_over`] for `mqtts://`.
 //!
-//! The current flow is intentionally simple and matches what curl does for
-//! `mqtt://`: CONNECT → SUBSCRIBE → wait for the first PUBLISH → DISCONNECT.
-//! QoS is hard-coded to 0; QoS 1/2 (with PUBACK / PUBREC / PUBREL / PUBCOMP),
-//! retained-message flags on outbound packets, last-will, and MQTT v5 are not
-//! implemented.
+//! Two flows are supported, matching what curl does for `mqtt://`:
+//!
+//! * **Subscribe** ([`fetch`]) — `curl mqtt://host/topic`: CONNECT → SUBSCRIBE →
+//!   wait for the first PUBLISH → DISCONNECT, returning that payload.
+//! * **Publish** ([`publish`]) — `curl -d payload mqtt://host/topic` or
+//!   `curl -T file …`: CONNECT → PUBLISH → (PUBACK for QoS 1) → DISCONNECT.
+//!
+//! The CONNECT handshake is shared between both. Publish supports QoS 0
+//! (fire-and-forget, curl's default) and QoS 1 (PUBLISH then wait for the
+//! matching PUBACK). QoS 2 (PUBREC / PUBREL / PUBCOMP), retained-message
+//! flags, last-will, and MQTT v5 are not implemented.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -23,6 +29,7 @@ use crate::url::Url;
 const PKT_CONNECT: u8 = 1;
 const PKT_CONNACK: u8 = 2;
 const PKT_PUBLISH: u8 = 3;
+const PKT_PUBACK: u8 = 4;
 const PKT_SUBSCRIBE: u8 = 8;
 const PKT_SUBACK: u8 = 9;
 const PKT_PINGRESP: u8 = 13;
@@ -52,12 +59,48 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     }
 }
 
-fn run_session<S: Read + Write>(
+/// CONNECT, PUBLISH `payload` to the topic in `url.path` at the requested
+/// `qos`, wait for the PUBACK when `qos == 1`, then DISCONNECT.
+///
+/// This is the publisher side: `curl -d payload mqtt://host/topic` (and the
+/// `-T file` upload form). The topic comes from the URL path with its leading
+/// `/` stripped and is validated to be a legal *publish* topic (no wildcards,
+/// no NUL/control bytes). `qos` must be 0 or 1; QoS 2 is not implemented.
+pub fn publish(url: &Url, payload: &[u8], qos: u8) -> Result<()> {
+    let topic = url.path.strip_prefix('/').unwrap_or(&url.path);
+    if topic.is_empty() {
+        return Err(Error::InvalidUrl(format!(
+            "mqtt: no topic in URL path ({:?})",
+            url.path
+        )));
+    }
+    validate_publish_topic(topic)?;
+    if qos > 1 {
+        return Err(Error::BadResponse(format!(
+            "mqtt: unsupported publish QoS {qos} (only 0 and 1)"
+        )));
+    }
+
+    let (user, pass) = split_userinfo(url.userinfo.as_deref());
+
+    let addr = format!("{}:{}", url.host, url.port);
+    let tcp = TcpStream::connect(&addr)?;
+    if url.is_tls() {
+        let mut stream = crate::tls::connect_over(tcp, &url.host)?;
+        run_publish(&mut stream, topic, payload, qos, user, pass)
+    } else {
+        let mut stream = tcp;
+        run_publish(&mut stream, topic, payload, qos, user, pass)
+    }
+}
+
+/// Perform the shared CONNECT handshake: send CONNECT, read and validate the
+/// CONNACK. Returns once the broker has accepted the connection.
+fn connect_handshake<S: Read + Write>(
     stream: &mut S,
-    topic: &str,
     user: Option<&str>,
     pass: Option<&str>,
-) -> Result<Vec<u8>> {
+) -> Result<()> {
     let client_id = random_client_id();
     let connect = build_connect(&client_id, user, pass, 60);
     stream.write_all(&connect)?;
@@ -78,6 +121,66 @@ fn run_session<S: Read + Write>(
     if rc != 0 {
         return Err(Error::BadResponse(format!("mqtt: connack {rc}")));
     }
+    Ok(())
+}
+
+fn run_publish<S: Read + Write>(
+    stream: &mut S,
+    topic: &str,
+    payload: &[u8],
+    qos: u8,
+    user: Option<&str>,
+    pass: Option<&str>,
+) -> Result<()> {
+    connect_handshake(stream, user, pass)?;
+
+    // Packet identifier is only present in the PUBLISH (and required in the
+    // PUBACK) for QoS > 0. We always use 1 since this is a single, one-shot
+    // publish per connection.
+    let packet_id = 1u16;
+    let publish = build_publish(topic, payload, qos, packet_id);
+    stream.write_all(&publish)?;
+    stream.flush()?;
+
+    if qos == 1 {
+        // Wait for the matching PUBACK. Drain any PINGRESP the broker may
+        // interleave, like the subscribe loop does, and reject anything else.
+        loop {
+            let (ctype, body) = read_packet(stream)?;
+            match ctype {
+                PKT_PUBACK => {
+                    let acked = parse_puback(&body)?;
+                    if acked != packet_id {
+                        return Err(Error::BadResponse(format!(
+                            "mqtt: PUBACK packet id {acked} != sent {packet_id}"
+                        )));
+                    }
+                    break;
+                }
+                PKT_PINGRESP => continue,
+                other => {
+                    return Err(Error::BadResponse(format!(
+                        "mqtt: unexpected packet type {other} while awaiting PUBACK"
+                    )));
+                }
+            }
+        }
+    }
+
+    // DISCONNECT is a 2-byte fixed header with no remaining length payload.
+    let _ = stream.write_all(&[PKT_DISCONNECT << 4, 0x00]);
+    let _ = stream.flush();
+
+    Ok(())
+}
+
+fn run_session<S: Read + Write>(
+    stream: &mut S,
+    topic: &str,
+    user: Option<&str>,
+    pass: Option<&str>,
+) -> Result<Vec<u8>> {
+    connect_handshake(stream, user, pass)?;
 
     // SUBSCRIBE with packet id 1, single topic at QoS 0.
     let subscribe = build_subscribe(1, topic);
@@ -221,6 +324,70 @@ pub(crate) fn build_subscribe(packet_id: u16, topic: &str) -> Vec<u8> {
     out
 }
 
+/// Reject a topic that is not a valid MQTT *publish* topic name.
+///
+/// Per MQTT v3.1.1 §4.7, topic *names* used in PUBLISH (unlike the topic
+/// *filters* used in SUBSCRIBE) must not contain the wildcard characters `+`
+/// or `#`. We additionally reject the NUL character (forbidden in any MQTT
+/// UTF-8 string, §1.5.3) and other control characters, which guards against a
+/// crafted URL path smuggling framing/control bytes into the wire packet.
+fn validate_publish_topic(topic: &str) -> Result<()> {
+    for ch in topic.chars() {
+        match ch {
+            '+' | '#' => {
+                return Err(Error::InvalidUrl(format!(
+                    "mqtt: publish topic must not contain wildcard {ch:?}"
+                )));
+            }
+            '\0' => {
+                return Err(Error::InvalidUrl(
+                    "mqtt: publish topic must not contain NUL".into(),
+                ));
+            }
+            c if c.is_control() => {
+                return Err(Error::InvalidUrl(format!(
+                    "mqtt: publish topic must not contain control char {:?}",
+                    c
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Build the full bytes of a PUBLISH packet (type 3).
+///
+/// Fixed header: `0x30 | (qos << 1)` (DUP and RETAIN are left clear), then the
+/// remaining length. Variable header: the UTF-8 length-prefixed topic name,
+/// followed — only when `qos > 0` — by the 2-byte packet identifier. Payload:
+/// the body bytes verbatim. For QoS 0 the `packet_id` argument is ignored.
+pub(crate) fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    push_str(&mut body, topic);
+    if qos > 0 {
+        body.extend_from_slice(&packet_id.to_be_bytes());
+    }
+    body.extend_from_slice(payload);
+
+    let mut out = Vec::with_capacity(2 + body.len());
+    // High nibble = PKT_PUBLISH (3); low nibble carries DUP(8) RETAIN(1) and
+    // the 2-bit QoS in bits 1..2. We only ever set QoS.
+    out.push((PKT_PUBLISH << 4) | ((qos & 0x03) << 1));
+    write_remaining_length(&mut out, body.len());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Parse a PUBACK (type 4) body and return its packet identifier. The body is
+/// exactly the 2-byte big-endian packet id (MQTT v3.1.1 §3.4).
+fn parse_puback(body: &[u8]) -> Result<u16> {
+    if body.len() < 2 {
+        return Err(Error::BadResponse("mqtt: short PUBACK".into()));
+    }
+    Ok(u16::from_be_bytes([body[0], body[1]]))
+}
+
 /// Extract the application payload from a PUBLISH packet body.
 ///
 /// We only handle QoS 0 here, which is all `build_subscribe` ever requests:
@@ -312,6 +479,41 @@ pub(crate) fn write_remaining_length(out: &mut Vec<u8>, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In-memory `Read + Write` peer: reads pop bytes the broker would send,
+    /// writes are captured for inspection. EOF once the canned input is drained.
+    struct MockStream {
+        to_read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl MockStream {
+        fn new(to_read: Vec<u8>) -> Self {
+            MockStream {
+                to_read: std::io::Cursor::new(to_read),
+                written: Vec::new(),
+            }
+        }
+        fn written(&self) -> &[u8] {
+            &self.written
+        }
+    }
+
+    impl Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.to_read.read(buf)
+        }
+    }
+
+    impl Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     // Spec boundary values: each is the max of one varint length, and the
     // first value that needs one more byte.
@@ -415,6 +617,111 @@ mod tests {
         let got = build_subscribe(1, "a/b");
         let expected: Vec<u8> = vec![0x82, 0x08, 0x00, 0x01, 0x00, 0x03, b'a', b'/', b'b', 0x00];
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn build_publish_qos0_has_no_packet_id() {
+        // PUBLISH topic "top", payload "PAY", QoS 0.
+        //   fixed: 0x30 (type 3, flags 0), rem-length
+        //   body: 00 03 't' 'o' 'p' (topic)  'P' 'A' 'Y' (payload)
+        //   body length = 5 + 3 = 8
+        let got = build_publish("top", b"PAY", 0, 1);
+        let expected: Vec<u8> = vec![0x30, 0x08, 0x00, 0x03, b't', b'o', b'p', b'P', b'A', b'Y'];
+        assert_eq!(got, expected);
+        // QoS 0 ignores the packet id entirely: changing it does not move bytes.
+        assert_eq!(build_publish("top", b"PAY", 0, 9999), expected);
+    }
+
+    #[test]
+    fn build_publish_qos1_has_flag_and_packet_id() {
+        // PUBLISH topic "top", payload "PAY", QoS 1, packet id 7.
+        //   fixed: 0x32 (type 3, QoS bit = (1<<1)), rem-length
+        //   body: 00 03 't' 'o' 'p' (topic)  00 07 (packet id)  'P' 'A' 'Y'
+        //   body length = 5 + 2 + 3 = 10
+        let got = build_publish("top", b"PAY", 1, 7);
+        let expected: Vec<u8> = vec![
+            0x32, 0x0A, 0x00, 0x03, b't', b'o', b'p', 0x00, 0x07, b'P', b'A', b'Y',
+        ];
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn build_publish_large_payload_round_trips() {
+        // A payload that needs a 2-byte remaining-length varint exercises the
+        // framing end to end: build, then re-read with read_packet.
+        let payload = vec![0xABu8; 5000];
+        let pkt = build_publish("t", &payload, 0, 1);
+        // Fixed header byte then varint then body; feed through the reader.
+        let mut cur = std::io::Cursor::new(&pkt);
+        let (ctype, body) = read_packet(&mut cur).expect("read PUBLISH");
+        assert_eq!(ctype, PKT_PUBLISH);
+        let got = extract_publish_payload(&body).expect("payload");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn parse_puback_reads_packet_id() {
+        assert_eq!(parse_puback(&[0x00, 0x07]).unwrap(), 7);
+        assert_eq!(parse_puback(&[0x12, 0x34]).unwrap(), 0x1234);
+        // Trailing bytes (none in v3.1.1) are ignored; short bodies error.
+        assert!(parse_puback(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn qos1_publish_waits_for_matching_puback() {
+        // Drive run_publish against an in-memory peer that speaks CONNACK then
+        // PUBACK, and assert it parses our PUBLISH correctly off the wire.
+        let mut from_broker = Vec::new();
+        // CONNACK: type 2, rem-len 2, [session-present=0, rc=0].
+        from_broker.extend_from_slice(&[(PKT_CONNACK << 4), 0x02, 0x00, 0x00]);
+        // PUBACK: type 4, rem-len 2, packet id 1 (matches run_publish's id).
+        from_broker.extend_from_slice(&[(PKT_PUBACK << 4), 0x02, 0x00, 0x01]);
+
+        let mut peer = MockStream::new(from_broker);
+        run_publish(&mut peer, "a/b", b"hello", 1, None, None).expect("publish ok");
+
+        // The client should have written CONNECT, then a QoS-1 PUBLISH, then
+        // DISCONNECT. Skip the CONNECT to reach the PUBLISH.
+        let written = peer.written();
+        let mut cur = std::io::Cursor::new(&written);
+        let (c0, _) = read_packet(&mut cur).expect("connect");
+        assert_eq!(c0, PKT_CONNECT);
+        let publish_start = cur.position() as usize;
+        let expected_publish = build_publish("a/b", b"hello", 1, 1);
+        assert_eq!(
+            &written[publish_start..publish_start + expected_publish.len()],
+            expected_publish.as_slice()
+        );
+        // And a DISCONNECT trailing the PUBLISH.
+        let disc = &written[publish_start + expected_publish.len()..];
+        assert_eq!(disc, &[PKT_DISCONNECT << 4, 0x00]);
+    }
+
+    #[test]
+    fn qos1_publish_rejects_mismatched_puback() {
+        let mut from_broker = Vec::new();
+        from_broker.extend_from_slice(&[(PKT_CONNACK << 4), 0x02, 0x00, 0x00]);
+        // PUBACK for a different packet id (2) than we sent (1).
+        from_broker.extend_from_slice(&[(PKT_PUBACK << 4), 0x02, 0x00, 0x02]);
+        let mut peer = MockStream::new(from_broker);
+        let err = run_publish(&mut peer, "a/b", b"hi", 1, None, None).unwrap_err();
+        match err {
+            Error::BadResponse(m) => assert!(m.contains("PUBACK"), "got {m}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_publish_topic_rejects_wildcards_and_control() {
+        // Wildcards are legal in SUBSCRIBE filters but not PUBLISH names.
+        assert!(validate_publish_topic("sensor/+/temp").is_err());
+        assert!(validate_publish_topic("sensor/#").is_err());
+        // NUL and other control characters are rejected.
+        assert!(validate_publish_topic("a\0b").is_err());
+        assert!(validate_publish_topic("a\nb").is_err());
+        // Ordinary hierarchical topics are accepted.
+        assert!(validate_publish_topic("a/b/c").is_ok());
+        assert!(validate_publish_topic("home/kitchen/temp").is_ok());
     }
 
     #[test]

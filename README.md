@@ -34,7 +34,7 @@ Early, in active development.
 | GOPHER / GOPHERS (RFC 1436) | working | reads to EOF; item-type 7 search via `?<words>` (sends `selector\t<words>`) |
 | IMAP / IMAPS (RFC 9051) | working | CAPABILITY probe, STARTTLS upgrade (RFC 2595), SASL AUTHENTICATE PLAIN/LOGIN with LOGIN-command fallback (honors LOGINDISABLED); LIST / SELECT+FETCH / UID FETCH BODY[] |
 | LDAP / LDAPS (RFC 4511) | working | simple bind + search → LDIF; filter syntax: equality, presence, substring (`cn=foo*bar*`), and `& \| !` (extensible match excluded) |
-| MQTT / MQTTS (v3.1.1) | working | CONNECT, SUBSCRIBE, receive one PUBLISH (QoS 0) |
+| MQTT / MQTTS (v3.1.1) | working | CONNECT; SUBSCRIBE + receive one PUBLISH (QoS 0); PUBLISH via `-d`/`-T` at QoS 0 (default, matches curl) or QoS 1 (PUBLISH→PUBACK) in the protocol layer |
 | POP3 / POP3S (RFC 1939) | working | LIST or RETR, USER/PASS auth |
 | RTSP (RFC 7826) | working | OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN via `-X` with CSeq + Session tracking (interleaved transport); RTP media reception not implemented |
 | TFTP (RFC 1350) | working | read (RRQ) and write/upload (`-T`, WRQ) with timeout/retry, 256 MiB cap |
