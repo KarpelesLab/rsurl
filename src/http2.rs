@@ -2541,6 +2541,16 @@ impl<S: Read + Write> Connection<S> {
         // Connection window is billed regardless of whether the stream is
         // known — that's what the RFC requires.
         self.conn_recv_window.consume(frame_bytes);
+        // RFC 9113 §6.9.1: a receiver MUST treat a peer that sends more DATA
+        // than the advertised connection window as a FLOW_CONTROL_ERROR and
+        // tear down the connection. A conformant peer keeps `available` >= 0;
+        // only a strict overrun drives it negative (an exactly-full window
+        // reaching 0 is legitimate and must NOT be rejected).
+        if self.conn_recv_window.available < 0 {
+            return Err(Error::BadResponse(
+                "http2: flow-control window exceeded by peer".into(),
+            ));
+        }
         let known = self.streams.contains_key(&stream_id);
         if !known {
             // DATA for an unknown / already-evicted stream: drop silently per
@@ -2566,6 +2576,14 @@ impl<S: Read + Write> Connection<S> {
 
         let s = self.streams.get_mut(&stream_id).unwrap();
         s.recv_window.consume(frame_bytes);
+        // Per-stream counterpart of the connection-level check above
+        // (RFC 9113 §6.9.1). A negative window means the peer sent more DATA
+        // on this stream than we granted; exactly 0 is still legitimate.
+        if s.recv_window.available < 0 {
+            return Err(Error::BadResponse(
+                "http2: flow-control window exceeded by peer".into(),
+            ));
+        }
 
         // Strip padding to find the application bytes.
         let mut payload = frame.payload.as_slice();
@@ -4673,6 +4691,75 @@ mod tests {
         // Conn recv window has still been charged (the bytes did cross the
         // shared budget), then possibly replenished — verify the latter holds.
         assert!(conn.conn_recv_window.available <= OUR_INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn inbound_data_exceeding_conn_window_is_flow_control_error() {
+        // RFC 9113 §6.9.1: a single DATA frame larger than the advertised
+        // connection receive window must be rejected as a flow-control error.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        conn.process_frame(synth_status_200_headers(id, false))
+            .unwrap();
+
+        // OUR_INITIAL_WINDOW + 1 bytes overruns the 65_535 conn window.
+        let overrun = vec![0u8; OUR_INITIAL_WINDOW as usize + 1];
+        let err = conn
+            .process_frame(synth_data(id, &overrun, false))
+            .unwrap_err();
+        match err {
+            Error::BadResponse(m) => assert!(
+                m.contains("flow-control window exceeded"),
+                "unexpected message: {m}"
+            ),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_data_exceeding_stream_window_is_flow_control_error() {
+        // Same overrun but isolated to the per-stream window: inflate the
+        // connection window so only the stream window goes negative, proving
+        // the per-stream check fires independently.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        conn.process_frame(synth_status_200_headers(id, false))
+            .unwrap();
+
+        // Give the conn window plenty of room so it stays >= 0.
+        conn.conn_recv_window.available = i64::from(u32::MAX);
+
+        let overrun = vec![0u8; OUR_INITIAL_WINDOW as usize + 1];
+        let err = conn
+            .process_frame(synth_data(id, &overrun, false))
+            .unwrap_err();
+        match err {
+            Error::BadResponse(m) => assert!(
+                m.contains("flow-control window exceeded"),
+                "unexpected message: {m}"
+            ),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+        // The stream window must have actually gone negative.
+        assert!(conn.streams.get(&id).unwrap().recv_window.available < 0);
+    }
+
+    #[test]
+    fn inbound_data_filling_window_exactly_is_accepted() {
+        // A frame that drives the window to exactly 0 is legitimate and must
+        // NOT be rejected (only strictly-negative is an overrun).
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        conn.process_frame(synth_status_200_headers(id, false))
+            .unwrap();
+
+        let exact = vec![0u8; OUR_INITIAL_WINDOW as usize];
+        // Must succeed; both windows reach exactly 0 before replenish runs.
+        conn.process_frame(synth_data(id, &exact, false)).unwrap();
+        assert_eq!(conn.streams.get(&id).unwrap().body.len(), exact.len());
     }
 
     #[test]
