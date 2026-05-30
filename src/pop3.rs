@@ -55,6 +55,18 @@ fn split_userinfo(s: &str) -> (&str, &str) {
     }
 }
 
+/// Reject a URL-derived string containing CR, LF, NUL, or any other ASCII
+/// control byte before it's interpolated into a POP3 command. `what` names the
+/// field for the error message.
+fn reject_ctl(s: &str, what: &str) -> Result<()> {
+    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+        return Err(Error::BadResponse(format!(
+            "pop3: {what} contains illegal control byte {b:#04x}"
+        )));
+    }
+    Ok(())
+}
+
 /// Decide between LIST and RETR based on the URL path. Returns `None` for
 /// anything that doesn't fit `/`, `""`, or `/<positive integer>`.
 fn parse_path(path: &str) -> Option<Action> {
@@ -142,7 +154,16 @@ impl<R: Read + Write> Session<R> {
 
     /// Send `cmd` followed by CRLF. The underlying writer lives behind the
     /// BufReader, so we have to reach through `get_mut` to write.
+    ///
+    /// Refuses any command line containing CR, LF, or NUL: the CRLF terminator
+    /// is appended here, so an embedded CR/LF in URL-derived `user`/`pass`
+    /// would otherwise inject extra POP3 commands.
     fn send(&mut self, cmd: &str) -> Result<()> {
+        if cmd.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(Error::BadResponse(
+                "pop3: refusing to send command line with embedded CR/LF/NUL".into(),
+            ));
+        }
         let inner = self.io.get_mut();
         inner.write_all(cmd.as_bytes())?;
         inner.write_all(b"\r\n")?;
@@ -220,7 +241,11 @@ fn run<R: Read + Write>(
     session.read_status()?;
 
     // 2. Authenticate. We always send both USER and PASS; APOP and SASL are
-    //    deferred (see module note).
+    //    deferred (see module note). Reject control bytes in the URL-derived
+    //    credentials up front so a CR/LF can't smuggle extra commands (`send`
+    //    also guards the assembled line as a backstop).
+    reject_ctl(user, "pop3 user")?;
+    reject_ctl(pass, "pop3 password")?;
     session.send(&format!("USER {user}"))?;
     session.read_status()?;
     session.send(&format!("PASS {pass}"))?;
@@ -317,5 +342,50 @@ mod tests {
         assert_eq!(split_userinfo("alice"), ("alice", ""));
         assert_eq!(split_userinfo("alice:s:e:c"), ("alice", "s:e:c"));
         assert_eq!(split_userinfo(":pass"), ("", "pass"));
+    }
+
+    #[test]
+    fn reject_ctl_flags_control_bytes() {
+        assert!(reject_ctl("alice", "pop3 user").is_ok());
+        assert!(reject_ctl("p@ss:word", "pop3 password").is_ok());
+        assert!(reject_ctl("alice\r\nDELE 1", "pop3 user").is_err());
+        assert!(reject_ctl("alice\npass", "pop3 user").is_err());
+        assert!(reject_ctl("alice\0", "pop3 user").is_err());
+        assert!(reject_ctl("alice\x7f", "pop3 user").is_err());
+    }
+
+    /// In-memory Read+Write used to drive `Session::send` in tests.
+    struct MockIo {
+        written: Vec<u8>,
+    }
+    impl Read for MockIo {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Write for MockIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn send_rejects_embedded_crlf() {
+        let mut s = Session::new(BufReader::new(MockIo {
+            written: Vec::new(),
+        }));
+        assert!(matches!(
+            s.send("USER alice\r\nPASS x"),
+            Err(Error::BadResponse(_))
+        ));
+        assert!(matches!(s.send("USER a\nb"), Err(Error::BadResponse(_))));
+        assert!(matches!(s.send("USER a\0b"), Err(Error::BadResponse(_))));
+        // Clean command goes through with exactly one trailing CRLF.
+        s.send("USER alice").unwrap();
+        assert_eq!(s.io.get_ref().written, b"USER alice\r\n");
     }
 }

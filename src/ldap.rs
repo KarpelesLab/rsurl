@@ -310,6 +310,20 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Reject a percent-decoded URL component that contains NUL, CR, LF, or any
+/// other ASCII control byte before it's BER-encoded into an LDAP request.
+/// BER framing is length-prefixed so embedded control bytes don't break the
+/// wire format, but they have no legitimate place in a DN / bind value /
+/// filter and rejecting them is cheap defense-in-depth. `what` names the field.
+fn reject_ctl(s: &str, what: &str) -> Result<()> {
+    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+        return Err(Error::BadResponse(format!(
+            "ldap: {what} contains illegal control byte {b:#04x}"
+        )));
+    }
+    Ok(())
+}
+
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -553,6 +567,12 @@ fn encode_filter(out: &mut Vec<u8>, f: &Filter) {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Upper bound on a single LDAP message body length decoded from the wire.
+/// `read_message` would otherwise `vec![0u8; len]` for an attacker-chosen BER
+/// length bounded only by `usize` — an unbounded allocation / DoS vector.
+/// 64 MiB matches the crate's other body caps (e.g. `rtsp`, `websocket`).
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Wrap a Read+Write transport so we can hold either a raw TCP stream or a
 /// TLS-wrapped one behind the same code path.
 enum Transport {
@@ -587,6 +607,12 @@ impl Write for Transport {
 /// Read exactly one LDAP message off the wire and return its contents as a
 /// new Vec (the SEQUENCE body bytes — i.e. messageID, protocolOp, [controls]).
 fn read_message(t: &mut Transport) -> Result<Vec<u8>> {
+    read_message_from(t)
+}
+
+/// Generic body of [`read_message`], parameterized over the reader so it can be
+/// unit-tested with an in-memory cursor.
+fn read_message_from<R: Read>(t: &mut R) -> Result<Vec<u8>> {
     // Tag byte
     let mut tag_buf = [0u8; 1];
     read_exact(t, &mut tag_buf)?;
@@ -614,6 +640,11 @@ fn read_message(t: &mut Transport) -> Result<Vec<u8>> {
         }
         acc
     };
+    if len > MAX_MESSAGE_BYTES {
+        return Err(Error::BadResponse(format!(
+            "ldap: message length {len} exceeds maximum {MAX_MESSAGE_BYTES}"
+        )));
+    }
     // Body
     let mut body = vec![0u8; len];
     read_exact(t, &mut body)?;
@@ -731,8 +762,19 @@ fn parse_search_entry(body: &[u8]) -> Result<SearchEntry> {
 
 /// Append an LDIF representation of a single entry to `out`.
 fn write_ldif_entry(out: &mut Vec<u8>, dn: &str, attrs: &[(String, Vec<Vec<u8>>)]) {
+    // The `dn` line's *value* is the DN string; `write_ldif_line` already
+    // base64-encodes any value with CR/LF/control/high bytes, so a malicious DN
+    // can't forge extra LDIF lines. (`dn` itself is a fixed, safe name.)
     write_ldif_line(out, "dn", dn.as_bytes());
     for (name, vals) in attrs {
+        // A server-supplied attribute *name* is emitted verbatim and cannot be
+        // base64-encoded in LDIF (only values can). If the name carries
+        // CR/LF/`:`/control bytes it could forge new LDIF lines downstream
+        // (e.g. `cn\nuserPassword`), so drop any attribute whose name isn't a
+        // legal LDIF AttributeDescription rather than emit it unescaped.
+        if !ldif_name_is_safe(name) {
+            continue;
+        }
         for v in vals {
             write_ldif_line(out, name, v);
         }
@@ -740,8 +782,23 @@ fn write_ldif_entry(out: &mut Vec<u8>, dn: &str, attrs: &[(String, Vec<Vec<u8>>)
     out.push(b'\n');
 }
 
+/// True if `name` is a safe LDIF attribute description: non-empty, ASCII, and
+/// free of any character that could break the `name: value` framing (control
+/// bytes, `:`, space, or the leading `<` URL form). RFC 2849 attribute
+/// descriptions are restricted to letters/digits/`-`/`;`/`.` so this is
+/// conservative but never rejects a legitimate name.
+fn ldif_name_is_safe(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    name.bytes()
+        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b';' | b'.'))
+}
+
 /// Emit a single `name: value` LDIF line. Uses base64 form (`name:: ...`) when
-/// the value is not safe printable ASCII per RFC 2849.
+/// the value is not safe printable ASCII per RFC 2849. Callers must ensure
+/// `name` is a safe LDIF attribute description (see [`ldif_name_is_safe`]) —
+/// the value, by contrast, is always made safe here.
 fn write_ldif_line(out: &mut Vec<u8>, name: &str, value: &[u8]) {
     if ldif_is_safe(value) {
         out.extend_from_slice(name.as_bytes());
@@ -819,6 +876,11 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
         return Err(Error::UnsupportedScheme(url.scheme.clone()));
     }
     let q = parse_ldap_path(&url.path)?;
+    // The DN and filter are percent-decoded from the URL and BER-encoded into
+    // the search request; reject embedded control bytes (defense-in-depth — no
+    // legitimate DN/filter contains them).
+    reject_ctl(&q.dn, "search DN")?;
+    reject_ctl(&q.filter, "search filter")?;
 
     // Split userinfo into user/password.
     let (bind_name, bind_pass) = match url.userinfo.as_deref() {
@@ -828,6 +890,9 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
             None => (percent_decode(ui), String::new()),
         },
     };
+    // Same for the bind DN / password before they go into the BindRequest.
+    reject_ctl(&bind_name, "bind DN")?;
+    reject_ctl(&bind_pass, "bind password")?;
 
     // Connect.
     let sock = connect_with_timeout(&url.host, url.port)?;
@@ -1110,6 +1175,83 @@ mod tests {
         write_ldif_line(&mut out, "cn", &[0xc3, 0xa9]);
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with("cn:: "), "got {s:?}");
+    }
+
+    #[test]
+    fn ldif_name_safety() {
+        assert!(ldif_name_is_safe("cn"));
+        assert!(ldif_name_is_safe("userPassword"));
+        assert!(ldif_name_is_safe("attr-1.2;binary"));
+        // Empty, or anything with framing-breaking bytes, is unsafe.
+        assert!(!ldif_name_is_safe(""));
+        assert!(!ldif_name_is_safe("cn\nuserPassword"));
+        assert!(!ldif_name_is_safe("cn:evil"));
+        assert!(!ldif_name_is_safe("cn evil"));
+        assert!(!ldif_name_is_safe("cn\0"));
+    }
+
+    #[test]
+    fn write_ldif_entry_drops_unsafe_attribute_names() {
+        // A malicious server returns an attribute whose NAME embeds a newline
+        // to forge an extra LDIF line. The forged name must be dropped, while
+        // a sibling legitimate attribute is still emitted.
+        let attrs = vec![
+            ("cn\nuserPassword".to_string(), vec![b"secret".to_vec()]),
+            ("mail".to_string(), vec![b"a@b".to_vec()]),
+        ];
+        let mut out = Vec::new();
+        write_ldif_entry(&mut out, "cn=alice,dc=ex", &attrs);
+        let s = String::from_utf8(out).unwrap();
+        // The forged name never appears as a line.
+        assert!(!s.contains("userPassword"));
+        assert!(!s.contains("secret"));
+        // The good attribute survives, and the DN line is present.
+        assert!(s.contains("dn: cn=alice,dc=ex"));
+        assert!(s.contains("mail: a@b"));
+    }
+
+    #[test]
+    fn write_ldif_entry_base64s_dn_with_newline() {
+        // A DN carrying a newline can't forge lines: its value is base64-encoded.
+        let mut out = Vec::new();
+        write_ldif_entry(&mut out, "cn=alice\ncn=evil", &[]);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("dn:: "), "got {s:?}");
+        assert!(!s.contains("cn=evil\n"));
+    }
+
+    #[test]
+    fn reject_ctl_flags_control_bytes() {
+        assert!(reject_ctl("dc=example,dc=com", "search DN").is_ok());
+        assert!(reject_ctl("(cn=Alice Smith)", "search filter").is_ok());
+        assert!(reject_ctl("cn=a\nob", "search DN").is_err());
+        assert!(reject_ctl("cn=a\rb", "bind DN").is_err());
+        assert!(reject_ctl("cn=a\0b", "bind password").is_err());
+        assert!(reject_ctl("cn=a\x7f", "search DN").is_err());
+    }
+
+    #[test]
+    fn read_message_rejects_oversized_length() {
+        // A SEQUENCE header declaring a body larger than MAX_MESSAGE_BYTES must
+        // be rejected before we `vec![0u8; len]`. No body is supplied — the
+        // error has to fire on the length check alone.
+        let big = MAX_MESSAGE_BYTES + 1;
+        let mut wire = vec![tag::SEQUENCE];
+        encode_length(big, &mut wire);
+        let mut io = std::io::Cursor::new(wire);
+        let err = read_message_from(&mut io).expect_err("oversized length must error");
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn read_message_accepts_within_cap() {
+        // A small, well-formed message reads back its body bytes intact.
+        let mut wire = vec![tag::SEQUENCE];
+        encode_length(3, &mut wire);
+        wire.extend_from_slice(&[0x01, 0x02, 0x03]);
+        let mut io = std::io::Cursor::new(wire);
+        let body = read_message_from(&mut io).unwrap();
+        assert_eq!(body, vec![0x01, 0x02, 0x03]);
     }
 
     #[test]

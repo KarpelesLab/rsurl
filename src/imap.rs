@@ -26,6 +26,12 @@ use crate::error::{Error, Result};
 use crate::tls::{connect_over, TlsStream};
 use crate::url::Url;
 
+/// Upper bound on a single server-declared IMAP literal (`{N}`). The size is
+/// chosen by the server, and `read_exact` would otherwise `Vec::with_capacity`
+/// and read that many bytes — an unbounded allocation / DoS vector. 64 MiB
+/// matches the crate's other body caps (e.g. `rtsp`, `websocket`).
+const MAX_LITERAL_BYTES: usize = 64 * 1024 * 1024;
+
 /// LOGIN (using userinfo or fall back to anonymous), SELECT the mailbox from
 /// `url.path`, then either LIST mailboxes or FETCH a specific message and
 /// return the raw RFC 5322 message bytes (or the LIST output).
@@ -432,6 +438,11 @@ impl LineReader {
             // verbatim and treat them as a continuation of the same logical
             // response (so the tagged-line check below doesn't trip on them).
             if let Some(n) = extract_literal_size(&line) {
+                if n > MAX_LITERAL_BYTES {
+                    return Err(Error::BadResponse(format!(
+                        "imap: literal size {n} exceeds maximum {MAX_LITERAL_BYTES}"
+                    )));
+                }
                 let bytes = self.read_exact(sock, n)?;
                 text.push_str(&String::from_utf8_lossy(&bytes));
                 literals.push(bytes);
@@ -617,6 +628,21 @@ mod tests {
         assert_eq!(literals, vec![b"hello".to_vec()]);
         assert!(text.contains("hello"));
         assert!(text.contains("a001 OK"));
+    }
+
+    #[test]
+    fn line_reader_rejects_oversized_literal() {
+        // A server advertising a literal larger than MAX_LITERAL_BYTES must be
+        // rejected before we try to allocate/read that many bytes. We don't
+        // supply the body — the error has to fire on the size check alone.
+        let big = MAX_LITERAL_BYTES + 1;
+        let wire = format!("* 1 FETCH (BODY[] {{{big}}}\r\n");
+        let mut src: &[u8] = wire.as_bytes();
+        let mut lr = LineReader::new();
+        let err = lr
+            .read_response_with_literals(&mut src, "a001")
+            .expect_err("oversized literal must be rejected");
+        assert!(matches!(err, Error::BadResponse(_)));
     }
 
     #[test]

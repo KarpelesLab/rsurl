@@ -68,6 +68,12 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
     // 1) Control channel.
     let tcp = TcpStream::connect((url.host.as_str(), url.port))?;
+    // Remember the control connection's peer address. PASV replies carry a
+    // server-chosen data-connection IP which we deliberately ignore (a hostile
+    // control server could point it at an internal service — the classic FTP
+    // "bounce"/SSRF). curl's safe default is to dial the data connection to the
+    // control connection's peer, using only the server-supplied port.
+    let ctrl_peer_ip = tcp.peer_addr()?.ip();
     let control = if url.scheme == "ftps" {
         Stream::Tls(Box::new(crate::tls::connect_over(tcp, &url.host)?))
     } else {
@@ -83,6 +89,11 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
     // 3) Login. Anonymous by default; honor `user[:pass]@` from the URL.
     let (user, pass) = split_userinfo(url.userinfo.as_deref());
+    // Reject control characters in URL-derived credentials so a CR/LF can't
+    // smuggle extra FTP commands onto the control channel (`send` also guards
+    // the assembled line, but validating the inputs gives a clearer error).
+    reject_ctl(&user, "ftp user")?;
+    reject_ctl(&pass, "ftp password")?;
     send(&mut ctrl, &format!("USER {user}"))?;
     let (c, _) = read_reply(&mut ctrl)?;
     match c {
@@ -112,7 +123,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
     // 5) Passive: try EPSV first (works on v4 *and* v6, no parsing of host
     //    bytes needed), fall back to PASV on permanent failure.
-    let (data_host, data_port) = open_passive(&mut ctrl, &url.host, url.port)?;
+    let (data_host, data_port) = open_passive(&mut ctrl, &url.host, ctrl_peer_ip)?;
 
     // 6) Issue the transfer command BEFORE opening the data socket on some
     //    servers, AFTER on others; the spec allows either. We connect first
@@ -129,7 +140,9 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     };
 
     // 7) RETR for files, LIST for directories. We treat a trailing '/' or
-    //    the bare root path as "list this directory".
+    //    the bare root path as "list this directory". Reject control bytes in
+    //    the path first so it can't break out of the RETR/LIST command line.
+    reject_ctl(&url.path, "ftp path")?;
     let cmd = if url.path.is_empty() || url.path == "/" {
         "LIST".to_string()
     } else if url.path.ends_with('/') {
@@ -181,7 +194,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 fn open_passive<R: Read + Write>(
     ctrl: &mut BufReader<R>,
     fallback_host: &str,
-    _fallback_port: u16,
+    ctrl_peer_ip: std::net::IpAddr,
 ) -> Result<(String, u16)> {
     send(ctrl, "EPSV")?;
     let (c, m) = read_reply(ctrl)?;
@@ -202,16 +215,44 @@ fn open_passive<R: Read + Write>(
     if c2 != 227 {
         return Err(Error::BadResponse(format!("ftp PASV: {c2} {m2}")));
     }
-    parse_pasv(&m2).ok_or_else(|| Error::BadResponse(format!("ftp PASV: cannot parse: {m2}")))
+    // Parse the reply only for its PORT — the server-supplied IP is ignored to
+    // prevent an FTP bounce/SSRF. We dial the control connection's peer instead
+    // (curl's safe default; also keeps PASV consistent with EPSV above).
+    let (_ignored_host, port) = parse_pasv(&m2)
+        .ok_or_else(|| Error::BadResponse(format!("ftp PASV: cannot parse: {m2}")))?;
+    Ok((ctrl_peer_ip.to_string(), port))
 }
 
 /// Write a single FTP command followed by CRLF, using the BufReader's
 /// underlying writer (BufReader itself isn't `Write`).
+///
+/// Refuses to send a command line that already contains a CR, LF, or NUL: the
+/// CRLF terminator is appended here, so any embedded CR/LF in the assembled
+/// line would be a command-injection vector (URL-derived user/pass/path flow
+/// into these commands). This is the last line of defense behind the explicit
+/// [`reject_ctl`] checks on the individual inputs.
 fn send<R: Read + Write>(r: &mut BufReader<R>, line: &str) -> Result<()> {
+    if line.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(Error::BadResponse(
+            "ftp: refusing to send command line with embedded CR/LF/NUL".into(),
+        ));
+    }
     let w = r.get_mut();
     w.write_all(line.as_bytes())?;
     w.write_all(b"\r\n")?;
     w.flush()?;
+    Ok(())
+}
+
+/// Reject a URL-derived string that contains CR, LF, NUL, or any other ASCII
+/// control byte before it's interpolated into an FTP control command. `what`
+/// names the field for the error message.
+fn reject_ctl(s: &str, what: &str) -> Result<()> {
+    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+        return Err(Error::BadResponse(format!(
+            "ftp: {what} contains illegal control byte {b:#04x}"
+        )));
+    }
     Ok(())
 }
 
@@ -299,11 +340,14 @@ fn parse_pasv(text: &str) -> Option<(String, u16)> {
         return None;
     }
     let nums: Vec<u16> = parts.iter().filter_map(|p| p.parse::<u16>().ok()).collect();
-    if nums.len() != 6 || nums[..4].iter().any(|&n| n > 255) {
+    // All six fields are octets (0..=255): the four IP bytes *and* the two
+    // port bytes. Range-checking the port bytes too avoids a silent truncation
+    // when computing the 16-bit port below.
+    if nums.len() != 6 || nums.iter().any(|&n| n > 255) {
         return None;
     }
     let host = format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]);
-    let port = (nums[4] << 8) | nums[5];
+    let port = ((nums[4] as u8 as u16) << 8) | nums[5] as u8 as u16;
     Some((host, port))
 }
 
@@ -435,6 +479,89 @@ mod tests {
         assert!(parse_pasv("nope").is_none());
         assert!(parse_pasv("(1,2,3)").is_none());
         assert!(parse_pasv("(256,0,0,1,1,1)").is_none()); // octet > 255
+    }
+
+    #[test]
+    fn pasv_rejects_out_of_range_port_bytes() {
+        // Port bytes >255 would silently truncate when combined; reject them.
+        assert!(parse_pasv("(10,0,0,1,256,5)").is_none());
+        assert!(parse_pasv("(10,0,0,1,5,256)").is_none());
+        // 255,255 is the largest legal pair → port 65535.
+        let (_, port) = parse_pasv("(10,0,0,1,255,255)").unwrap();
+        assert_eq!(port, 65535);
+    }
+
+    /// Scripted in-memory transport: serves `reply_script` to reads and
+    /// records everything written so tests can assert on commands sent.
+    struct MockIo {
+        to_read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl Read for MockIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.to_read.read(buf)
+        }
+    }
+    impl Write for MockIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn open_passive_pasv_dials_control_peer_not_reply_ip() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // EPSV is refused (500), then PASV advertises a *different* IP
+        // (10.0.0.1) that we must ignore in favor of the control peer.
+        let script = "500 EPSV not understood\r\n227 Entering Passive Mode (10,0,0,1,4,5)\r\n";
+        let mut io = BufReader::new(MockIo {
+            to_read: std::io::Cursor::new(script.as_bytes().to_vec()),
+            written: Vec::new(),
+        });
+        let ctrl_peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let (host, port) = open_passive(&mut io, "ftp.example.com", ctrl_peer).unwrap();
+        // Host is the control peer, NOT the 10.0.0.1 from the PASV reply.
+        assert_eq!(host, "203.0.113.7");
+        // Port is still taken from the (validated) PASV reply.
+        assert_eq!(port, 4 * 256 + 5);
+    }
+
+    #[test]
+    fn send_rejects_embedded_crlf() {
+        let mut io = BufReader::new(MockIo {
+            to_read: std::io::Cursor::new(Vec::new()),
+            written: Vec::new(),
+        });
+        assert!(matches!(
+            send(&mut io, "USER alice\r\nDELE secret"),
+            Err(Error::BadResponse(_))
+        ));
+        assert!(matches!(
+            send(&mut io, "USER alice\nNOOP"),
+            Err(Error::BadResponse(_))
+        ));
+        assert!(matches!(
+            send(&mut io, "USER alice\0bob"),
+            Err(Error::BadResponse(_))
+        ));
+        // A clean line goes through and gets exactly one CRLF appended.
+        send(&mut io, "USER alice").unwrap();
+        assert_eq!(io.get_ref().written, b"USER alice\r\n");
+    }
+
+    #[test]
+    fn reject_ctl_flags_control_bytes() {
+        assert!(reject_ctl("alice", "ftp user").is_ok());
+        assert!(reject_ctl("a/b/c.txt", "ftp path").is_ok());
+        assert!(reject_ctl("alice\r\nPASS x", "ftp user").is_err());
+        assert!(reject_ctl("a\nb", "ftp path").is_err());
+        assert!(reject_ctl("a\0b", "ftp user").is_err());
+        assert!(reject_ctl("a\x7fb", "ftp user").is_err()); // DEL
     }
 
     #[test]
