@@ -1,4 +1,4 @@
-//! Response-body decompression for `Content-Encoding: gzip | deflate`.
+//! Response-body decompression for `Content-Encoding: gzip | deflate | zstd | br`.
 //!
 //! `Accept-Encoding: gzip, deflate` is offered by default on every HTTP
 //! request rsurl makes; this module is the matching decode side. It is the
@@ -11,23 +11,27 @@
 //! * **gzip** (RFC 1952) and **deflate** (RFC 1951) are decoded.
 //!   `x-gzip` is accepted as a gzip alias because some legacy servers
 //!   still emit it.
+//! * **zstd** (RFC 8878) and **br** (brotli, RFC 7932) are decoded too,
+//!   via `compcol`'s pure-Rust codecs — no C dependency is pulled in.
 //! * **identity** is a no-op pass-through.
-//! * **brotli**, **zstd**, and **compress** are not implemented; a body
-//!   labelled with one of those is returned verbatim and the encoding
-//!   token is reported so the caller can decide what to do (today, we
-//!   leave the header in place and ship the bytes through unchanged —
-//!   matching what curl does when it doesn't know an encoding).
+//! * **compress** (LZW) is not implemented; a body labelled with it (or any
+//!   other unknown encoding) is returned verbatim and the encoding token is
+//!   reported so the caller can decide what to do (today, we leave the header
+//!   in place and ship the bytes through unchanged — matching what curl does
+//!   when it doesn't know an encoding).
 //!
 //! `Content-Encoding` is a list. RFC 9110 §8.4.1 says encodings are applied
 //! in the order listed, so decoding walks the list **right-to-left**.
 
 use std::io::Read;
 
+use compcol::brotli::Brotli;
 use compcol::deflate::Deflate;
 use compcol::gzip::Gzip;
 use compcol::io::DecoderReader;
 use compcol::limit::LimitedDecoder;
 use compcol::zlib::Zlib;
+use compcol::zstd::Zstd;
 use compcol::Algorithm;
 
 use crate::error::{Error, Result};
@@ -106,6 +110,16 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
                 budget = budget.saturating_sub(current.len() as u64);
                 peeled = true;
             }
+            Some(Layer::Zstd) => {
+                current = unzstd(&current, budget)?;
+                budget = budget.saturating_sub(current.len() as u64);
+                peeled = true;
+            }
+            Some(Layer::Brotli) => {
+                current = unbrotli(&current, budget)?;
+                budget = budget.saturating_sub(current.len() as u64);
+                peeled = true;
+            }
             None => {
                 // Unknown outer layer — return what we have so far with the
                 // body untouched from this point in. We can't safely strip
@@ -127,6 +141,8 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
 enum Layer {
     Gzip,
     Deflate,
+    Zstd,
+    Brotli,
     Identity,
 }
 
@@ -137,6 +153,10 @@ impl Layer {
             Some(Layer::Gzip)
         } else if token.eq_ignore_ascii_case("deflate") {
             Some(Layer::Deflate)
+        } else if token.eq_ignore_ascii_case("zstd") {
+            Some(Layer::Zstd)
+        } else if token.eq_ignore_ascii_case("br") {
+            Some(Layer::Brotli)
         } else if token.eq_ignore_ascii_case("identity") {
             Some(Layer::Identity)
         } else {
@@ -180,6 +200,21 @@ fn inflate_zlib(src: &[u8], budget: u64) -> Result<Vec<u8>> {
         .map_err(|_| Error::BadResponse(format!("deflate decode failed: {zlib_err}")))
 }
 
+/// Decode a `zstd`-encoded (RFC 8878) body. Routes through the same
+/// budget-bounded streaming path as gzip/deflate; compcol's zstd decoder is
+/// pure Rust and plugs into the generic `decode_with` via its `Algorithm` impl.
+fn unzstd(src: &[u8], budget: u64) -> Result<Vec<u8>> {
+    decode_with::<Zstd>(src, budget)
+        .map_err(|e| Error::BadResponse(format!("zstd decode failed: {e}")))
+}
+
+/// Decode a `br`-encoded (brotli, RFC 7932) body. Same budget-bounded
+/// streaming path as the other codecs.
+fn unbrotli(src: &[u8], budget: u64) -> Result<Vec<u8>> {
+    decode_with::<Brotli>(src, budget)
+        .map_err(|e| Error::BadResponse(format!("brotli decode failed: {e}")))
+}
+
 /// Strip `Content-Encoding` and `Content-Length` from a response header
 /// list after a successful in-place body decode. Returns the new headers.
 ///
@@ -210,6 +245,14 @@ mod tests {
 
     fn raw_deflate(data: &[u8]) -> Vec<u8> {
         compress_to_vec::<Deflate>(data).expect("deflate encode")
+    }
+
+    fn zstd(data: &[u8]) -> Vec<u8> {
+        compress_to_vec::<Zstd>(data).expect("zstd encode")
+    }
+
+    fn brotli(data: &[u8]) -> Vec<u8> {
+        compress_to_vec::<Brotli>(data).expect("brotli encode")
     }
 
     #[test]
@@ -268,11 +311,93 @@ mod tests {
 
     #[test]
     fn unknown_outer_layer_returns_undecoded() {
-        // br first means we can't reach the gzip layer underneath.
+        // `compress` (LZW) is still unimplemented; as the outer layer it
+        // means we can't reach the gzip layer underneath, so the body is
+        // returned verbatim with nothing peeled.
         let payload = gz(b"inner");
-        let out = decode_body(payload.clone(), "gzip, br").unwrap();
+        let out = decode_body(payload.clone(), "gzip, compress").unwrap();
         assert_eq!(out.body, payload);
         assert!(!out.decoded);
+    }
+
+    #[test]
+    fn decodes_zstd() {
+        let out = decode_body(zstd(b"hello zstd world"), "zstd").unwrap();
+        assert_eq!(out.body, b"hello zstd world");
+        assert!(out.decoded);
+    }
+
+    #[test]
+    fn decodes_brotli() {
+        let out = decode_body(brotli(b"hello brotli world"), "br").unwrap();
+        assert_eq!(out.body, b"hello brotli world");
+        assert!(out.decoded);
+    }
+
+    #[test]
+    fn zstd_token_is_case_insensitive() {
+        let out = decode_body(zstd(b"Z"), "ZSTD").unwrap();
+        assert_eq!(out.body, b"Z");
+    }
+
+    #[test]
+    fn brotli_token_is_case_insensitive() {
+        let out = decode_body(brotli(b"B"), "BR").unwrap();
+        assert_eq!(out.body, b"B");
+    }
+
+    #[test]
+    fn corrupt_zstd_reports_error() {
+        let mut bad = zstd(b"valid payload");
+        // Truncate the frame so the decoder can't reach the end-of-stream.
+        bad.truncate(bad.len() / 2);
+        let err = decode_body(bad, "zstd").unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("zstd"), "got {msg:?}"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_brotli_reports_error() {
+        // A valid brotli frame chopped in half mid-stream must surface as a
+        // decode error rather than silently producing a truncated body.
+        let mut bad = brotli(b"a reasonably long brotli payload to truncate");
+        bad.truncate(bad.len() / 2);
+        let err = decode_body(bad, "br").unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("brotli"), "got {msg:?}"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zstd_then_gzip_share_one_budget() {
+        // Mixed stack within the layer cap: gzip(zstd(plain)), labelled
+        // "zstd, gzip" (applied in order zstd-then-gzip, peeled right-to-left).
+        let inner = zstd(b"mixed payload");
+        let outer = gz(&inner);
+        let out = decode_body(outer, "zstd, gzip").unwrap();
+        assert_eq!(out.body, b"mixed payload");
+        assert!(out.decoded);
+    }
+
+    #[test]
+    fn zstd_bomb_rejected_by_budget_cap() {
+        // Compress far more than MAX_BODY_BYTES of highly-compressible input;
+        // the cumulative budget must reject it instead of materialising the
+        // full expansion. The compressed frame itself is tiny.
+        let huge = vec![0u8; MAX_BODY_BYTES + (1 << 20)];
+        let bomb = zstd(&huge);
+        assert!(
+            bomb.len() < huge.len(),
+            "fixture should actually be compressed"
+        );
+        let err = decode_body(bomb, "zstd").unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("zstd"), "got {msg:?}"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     #[test]

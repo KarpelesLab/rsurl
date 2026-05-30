@@ -42,11 +42,14 @@ purecrypto = "0.2"
 # the purecrypto backend.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12", "logging"] }
 rustls-pemfile = { version = "2", optional = true }
-# gzip / zlib / raw-deflate codecs. `compcol` is our own pure-Rust
-# compression collection; `std` enables the `io` adapter we use to bound
-# decompressed output via `LimitedDecoder`. `factory` and `rle` are not
-# needed here, so leave default features off and opt in to only what we use.
-compcol = { version = "0.4", default-features = false, features = ["std", "gzip", "zlib"] }
+# gzip / zlib / raw-deflate / zstd / brotli codecs. `compcol` is our own
+# pure-Rust compression collection; `std` enables the `io` adapter we use to
+# bound decompressed output via `LimitedDecoder`. The `zstd` and `brotli`
+# features are pure-Rust (each only pulls in `alloc`, no `*-sys` C crate), so
+# we can decode those response encodings without breaking the no-C guarantee.
+# `factory` and `rle` are not needed here, so leave default features off and
+# opt in to only what we use.
+compcol = { version = "0.4", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli"] }
 
 [profile.release]
 lto = "thin"

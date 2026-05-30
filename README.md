@@ -22,7 +22,7 @@ Early, in active development.
 |---|---|---|
 | HTTP/1.1 (all methods) | working | Content-Length, chunked, read-to-EOF body modes |
 | Connection reuse | working | process-wide keep-alive pool for HTTP/1.1 (plain & TLS); HTTP/2 keeps its own pool |
-| Response compression | working | `gzip` / `deflate` / `x-gzip` decoded transparently (always-on) |
+| Response compression | working | `gzip` / `deflate` / `x-gzip` / `zstd` / `br` decoded transparently (always-on) |
 | Cookies (`-b` / `-c`) | working | RFC 6265 jar; Netscape `cookies.txt` I/O, curl-compatible |
 | HTTP proxy (`-x`) | working | absolute-form for plain HTTP, `CONNECT` tunnel for HTTPS, Basic auth, `--noproxy` / `*_PROXY` env vars |
 | HTTPS via purecrypto | working | TLS 1.2/1.3, system roots, full cert verification |
