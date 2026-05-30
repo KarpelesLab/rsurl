@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/rsurl/compare/v0.0.4...v0.0.5) - 2026-05-30
+
+### Other
+
+- enforce inbound flow-control window, reject peer overrun (FLOW_CONTROL_ERROR)
+- fail closed when an existing known_hosts file cannot be read (avoid silent TOFU accept-all)
+- bound filter-parser recursion depth to prevent stack-overflow DoS
+- cap packet remaining-length at 64 MiB to prevent pre-alloc memory exhaustion
+- reject backslash and percent in reg-name host (parser-differential host confusion)
+- bound status/header/chunk-size/trailer line reads to prevent server-driven OOM (DoS)
+- fix three confirmed security bugs in Set-Cookie handling
+- reject pre-TLS pipelined data before STARTTLS upgrade (CVE-2011-0411 class injection)
+- bound attacker-controlled QPACK literal lengths with checked_add (fix slice-index panic / remote DoS)
+
 ## [0.0.4](https://github.com/KarpelesLab/rsurl/compare/v0.0.3...v0.0.4) - 2026-05-30
 
 ### Other
