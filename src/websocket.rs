@@ -17,7 +17,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use purecrypto::hash::{Digest, Sha1};
 
@@ -71,7 +71,7 @@ fn tcp_connect(url: &Url) -> Result<TcpStream> {
 /// Drive the HTTP/1.1 upgrade handshake on `stream`. After this returns, the
 /// stream sits at the first byte of the first WS frame.
 fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
-    let key_bytes: [u8; 16] = random_16();
+    let key_bytes: [u8; 16] = random_16()?;
     let key_b64 = base64_encode(&key_bytes);
 
     let host_header =
@@ -188,7 +188,7 @@ fn read_data_and_close<S: Read + Write>(stream: &mut S) -> Result<Vec<u8>> {
         match frame.opcode {
             OPCODE_TEXT | OPCODE_BINARY => break frame.payload,
             OPCODE_PING => {
-                let pong = build_client_frame(OPCODE_PONG, &frame.payload);
+                let pong = build_client_frame(OPCODE_PONG, &frame.payload)?;
                 stream.write_all(&pong)?;
                 stream.flush()?;
             }
@@ -215,9 +215,13 @@ fn read_data_and_close<S: Read + Write>(stream: &mut S) -> Result<Vec<u8>> {
     // frames — but with a zero-length payload there's nothing to mask, and
     // every implementation in the wild accepts \x88\x00 here. We send the
     // properly masked variant anyway to stay spec-clean.
-    let close = build_client_frame(OPCODE_CLOSE, &[]);
-    let _ = stream.write_all(&close);
-    let _ = stream.flush();
+    // A failure to obtain entropy for the close frame is non-fatal: we've
+    // already captured the payload, so just skip the polite close in that
+    // (extremely unlikely) case rather than discarding a good result.
+    if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
+        let _ = stream.write_all(&close);
+        let _ = stream.flush();
+    }
     Ok(payload)
 }
 
@@ -279,10 +283,11 @@ fn read_frame<S: Read>(stream: &mut S) -> Result<Frame> {
 }
 
 /// Build an unfragmented client-to-server frame with the given opcode and
-/// payload. Client frames must be masked (RFC 6455 §5.3).
-fn build_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+/// payload. Client frames must be masked (RFC 6455 §5.3), and the mask must
+/// be unpredictable, so this fails if no secure entropy source is available.
+fn build_client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>> {
     let mask: [u8; 4] = {
-        let r = random_16();
+        let r = random_16()?;
         [r[0], r[1], r[2], r[3]]
     };
     let mut out = Vec::with_capacity(2 + 8 + 4 + payload.len());
@@ -303,7 +308,7 @@ fn build_client_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     for (i, b) in out[start..].iter_mut().enumerate() {
         *b ^= mask[i & 3];
     }
-    out
+    Ok(out)
 }
 
 fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
@@ -328,43 +333,23 @@ fn derive_accept(key_b64: &str) -> String {
     base64_encode(digest.as_ref())
 }
 
-/// 16 random bytes for `Sec-WebSocket-Key` and mask seeds. Tries the OS RNG
-/// first; falls back to a time-mixed seed if it can't be read (e.g. in an
-/// extremely locked-down sandbox). This is *not* security-grade entropy in
-/// the fallback path, but the WS spec only requires the key be
-/// "randomly selected" for handshake uniqueness, not unpredictability.
-fn random_16() -> [u8; 16] {
+/// 16 cryptographically-random bytes for the `Sec-WebSocket-Key` and frame
+/// masks, sourced from the crate's vetted CSPRNG ([`purecrypto::rng::OsRng`],
+/// the same source used by `mqtt.rs`).
+///
+/// `OsRng::fill_bytes` panics if it cannot read OS entropy (e.g. a missing
+/// `/dev/urandom` in a locked-down sandbox). We catch that and surface it as
+/// a connection error rather than either crashing the process or — worse —
+/// falling back to predictable time/PID entropy: a guessable mask weakens the
+/// masking the spec relies on, so failing closed is the secure choice.
+fn random_16() -> Result<[u8; 16]> {
     use purecrypto::rng::{OsRng, RngCore};
     let mut out = [0u8; 16];
-    // OsRng::fill_bytes panics on read failure; catch that with a thread-safe
-    // direct-read attempt so a missing /dev/urandom doesn't kill the process.
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut out))
-        .is_ok()
-    {
-        return out;
-    }
-    // Last-ditch fallback. Mix a few sources of jitter.
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0));
-    let nanos = now.as_nanos() as u64;
-    let pid = std::process::id() as u64;
-    let mut state = nanos ^ (pid.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    for chunk in out.chunks_mut(8) {
-        // SplitMix64.
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        let bytes = z.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-    // Silence unused warning if OsRng path was preferred but failed.
-    let _ = OsRng;
-    let _ = <OsRng as RngCore>::next_u32;
-    out
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        OsRng.fill_bytes(&mut out);
+    }))
+    .map_err(|_| Error::BadResponse("websocket: no secure entropy source available".into()))?;
+    Ok(out)
 }
 
 /// Standard base64 (RFC 4648 §4) with `=` padding. Hand-rolled so we don't
@@ -477,7 +462,7 @@ mod tests {
     fn build_close_frame_short_payload() {
         // Empty close frame: header byte 0x88 (FIN + opcode 8), len byte has
         // MASK bit set + payload-len 0, plus a 4-byte mask. Total: 6 bytes.
-        let frame = build_client_frame(OPCODE_CLOSE, &[]);
+        let frame = build_client_frame(OPCODE_CLOSE, &[]).unwrap();
         assert_eq!(frame.len(), 6);
         assert_eq!(frame[0], 0x88);
         assert_eq!(frame[1], 0x80); // mask flag set, length 0
@@ -486,7 +471,7 @@ mod tests {
     #[test]
     fn build_text_frame_masks_payload() {
         let payload = b"hi";
-        let frame = build_client_frame(OPCODE_TEXT, payload);
+        let frame = build_client_frame(OPCODE_TEXT, payload).unwrap();
         // Header (2) + mask (4) + payload (2) = 8.
         assert_eq!(frame.len(), 8);
         assert_eq!(frame[0], 0x81);
@@ -503,7 +488,7 @@ mod tests {
     #[test]
     fn build_frame_uses_16bit_length_for_medium_payload() {
         let payload = vec![0u8; 200];
-        let frame = build_client_frame(OPCODE_BINARY, &payload);
+        let frame = build_client_frame(OPCODE_BINARY, &payload).unwrap();
         assert_eq!(frame[0], 0x82);
         assert_eq!(frame[1], 0x80 | 126);
         let len = u16::from_be_bytes([frame[2], frame[3]]);
@@ -515,7 +500,7 @@ mod tests {
     #[test]
     fn build_frame_uses_64bit_length_for_large_payload() {
         let payload = vec![0u8; 70_000];
-        let frame = build_client_frame(OPCODE_BINARY, &payload);
+        let frame = build_client_frame(OPCODE_BINARY, &payload).unwrap();
         assert_eq!(frame[1], 0x80 | 127);
         let len = u64::from_be_bytes([
             frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8], frame[9],
@@ -525,8 +510,17 @@ mod tests {
 
     #[test]
     fn random_16_is_nonzero() {
-        // Astronomically unlikely the OS or fallback returns all zeros.
-        let r = random_16();
+        // Astronomically unlikely the CSPRNG returns all zeros.
+        let r = random_16().expect("OS entropy available in the test environment");
         assert_ne!(r, [0u8; 16]);
+    }
+
+    #[test]
+    fn random_16_is_not_constant() {
+        // Two draws should differ — a sanity check that we're pulling fresh
+        // entropy, not a fixed seed.
+        let a = random_16().unwrap();
+        let b = random_16().unwrap();
+        assert_ne!(a, b);
     }
 }

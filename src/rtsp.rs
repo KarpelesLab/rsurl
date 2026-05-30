@@ -33,6 +33,13 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| Error::InvalidUrl(url.host.clone()))?;
+    // `url.host` and `url.path` are interpolated raw into the
+    // `DESCRIBE <uri> RTSP/1.0` request line and the `Host`-style URI. A bare
+    // CR, LF, NUL, or other control byte would let an attacker forge the
+    // request line or inject extra headers, so reject them up front.
+    reject_control_bytes(&url.host, "host")?;
+    reject_control_bytes(&url.path, "path")?;
+
     let stream = TcpStream::connect_timeout(&sock, CONNECT_TIMEOUT)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -44,6 +51,16 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
     let reader = BufReader::new(&stream);
     read_response_body(reader)
+}
+
+/// Reject any ASCII control byte (including CR, LF, and NUL) in a
+/// URL-derived RTSP request field, returning [`Error::InvalidUrl`]. This
+/// prevents request-line / header CRLF injection on the control connection.
+fn reject_control_bytes(value: &str, field: &str) -> Result<()> {
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::InvalidUrl(format!("rtsp: control byte in {field}")));
+    }
+    Ok(())
 }
 
 /// Reconstruct the absolute request-URI for use on the RTSP request line.
@@ -193,6 +210,24 @@ mod tests {
         assert!(req.contains("\r\nAccept: application/sdp\r\n"));
         assert!(req.contains("\r\nUser-Agent: rsurl/"));
         assert!(req.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn reject_control_bytes_flags_crlf() {
+        assert!(reject_control_bytes("exa\r\nmple.com", "host").is_err());
+        assert!(reject_control_bytes("/path\nDESCRIBE", "path").is_err());
+        assert!(reject_control_bytes("/path\rfoo", "path").is_err());
+        // NUL is a control byte too.
+        assert!(reject_control_bytes("ho\0st", "host").is_err());
+        // Clean values pass.
+        assert!(reject_control_bytes("example.com", "host").is_ok());
+        assert!(reject_control_bytes("/axis-media/media.amp", "path").is_ok());
+    }
+
+    #[test]
+    fn reject_control_bytes_returns_invalid_url() {
+        let err = reject_control_bytes("a\r\nb", "host").unwrap_err();
+        assert!(matches!(err, Error::InvalidUrl(_)));
     }
 
     #[test]

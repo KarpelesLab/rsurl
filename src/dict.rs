@@ -95,12 +95,32 @@ fn parse_path(path: &str) -> Result<DictRequest> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ".".into());
 
+    // The word/database/strategy are interpolated raw into CRLF-terminated
+    // DICT command lines (see `DictRequest::to_command` / `fetch`). A bare
+    // CR, LF, NUL, or other control byte in the URL would let an attacker
+    // inject additional DICT commands onto the wire, so reject them here.
+    reject_control_bytes(&word, "word", path)?;
+    reject_control_bytes(&database, "database", path)?;
+    reject_control_bytes(&strategy, "strategy", path)?;
+
     Ok(DictRequest {
         verb,
         word,
         database,
         strategy,
     })
+}
+
+/// Reject any ASCII control byte (including CR, LF, and NUL) in a
+/// URL-derived DICT field, returning [`Error::InvalidUrl`]. This prevents
+/// CRLF command injection on the DICT control connection.
+fn reject_control_bytes(value: &str, field: &str, path: &str) -> Result<()> {
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(Error::InvalidUrl(format!(
+            "dict: control byte in {field} of path '{path}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Read the three-digit status code at the start of a DICT response line.
@@ -329,6 +349,30 @@ mod tests {
     fn path_with_only_verb_prefix_is_rejected() {
         assert!(parse_path("/d:").is_err());
         assert!(parse_path("/m:").is_err());
+    }
+
+    #[test]
+    fn path_rejects_crlf_injection_in_word() {
+        // A raw CR/LF in the word would inject an extra DICT command.
+        let err = parse_path("/d:rust\r\nQUIT").unwrap_err();
+        assert!(matches!(err, Error::InvalidUrl(_)));
+        assert!(parse_path("/rust\nDEFINE * evil").is_err());
+        assert!(parse_path("/d:rust\rQUIT").is_err());
+    }
+
+    #[test]
+    fn path_rejects_control_bytes_in_database_and_strategy() {
+        assert!(parse_path("/d:rust:fol\r\ndoc").is_err());
+        assert!(parse_path("/m:rust:foldoc:pre\nfix").is_err());
+        // NUL byte is also a control byte.
+        assert!(parse_path("/d:rust:fol\0doc").is_err());
+    }
+
+    #[test]
+    fn path_accepts_clean_input() {
+        // Sanity: ordinary words with no control bytes still parse.
+        assert!(parse_path("/d:rust:foldoc").is_ok());
+        assert!(parse_path("/m:rust:foldoc:prefix").is_ok());
     }
 
     #[test]
