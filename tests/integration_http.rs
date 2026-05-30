@@ -1056,3 +1056,227 @@ fn cli_form_and_data_are_mutually_exclusive() {
         "stderr should explain conflict: {err}"
     );
 }
+
+/// `-d` and `-T` are mutually exclusive too — same exit-2 path.
+#[test]
+fn cli_data_and_upload_are_mutually_exclusive() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-d", "a=1", "-T", "/etc/hostname", "http://127.0.0.1:1/x"])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(out.status.code(), Some(2), "expected exit 2");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("mutually exclusive"),
+        "stderr should explain conflict: {err}"
+    );
+}
+
+/// `-F` and `-T` are mutually exclusive too — same exit-2 path.
+#[test]
+fn cli_form_and_upload_are_mutually_exclusive() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-F", "x=y", "-T", "/etc/hostname", "http://127.0.0.1:1/x"])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(out.status.code(), Some(2), "expected exit 2");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("mutually exclusive"),
+        "stderr should explain conflict: {err}"
+    );
+}
+
+/// `-F name=<file` reads the file but emits it as a **form field**, not a
+/// file upload: the part carries the file bytes as its value but has no
+/// `filename=` attribute and no auto-defaulted `Content-Type`. This is the
+/// behavioural distinction from `@file` and the reason `<` exists at all.
+#[test]
+fn cli_form_field_from_file_has_no_filename() {
+    use std::io::Write;
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("rsurl-lt-{}.txt", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(b"FIELD-VALUE").unwrap();
+    }
+    let arg = format!("note=<{}", tmp.display());
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-F", &arg, &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&tmp);
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    let ct = got.1.expect("Content-Type set");
+    let boundary = extract_boundary(&ct);
+    let part = find_part(&got.2, &boundary, "name=\"note\"");
+    let s = std::str::from_utf8(part).unwrap();
+    assert!(
+        !s.contains("filename="),
+        "FileAsField must not add filename=: {s}"
+    );
+    assert!(
+        !s.contains("Content-Type:"),
+        "FileAsField must not auto-set Content-Type: {s}"
+    );
+    assert!(
+        s.ends_with("\r\n\r\nFIELD-VALUE"),
+        "file bytes must arrive verbatim as field value: {s}"
+    );
+}
+
+/// `--form-escape` switches name/filename encoding from backslash-escape
+/// (the curl-historical default we already test) to RFC 7578 §4.2
+/// percent-encoding, so `"` becomes `%22` on the wire.
+#[test]
+fn cli_form_escape_percent_encodes_name() {
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["--form-escape", "-F", "weird\"name=v", &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    let ct = got.1.expect("Content-Type set");
+    let boundary = extract_boundary(&ct);
+    // Match on the percent-encoded form because the raw `"` no longer
+    // appears in the part header line.
+    let part = find_part(&got.2, &boundary, "name=\"weird%22name\"");
+    let s = std::str::from_utf8(part).unwrap();
+    assert!(
+        s.contains("name=\"weird%22name\""),
+        "expected RFC 7578 %22 encoding, got: {s}"
+    );
+    assert!(
+        !s.contains("\\\""),
+        "must not also backslash-escape when --form-escape is on: {s}"
+    );
+}
+
+/// Setting `;filename=` on an otherwise-literal `-F` part promotes it to
+/// an upload shape: the wire part gains `filename="…"` *and* the default
+/// `Content-Type: application/octet-stream`, matching curl's behaviour of
+/// "this string is a tiny file, treat it as such".
+#[test]
+fn cli_form_literal_with_filename_modifier_becomes_upload() {
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-F", "blob=hello;filename=hi.txt", &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    let ct = got.1.expect("Content-Type set");
+    let boundary = extract_boundary(&ct);
+    let part = find_part(&got.2, &boundary, "name=\"blob\"");
+    let s = std::str::from_utf8(part).unwrap();
+    assert!(
+        s.contains("name=\"blob\"; filename=\"hi.txt\"\r\n"),
+        ";filename= must promote literal to upload shape: {s}"
+    );
+    assert!(
+        s.contains("Content-Type: application/octet-stream\r\n"),
+        "promoted literal needs default octet-stream Content-Type: {s}"
+    );
+    assert!(
+        s.ends_with("\r\n\r\nhello"),
+        "promoted literal body must be the literal text: {s}"
+    );
+}
+
+/// `--data-raw @notafile` must put the literal bytes `@notafile` on the
+/// wire — no file read, no error. This is the whole point of `--data-raw`
+/// vs `-d` (which would try to open `notafile` and fail).
+#[test]
+fn cli_data_raw_leaves_at_literal_on_wire() {
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["--data-raw", "@notafile", &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(got.0, "POST");
+    assert_eq!(
+        got.1.as_deref(),
+        Some("application/x-www-form-urlencoded"),
+        "--data-raw still defaults to form-urlencoded"
+    );
+    assert_eq!(
+        got.2, b"@notafile",
+        "--data-raw must put the literal `@` text on the wire"
+    );
+}
+
+/// A user-supplied `Content-Type:` via `-H` must override the per-body
+/// default (`application/x-www-form-urlencoded` for `-d`, `multipart/…`
+/// for `-F`, `application/octet-stream` for `-T`). We check the `-d`
+/// path because it's the most common; the same code path serves all
+/// three, so this locks in the contract for everyone.
+#[test]
+fn cli_custom_content_type_header_overrides_default() {
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            r#"{"k":"v"}"#,
+            &server.url("/post"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(got.0, "POST");
+    assert_eq!(
+        got.1.as_deref(),
+        Some("application/json"),
+        "explicit -H Content-Type must win over the per-flag default"
+    );
+    assert_eq!(got.2, br#"{"k":"v"}"#);
+}
