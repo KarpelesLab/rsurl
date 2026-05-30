@@ -38,7 +38,7 @@ Early, in active development.
 | POP3 / POP3S (RFC 1939) | working | LIST or RETR, USER/PASS auth |
 | RTSP (RFC 7826) | working | DESCRIBE only; SETUP/PLAY session flow deferred |
 | TFTP (RFC 1350) | working | read side with timeout/retry, 256 MiB cap |
-| WS / WSS (RFC 6455) | working | reads one data frame then closes |
+| WS / WSS (RFC 6455) | working | send + receive data frames, fragmented message reassembly, ping/pong/close handling |
 
 \* HTTP/2 verified live against nghttp2.org and cloudflare.com from the implementation
 worktree. Available via `--http2` (force) or auto-negotiated via ALPN.

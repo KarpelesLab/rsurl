@@ -3,17 +3,29 @@
 //! WS handshakes are HTTP/1.1 `Upgrade: websocket` requests followed by
 //! binary/text frames. We perform the handshake by hand (so we can sit on the
 //! raw stream without buffered-reader leftovers eating into the frame
-//! channel), then read frames until we get a data frame. For `wss://`, the
-//! TCP stream is wrapped with [`crate::tls::connect_over`] before sending the
-//! upgrade.
+//! channel), then drive a proper frame loop. For `wss://`, the TCP stream is
+//! wrapped with [`crate::tls::connect_over`] before sending the upgrade.
+//!
+//! What this module does:
+//!   * Send-side data frames: [`send_message`] writes a masked client
+//!     text/binary frame (client frames MUST be masked, RFC 6455 §5.3).
+//!   * Receive-side reassembly: [`read_message`] runs a frame loop that
+//!     stitches an initial data frame (FIN=0) and its CONTINUATION frames
+//!     (opcode 0x0) back into one message, enforcing the
+//!     [`MAX_PAYLOAD_BYTES`] cap on the *cumulative* reassembled size so a
+//!     fragmented bomb can't slip past it.
+//!   * Control frames inline: a PING is answered with a PONG echoing its
+//!     application data, an unsolicited PONG is ignored, and a CLOSE is
+//!     answered with a CLOSE before returning cleanly. Control frames are
+//!     handled both while waiting for the first data frame and in between
+//!     fragments. Per §5.4/§5.5 control frames must not be fragmented and
+//!     carry at most 125 bytes; violations are rejected as protocol errors.
 //!
 //! Limitations of this scaffold (intentionally deferred):
-//!   * Send-side data frames (we only read one frame, then close).
-//!   * Fragmented messages (FIN=0 continuation chains).
-//!   * Streaming/large payloads — the whole payload is buffered.
+//!   * Streaming/large payloads — the whole message is buffered in memory.
 //!   * permessage-deflate or any other extension.
-//!   * Ping intervals / keepalive; we only react to a ping if the peer sends
-//!     one before our first data frame arrives.
+//!   * Ping *intervals* / timer-driven keepalive; we react to peer pings but
+//!     do not proactively send our own on a schedule.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -36,8 +48,9 @@ const OPCODE_PONG: u8 = 0xA;
 
 const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Open a WS connection, read one text or binary data frame, close cleanly,
-/// and return that frame's payload.
+/// Open a WS connection, read one full text or binary message (reassembling
+/// fragments and answering any interleaved ping/close control frames), send a
+/// close, and return that message's payload.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
         "ws" => {
@@ -178,46 +191,163 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<()> {
     Ok(())
 }
 
-/// Read frames until a data frame arrives, then send a close frame and
-/// return the data frame's payload. Pings are answered with a pong; a close
-/// from the server short-circuits to returning whatever (likely empty)
-/// payload we have collected.
-fn read_data_and_close<S: Read + Write>(stream: &mut S) -> Result<Vec<u8>> {
-    let payload = loop {
+/// What [`read_message`] produced for the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Message {
+    /// A reassembled text or binary message.
+    Data { opcode: u8, payload: Vec<u8> },
+    /// The peer initiated a close; we have already answered it.
+    Closed,
+}
+
+/// Max payload of a control frame (RFC 6455 §5.5).
+const MAX_CONTROL_PAYLOAD: usize = 125;
+
+/// Run the receive frame loop until one full data message is reassembled or
+/// the peer closes. Control frames (ping/pong/close) are handled inline:
+///
+///   * PING → reply with a PONG echoing the application data.
+///   * PONG → ignored (unsolicited keepalive response).
+///   * CLOSE → reply with a CLOSE and return [`Message::Closed`].
+///
+/// Control frames are honored both before the first data frame and in between
+/// fragments. Data fragments (initial frame with FIN=0 followed by
+/// CONTINUATION frames until FIN=1) are stitched together, with the
+/// cumulative size enforced against [`MAX_PAYLOAD_BYTES`] so a fragmented
+/// payload cannot exceed the cap that a single frame would be held to.
+fn read_message<S: Read + Write>(stream: &mut S) -> Result<Message> {
+    // State for an in-progress fragmented data message. `None` means we are
+    // not currently inside a fragmentation chain.
+    let mut frag_opcode: Option<u8> = None;
+    let mut buf: Vec<u8> = Vec::new();
+
+    loop {
         let frame = read_frame(stream)?;
-        match frame.opcode {
-            OPCODE_TEXT | OPCODE_BINARY => break frame.payload,
-            OPCODE_PING => {
-                let pong = build_client_frame(OPCODE_PONG, &frame.payload)?;
-                stream.write_all(&pong)?;
-                stream.flush()?;
+
+        // Control frames (opcode >= 0x8) may be interleaved between fragments
+        // but MUST NOT themselves be fragmented and MUST have payload <= 125.
+        if frame.opcode >= 0x8 {
+            if !frame.fin {
+                return Err(Error::BadResponse(
+                    "fragmented control frame (FIN=0 on a control opcode)".into(),
+                ));
             }
-            OPCODE_PONG => continue,
-            OPCODE_CLOSE => {
-                // Echo a close and bail out with whatever we have.
-                let _ = stream.write_all(&[0x88, 0x00]);
-                let _ = stream.flush();
-                return Ok(Vec::new());
+            if frame.payload.len() > MAX_CONTROL_PAYLOAD {
+                return Err(Error::BadResponse(format!(
+                    "control frame payload too large: {} bytes (max {MAX_CONTROL_PAYLOAD})",
+                    frame.payload.len()
+                )));
+            }
+            match frame.opcode {
+                OPCODE_PING => {
+                    let pong = build_client_frame(OPCODE_PONG, &frame.payload)?;
+                    stream.write_all(&pong)?;
+                    stream.flush()?;
+                    continue;
+                }
+                OPCODE_PONG => continue,
+                OPCODE_CLOSE => {
+                    // Echo the close (masked, per §5.3). Best-effort: if we
+                    // can't build it we still report a clean close.
+                    if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
+                        let _ = stream.write_all(&close);
+                        let _ = stream.flush();
+                    }
+                    return Ok(Message::Closed);
+                }
+                other => {
+                    return Err(Error::BadResponse(format!(
+                        "unknown WS control opcode 0x{other:x}"
+                    )));
+                }
+            }
+        }
+
+        // Data / continuation frames.
+        match frame.opcode {
+            OPCODE_TEXT | OPCODE_BINARY => {
+                if frag_opcode.is_some() {
+                    return Err(Error::BadResponse(
+                        "new data frame began while a fragmented message was in progress".into(),
+                    ));
+                }
+                accumulate(&mut buf, &frame.payload)?;
+                if frame.fin {
+                    return Ok(Message::Data {
+                        opcode: frame.opcode,
+                        payload: buf,
+                    });
+                }
+                frag_opcode = Some(frame.opcode);
             }
             OPCODE_CONT => {
-                return Err(Error::BadResponse(
-                    "unexpected continuation frame before any data frame".into(),
-                ));
+                let opcode = frag_opcode.ok_or_else(|| {
+                    Error::BadResponse("continuation frame with no message in progress".into())
+                })?;
+                accumulate(&mut buf, &frame.payload)?;
+                if frame.fin {
+                    return Ok(Message::Data {
+                        opcode,
+                        payload: buf,
+                    });
+                }
             }
             other => {
                 return Err(Error::BadResponse(format!("unknown WS opcode 0x{other:x}")));
             }
         }
+    }
+}
+
+/// Append `chunk` to the reassembly buffer, enforcing the cumulative cap.
+/// `read_frame` already bounds a single frame; this guards against many
+/// small fragments adding up past [`MAX_PAYLOAD_BYTES`].
+fn accumulate(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+    let total = buf.len() as u64 + chunk.len() as u64;
+    if total > MAX_PAYLOAD_BYTES {
+        return Err(Error::BadResponse(format!(
+            "reassembled WS message too large: {total} bytes (max {MAX_PAYLOAD_BYTES})"
+        )));
+    }
+    buf.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// Send a masked client data frame. `opcode` must be [`OPCODE_TEXT`] or
+/// [`OPCODE_BINARY`]; the payload is masked per RFC 6455 §5.3 using the
+/// crate's CSPRNG. Exposed for a transfer/CLI layer to drive the send side
+/// (not yet wired into the one-shot `fetch` path, hence `dead_code`).
+#[allow(dead_code)]
+fn send_message<S: Write>(stream: &mut S, opcode: u8, payload: &[u8]) -> Result<()> {
+    if opcode != OPCODE_TEXT && opcode != OPCODE_BINARY {
+        return Err(Error::BadResponse(format!(
+            "send_message expects a data opcode (text/binary), got 0x{opcode:x}"
+        )));
+    }
+    let frame = build_client_frame(opcode, payload)?;
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Read frames until a full data message is reassembled, then send a close
+/// frame and return that message's payload. Interleaved pings are answered
+/// with pongs; a close from the server short-circuits to returning whatever
+/// (likely empty) payload we have collected.
+fn read_data_and_close<S: Read + Write>(stream: &mut S) -> Result<Vec<u8>> {
+    let payload = match read_message(stream)? {
+        Message::Data { payload, .. } => payload,
+        // Peer closed before sending data; read_message already replied.
+        Message::Closed => return Ok(Vec::new()),
     };
 
-    // Polite close: \x88 = FIN + opcode 0x8, \x00 = empty unmasked payload.
-    // Strictly speaking, client→server frames must be masked, even close
-    // frames — but with a zero-length payload there's nothing to mask, and
-    // every implementation in the wild accepts \x88\x00 here. We send the
-    // properly masked variant anyway to stay spec-clean.
-    // A failure to obtain entropy for the close frame is non-fatal: we've
-    // already captured the payload, so just skip the polite close in that
-    // (extremely unlikely) case rather than discarding a good result.
+    // Polite close. Client→server frames must be masked (RFC 6455 §5.3),
+    // including close frames; with a zero-length payload there's nothing to
+    // mask, but we send the properly masked variant anyway to stay
+    // spec-clean. A failure to obtain entropy for the close frame is
+    // non-fatal: we've already captured the payload, so just skip the polite
+    // close in that (extremely unlikely) case rather than discarding a good
+    // result.
     if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
         let _ = stream.write_all(&close);
         let _ = stream.flush();
@@ -398,6 +528,98 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// In-memory duplex stream: `inbound` is what the "server" sends to us
+    /// (drained by `read`), `sent` captures what we write back. Lets us drive
+    /// the full read/control-frame loop without a socket.
+    struct MockStream {
+        inbound: Cursor<Vec<u8>>,
+        sent: Vec<u8>,
+    }
+
+    impl MockStream {
+        fn new(inbound: Vec<u8>) -> Self {
+            MockStream {
+                inbound: Cursor::new(inbound),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inbound.read(buf)
+        }
+    }
+
+    impl Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build an unmasked server-to-client frame (server frames must not be
+    /// masked) for feeding into the mock stream.
+    fn server_frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let b0 = if fin { 0x80 } else { 0x00 } | (opcode & 0x0F);
+        out.push(b0);
+        let n = payload.len();
+        if n < 126 {
+            out.push(n as u8);
+        } else if n <= u16::MAX as usize {
+            out.push(126);
+            out.extend_from_slice(&(n as u16).to_be_bytes());
+        } else {
+            out.push(127);
+            out.extend_from_slice(&(n as u64).to_be_bytes());
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Decode every frame the client wrote into `sent`, returning
+    /// `(opcode, unmasked_payload)` pairs. Asserts each is masked, as client
+    /// frames must be (RFC 6455 §5.3).
+    fn decode_sent(sent: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        let mut i = 0;
+        while i < sent.len() {
+            let opcode = sent[i] & 0x0F;
+            let masked = (sent[i + 1] & 0x80) != 0;
+            assert!(masked, "client frame must be masked");
+            let len7 = sent[i + 1] & 0x7F;
+            i += 2;
+            let len = match len7 {
+                0..=125 => len7 as usize,
+                126 => {
+                    let l = u16::from_be_bytes([sent[i], sent[i + 1]]) as usize;
+                    i += 2;
+                    l
+                }
+                127 => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&sent[i..i + 8]);
+                    i += 8;
+                    u64::from_be_bytes(b) as usize
+                }
+                _ => unreachable!(),
+            };
+            let mask = [sent[i], sent[i + 1], sent[i + 2], sent[i + 3]];
+            i += 4;
+            let mut payload = sent[i..i + len].to_vec();
+            i += len;
+            for (j, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[j & 3];
+            }
+            frames.push((opcode, payload));
+        }
+        frames
+    }
+
     #[test]
     fn base64_encode_hello() {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
@@ -522,5 +744,177 @@ mod tests {
         let a = random_16().unwrap();
         let b = random_16().unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn reassembles_fragmented_text_message() {
+        // "Hel" (text, FIN=0) + "lo " (cont, FIN=0) + "world" (cont, FIN=1).
+        let mut inbound = server_frame(false, OPCODE_TEXT, b"Hel");
+        inbound.extend(server_frame(false, OPCODE_CONT, b"lo "));
+        inbound.extend(server_frame(true, OPCODE_CONT, b"world"));
+        let mut s = MockStream::new(inbound);
+        let msg = read_message(&mut s).expect("reassembles");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_TEXT,
+                payload: b"Hello world".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn ping_between_fragments_gets_pong_and_message_completes() {
+        // "foo" (text, FIN=0), a PING with "pingdata", then "bar" (cont,
+        // FIN=1). The message must still reassemble and a PONG echoing the
+        // ping data must have been sent.
+        let mut inbound = server_frame(false, OPCODE_TEXT, b"foo");
+        inbound.extend(server_frame(true, OPCODE_PING, b"pingdata"));
+        inbound.extend(server_frame(true, OPCODE_CONT, b"bar"));
+        let mut s = MockStream::new(inbound);
+        let msg = read_message(&mut s).expect("completes despite ping");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_TEXT,
+                payload: b"foobar".to_vec(),
+            }
+        );
+        let sent = decode_sent(&s.sent);
+        assert_eq!(sent.len(), 1, "exactly one pong expected");
+        assert_eq!(sent[0].0, OPCODE_PONG);
+        assert_eq!(sent[0].1, b"pingdata");
+    }
+
+    #[test]
+    fn close_is_answered_and_returns_closed() {
+        let inbound = server_frame(true, OPCODE_CLOSE, &[]);
+        let mut s = MockStream::new(inbound);
+        let msg = read_message(&mut s).expect("handles close");
+        assert_eq!(msg, Message::Closed);
+        let sent = decode_sent(&s.sent);
+        assert_eq!(sent.len(), 1, "exactly one close reply expected");
+        assert_eq!(sent[0].0, OPCODE_CLOSE);
+    }
+
+    #[test]
+    fn unsolicited_pong_is_ignored_then_data_returns() {
+        let mut inbound = server_frame(true, OPCODE_PONG, b"x");
+        inbound.extend(server_frame(true, OPCODE_TEXT, b"hi"));
+        let mut s = MockStream::new(inbound);
+        let msg = read_message(&mut s).expect("ignores pong");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_TEXT,
+                payload: b"hi".to_vec(),
+            }
+        );
+        // Nothing should have been written for the pong.
+        assert!(s.sent.is_empty(), "unsolicited pong must not be answered");
+    }
+
+    #[test]
+    fn send_message_produces_masked_frame() {
+        let mut s = MockStream::new(Vec::new());
+        send_message(&mut s, OPCODE_TEXT, b"hello").expect("sends");
+        // Raw bytes: FIN+text, MASK+len, 4-byte mask, 5 masked bytes.
+        assert_eq!(s.sent[0], 0x81);
+        assert_eq!(s.sent[1], 0x80 | 5);
+        assert_eq!(s.sent.len(), 2 + 4 + 5);
+        let decoded = decode_sent(&s.sent);
+        assert_eq!(decoded, vec![(OPCODE_TEXT, b"hello".to_vec())]);
+    }
+
+    #[test]
+    fn send_message_rejects_control_opcode() {
+        let mut s = MockStream::new(Vec::new());
+        let err = send_message(&mut s, OPCODE_PING, b"x")
+            .expect_err("control opcode must be rejected for send_message");
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+        assert!(s.sent.is_empty());
+    }
+
+    #[test]
+    fn oversized_cumulative_fragmented_payload_is_rejected() {
+        // Two frames whose individual sizes are fine, but whose sum exceeds
+        // MAX_PAYLOAD_BYTES — the cumulative cap must catch it. We forge the
+        // header to claim a huge length without actually allocating the bytes
+        // would still trip read_frame's per-frame cap, so instead we lower the
+        // bar by checking `accumulate` directly against the cap boundary.
+        let mut buf = vec![0u8; (MAX_PAYLOAD_BYTES - 1) as usize];
+        // One more byte is exactly at the cap: allowed.
+        accumulate(&mut buf, &[0u8]).expect("exactly at the cap is allowed");
+        // The next byte pushes over the cap: rejected.
+        let err = accumulate(&mut buf, &[0u8]).expect_err("over the cap must be rejected");
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fragmented_control_frame_is_rejected() {
+        // A PING with FIN=0 is illegal: control frames must not be fragmented.
+        let inbound = server_frame(false, OPCODE_PING, b"x");
+        let mut s = MockStream::new(inbound);
+        let err = read_message(&mut s).expect_err("fragmented control must be rejected");
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_control_frame_is_rejected() {
+        // A PING with a 126-byte payload exceeds the 125-byte control cap.
+        let inbound = server_frame(true, OPCODE_PING, &[0u8; 126]);
+        let mut s = MockStream::new(inbound);
+        let err = read_message(&mut s).expect_err("oversized control must be rejected");
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_data_frame_during_fragmentation_is_rejected() {
+        // text(FIN=0) then a second text(FIN=1) without a continuation: the
+        // peer must use opcode 0x0 to continue, so this is a protocol error.
+        let mut inbound = server_frame(false, OPCODE_TEXT, b"a");
+        inbound.extend(server_frame(true, OPCODE_TEXT, b"b"));
+        let mut s = MockStream::new(inbound);
+        let err = read_message(&mut s).expect_err("interleaved new data frame must be rejected");
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lone_continuation_frame_is_rejected() {
+        // A continuation frame with no message in progress is illegal.
+        let inbound = server_frame(true, OPCODE_CONT, b"x");
+        let mut s = MockStream::new(inbound);
+        let err = read_message(&mut s).expect_err("lone continuation must be rejected");
+        match err {
+            Error::BadResponse(_) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_data_and_close_returns_reassembled_payload_and_sends_close() {
+        let mut inbound = server_frame(false, OPCODE_BINARY, &[1, 2, 3]);
+        inbound.extend(server_frame(true, OPCODE_CONT, &[4, 5]));
+        let mut s = MockStream::new(inbound);
+        let payload = read_data_and_close(&mut s).expect("reads message");
+        assert_eq!(payload, vec![1, 2, 3, 4, 5]);
+        // A polite close should have been written.
+        let sent = decode_sent(&s.sent);
+        assert_eq!(sent.last().map(|f| f.0), Some(OPCODE_CLOSE));
     }
 }
