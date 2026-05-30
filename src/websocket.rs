@@ -7,12 +7,12 @@
 //! wrapped with [`crate::tls::connect_over`] before sending the upgrade.
 //!
 //! What this module does:
-//!   * Send-side data frames: [`send_message`] writes a masked client
+//!   * Send-side data frames: `send_message` writes a masked client
 //!     text/binary frame (client frames MUST be masked, RFC 6455 §5.3).
-//!   * Receive-side reassembly: [`read_message`] runs a frame loop that
+//!   * Receive-side reassembly: `read_message` runs a frame loop that
 //!     stitches an initial data frame (FIN=0) and its CONTINUATION frames
 //!     (opcode 0x0) back into one message, enforcing the
-//!     [`MAX_PAYLOAD_BYTES`] cap on the *cumulative* reassembled size so a
+//!     `MAX_PAYLOAD_BYTES` cap on the *cumulative* reassembled size so a
 //!     fragmented bomb can't slip past it.
 //!   * Control frames inline: a PING is answered with a PONG echoing its
 //!     application data, an unsolicited PONG is ignored, and a CLOSE is
@@ -26,11 +26,11 @@
 //!     server agrees, data messages whose first frame has RSV1 set are
 //!     per-message DEFLATE-compressed (RFC 1951 raw deflate) — we append the
 //!     `00 00 FF FF` empty-block terminator the sender strips and inflate,
-//!     bounding the inflated size against [`MAX_PAYLOAD_BYTES`] so a
+//!     bounding the inflated size against `MAX_PAYLOAD_BYTES` so a
 //!     compression bomb can't bypass the cap. Outgoing messages are deflated
 //!     and flagged with RSV1 when compression is negotiated. RSV1 is rejected
 //!     when compression was *not* negotiated, RSV2/RSV3 are always rejected,
-//!     and RSV1 on a control frame is rejected. See [`Pmd`] for the
+//!     and RSV1 on a control frame is rejected. See `Pmd` for the
 //!     context-takeover decision.
 //!
 //! Limitations of this scaffold (intentionally deferred):
@@ -113,7 +113,7 @@ struct Pmd {
 impl Pmd {
     /// Inflate one full (reassembled) compressed message payload. Appends the
     /// stripped `00 00 FF FF` terminator (RFC 7692 §7.2.2) and runs raw
-    /// DEFLATE, bounding the inflated output at [`MAX_PAYLOAD_BYTES`] so a
+    /// DEFLATE, bounding the inflated output at `MAX_PAYLOAD_BYTES` so a
     /// compression bomb can't slip past the cap. The decoder's sliding window
     /// is carried across messages unless `server_no_context_takeover` was
     /// negotiated, in which case it is reset first.
@@ -365,7 +365,7 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
 }
 
 /// Parse a `Sec-WebSocket-Extensions` response value and, if it selects
-/// `permessage-deflate`, return the negotiated [`Pmd`] state. Returns `None`
+/// `permessage-deflate`, return the negotiated `Pmd` state. Returns `None`
 /// if permessage-deflate was not selected.
 ///
 /// The header is a comma-separated list of extensions, each a semicolon-
@@ -408,7 +408,7 @@ fn parse_pmd_response(value: &str) -> Option<Pmd> {
     None
 }
 
-/// What [`read_message`] produced for the caller.
+/// What `read_message` produced for the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Message {
     /// A reassembled text or binary message.
@@ -430,7 +430,7 @@ const MAX_CONTROL_PAYLOAD: usize = 125;
 /// Control frames are honored both before the first data frame and in between
 /// fragments. Data fragments (initial frame with FIN=0 followed by
 /// CONTINUATION frames until FIN=1) are stitched together, with the
-/// cumulative size enforced against [`MAX_PAYLOAD_BYTES`] so a fragmented
+/// cumulative size enforced against `MAX_PAYLOAD_BYTES` so a fragmented
 /// payload cannot exceed the cap that a single frame would be held to.
 ///
 /// permessage-deflate (RFC 7692 §7.2.2): if `pmd` is `Some` (the extension
@@ -568,7 +568,7 @@ fn finish_data_message(
 
 /// Append `chunk` to the reassembly buffer, enforcing the cumulative cap.
 /// `read_frame` already bounds a single frame; this guards against many
-/// small fragments adding up past [`MAX_PAYLOAD_BYTES`].
+/// small fragments adding up past `MAX_PAYLOAD_BYTES`.
 fn accumulate(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
     let total = buf.len() as u64 + chunk.len() as u64;
     if total > MAX_PAYLOAD_BYTES {
@@ -654,7 +654,7 @@ struct Frame {
 /// RSV2 and RSV3 are always rejected (no extension that uses them is
 /// negotiated). RSV1 is surfaced via [`Frame::rsv1`]; whether it is legal
 /// depends on context (permessage-deflate negotiation + frame type), which is
-/// enforced by the caller in [`read_message`].
+/// enforced by the caller in `read_message`.
 fn read_frame<S: Read>(stream: &mut S) -> Result<Frame> {
     let mut header = [0u8; 2];
     read_exact(stream, &mut header)?;
@@ -905,7 +905,7 @@ mod tests {
         out
     }
 
-    /// A negotiated [`Pmd`] in `server_no_context_takeover` mode (the common
+    /// A negotiated `Pmd` in `server_no_context_takeover` mode (the common
     /// case for our offer), for driving the receive path in tests.
     fn test_pmd() -> Pmd {
         Pmd {

@@ -1032,7 +1032,11 @@ fn cli_upload_file_uses_put_and_octet_stream() {
 fn cli_upload_file_rejects_unsupported_scheme() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
-        .args(["-T", "/etc/hostname", "dict://example.invalid/foo"])
+        .args([
+            "-T",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            "dict://example.invalid/foo",
+        ])
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
@@ -1048,7 +1052,11 @@ fn cli_upload_file_rejects_unsupported_scheme() {
 fn cli_upload_file_ftp_attempts_transfer() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
-        .args(["-T", "/etc/hostname", "ftp://host.invalid/foo"])
+        .args([
+            "-T",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            "ftp://host.invalid/foo",
+        ])
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
@@ -1066,7 +1074,12 @@ fn cli_upload_file_ftp_attempts_transfer() {
 fn cli_append_ftp_attempts_transfer() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
-        .args(["-a", "-T", "/etc/hostname", "ftp://host.invalid/foo"])
+        .args([
+            "-a",
+            "-T",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            "ftp://host.invalid/foo",
+        ])
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
@@ -1089,7 +1102,7 @@ fn cli_append_with_continue_at_prefers_appe() {
             "-C",
             "10",
             "-T",
-            "/etc/hostname",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
             "ftp://host.invalid/foo",
         ])
         .output()
@@ -1108,7 +1121,13 @@ fn cli_append_with_continue_at_prefers_appe() {
 fn cli_continue_at_dash_is_rejected() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
-        .args(["-C", "-", "-T", "/etc/hostname", "ftp://host.invalid/foo"])
+        .args([
+            "-C",
+            "-",
+            "-T",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            "ftp://host.invalid/foo",
+        ])
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
@@ -1137,7 +1156,13 @@ fn cli_form_and_data_are_mutually_exclusive() {
 fn cli_data_and_upload_are_mutually_exclusive() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
-        .args(["-d", "a=1", "-T", "/etc/hostname", "http://127.0.0.1:1/x"])
+        .args([
+            "-d",
+            "a=1",
+            "-T",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            "http://127.0.0.1:1/x",
+        ])
         .output()
         .expect("spawn rsurl");
     assert_eq!(out.status.code(), Some(2), "expected exit 2");
@@ -1153,7 +1178,13 @@ fn cli_data_and_upload_are_mutually_exclusive() {
 fn cli_form_and_upload_are_mutually_exclusive() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
-        .args(["-F", "x=y", "-T", "/etc/hostname", "http://127.0.0.1:1/x"])
+        .args([
+            "-F",
+            "x=y",
+            "-T",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            "http://127.0.0.1:1/x",
+        ])
         .output()
         .expect("spawn rsurl");
     assert_eq!(out.status.code(), Some(2), "expected exit 2");

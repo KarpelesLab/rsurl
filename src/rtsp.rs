@@ -83,7 +83,7 @@ impl Session {
     /// Connect to the RTSP server identified by `url` and prepare a session.
     ///
     /// The host and path are validated for control bytes up front (see
-    /// [`reject_control_bytes`]) so they cannot forge the request line or
+    /// `reject_control_bytes`) so they cannot forge the request line or
     /// inject headers on the control connection.
     pub fn connect(url: &Url) -> Result<Self> {
         // `url.host` and `url.path` are interpolated raw into the request
@@ -165,7 +165,7 @@ impl Session {
     }
 
     /// `SETUP` — establish transport for the stream. Offers
-    /// [`DEFAULT_TRANSPORT`] and captures the `Session` id from the response
+    /// `DEFAULT_TRANSPORT` and captures the `Session` id from the response
     /// (stripping any `;timeout=` parameter) for later requests.
     pub fn setup(&mut self) -> Result<RtspResponse> {
         let resp = self.request("SETUP", &[("Transport", DEFAULT_TRANSPORT.to_string())])?;

@@ -302,7 +302,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 /// Sends a Write Request, waits for the server's ACK of block 0 (latching its
 /// TID exactly as the read path does), then drives a lockstep DATA/ACK loop:
 /// send DATA block N, wait for ACK N (retransmitting on timeout), advance. A
-/// final block shorter than [`BLOCK_SIZE`] — possibly empty when `data` is an
+/// final block shorter than `BLOCK_SIZE` — possibly empty when `data` is an
 /// exact multiple of 512 — terminates the transfer per RFC 1350 §6.
 pub fn store(url: &Url, data: &[u8]) -> Result<()> {
     let filename = filename_of(url)?;
