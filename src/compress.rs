@@ -1,4 +1,4 @@
-//! Response-body decompression for `Content-Encoding: gzip | deflate | zstd | br`.
+//! Response-body decompression for `Content-Encoding: gzip | deflate | zstd | br | compress`.
 //!
 //! `Accept-Encoding: gzip, deflate` is offered by default on every HTTP
 //! request rsurl makes; this module is the matching decode side. It is the
@@ -6,19 +6,22 @@
 //! it, a vanilla GET against any modern HTTP server returns a body that
 //! looks like binary noise.
 //!
-//! Scope is deliberately narrow:
+//! Scope:
 //!
 //! * **gzip** (RFC 1952) and **deflate** (RFC 1951) are decoded.
 //!   `x-gzip` is accepted as a gzip alias because some legacy servers
 //!   still emit it.
-//! * **zstd** (RFC 8878) and **br** (brotli, RFC 7932) are decoded too,
-//!   via `compcol`'s pure-Rust codecs — no C dependency is pulled in.
+//! * **zstd** (RFC 8878), **br** (brotli, RFC 7932) and **compress** /
+//!   **x-compress** (the classic Unix `.Z` LZW format defined by the
+//!   `compress(1)` utility) are decoded too, all via `compcol`'s pure-Rust
+//!   codecs — no C dependency is pulled in.
 //! * **identity** is a no-op pass-through.
-//! * **compress** (LZW) is not implemented; a body labelled with it (or any
-//!   other unknown encoding) is returned verbatim and the encoding token is
-//!   reported so the caller can decide what to do (today, we leave the header
-//!   in place and ship the bytes through unchanged — matching what curl does
-//!   when it doesn't know an encoding).
+//!
+//! With LZW wired in, every common HTTP content coding is now supported. Any
+//! other unknown encoding is returned verbatim and the encoding token is
+//! reported so the caller can decide what to do (today, we leave the header in
+//! place and ship the bytes through unchanged — matching what curl does when it
+//! doesn't know an encoding).
 //!
 //! `Content-Encoding` is a list. RFC 9110 §8.4.1 says encodings are applied
 //! in the order listed, so decoding walks the list **right-to-left**.
@@ -30,6 +33,7 @@ use compcol::deflate::Deflate;
 use compcol::gzip::Gzip;
 use compcol::io::DecoderReader;
 use compcol::limit::LimitedDecoder;
+use compcol::lzw::Lzw;
 use compcol::zlib::Zlib;
 use compcol::zstd::Zstd;
 use compcol::Algorithm;
@@ -120,6 +124,11 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
                 budget = budget.saturating_sub(current.len() as u64);
                 peeled = true;
             }
+            Some(Layer::Compress) => {
+                current = uncompress(&current, budget)?;
+                budget = budget.saturating_sub(current.len() as u64);
+                peeled = true;
+            }
             None => {
                 // Unknown outer layer — return what we have so far with the
                 // body untouched from this point in. We can't safely strip
@@ -143,6 +152,7 @@ enum Layer {
     Deflate,
     Zstd,
     Brotli,
+    Compress,
     Identity,
 }
 
@@ -157,6 +167,9 @@ impl Layer {
             Some(Layer::Zstd)
         } else if token.eq_ignore_ascii_case("br") {
             Some(Layer::Brotli)
+        } else if token.eq_ignore_ascii_case("compress") || token.eq_ignore_ascii_case("x-compress")
+        {
+            Some(Layer::Compress)
         } else if token.eq_ignore_ascii_case("identity") {
             Some(Layer::Identity)
         } else {
@@ -215,6 +228,17 @@ fn unbrotli(src: &[u8], budget: u64) -> Result<Vec<u8>> {
         .map_err(|e| Error::BadResponse(format!("brotli decode failed: {e}")))
 }
 
+/// Decode a `compress` / `x-compress`-encoded body — the classic Unix `.Z`
+/// LZW format (magic `0x1F 0x9D`, block mode, early-change width growth and
+/// group padding) defined by `compress(1)`. Routes through the same
+/// budget-bounded streaming path as the other codecs; compcol's LZW decoder is
+/// pure Rust and plugs into the generic `decode_with` via its `Algorithm` impl,
+/// so no bespoke bit-banging lives here.
+fn uncompress(src: &[u8], budget: u64) -> Result<Vec<u8>> {
+    decode_with::<Lzw>(src, budget)
+        .map_err(|e| Error::BadResponse(format!("compress decode failed: {e}")))
+}
+
 /// Strip `Content-Encoding` and `Content-Length` from a response header
 /// list after a successful in-place body decode. Returns the new headers.
 ///
@@ -253,6 +277,10 @@ mod tests {
 
     fn brotli(data: &[u8]) -> Vec<u8> {
         compress_to_vec::<Brotli>(data).expect("brotli encode")
+    }
+
+    fn lzw(data: &[u8]) -> Vec<u8> {
+        compress_to_vec::<Lzw>(data).expect("lzw encode")
     }
 
     #[test]
@@ -311,11 +339,11 @@ mod tests {
 
     #[test]
     fn unknown_outer_layer_returns_undecoded() {
-        // `compress` (LZW) is still unimplemented; as the outer layer it
+        // An unrecognised outer layer (`snappy` is not a coding we decode)
         // means we can't reach the gzip layer underneath, so the body is
         // returned verbatim with nothing peeled.
         let payload = gz(b"inner");
-        let out = decode_body(payload.clone(), "gzip, compress").unwrap();
+        let out = decode_body(payload.clone(), "gzip, snappy").unwrap();
         assert_eq!(out.body, payload);
         assert!(!out.decoded);
     }
@@ -354,6 +382,92 @@ mod tests {
         let err = decode_body(bad, "zstd").unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("zstd"), "got {msg:?}"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_compress() {
+        let out = decode_body(lzw(b"hello compress world"), "compress").unwrap();
+        assert_eq!(out.body, b"hello compress world");
+        assert!(out.decoded);
+    }
+
+    #[test]
+    fn compress_token_is_case_insensitive() {
+        // Both the canonical token and the `x-compress` legacy alias, in
+        // assorted casings, must route to the LZW decoder.
+        let out = decode_body(lzw(b"C"), "COMPRESS").unwrap();
+        assert_eq!(out.body, b"C");
+
+        let out = decode_body(lzw(b"x"), "x-compress").unwrap();
+        assert_eq!(out.body, b"x");
+
+        let out = decode_body(lzw(b"X"), "X-Compress").unwrap();
+        assert_eq!(out.body, b"X");
+    }
+
+    #[test]
+    fn decodes_compress_across_code_width_boundary() {
+        // A few KB of mixed repetitive + varied data forces the encoder past
+        // the 9->10-bit code-width bump (and likely further), and across at
+        // least one group-padding realignment — exercising the parts of the
+        // `.Z` format a trivial decoder gets wrong. Round-trip must be exact.
+        let mut payload = Vec::with_capacity(8192);
+        for i in 0u32..2048 {
+            payload.extend_from_slice(b"the quick brown fox ");
+            payload.push((i & 0xFF) as u8);
+            payload.push((i.wrapping_mul(31) & 0xFF) as u8);
+        }
+        let encoded = lzw(&payload);
+        assert!(
+            encoded.len() < payload.len(),
+            "fixture should actually be compressed"
+        );
+        let out = decode_body(encoded, "compress").unwrap();
+        assert_eq!(out.body, payload);
+        assert!(out.decoded);
+    }
+
+    #[test]
+    fn corrupt_compress_reports_error() {
+        // Wrong magic bytes: not a `.Z` stream at all.
+        let err = decode_body(b"not a dot-Z stream at all".to_vec(), "compress").unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("compress"), "got {msg:?}"),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        // Valid header + codestream chopped mid-stream must also surface as a
+        // decode error rather than a silently-truncated body.
+        let mut truncated = lzw(b"a reasonably long compress payload to truncate hard");
+        truncated.truncate(truncated.len() / 2 + 1);
+        // Truncation may or may not error depending on where the cut lands;
+        // if it decodes, it must not equal the original (data was lost).
+        match decode_body(truncated, "compress") {
+            Ok(out) => assert_ne!(
+                out.body, b"a reasonably long compress payload to truncate hard",
+                "truncated stream should not reproduce the full original"
+            ),
+            Err(Error::BadResponse(msg)) => assert!(msg.contains("compress"), "got {msg:?}"),
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compress_bomb_rejected_by_budget_cap() {
+        // A large zero-fill compresses to a tiny `.Z` frame but expands past
+        // MAX_BODY_BYTES; the cumulative budget must reject it instead of
+        // materialising the full expansion.
+        let huge = vec![0u8; MAX_BODY_BYTES + (1 << 20)];
+        let bomb = lzw(&huge);
+        assert!(
+            bomb.len() < huge.len(),
+            "fixture should actually be compressed"
+        );
+        let err = decode_body(bomb, "compress").unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("compress"), "got {msg:?}"),
             other => panic!("unexpected error variant: {other:?}"),
         }
     }
