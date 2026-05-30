@@ -77,7 +77,7 @@ impl Url {
         // the stored `host` because every transport/`Host:`-header construction
         // in the crate concatenates `host` directly and an IPv6 literal needs
         // them to remain unambiguous.
-        let (host, port) = if let Some(close) = hostport.find(']') {
+        let (host, port, bracketed) = if let Some(close) = hostport.find(']') {
             if !hostport.starts_with('[') {
                 return Err(Error::InvalidUrl(s.to_string()));
             }
@@ -90,7 +90,7 @@ impl Url {
             } else {
                 return Err(Error::InvalidUrl(s.to_string()));
             };
-            (&hostport[..=close], port)
+            (&hostport[..=close], port, true)
         } else if hostport.starts_with('[') {
             // Opening bracket with no closing one — unterminated IPv6 literal.
             return Err(Error::InvalidUrl(s.to_string()));
@@ -101,9 +101,9 @@ impl Url {
                     let p: u16 = hostport[i + 1..]
                         .parse()
                         .map_err(|_| Error::InvalidUrl(s.to_string()))?;
-                    (h, p)
+                    (h, p, false)
                 }
-                None => (hostport, default_port),
+                None => (hostport, default_port, false),
             }
         };
 
@@ -122,8 +122,26 @@ impl Url {
         // of them would let an attacker splice in extra header lines (CRLF
         // injection / request smuggling), so reject them outright.
         reject_forbidden(host, s)?;
+        // Parser-differential / host-confusion hardening: a backslash is
+        // treated like `/` by some resolvers and agents, and a literal `%`
+        // is meaningless in a host here (no host percent-decoding happens).
+        // Either one in a reg-name/IPv4 host lets a crafted authority split
+        // differently across components (e.g. `allowed.example\@evil.example`),
+        // so reject both. This does NOT apply to bracketed IPv6 literals,
+        // whose zone IDs legitimately use `%`.
+        if !bracketed && host.bytes().any(|b| b == b'\\' || b == b'%') {
+            return Err(Error::InvalidUrl(s.to_string()));
+        }
         if let Some(info) = &userinfo {
             reject_forbidden(info, s)?;
+            // A backslash anywhere in the authority is the host-confusion
+            // bait: agents that fold `\` into `/` reparse the authority so
+            // that the text before the `\@` becomes the host. Because we
+            // split userinfo with `rfind('@')`, such a backslash lands here
+            // rather than in `host`, so reject it in the userinfo too.
+            if info.bytes().any(|b| b == b'\\') {
+                return Err(Error::InvalidUrl(s.to_string()));
+            }
         }
         reject_forbidden(path, s)?;
 
@@ -424,6 +442,38 @@ mod tests {
     #[test]
     fn rejects_space_in_host() {
         assert!(Url::parse("http://exa mple.com/").is_err());
+    }
+
+    #[test]
+    fn rejects_backslash_in_host() {
+        // A backslash in a reg-name host is treated like `/` by some agents,
+        // enabling authority confusion — reject it.
+        assert!(Url::parse("http://a\\b.com/").is_err());
+        assert!(Url::parse("http://allowed\\@evil.com/").is_err());
+    }
+
+    #[test]
+    fn rejects_percent_in_host() {
+        // A literal `%` in a reg-name host is meaningless (no host
+        // percent-decoding happens) and aids parser-differential attacks.
+        assert!(Url::parse("http://ho%73t.com/").is_err());
+    }
+
+    #[test]
+    fn allows_normal_host_with_port() {
+        let u = Url::parse("http://host.example:8080/p").unwrap();
+        assert_eq!(u.host, "host.example");
+        assert_eq!(u.port, 8080);
+        assert_eq!(u.path, "/p");
+    }
+
+    #[test]
+    fn ipv6_literal_unaffected_by_host_denylist() {
+        // The backslash/percent rejection must not touch bracketed IPv6.
+        let u = Url::parse("http://[::1]:8080/").unwrap();
+        assert_eq!(u.host, "[::1]");
+        assert_eq!(u.port, 8080);
+        assert_eq!(u.path, "/");
     }
 
     #[test]
