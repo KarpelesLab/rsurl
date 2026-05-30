@@ -31,12 +31,19 @@
 //!   that's wire-legal because the H bit is per-string. The Huffman table
 //!   is duplicated from the HPACK decoder in [`crate::http2`]; see the
 //!   note inside `qpack::HUFFMAN` for the rationale.
-//! * **QPACK dynamic table**: not implemented. We send a zero-length
-//!   QPACK encoder stream and silently drop the peer's encoder stream
-//!   bytes. Indexed references into the dynamic table in a response will
-//!   be rejected as a decode error. Most servers accept zero dynamic-table
-//!   capacity from a client (see SETTINGS_QPACK_MAX_TABLE_CAPACITY=0) and
-//!   downgrade.
+//! * **QPACK dynamic table**: decoder side implemented (RFC 9204). We
+//!   advertise a non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY` and
+//!   `SETTINGS_QPACK_BLOCKED_STREAMS = 0`, read the peer's encoder
+//!   stream, apply Insert With Name Reference / Insert With Literal Name /
+//!   Set Dynamic Table Capacity / Duplicate instructions (§4.3) into a
+//!   bounded dynamic table, and resolve dynamic / post-base field-line
+//!   references (§4.5) when decoding a response HEADERS block. We send
+//!   Section Acknowledgement back on the decoder stream (§4.4). Because
+//!   we advertise zero blocked streams, the encoder must send every
+//!   insert a header block references *before* that block — the normal
+//!   single-connection ordering, which our I/O loop drains first. The
+//!   **encoder** (request) side still emits literal-only field lines —
+//!   wire-legal, since the dynamic table is optional for the sender.
 //! * **HTTP/3 control / QPACK encoder / decoder unidirectional streams**:
 //!   we open the control stream and send SETTINGS, but the encoder /
 //!   decoder streams are only opened on demand if the dynamic table is in
@@ -165,6 +172,26 @@ pub(crate) mod uni_stream_type {
     pub const QPACK_DECODER: u64 = 0x03;
 }
 
+/// HTTP/3 and QPACK SETTINGS identifiers (RFC 9114 §7.2.4.1, RFC 9204 §5).
+#[allow(dead_code)]
+pub(crate) mod settings_id {
+    pub const QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
+    pub const MAX_FIELD_SECTION_SIZE: u64 = 0x06;
+    pub const QPACK_BLOCKED_STREAMS: u64 = 0x07;
+}
+
+/// Dynamic-table capacity (bytes) we advertise via
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5). This bounds the memory
+/// the decoder's dynamic table can ever hold.
+pub(crate) const QPACK_MAX_TABLE_CAPACITY: u64 = 4096;
+
+/// Number of streams we permit to be "blocked" on as-yet-unreceived
+/// dynamic-table inserts (RFC 9204 §2.1.2). We advertise 0: the encoder
+/// must deliver every insert a header block references *before* that block,
+/// which is the normal single-connection ordering and lets us decode without
+/// a blocked-stream queue.
+pub(crate) const QPACK_BLOCKED_STREAMS: u64 = 0;
+
 /// A parsed HTTP/3 frame header — just the type + length prefix. The payload
 /// is read out of the stream separately so callers can stream large DATA
 /// frames without buffering.
@@ -205,9 +232,16 @@ pub(crate) mod qpack {
     //!
     //! The decoder accepts indexed-static and the two literal-name variants
     //! (with static-name reference, with literal name), Huffman-coded or
-    //! not (the H bit selects RFC 7541 Appendix B prefix decoding). It
-    //! still rejects dynamic-table references with [`Error::BadResponse`]
-    //! so the failure is observable.
+    //! not (the H bit selects RFC 7541 Appendix B prefix decoding).
+    //!
+    //! Dynamic-table references (RFC 9204 §4.5) are decoded too: a
+    //! [`DynamicTable`] holds entries inserted via the peer's encoder
+    //! stream (§4.3), and [`decode_field_section`] resolves indexed,
+    //! post-base, and literal-with-name-reference field lines against it
+    //! using the Base computed from the field-section prefix (§4.5.1). The
+    //! table is bounded by the advertised capacity, never allocates
+    //! unboundedly, and rejects inconsistent Required Insert Counts with
+    //! [`Error::BadResponse`] so failures stay observable.
 
     use crate::error::{Error, Result};
 
@@ -216,6 +250,283 @@ pub(crate) mod qpack {
     /// bomb: a small compressed field section can otherwise expand into a
     /// huge header list and exhaust memory.
     const MAX_DECODED_HEADER_LIST: usize = 256 * 1024;
+
+    /// Hard cap on the dynamic-table capacity we will ever honor, regardless
+    /// of a peer's Set Dynamic Table Capacity instruction. The encoder may
+    /// only raise capacity up to the value we advertised in
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §3.2.3); we clamp to this
+    /// to bound memory even if our own SETTINGS value were ever raised.
+    pub(crate) const MAX_DYNAMIC_CAPACITY: usize = 4096;
+
+    /// Per-entry overhead in the RFC 9204 §3.2.1 size accounting: an entry's
+    /// size is `name.len() + value.len() + 32`.
+    const ENTRY_OVERHEAD: usize = 32;
+
+    /// The QPACK dynamic table (RFC 9204 §3.2): a FIFO of `(name, value)`
+    /// entries fed by the peer's encoder stream. Entries are addressed by an
+    /// ever-increasing *absolute index* (§3.2.4); the oldest live entry has
+    /// the smallest absolute index. `insert_count` is the total number of
+    /// entries ever inserted, so the next insert lands at absolute index
+    /// `insert_count` and `dropped` counts entries evicted off the front.
+    #[derive(Debug, Default)]
+    pub(crate) struct DynamicTable {
+        /// Live entries, oldest first. `entries[0]` has absolute index
+        /// `dropped`.
+        entries: std::collections::VecDeque<(String, String)>,
+        /// Sum of `name+value+32` over the live entries (RFC 9204 §3.2.1).
+        size: usize,
+        /// Maximum total size; raised/lowered by Set Dynamic Table Capacity,
+        /// clamped to [`MAX_DYNAMIC_CAPACITY`].
+        capacity: usize,
+        /// Total entries ever inserted (the Insert Count, RFC 9204 §2.1.4).
+        insert_count: u64,
+        /// Number of entries evicted off the front. `dropped + entries.len()
+        /// == insert_count`.
+        dropped: u64,
+    }
+
+    impl DynamicTable {
+        /// A fresh, zero-capacity table. The peer must raise the capacity via
+        /// Set Dynamic Table Capacity (up to our advertised maximum) before it
+        /// can insert anything.
+        pub(crate) fn new() -> Self {
+            DynamicTable::default()
+        }
+
+        /// Total inserts ever applied (RFC 9204 §2.1.4 Insert Count). Equals
+        /// the absolute index that the next insert will occupy.
+        pub(crate) fn insert_count(&self) -> u64 {
+            self.insert_count
+        }
+
+        /// Set the table capacity (RFC 9204 §3.2.3). Clamped to our hard cap;
+        /// evicts oldest entries until `size <= capacity`. A capacity below
+        /// our advertised maximum is always legal; a capacity above it is a
+        /// QPACK encoder-stream error.
+        pub(crate) fn set_capacity(&mut self, cap: u64) -> Result<()> {
+            if cap > MAX_DYNAMIC_CAPACITY as u64 {
+                return Err(Error::BadResponse(format!(
+                    "qpack: encoder set capacity {cap} above advertised max {MAX_DYNAMIC_CAPACITY}"
+                )));
+            }
+            self.capacity = cap as usize;
+            self.evict_to_fit(0);
+            Ok(())
+        }
+
+        /// Evict oldest entries until `size + incoming <= capacity`.
+        fn evict_to_fit(&mut self, incoming: usize) {
+            while self.size + incoming > self.capacity {
+                match self.entries.pop_front() {
+                    Some((n, v)) => {
+                        self.size -= n.len() + v.len() + ENTRY_OVERHEAD;
+                        self.dropped += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        /// Insert a new entry (RFC 9204 §3.2.2). If the entry alone exceeds
+        /// capacity it cannot be added — that's an encoder error. Otherwise we
+        /// evict oldest entries to make room, push, and bump the insert count.
+        pub(crate) fn insert(&mut self, name: String, value: String) -> Result<()> {
+            let entry_size = name.len() + value.len() + ENTRY_OVERHEAD;
+            if entry_size > self.capacity {
+                return Err(Error::BadResponse(format!(
+                    "qpack: dynamic entry size {entry_size} exceeds capacity {}",
+                    self.capacity
+                )));
+            }
+            self.evict_to_fit(entry_size);
+            self.size += entry_size;
+            self.entries.push_back((name, value));
+            self.insert_count += 1;
+            Ok(())
+        }
+
+        /// Look up an entry by its absolute index (RFC 9204 §3.2.4). Returns
+        /// an error if the entry has been evicted or never existed.
+        pub(crate) fn get_absolute(&self, abs: u64) -> Result<&(String, String)> {
+            if abs < self.dropped || abs >= self.insert_count {
+                return Err(Error::BadResponse(format!(
+                    "qpack: dynamic absolute index {abs} not live (dropped {}, count {})",
+                    self.dropped, self.insert_count
+                )));
+            }
+            let pos = (abs - self.dropped) as usize;
+            self.entries
+                .get(pos)
+                .ok_or_else(|| Error::BadResponse("qpack: dynamic index out of range".into()))
+        }
+    }
+
+    /// Apply one or more QPACK encoder-stream instructions (RFC 9204 §4.3)
+    /// from `buf` into `table`. Returns the number of bytes consumed: a whole
+    /// number of complete instructions. A partial trailing instruction is
+    /// left unconsumed for the caller to retry once more bytes arrive.
+    pub(crate) fn apply_encoder_instructions(
+        table: &mut DynamicTable,
+        buf: &[u8],
+    ) -> Result<usize> {
+        let mut p = 0;
+        while p < buf.len() {
+            match decode_encoder_instruction(table, &buf[p..])? {
+                Some(used) => p += used,
+                None => break, // need more bytes for this instruction
+            }
+        }
+        Ok(p)
+    }
+
+    /// Decode and apply a single encoder-stream instruction at the start of
+    /// `buf`. `Ok(Some(n))` applied one instruction consuming `n` bytes;
+    /// `Ok(None)` means the buffer holds only a partial instruction.
+    fn decode_encoder_instruction(table: &mut DynamicTable, buf: &[u8]) -> Result<Option<usize>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        let b0 = buf[0];
+        if b0 & 0b1000_0000 != 0 {
+            // Insert With Name Reference (§4.3.2): 1 T iiiiii (6-bit index).
+            let t_static = b0 & 0b0100_0000 != 0;
+            let (idx, used) = decode_int(b0, 6, &buf[1..])?;
+            let mut p = 1 + used;
+            let name = if t_static {
+                let (n, _) = *STATIC_TABLE.get(idx as usize).ok_or_else(|| {
+                    Error::BadResponse(format!(
+                        "qpack: encoder static name index {idx} out of range"
+                    ))
+                })?;
+                n.to_string()
+            } else {
+                // Dynamic name reference uses a relative index (§3.2.5):
+                // abs = insert_count - 1 - rel.
+                let abs = relative_to_absolute_insert(table.insert_count(), idx)?;
+                table.get_absolute(abs)?.0.clone()
+            };
+            let (value, vlen) = match try_decode_literal_string_7bit(&buf[p..])? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            p += vlen;
+            table.insert(name, value)?;
+            Ok(Some(p))
+        } else if b0 & 0b0100_0000 != 0 {
+            // Insert With Literal Name (§4.3.3): 01 H nnnnn (5-bit name len).
+            let huffman = b0 & 0b0010_0000 != 0;
+            let (nlen, used) = decode_int(b0, 5, &buf[1..])?;
+            let mut p = 1 + used;
+            let nlen = nlen as usize;
+            if p + nlen > buf.len() {
+                return Ok(None);
+            }
+            let name = decode_string_bytes(&buf[p..p + nlen], huffman, "encoder literal name")?;
+            p += nlen;
+            let (value, vlen) = match try_decode_literal_string_7bit(&buf[p..])? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            p += vlen;
+            table.insert(name, value)?;
+            Ok(Some(p))
+        } else if b0 & 0b0010_0000 != 0 {
+            // Set Dynamic Table Capacity (§4.3.1): 001 ccccc (5-bit capacity).
+            let (cap, used) = decode_int(b0, 5, &buf[1..])?;
+            table.set_capacity(cap)?;
+            Ok(Some(1 + used))
+        } else {
+            // Duplicate (§4.3.4): 000 iiiii (5-bit relative index).
+            let (idx, used) = decode_int(b0, 5, &buf[1..])?;
+            let abs = relative_to_absolute_insert(table.insert_count(), idx)?;
+            let (n, v) = table.get_absolute(abs)?.clone();
+            table.insert(n, v)?;
+            Ok(Some(1 + used))
+        }
+    }
+
+    /// Encoder-instruction relative index → absolute index (RFC 9204 §3.2.5):
+    /// the relative index is counted back from the most recent insert, so
+    /// `abs = insert_count - 1 - rel`. Errors if it underflows.
+    fn relative_to_absolute_insert(insert_count: u64, rel: u64) -> Result<u64> {
+        insert_count
+            .checked_sub(1)
+            .and_then(|last| last.checked_sub(rel))
+            .ok_or_else(|| {
+                Error::BadResponse(format!(
+                    "qpack: relative index {rel} out of range (insert count {insert_count})"
+                ))
+            })
+    }
+
+    /// Decode raw `bytes` as a header name/value, applying Huffman if `huffman`
+    /// is set, then validating UTF-8. `what` names the field for error text.
+    fn decode_string_bytes(bytes: &[u8], huffman: bool, what: &str) -> Result<String> {
+        if huffman {
+            let decoded = huffman_decode(bytes)?;
+            String::from_utf8(decoded)
+                .map_err(|_| Error::BadResponse(format!("qpack: {what} not utf-8")))
+        } else {
+            std::str::from_utf8(bytes)
+                .map_err(|_| Error::BadResponse(format!("qpack: {what} not utf-8")))
+                .map(|s| s.to_string())
+        }
+    }
+
+    /// Like [`decode_literal_string_7bit`] but returns `Ok(None)` when the
+    /// buffer holds only a partial string (used while streaming the encoder
+    /// stream, where instructions can straddle datagram boundaries).
+    fn try_decode_literal_string_7bit(buf: &[u8]) -> Result<Option<(String, usize)>> {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        let b = buf[0];
+        let huffman = b & 0b1000_0000 != 0;
+        // We need the full length-prefix integer before we know the string
+        // length; if it's truncated, ask for more bytes rather than erroring.
+        let (slen, used) = match decode_int_partial(b, 7, &buf[1..])? {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let start = 1 + used;
+        let end = start + slen as usize;
+        if end > buf.len() {
+            return Ok(None);
+        }
+        let s = decode_string_bytes(&buf[start..end], huffman, "literal string")?;
+        Ok(Some((s, end)))
+    }
+
+    /// Like [`decode_int`] but distinguishes "truncated, need more bytes"
+    /// (`Ok(None)`) from a hard error. Used by the streaming encoder-stream
+    /// parser; the field-section decoder uses the non-partial variant since it
+    /// always has the whole block.
+    fn decode_int_partial(first: u8, prefix_bits: u8, rest: &[u8]) -> Result<Option<(u64, usize)>> {
+        debug_assert!((1..=8).contains(&prefix_bits));
+        let mask = ((1u16 << prefix_bits) - 1) as u8;
+        let prefix = (first & mask) as u64;
+        let max_prefix = mask as u64;
+        if prefix < max_prefix {
+            return Ok(Some((prefix, 0)));
+        }
+        let mut value = max_prefix;
+        let mut shift = 0u32;
+        let mut used = 0usize;
+        for &b in rest {
+            used += 1;
+            value = value
+                .checked_add(((b & 0x7F) as u64) << shift)
+                .ok_or_else(|| Error::BadResponse("qpack int overflow".into()))?;
+            if b & 0x80 == 0 {
+                return Ok(Some((value, used)));
+            }
+            shift += 7;
+            if shift > 63 {
+                return Err(Error::BadResponse("qpack int too long".into()));
+            }
+        }
+        Ok(None) // ran out of bytes mid-integer
+    }
 
     /// RFC 9204 Appendix A — the 99-entry QPACK static table.
     ///
@@ -458,18 +769,111 @@ pub(crate) mod qpack {
     /// Decoded field section.
     pub type Fields = Vec<(String, String)>;
 
-    /// Decode a complete QPACK field section. Handles indexed-static
-    /// references and both plain and Huffman-coded literals. Rejects any
-    /// reference to the dynamic table with `Error::BadResponse`.
+    /// Decode a complete QPACK field section against the static table only
+    /// (no dynamic-table state). Convenience wrapper used by tests and any
+    /// caller that knows the block can't reference the dynamic table; a
+    /// dynamic reference here is an error because the empty table can't
+    /// satisfy it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn decode_field_section(buf: &[u8]) -> Result<Fields> {
+        let table = DynamicTable::new();
+        decode_field_section_with(buf, &table)
+    }
+
+    /// Compute `MaxEntries = floor(capacity / 32)` (RFC 9204 §3.2.2), the
+    /// modulus used by the Required Insert Count wrap-around encoding.
+    fn max_entries() -> u64 {
+        (MAX_DYNAMIC_CAPACITY / ENTRY_OVERHEAD) as u64
+    }
+
+    /// Decode the Required Insert Count from its encoded wire value
+    /// (RFC 9204 §4.5.1.1). `total_inserts` is the table's current insert
+    /// count. Returns the reconstructed absolute Required Insert Count.
+    pub(crate) fn decode_required_insert_count(encoded: u64, total_inserts: u64) -> Result<u64> {
+        if encoded == 0 {
+            return Ok(0);
+        }
+        let max_entries = max_entries();
+        let full_range = 2 * max_entries;
+        if encoded > full_range {
+            return Err(Error::BadResponse(format!(
+                "qpack: encoded Required Insert Count {encoded} exceeds 2*MaxEntries {full_range}"
+            )));
+        }
+        let max_value = total_inserts + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut ric = max_wrapped + encoded - 1;
+        if ric > max_value {
+            if ric <= full_range {
+                return Err(Error::BadResponse(
+                    "qpack: Required Insert Count wrap underflow".into(),
+                ));
+            }
+            ric -= full_range;
+        }
+        if ric == 0 {
+            return Err(Error::BadResponse(
+                "qpack: reconstructed Required Insert Count is zero".into(),
+            ));
+        }
+        Ok(ric)
+    }
+
+    /// Cheap predicate: does this field section's prefix carry a non-zero
+    /// encoded Required Insert Count? If so the block references the dynamic
+    /// table and (RFC 9204 §4.4.1) we owe the peer a Section Acknowledgement.
+    /// Returns `false` for any malformed prefix — the decode itself surfaces
+    /// the real error.
+    pub(crate) fn block_references_dynamic_table(buf: &[u8]) -> bool {
+        if buf.is_empty() {
+            return false;
+        }
+        match decode_int(buf[0], 8, &buf[1..]) {
+            Ok((enc_ric, _)) => enc_ric != 0,
+            Err(_) => false,
+        }
+    }
+
+    /// Decode the Base from the second field-section-prefix integer
+    /// (RFC 9204 §4.5.1.2). The sign bit `S` (0b1000_0000 of the first byte)
+    /// selects the direction of the Delta Base offset from `ric`.
+    fn decode_base(first: u8, rest: &[u8], ric: u64) -> Result<(u64, usize)> {
+        let sign = first & 0b1000_0000 != 0;
+        let (delta_base, used) = decode_int(first, 7, rest)?;
+        let base = if sign {
+            // S=1: Base = ReqInsertCount - DeltaBase - 1.
+            ric.checked_sub(delta_base)
+                .and_then(|x| x.checked_sub(1))
+                .ok_or_else(|| Error::BadResponse("qpack: negative Base".into()))?
+        } else {
+            // S=0: Base = ReqInsertCount + DeltaBase.
+            ric.checked_add(delta_base)
+                .ok_or_else(|| Error::BadResponse("qpack: Base overflow".into()))?
+        };
+        Ok((base, used))
+    }
+
+    /// Decode a complete QPACK field section, resolving dynamic-table
+    /// references against `table`. Handles indexed-static, indexed-dynamic,
+    /// post-base-indexed, the literal-name variants (static / dynamic /
+    /// post-base), and literal-literal lines, Huffman-coded or not.
+    ///
+    /// Enforces the Required Insert Count from the field-section prefix
+    /// (§4.5.1): the caller must have applied enough encoder-stream inserts
+    /// (we advertise zero blocked streams, so the encoder sends them first).
+    /// If the table can't satisfy the block, that's a `QPACK_DECOMPRESSION_FAILED`
+    /// surfaced as `Error::BadResponse`.
+    pub(crate) fn decode_field_section_with(buf: &[u8], table: &DynamicTable) -> Result<Fields> {
         if buf.is_empty() {
             return Err(Error::BadResponse("qpack: empty field section".into()));
         }
         // Field Section Prefix: Required Insert Count (8-bit prefix) + Base.
-        let (ric, n1) = decode_int(buf[0], 8, &buf[1..])?;
-        if ric != 0 {
+        let (enc_ric, n1) = decode_int(buf[0], 8, &buf[1..])?;
+        let ric = decode_required_insert_count(enc_ric, table.insert_count())?;
+        if ric > table.insert_count() {
             return Err(Error::BadResponse(format!(
-                "qpack: nonzero Required Insert Count ({ric}) — dynamic table not supported"
+                "qpack: Required Insert Count {ric} exceeds available inserts {}",
+                table.insert_count()
             )));
         }
         let mut p = 1 + n1;
@@ -478,7 +882,7 @@ pub(crate) mod qpack {
                 "qpack: truncated field-section prefix".into(),
             ));
         }
-        let (_base, n2) = decode_int(buf[p], 7, &buf[p + 1..])?;
+        let (base, n2) = decode_base(buf[p], &buf[p + 1..], ric)?;
         p += 1 + n2;
 
         let mut out: Fields = Vec::new();
@@ -489,37 +893,39 @@ pub(crate) mod qpack {
         while p < buf.len() {
             let b = buf[p];
             let entry: (String, String) = if b & 0b1000_0000 != 0 {
-                // Indexed Field Line: 0b1Txxxxxx
+                // Indexed Field Line (§4.5.2): 0b1Txxxxxx
                 let t_static = b & 0b0100_0000 != 0;
                 let (idx, used) = decode_int(b, 6, &buf[p + 1..])?;
                 p += 1 + used;
-                if !t_static {
-                    return Err(Error::BadResponse(
-                        "qpack: dynamic-table indexed reference".into(),
-                    ));
+                if t_static {
+                    let (n, v) = *STATIC_TABLE.get(idx as usize).ok_or_else(|| {
+                        Error::BadResponse(format!("qpack: static index out of range: {idx}"))
+                    })?;
+                    (n.to_string(), v.to_string())
+                } else {
+                    // Dynamic: relative to Base (§3.2.6): abs = base - 1 - idx.
+                    let abs = field_relative_to_absolute(base, idx)?;
+                    table.get_absolute(abs)?.clone()
                 }
-                let (n, v) = *STATIC_TABLE.get(idx as usize).ok_or_else(|| {
-                    Error::BadResponse(format!("qpack: static index out of range: {idx}"))
-                })?;
-                (n.to_string(), v.to_string())
             } else if b & 0b0100_0000 != 0 {
-                // Literal Field Line With Name Reference: 0b01NTxxxx
+                // Literal Field Line With Name Reference (§4.5.4): 0b01NTxxxx
                 let t_static = b & 0b0001_0000 != 0;
                 let (idx, used) = decode_int(b, 4, &buf[p + 1..])?;
                 p += 1 + used;
-                if !t_static {
-                    return Err(Error::BadResponse(
-                        "qpack: dynamic-table name reference".into(),
-                    ));
-                }
-                let (name, _) = *STATIC_TABLE.get(idx as usize).ok_or_else(|| {
-                    Error::BadResponse(format!("qpack: static name index out of range: {idx}"))
-                })?;
+                let name = if t_static {
+                    let (n, _) = *STATIC_TABLE.get(idx as usize).ok_or_else(|| {
+                        Error::BadResponse(format!("qpack: static name index out of range: {idx}"))
+                    })?;
+                    n.to_string()
+                } else {
+                    let abs = field_relative_to_absolute(base, idx)?;
+                    table.get_absolute(abs)?.0.clone()
+                };
                 let value = decode_literal_string_7bit(&buf[p..])?;
                 p += value.1;
-                (name.to_string(), value.0)
+                (name, value.0)
             } else if b & 0b0010_0000 != 0 {
-                // Literal Field Line With Literal Name: 0b001NHXXX
+                // Literal Field Line With Literal Name (§4.5.6): 0b001NHXXX
                 let huffman = b & 0b0000_1000 != 0;
                 let (nlen, used) = decode_int(b, 3, &buf[p + 1..])?;
                 p += 1 + used;
@@ -527,27 +933,27 @@ pub(crate) mod qpack {
                 if p + nlen > buf.len() {
                     return Err(Error::BadResponse("qpack: truncated literal name".into()));
                 }
-                let raw = &buf[p..p + nlen];
-                let name = if huffman {
-                    let bytes = huffman_decode(raw)?;
-                    String::from_utf8(bytes)
-                        .map_err(|_| Error::BadResponse("qpack: literal name not utf-8".into()))?
-                } else {
-                    std::str::from_utf8(raw)
-                        .map_err(|_| Error::BadResponse("qpack: literal name not utf-8".into()))?
-                        .to_string()
-                };
+                let name = decode_string_bytes(&buf[p..p + nlen], huffman, "literal name")?;
                 p += nlen;
                 let value = decode_literal_string_7bit(&buf[p..])?;
                 p += value.1;
                 (name, value.0)
+            } else if b & 0b0001_0000 != 0 {
+                // Indexed Field Line With Post-Base Index (§4.5.3): 0b0001xxxx
+                let (idx, used) = decode_int(b, 4, &buf[p + 1..])?;
+                p += 1 + used;
+                let abs = post_base_to_absolute(base, idx)?;
+                table.get_absolute(abs)?.clone()
             } else {
-                // 0b0000xxxx or 0b0001xxxx — Indexed Field Line With
-                // Post-Base Index, or Literal With Post-Base Name
-                // Reference. Both reference the dynamic table.
-                return Err(Error::BadResponse(
-                    "qpack: post-base reference (dynamic table not supported)".into(),
-                ));
+                // Literal Field Line With Post-Base Name Reference (§4.5.5):
+                // 0b0000NHHH — N (never-index) bit, then 3-bit post-base index.
+                let (idx, used) = decode_int(b, 3, &buf[p + 1..])?;
+                p += 1 + used;
+                let abs = post_base_to_absolute(base, idx)?;
+                let name = table.get_absolute(abs)?.0.clone();
+                let value = decode_literal_string_7bit(&buf[p..])?;
+                p += value.1;
+                (name, value.0)
             };
             list_size = list_size
                 .saturating_add(entry.0.len())
@@ -561,6 +967,25 @@ pub(crate) mod qpack {
             out.push(entry);
         }
         Ok(out)
+    }
+
+    /// Field-line relative index → absolute index (RFC 9204 §3.2.6): the
+    /// index is relative to Base, counting backwards, so `abs = base - 1 - rel`.
+    fn field_relative_to_absolute(base: u64, rel: u64) -> Result<u64> {
+        base.checked_sub(1)
+            .and_then(|x| x.checked_sub(rel))
+            .ok_or_else(|| {
+                Error::BadResponse(format!(
+                    "qpack: field relative index {rel} out of range (Base {base})"
+                ))
+            })
+    }
+
+    /// Post-base index → absolute index (RFC 9204 §3.2.6): post-base entries
+    /// are at or after Base, so `abs = base + idx`.
+    fn post_base_to_absolute(base: u64, idx: u64) -> Result<u64> {
+        base.checked_add(idx)
+            .ok_or_else(|| Error::BadResponse("qpack: post-base index overflow".into()))
     }
 
     /// Decode a 7-bit-prefix literal string (H + 7-bit length). Returns
@@ -966,6 +1391,47 @@ const MAX_DATAGRAM: usize = 65_535;
 /// client advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY=0`, but a
 /// non-conforming peer can still emit dynamic references which we will
 /// reject with `Error::BadResponse`.
+/// Per-connection HTTP/3 / QPACK decoder state. Holds the QPACK dynamic
+/// table fed by the peer's encoder stream, the partial-read buffers for the
+/// server's unidirectional streams (so an instruction split across datagrams
+/// can be reassembled), and the client's QPACK decoder stream id (where we
+/// send Section Acknowledgements).
+struct Http3State {
+    /// The QPACK dynamic table, populated from the peer's encoder stream.
+    dyn_table: qpack::DynamicTable,
+    /// Our QPACK decoder stream id, if we managed to open it.
+    decoder_stream: Option<StreamId>,
+    /// Per server-uni-stream reassembly state, keyed by stream id value.
+    uni: std::collections::HashMap<u64, UniStreamState>,
+}
+
+/// State for one server-initiated unidirectional stream while we classify it
+/// by its leading stream-type varint and (for the QPACK encoder stream)
+/// accumulate and apply instructions.
+#[derive(Default)]
+struct UniStreamState {
+    /// Bytes received but not yet processed (a partial type prefix, or a
+    /// partial encoder instruction).
+    buf: Vec<u8>,
+    /// The decoded stream type, once the leading varint has been read.
+    ty: Option<u64>,
+}
+
+/// Cap on bytes we buffer from a single server uni-stream awaiting a complete
+/// QPACK encoder instruction. Bounds memory against a peer that dribbles an
+/// unterminated instruction. Generous relative to any real instruction.
+const MAX_UNI_BUFFER: usize = 64 * 1024;
+
+impl Http3State {
+    fn new(decoder_stream: Option<StreamId>) -> Self {
+        Http3State {
+            dyn_table: qpack::DynamicTable::new(),
+            decoder_stream,
+            uni: std::collections::HashMap::new(),
+        }
+    }
+}
+
 pub fn send(req: Request) -> Result<Response> {
     if req.url.scheme != "https" {
         // HTTP/3 only runs over QUIC, which only runs encrypted.
@@ -986,6 +1452,11 @@ pub fn send(req: Request) -> Result<Response> {
     // servers don't strictly police it on a one-shot request.
     let _ = open_control_stream(&mut conn);
 
+    // RFC 9204 §4.2 — open the QPACK encoder + decoder streams so we can
+    // (a) be a well-formed peer and (b) send Section Acknowledgements back.
+    let decoder_stream = open_qpack_streams(&mut conn);
+    let mut state = Http3State::new(decoder_stream);
+
     // The first client-initiated bidi stream is StreamId 0 in the absence
     // of any prior streams. `open_bidi` allocates and returns the next
     // available ID for us.
@@ -996,7 +1467,75 @@ pub fn send(req: Request) -> Result<Response> {
     write_request(&mut conn, request_stream, &req)?;
     pump(&mut conn, &sock, peer, req.read_timeout)?;
 
-    read_response(&mut conn, &sock, peer, request_stream, &req)
+    read_response(&mut conn, &sock, peer, request_stream, &req, &mut state)
+}
+
+/// Read all readable server-initiated unidirectional streams, classify each
+/// by its leading stream-type varint (RFC 9114 §6.2), and apply the QPACK
+/// encoder stream's instructions (RFC 9204 §4.3) into the dynamic table.
+/// Bytes on the server's control / decoder / push streams are buffered-and-
+/// discarded for our one-shot model. This must run BEFORE we decode a
+/// response HEADERS block so the table is populated (we advertise zero
+/// blocked streams, so the encoder front-loads every referenced insert).
+fn drain_uni_streams(conn: &mut QuicConnection, state: &mut Http3State) -> Result<()> {
+    // Snapshot the readable server uni-streams; reading mutates the iterator
+    // source, so collect ids first.
+    let ids: Vec<StreamId> = conn
+        .readable_streams()
+        .filter(|s| s.is_uni() && s.is_server_initiated())
+        .collect();
+    for sid in ids {
+        let mut tmp = vec![0u8; 16 * 1024];
+        // A read error on a uni stream we don't strictly need is not fatal for
+        // a one-shot request; `while let Ok` simply stops draining it. `n == 0`
+        // (no more buffered bytes right now) also ends this pass.
+        while let Ok((n, _fin)) = conn.read(sid, &mut tmp) {
+            if n == 0 {
+                break;
+            }
+            let entry = state.uni.entry(sid.value()).or_default();
+            if entry.buf.len() + n > MAX_UNI_BUFFER {
+                return Err(Error::BadResponse(
+                    "http3: server uni-stream buffer exceeded limit".into(),
+                ));
+            }
+            entry.buf.extend_from_slice(&tmp[..n]);
+        }
+        // Process whatever is buffered for this stream.
+        process_uni_stream(state, sid.value())?;
+    }
+    Ok(())
+}
+
+/// Classify and process the buffered bytes for one server uni-stream. Once
+/// the leading stream-type varint is known, QPACK-encoder bytes are applied
+/// to the dynamic table and other stream types are drained.
+fn process_uni_stream(state: &mut Http3State, sid: u64) -> Result<()> {
+    let entry = state.uni.entry(sid).or_default();
+    // Decode the stream-type prefix once.
+    if entry.ty.is_none() {
+        match varint::decode(&entry.buf) {
+            Ok((ty, used)) => {
+                entry.ty = Some(ty);
+                entry.buf.drain(..used);
+            }
+            Err(_) => return Ok(()), // need more bytes for the type prefix
+        }
+    }
+    match entry.ty {
+        Some(uni_stream_type::QPACK_ENCODER) => {
+            let consumed = qpack::apply_encoder_instructions(&mut state.dyn_table, &entry.buf)?;
+            let entry = state.uni.get_mut(&sid).expect("entry present");
+            entry.buf.drain(..consumed);
+        }
+        // Control / decoder / push / unknown: drain and ignore for our
+        // one-shot request. We never reference push, and the server's
+        // control SETTINGS don't change our literal-only request encoding.
+        _ => {
+            entry.buf.clear();
+        }
+    }
+    Ok(())
 }
 
 /// Build the QUIC client connection with the right transport-parameter set
@@ -1156,19 +1695,57 @@ fn handshake(
 }
 
 /// Open a client-initiated unidirectional stream and send the HTTP/3
-/// SETTINGS frame on it (RFC 9114 §6.2.1 + §7.2.4). Best-effort.
+/// SETTINGS frame on it (RFC 9114 §6.2.1 + §7.2.4). We advertise a non-zero
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` so the server may use its encoder's
+/// dynamic table, and `SETTINGS_QPACK_BLOCKED_STREAMS = 0` (the encoder must
+/// front-load every insert a header block references). Best-effort.
 fn open_control_stream(conn: &mut QuicConnection) -> Result<()> {
     let sid = conn
         .open_uni()
         .map_err(|e| Error::BadResponse(format!("http3: open_uni: {e:?}")))?;
     // Stream-type prefix: 0x00 = control.
-    let mut prefix = Vec::with_capacity(2);
+    let mut prefix = Vec::with_capacity(16);
     varint::encode(uni_stream_type::CONTROL, &mut prefix);
-    // Empty SETTINGS frame (a SETTINGS payload is a sequence of
-    // identifier+value varint pairs; an empty payload is legal).
-    Frame::encode_header(frame_type::SETTINGS, 0, &mut prefix);
+    // SETTINGS payload: a sequence of identifier+value varint pairs.
+    let mut settings = Vec::with_capacity(8);
+    varint::encode(settings_id::QPACK_MAX_TABLE_CAPACITY, &mut settings);
+    varint::encode(QPACK_MAX_TABLE_CAPACITY, &mut settings);
+    varint::encode(settings_id::QPACK_BLOCKED_STREAMS, &mut settings);
+    varint::encode(QPACK_BLOCKED_STREAMS, &mut settings);
+    Frame::encode_header(frame_type::SETTINGS, settings.len() as u64, &mut prefix);
+    prefix.extend_from_slice(&settings);
     write_all(conn, sid, &prefix)?;
     Ok(())
+}
+
+/// Open the client's QPACK encoder and decoder unidirectional streams
+/// (RFC 9204 §4.2). We never insert into our own dynamic table (the request
+/// encoder emits literals only), so the encoder stream carries just its
+/// type byte. The decoder stream is where we send Section Acknowledgements
+/// back to the peer. Returns the decoder stream id for later writes.
+/// Best-effort: returns `None` on any stream-API error so a one-shot request
+/// can still proceed.
+fn open_qpack_streams(conn: &mut QuicConnection) -> Option<StreamId> {
+    // Encoder stream: just the stream-type prefix; no instructions follow.
+    if let Ok(enc) = conn.open_uni() {
+        let mut buf = Vec::with_capacity(1);
+        varint::encode(uni_stream_type::QPACK_ENCODER, &mut buf);
+        let _ = write_all(conn, enc, &buf);
+    }
+    // Decoder stream: type prefix, then Section Ack instructions as we decode.
+    let dec = conn.open_uni().ok()?;
+    let mut buf = Vec::with_capacity(1);
+    varint::encode(uni_stream_type::QPACK_DECODER, &mut buf);
+    if write_all(conn, dec, &buf).is_err() {
+        return None;
+    }
+    Some(dec)
+}
+
+/// Encode a QPACK decoder-stream Section Acknowledgement (RFC 9204 §4.4.1):
+/// pattern `1` then the stream ID as a 7-bit-prefix integer.
+fn encode_section_ack(stream_id: u64, out: &mut Vec<u8>) {
+    qpack::encode_int(stream_id, 7, 0b1000_0000, out);
 }
 
 fn write_all(conn: &mut QuicConnection, sid: StreamId, mut data: &[u8]) -> Result<()> {
@@ -1281,6 +1858,7 @@ fn read_response(
     peer: std::net::SocketAddr,
     sid: StreamId,
     req: &Request,
+    state: &mut Http3State,
 ) -> Result<Response> {
     let total_deadline = req
         .read_timeout
@@ -1303,6 +1881,11 @@ fn read_response(
             return Err(Error::BadResponse("http3: peer closed connection".into()));
         }
 
+        // Apply any QPACK encoder-stream inserts the server has sent BEFORE we
+        // try to decode a HEADERS block, since we advertise zero blocked
+        // streams and the encoder front-loads every referenced insert.
+        drain_uni_streams(conn, state)?;
+
         // Pull whatever has arrived on the request stream.
         let mut tmp = vec![0u8; 16 * 1024];
         let (n, fin) = match conn.read(sid, &mut tmp) {
@@ -1318,11 +1901,17 @@ fn read_response(
 
         // Try to peel frames off the buffer.
         loop {
-            let consumed = match try_consume_frame(&stream_buf, &mut headers, &mut body) {
-                FrameOutcome::Consumed(n) => n,
-                FrameOutcome::NeedMore => break,
-                FrameOutcome::Err(e) => return Err(e),
-            };
+            let (consumed, ack_owed) =
+                match try_consume_frame(&stream_buf, &mut headers, &mut body, &state.dyn_table) {
+                    FrameOutcome::Consumed(n, ack) => (n, ack),
+                    FrameOutcome::NeedMore => break,
+                    FrameOutcome::Err(e) => return Err(e),
+                };
+            if ack_owed {
+                // RFC 9204 §4.4.1: acknowledge a section that referenced the
+                // dynamic table. Best-effort; the result doesn't depend on it.
+                send_section_ack(conn, sid, state);
+            }
             stream_buf.drain(..consumed);
             if stream_buf.is_empty() {
                 break;
@@ -1347,18 +1936,25 @@ fn read_response(
 }
 
 enum FrameOutcome {
-    Consumed(usize),
+    /// Consumed `n` bytes; the bool is `true` when the frame was a HEADERS
+    /// block that referenced the dynamic table and thus owes a Section
+    /// Acknowledgement (RFC 9204 §4.4.1).
+    Consumed(usize, bool),
     NeedMore,
     Err(Error),
 }
 
 /// Try to parse one HTTP/3 frame out of `buf`. On success, the relevant
 /// output bucket (HEADERS → `headers`, DATA → `body`) is populated and the
-/// number of bytes consumed is returned.
+/// number of bytes consumed is returned. A HEADERS block is decoded against
+/// `dyn_table`; the returned flag reports whether the block referenced the
+/// dynamic table (Required Insert Count > 0), so the caller can send a
+/// Section Acknowledgement.
 fn try_consume_frame(
     buf: &[u8],
     headers: &mut Option<qpack::Fields>,
     body: &mut Vec<u8>,
+    dyn_table: &qpack::DynamicTable,
 ) -> FrameOutcome {
     let (frame, hdr_len) = match Frame::decode_header(buf) {
         Ok(x) => x,
@@ -1389,7 +1985,7 @@ fn try_consume_frame(
     }
     let payload = &buf[hdr_len..total];
     match frame.ty {
-        frame_type::HEADERS => match qpack::decode_field_section(payload) {
+        frame_type::HEADERS => match qpack::decode_field_section_with(payload, dyn_table) {
             Ok(fields) => {
                 if headers.is_some() {
                     // Trailers — RFC 9114 §4.1 allows them, but the
@@ -1397,16 +1993,28 @@ fn try_consume_frame(
                 } else {
                     *headers = Some(fields);
                 }
-                FrameOutcome::Consumed(total)
+                let ack_owed = qpack::block_references_dynamic_table(payload);
+                FrameOutcome::Consumed(total, ack_owed)
             }
             Err(e) => FrameOutcome::Err(e),
         },
         frame_type::DATA => {
             body.extend_from_slice(payload);
-            FrameOutcome::Consumed(total)
+            FrameOutcome::Consumed(total, false)
         }
         // RFC 9114 §7.2.8 reserved/grease types — ignore (drain).
-        _ => FrameOutcome::Consumed(total),
+        _ => FrameOutcome::Consumed(total, false),
+    }
+}
+
+/// Send a QPACK Section Acknowledgement for `request_sid` on our decoder
+/// stream (RFC 9204 §4.4.1). Best-effort: failures are non-fatal for a
+/// one-shot request.
+fn send_section_ack(conn: &mut QuicConnection, request_sid: StreamId, state: &Http3State) {
+    if let Some(dec) = state.decoder_stream {
+        let mut out = Vec::with_capacity(4);
+        encode_section_ack(request_sid.value(), &mut out);
+        let _ = write_all(conn, dec, &out);
     }
 }
 
@@ -1768,8 +2376,9 @@ mod tests {
         Frame::encode_header(frame_type::HEADERS, MAX_HEADERS_FRAME_LEN + 1, &mut buf);
         let mut headers = None;
         let mut body = Vec::new();
+        let table = qpack::DynamicTable::new();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body),
+            try_consume_frame(&buf, &mut headers, &mut body, &table),
             FrameOutcome::Err(Error::BadResponse(_))
         ));
     }
@@ -1782,9 +2391,463 @@ mod tests {
         Frame::encode_header(frame_type::DATA, (MAX_RESPONSE_BYTES + 1) as u64, &mut buf);
         let mut headers = None;
         let mut body = Vec::new();
+        let table = qpack::DynamicTable::new();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body),
+            try_consume_frame(&buf, &mut headers, &mut body, &table),
             FrameOutcome::Err(Error::BadResponse(_))
         ));
+    }
+
+    // ---- QPACK dynamic table: encoder stream (RFC 9204 §4.3) --------------
+
+    /// Test helper: a dynamic table with the capacity we'd accept after the
+    /// peer raises it to our advertised maximum.
+    fn table_at_max() -> qpack::DynamicTable {
+        let mut t = qpack::DynamicTable::new();
+        t.set_capacity(qpack::MAX_DYNAMIC_CAPACITY as u64)
+            .expect("set capacity");
+        t
+    }
+
+    /// Encode an Insert With Literal Name instruction (§4.3.3, H=0).
+    fn enc_insert_literal(name: &str, value: &str, out: &mut Vec<u8>) {
+        // Pattern 0b01 H nnnnn, H=0, 5-bit name length prefix.
+        qpack::encode_int(name.len() as u64, 5, 0b0100_0000, out);
+        out.extend_from_slice(name.as_bytes());
+        qpack::encode_string_7bit(value, out);
+    }
+
+    /// Encode an Insert With Name Reference instruction (§4.3.2).
+    /// `t_static` selects the static (T=1) vs dynamic (T=0) name table.
+    fn enc_insert_name_ref(t_static: bool, idx: u64, value: &str, out: &mut Vec<u8>) {
+        // Pattern 0b1 T iiiiii, 6-bit index prefix.
+        let pat = 0b1000_0000 | if t_static { 0b0100_0000 } else { 0 };
+        qpack::encode_int(idx, 6, pat, out);
+        qpack::encode_string_7bit(value, out);
+    }
+
+    /// Encode a Set Dynamic Table Capacity instruction (§4.3.1).
+    fn enc_set_capacity(cap: u64, out: &mut Vec<u8>) {
+        // Pattern 0b001 ccccc, 5-bit prefix.
+        qpack::encode_int(cap, 5, 0b0010_0000, out);
+    }
+
+    /// Encode a Duplicate instruction (§4.3.4).
+    fn enc_duplicate(rel: u64, out: &mut Vec<u8>) {
+        // Pattern 0b000 iiiii, 5-bit prefix.
+        qpack::encode_int(rel, 5, 0b0000_0000, out);
+    }
+
+    #[test]
+    fn qpack_encoder_insert_literal_name_adds_entry() {
+        let mut t = table_at_max();
+        let mut wire = Vec::new();
+        enc_insert_literal("x-custom", "hello", &mut wire);
+        let used = qpack::apply_encoder_instructions(&mut t, &wire).expect("apply");
+        assert_eq!(used, wire.len(), "consumed the whole instruction");
+        assert_eq!(t.insert_count(), 1);
+        // Absolute index 0 is the first (and only) entry.
+        assert_eq!(
+            t.get_absolute(0).expect("entry"),
+            &("x-custom".to_string(), "hello".to_string())
+        );
+    }
+
+    #[test]
+    fn qpack_encoder_insert_name_ref_static_and_dynamic() {
+        let mut t = table_at_max();
+        let mut wire = Vec::new();
+        // Static name ref: index 0 = ":authority", value "example.com".
+        enc_insert_name_ref(true, 0, "example.com", &mut wire);
+        // Dynamic name ref: relative index 0 → the entry we just inserted,
+        // i.e. name ":authority", value "other.example".
+        enc_insert_name_ref(false, 0, "other.example", &mut wire);
+        let used = qpack::apply_encoder_instructions(&mut t, &wire).expect("apply");
+        assert_eq!(used, wire.len());
+        assert_eq!(t.insert_count(), 2);
+        assert_eq!(
+            t.get_absolute(0).unwrap(),
+            &(":authority".to_string(), "example.com".to_string())
+        );
+        assert_eq!(
+            t.get_absolute(1).unwrap(),
+            &(":authority".to_string(), "other.example".to_string())
+        );
+    }
+
+    #[test]
+    fn qpack_encoder_set_capacity_resizes_and_evicts() {
+        let mut t = table_at_max();
+        let mut wire = Vec::new();
+        // Two entries, each size = name+value+32.
+        enc_insert_literal("aaaa", "bbbb", &mut wire); // 4+4+32 = 40
+        enc_insert_literal("cccc", "dddd", &mut wire); // 40
+        qpack::apply_encoder_instructions(&mut t, &wire).expect("apply");
+        assert_eq!(t.insert_count(), 2);
+        assert!(t.get_absolute(0).is_ok());
+
+        // Shrink capacity below two entries' worth (40 each → cap 60 leaves
+        // room for only the newest). The oldest (abs 0) is evicted.
+        let mut shrink = Vec::new();
+        enc_set_capacity(60, &mut shrink);
+        qpack::apply_encoder_instructions(&mut t, &shrink).expect("shrink");
+        assert!(t.get_absolute(0).is_err(), "oldest evicted");
+        assert_eq!(
+            t.get_absolute(1).unwrap(),
+            &("cccc".to_string(), "dddd".to_string())
+        );
+        // insert_count is monotonic even across eviction.
+        assert_eq!(t.insert_count(), 2);
+    }
+
+    #[test]
+    fn qpack_encoder_duplicate_readds_entry() {
+        let mut t = table_at_max();
+        let mut wire = Vec::new();
+        enc_insert_literal("foo", "bar", &mut wire);
+        // Duplicate relative index 0 → re-add the just-inserted entry.
+        enc_duplicate(0, &mut wire);
+        qpack::apply_encoder_instructions(&mut t, &wire).expect("apply");
+        assert_eq!(t.insert_count(), 2);
+        assert_eq!(t.get_absolute(0).unwrap(), t.get_absolute(1).unwrap());
+        assert_eq!(
+            t.get_absolute(1).unwrap(),
+            &("foo".to_string(), "bar".to_string())
+        );
+    }
+
+    #[test]
+    fn qpack_encoder_eviction_on_overflow() {
+        // Capacity 100 holds two 40-byte entries (80) but a third evicts the
+        // oldest (size accounting RFC 9204 §3.2.1).
+        let mut t = qpack::DynamicTable::new();
+        t.set_capacity(100).unwrap();
+        let mut wire = Vec::new();
+        enc_insert_literal("aaaa", "1111", &mut wire); // abs 0, size 40
+        enc_insert_literal("bbbb", "2222", &mut wire); // abs 1, size 40
+        enc_insert_literal("cccc", "3333", &mut wire); // abs 2, evicts abs 0
+        qpack::apply_encoder_instructions(&mut t, &wire).expect("apply");
+        assert_eq!(t.insert_count(), 3);
+        assert!(t.get_absolute(0).is_err(), "abs 0 evicted");
+        assert_eq!(
+            t.get_absolute(1).unwrap(),
+            &("bbbb".to_string(), "2222".to_string())
+        );
+        assert_eq!(
+            t.get_absolute(2).unwrap(),
+            &("cccc".to_string(), "3333".to_string())
+        );
+    }
+
+    #[test]
+    fn qpack_encoder_capacity_above_advertised_is_rejected() {
+        let mut t = qpack::DynamicTable::new();
+        let mut wire = Vec::new();
+        enc_set_capacity(qpack::MAX_DYNAMIC_CAPACITY as u64 + 1, &mut wire);
+        assert!(qpack::apply_encoder_instructions(&mut t, &wire).is_err());
+    }
+
+    #[test]
+    fn qpack_encoder_partial_instruction_is_held() {
+        // A truncated Insert With Literal Name (value bytes missing) must be
+        // left unconsumed so the streaming caller can retry after more bytes.
+        let mut t = table_at_max();
+        let mut full = Vec::new();
+        enc_insert_literal("name", "value", &mut full);
+        // Feed all but the last byte.
+        let used = qpack::apply_encoder_instructions(&mut t, &full[..full.len() - 1])
+            .expect("partial apply");
+        assert_eq!(used, 0, "no complete instruction yet");
+        assert_eq!(t.insert_count(), 0);
+        // Now the whole thing applies.
+        let used = qpack::apply_encoder_instructions(&mut t, &full).expect("apply");
+        assert_eq!(used, full.len());
+        assert_eq!(t.insert_count(), 1);
+    }
+
+    #[test]
+    fn qpack_encoder_rfc9204_appendix_b2_cross_check() {
+        // RFC 9204 Appendix B.2 — the exact encoder-stream byte sequence the
+        // RFC shows a server emitting:
+        //   3fbd01                Set Dynamic Table Capacity = 220
+        //   c0 0f www.example.com Insert With Name Reference, static idx 0
+        //                          (:authority=www.example.com)
+        //   c1 0c /sample/path    Insert With Name Reference, static idx 1
+        //                          (:path=/sample/path)
+        // We apply the real RFC bytes and assert the resulting dynamic table.
+        let mut wire: Vec<u8> = vec![0x3f, 0xbd, 0x01];
+        wire.extend_from_slice(&[0xc0, 0x0f]);
+        wire.extend_from_slice(b"www.example.com");
+        wire.extend_from_slice(&[0xc1, 0x0c]);
+        wire.extend_from_slice(b"/sample/path");
+
+        let mut t = qpack::DynamicTable::new();
+        let used = qpack::apply_encoder_instructions(&mut t, &wire).expect("apply");
+        assert_eq!(used, wire.len(), "consumed entire Appendix B.2 stream");
+        assert_eq!(t.insert_count(), 2);
+        // Absolute index 0 / 1 per RFC Appendix B.2.
+        assert_eq!(
+            t.get_absolute(0).unwrap(),
+            &(":authority".to_string(), "www.example.com".to_string())
+        );
+        assert_eq!(
+            t.get_absolute(1).unwrap(),
+            &(":path".to_string(), "/sample/path".to_string())
+        );
+
+        // RFC 9204 Appendix B.2 then shows the Stream-4 request header block:
+        //   0381  Field Section Prefix: Required Insert Count = 2 (enc 0x03),
+        //         Base = 0 (prefix byte 0x81 → S=1, DeltaBase=1, so
+        //         Base = RIC - DeltaBase - 1 = 2 - 1 - 1 = 0)
+        //   10    Indexed Field Line With Post-Base Index, abs = 0+0 = 0
+        //         (:authority=www.example.com)
+        //   11    Indexed Field Line With Post-Base Index, abs = 0+1 = 1
+        //         (:path=/sample/path)
+        let block: [u8; 4] = [0x03, 0x81, 0x10, 0x11];
+        let fields = qpack::decode_field_section_with(&block, &t).expect("decode block");
+        assert_eq!(
+            fields,
+            vec![
+                (":authority".to_string(), "www.example.com".to_string()),
+                (":path".to_string(), "/sample/path".to_string()),
+            ]
+        );
+        assert!(qpack::block_references_dynamic_table(&block));
+    }
+
+    // ---- QPACK field-section prefix (RFC 9204 §4.5.1) ---------------------
+
+    #[test]
+    fn qpack_required_insert_count_round_trips() {
+        // §4.5.1.1: the wrap-around encoding. With MaxEntries = 4096/32 = 128
+        // and FullRange = 256, encode several RICs against a total-inserts
+        // count and confirm reconstruction. The encoder formula is
+        // EncInsertCount = ReqInsertCount mod FullRange + 1 (for RIC > 0).
+        //
+        // The reconstruction is only well-defined when the true RIC lies in
+        // the window (TotalInserts + MaxEntries - FullRange, TotalInserts +
+        // MaxEntries] — i.e. roughly within FullRange of the insert count,
+        // which always holds for a real block (RIC <= insert count). All
+        // cases below satisfy that.
+        let max_entries = (qpack::MAX_DYNAMIC_CAPACITY / 32) as u64;
+        let full_range = 2 * max_entries; // 256
+        for &(ric, total) in &[
+            (1u64, 1u64),
+            (5, 10),
+            (128, 200),
+            (255, 300),
+            (400, 400), // RIC == insert count
+            (300, 400), // RIC within FullRange below the insert count
+            (512, 600), // wraps past one FullRange multiple
+        ] {
+            let enc = (ric % full_range) + 1;
+            let got = qpack::decode_required_insert_count(enc, total).expect("decode RIC");
+            assert_eq!(got, ric, "RIC {ric} total {total} enc {enc}");
+        }
+        // EncInsertCount 0 always means RIC 0.
+        assert_eq!(qpack::decode_required_insert_count(0, 99).unwrap(), 0);
+    }
+
+    #[test]
+    fn qpack_required_insert_count_rejects_out_of_range() {
+        let max_entries = (qpack::MAX_DYNAMIC_CAPACITY / 32) as u64;
+        let full_range = 2 * max_entries;
+        // EncInsertCount > FullRange is illegal.
+        assert!(qpack::decode_required_insert_count(full_range + 1, 0).is_err());
+    }
+
+    // ---- QPACK full decode with dynamic references (RFC 9204 §4.5) --------
+
+    /// Encode a field-section prefix (§4.5.1): Required Insert Count and Base.
+    /// `enc_ric` is the already-§4.5.1.1-encoded insert count; `delta_base`
+    /// and `sign` give the Base.
+    fn enc_prefix(enc_ric: u64, sign: bool, delta_base: u64, out: &mut Vec<u8>) {
+        qpack::encode_int(enc_ric, 8, 0x00, out);
+        let pat = if sign { 0b1000_0000 } else { 0 };
+        qpack::encode_int(delta_base, 7, pat, out);
+    }
+
+    #[test]
+    fn qpack_decode_with_dynamic_indexed_post_base_and_name_ref() {
+        // Build a dynamic table via encoder-stream inserts, then a HEADERS
+        // block that references it three ways.
+        let mut t = table_at_max();
+        let mut enc = Vec::new();
+        // abs 0: ("x-a", "va") via literal name.
+        enc_insert_literal("x-a", "va", &mut enc);
+        // abs 1: (":status", "200") via static name ref idx 25? Use literal to
+        // keep the name predictable: ("x-b", "vb").
+        enc_insert_literal("x-b", "vb", &mut enc);
+        // abs 2: ("x-c", "vc").
+        enc_insert_literal("x-c", "vc", &mut enc);
+        qpack::apply_encoder_instructions(&mut t, &enc).expect("inserts");
+        assert_eq!(t.insert_count(), 3);
+
+        // Field section: RIC = 3 (all three inserts needed). To exercise a
+        // post-base reference we need Base < insert_count, so set Base = 2 via
+        // the §4.5.1.2 sign form: Base = RIC - DeltaBase - 1 = 3 - 0 - 1 = 2.
+        // EncInsertCount for RIC=3 is (3 % FullRange) + 1 = 4.
+        // With Base=2: relative 0 → abs 1, relative 1 → abs 0; post-base 0 → abs 2.
+        let mut block = Vec::new();
+        enc_prefix(4, true, 0, &mut block); // RIC=3, Base=2
+
+        // Indexed Field Line (dynamic, T=0), relative index 1 → abs 0 ("x-a").
+        // Pattern 0b10 iiiiii (T=0), 6-bit prefix.
+        qpack::encode_int(1, 6, 0b1000_0000, &mut block);
+        // Indexed Field Line (dynamic), relative index 0 → abs 1 ("x-b").
+        qpack::encode_int(0, 6, 0b1000_0000, &mut block);
+        // Indexed Field Line With Post-Base Index, post-base 0 → abs 2 ("x-c").
+        // Pattern 0b0001 iiii, 4-bit prefix.
+        qpack::encode_int(0, 4, 0b0001_0000, &mut block);
+        // Literal Field Line With Name Reference (dynamic, T=0), relative
+        // index 1 → abs 0 name "x-a", value "lit". Pattern 0b01 N T iiii,
+        // N=0 T=0, 4-bit index prefix.
+        qpack::encode_int(1, 4, 0b0100_0000, &mut block);
+        qpack::encode_string_7bit("lit", &mut block);
+
+        let fields = qpack::decode_field_section_with(&block, &t).expect("decode");
+        assert_eq!(
+            fields,
+            vec![
+                ("x-a".to_string(), "va".to_string()),
+                ("x-b".to_string(), "vb".to_string()),
+                ("x-c".to_string(), "vc".to_string()),
+                ("x-a".to_string(), "lit".to_string()),
+            ]
+        );
+        // A block with RIC>0 owes a Section Acknowledgement.
+        assert!(qpack::block_references_dynamic_table(&block));
+    }
+
+    #[test]
+    fn qpack_decode_post_base_name_reference() {
+        // Exercise §4.5.5 Literal Field Line With Post-Base Name Reference.
+        let mut t = table_at_max();
+        let mut enc = Vec::new();
+        enc_insert_literal("x-name", "ignored", &mut enc); // abs 0
+        qpack::apply_encoder_instructions(&mut t, &enc).expect("insert");
+
+        let mut block = Vec::new();
+        // RIC = 1 → enc = (1 % 256) + 1 = 2. Base = 0 (sign=0, delta_base=0
+        // gives Base=RIC=1; we want Base=0 so post-base 0 → abs 0).
+        // Base = RIC - DeltaBase - 1 with sign=1: 1 - 0 - 1 = 0.
+        enc_prefix(2, true, 0, &mut block); // Base = 0
+                                            // Literal With Post-Base Name Reference: 0b0000 N iii, N=0, 3-bit
+                                            // post-base index = 0 → abs 0, name "x-name".
+        qpack::encode_int(0, 3, 0b0000_0000, &mut block);
+        qpack::encode_string_7bit("v", &mut block);
+
+        let fields = qpack::decode_field_section_with(&block, &t).expect("decode");
+        assert_eq!(fields, vec![("x-name".to_string(), "v".to_string())]);
+    }
+
+    #[test]
+    fn qpack_decode_mixes_static_and_dynamic() {
+        // A realistic response: indexed-static :status 200, plus a dynamic
+        // indexed header. Confirms the static path still works alongside.
+        let mut t = table_at_max();
+        let mut enc = Vec::new();
+        enc_insert_literal("x-dyn", "dynval", &mut enc); // abs 0
+        qpack::apply_encoder_instructions(&mut t, &enc).expect("insert");
+
+        let mut block = Vec::new();
+        enc_prefix(2, false, 0, &mut block); // RIC=1 (enc=2), Base=1
+                                             // Indexed static: :status 200 = static index 25, T=1, 6-bit prefix.
+        qpack::encode_int(25, 6, 0b1100_0000, &mut block);
+        // Indexed dynamic: Base=1, relative 0 → abs 0 ("x-dyn","dynval").
+        qpack::encode_int(0, 6, 0b1000_0000, &mut block);
+
+        let fields = qpack::decode_field_section_with(&block, &t).expect("decode");
+        assert_eq!(
+            fields,
+            vec![
+                (":status".to_string(), "200".to_string()),
+                ("x-dyn".to_string(), "dynval".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn qpack_decode_unsatisfiable_required_insert_count_errors() {
+        // RIC larger than the table's insert count → decompression failure.
+        let mut t = table_at_max();
+        let mut enc = Vec::new();
+        enc_insert_literal("a", "b", &mut enc); // insert_count becomes 1
+        qpack::apply_encoder_instructions(&mut t, &enc).unwrap();
+
+        let mut block = Vec::new();
+        // Ask for RIC = 5 (enc = (5 % 256)+1 = 6) but only 1 insert exists.
+        enc_prefix(6, false, 0, &mut block);
+        // A single dynamic indexed line (won't be reached — prefix check fails).
+        qpack::encode_int(0, 6, 0b1000_0000, &mut block);
+        let err = qpack::decode_field_section_with(&block, &t).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn qpack_decode_dynamic_index_out_of_range_errors() {
+        // A field line referencing an absolute index the table doesn't have
+        // (evicted / never inserted) → decode error.
+        let mut t = table_at_max();
+        let mut enc = Vec::new();
+        enc_insert_literal("a", "b", &mut enc); // abs 0, insert_count 1
+        qpack::apply_encoder_instructions(&mut t, &enc).unwrap();
+
+        let mut block = Vec::new();
+        enc_prefix(2, false, 0, &mut block); // RIC=1, Base=1
+                                             // Relative index 5 → field_relative_to_absolute(1, 5) underflows.
+        qpack::encode_int(5, 6, 0b1000_0000, &mut block);
+        assert!(qpack::decode_field_section_with(&block, &t).is_err());
+    }
+
+    #[test]
+    fn qpack_decode_dynamic_reference_bomb_trips_list_cap() {
+        // Even with dynamic references, the decoded-header-list cap must trip.
+        // Insert one large entry, then reference it many times via Duplicate-
+        // free indexed lines so the decoded list explodes.
+        let mut t = table_at_max();
+        let mut enc = Vec::new();
+        // One ~4000-byte value won't fit (cap 4096, entry size = name+val+32);
+        // use a value that fits: name "a" (1) + value 3000 + 32 = 3033 < 4096.
+        let big = "x".repeat(3000);
+        enc_insert_literal("a", &big, &mut enc); // abs 0
+        qpack::apply_encoder_instructions(&mut t, &enc).expect("insert");
+
+        let mut block = Vec::new();
+        enc_prefix(2, false, 0, &mut block); // RIC=1, Base=1
+                                             // Reference abs 0 (relative 0) ~100 times. Each contributes
+                                             // 1 + 3000 + 32 = 3033 to the list size; 100 * 3033 > 256 KiB cap.
+        for _ in 0..100 {
+            qpack::encode_int(0, 6, 0b1000_0000, &mut block);
+        }
+        let err = qpack::decode_field_section_with(&block, &t).unwrap_err();
+        match err {
+            Error::BadResponse(m) => assert!(m.contains("header list"), "msg: {m}"),
+            other => panic!("expected header-list-cap error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qpack_block_references_dynamic_table_predicate() {
+        // RIC=0 prefix → no dynamic reference; RIC>0 → owes Section Ack.
+        let mut zero = Vec::new();
+        enc_prefix(0, false, 0, &mut zero);
+        assert!(!qpack::block_references_dynamic_table(&zero));
+        let mut nonzero = Vec::new();
+        enc_prefix(2, false, 0, &mut nonzero);
+        assert!(qpack::block_references_dynamic_table(&nonzero));
+    }
+
+    #[test]
+    fn qpack_section_ack_encoding() {
+        // §4.4.1: Section Acknowledgement is pattern 1 then a 7-bit-prefix
+        // stream id. Stream id 0 → single byte 0x80.
+        let mut out = Vec::new();
+        encode_section_ack(0, &mut out);
+        assert_eq!(out, vec![0x80]);
+        // Stream id 4 (the request bidi stream) → 0x84.
+        let mut out = Vec::new();
+        encode_section_ack(4, &mut out);
+        assert_eq!(out, vec![0x84]);
     }
 }
