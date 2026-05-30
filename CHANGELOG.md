@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/rsurl/compare/v0.0.3...v0.0.4) - 2026-05-30
+
+### Other
+
+- concurrent stream multiplexing (send_multiplexed) over one connection
+- wire --http3/--http3-only into dispatch (was unreachable)
+- fix docs build and cross-platform FTP upload tests
+- *(release-plz)* use RELEASE_PLZ_TOKEN so release PRs get CI and releases trigger binaries
+
 ## [0.0.3](https://github.com/KarpelesLab/rsurl/compare/v0.0.2...v0.0.3) - 2026-05-30
 
 ### Other
