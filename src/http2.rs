@@ -79,6 +79,23 @@ const INITIAL_WINDOW_SIZE_MAX: u32 = 0x7fff_ffff; // 2^31 - 1
 const MAX_FRAME_SIZE_MIN: u32 = 16_384; // 2^14
 const MAX_FRAME_SIZE_MAX: u32 = 16_777_215; // 2^24 - 1
 
+/// Cumulative response-body ceiling (per stream). HTTP/2 flow control
+/// auto-replenishes, so without an absolute cap a server can stream DATA
+/// frames forever and exhaust memory. Mirrors HTTP/3's `MAX_RESPONSE_BYTES`.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Cap on the aggregate size of a single (HEADERS + CONTINUATION) header
+/// block we will buffer before END_HEADERS, in *compressed* wire bytes.
+/// Bounds the CONTINUATION-flood / unbounded-header-block class
+/// (CVE-2024-27316). We don't advertise `SETTINGS_MAX_HEADER_LIST_SIZE`, so
+/// this is a sane fixed ceiling on the on-the-wire block.
+const MAX_HEADERS_BUF: usize = 256 * 1024;
+
+/// Cap on the *decoded* header-list size (sum of `name + value + 32` per
+/// header, the RFC 7541 §4.1 accounting). Bounds HPACK decompression bombs:
+/// a small compressed block can otherwise expand into a huge header list.
+const MAX_DECODED_HEADER_LIST: usize = 256 * 1024;
+
 /// Peer (server) SETTINGS values, with RFC 9113 defaults for any parameter
 /// the peer hasn't sent. We track all six standard parameters even if we
 /// don't yet act on each of them; future tasks will consume more.
@@ -867,7 +884,7 @@ const HUFFMAN: [(u32, u8); 257] = [
 /// (left-aligned for that length) matches any code of that length. With 257
 /// symbols this is small enough to scan linearly.
 fn huffman_decode(input: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 2);
+    let mut out = Vec::with_capacity(input.len().saturating_mul(2));
     let mut acc: u64 = 0;
     let mut acc_len: u8 = 0;
 
@@ -1029,13 +1046,18 @@ impl Decoder {
     fn decode_block(&mut self, buf: &[u8]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
         let mut pos = 0;
+        // Running total of the decoded header-list size (RFC 7541 §4.1:
+        // `name.len() + value.len() + 32` per entry). Bounds a decompression
+        // bomb where a small compressed block expands into a huge list.
+        let mut list_size: usize = 0;
         while pos < buf.len() {
             let b = buf[pos];
+            let entry: (String, String);
             if b & 0x80 != 0 {
                 // Indexed header field (RFC 7541 §6.1).
                 let (idx, n) = decode_int(&buf[pos..], 7)?;
                 pos += n;
-                out.push(self.lookup(idx)?);
+                entry = self.lookup(idx)?;
             } else if b & 0x40 != 0 {
                 // Literal header field with incremental indexing (§6.2.1).
                 let (idx, n) = decode_int(&buf[pos..], 6)?;
@@ -1047,7 +1069,7 @@ impl Decoder {
                 };
                 let value = self.read_string(buf, &mut pos)?;
                 self.insert(name.clone(), value.clone());
-                out.push((name, value));
+                entry = (name, value);
             } else if b & 0x20 != 0 {
                 // Dynamic table size update (§6.3).
                 let (new_size, n) = decode_int(&buf[pos..], 5)?;
@@ -1055,6 +1077,7 @@ impl Decoder {
                 let cap = (new_size as usize).min(DYN_TABLE_CAP);
                 self.dyn_table_cap = cap;
                 self.evict_to_fit(0);
+                continue;
             } else {
                 // Literal w/o indexing (b & 0x10 == 0) or never-indexed
                 // (b & 0x10 != 0). Both use a 4-bit prefix; we treat them
@@ -1068,8 +1091,18 @@ impl Decoder {
                     self.lookup_name(idx)?
                 };
                 let value = self.read_string(buf, &mut pos)?;
-                out.push((name, value));
+                entry = (name, value);
             }
+            list_size = list_size
+                .saturating_add(entry.0.len())
+                .saturating_add(entry.1.len())
+                .saturating_add(32);
+            if list_size > MAX_DECODED_HEADER_LIST {
+                return Err(Error::BadResponse(
+                    "hpack: decoded header list exceeds limit".into(),
+                ));
+            }
+            out.push(entry);
         }
         Ok(out)
     }
@@ -1474,6 +1507,22 @@ impl Stream {
     /// chunk on this stream.
     fn send_budget(&self, conn_window: &ConnSendWindow) -> i64 {
         self.send_window.available.min(conn_window.available)
+    }
+
+    /// Append a header-block fragment (HEADERS / CONTINUATION) to the
+    /// accumulator, refusing to grow past [`MAX_HEADERS_BUF`]. Returning an
+    /// error here terminates the connection, which bounds the
+    /// CONTINUATION-flood / unbounded-header-block class (CVE-2024-27316):
+    /// without this an attacker can stream END_HEADERS-less CONTINUATION
+    /// frames forever and exhaust memory.
+    fn push_header_fragment(&mut self, frag: &[u8]) -> Result<()> {
+        if self.headers_buf.len().saturating_add(frag.len()) > MAX_HEADERS_BUF {
+            return Err(Error::BadResponse(
+                "header block exceeds size limit (CONTINUATION flood?)".into(),
+            ));
+        }
+        self.headers_buf.extend_from_slice(frag);
+        Ok(())
     }
 }
 
@@ -1955,8 +2004,7 @@ impl<S: Read + Write> Connection<S> {
                 self.streams
                     .get_mut(&stream_id)
                     .unwrap()
-                    .headers_buf
-                    .extend_from_slice(frag);
+                    .push_header_fragment(frag)?;
                 self.expecting_continuation = Some(stream_id);
             }
             return Ok(DispatchOutcome::Continue);
@@ -1964,7 +2012,7 @@ impl<S: Read + Write> Connection<S> {
         let new_state = state.recv_headers(end_stream)?;
 
         let s = self.streams.get_mut(&stream_id).unwrap();
-        s.headers_buf.extend_from_slice(frag);
+        s.push_header_fragment(frag)?;
         if end_stream {
             s.end_stream_recv = true;
         }
@@ -2013,7 +2061,7 @@ impl<S: Read + Write> Connection<S> {
         let s = self.streams.get_mut(&stream_id).ok_or_else(|| {
             Error::BadResponse(format!("CONTINUATION on unknown stream {stream_id}"))
         })?;
-        s.headers_buf.extend_from_slice(&frame.payload);
+        s.push_header_fragment(&frame.payload)?;
         let end_headers = frame.flags & FLAG_END_HEADERS != 0;
         if end_headers {
             let block = std::mem::take(&mut s.headers_buf);
@@ -2085,6 +2133,15 @@ impl<S: Read + Write> Connection<S> {
                 return Err(Error::BadResponse("DATA padding overruns payload".into()));
             }
             payload = &payload[..payload.len() - pad_len];
+        }
+        // Cumulative body cap. HTTP/2 flow control auto-replenishes (see the
+        // `replenish()` calls below), so it never stops a server that streams
+        // DATA forever — only an absolute ceiling does. Mirrors HTTP/3's
+        // `MAX_RESPONSE_BYTES`.
+        if s.body.len().saturating_add(payload.len()) > MAX_RESPONSE_BYTES {
+            return Err(Error::BadResponse(
+                "response body exceeds size limit".into(),
+            ));
         }
         s.body.extend_from_slice(payload);
         if end_stream {
@@ -3929,6 +3986,110 @@ mod tests {
         };
         let err = conn.process_frame(bad).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn data_frames_past_body_cap_are_rejected() {
+        // A server that streams DATA past MAX_RESPONSE_BYTES must be stopped
+        // with BadResponse rather than allowed to exhaust memory.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        // Seed the body right up against the ceiling, then push one more frame
+        // that tips it over.
+        conn.streams.get_mut(&id).unwrap().body = vec![0u8; MAX_RESPONSE_BYTES - 2];
+        let err = conn
+            .process_frame(synth_data(id, b"abc", false))
+            .unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+        // The over-limit payload must not have been appended.
+        assert_eq!(
+            conn.streams.get(&id).unwrap().body.len(),
+            MAX_RESPONSE_BYTES - 2
+        );
+    }
+
+    #[test]
+    fn continuation_flood_is_bounded() {
+        // HEADERS without END_HEADERS followed by a stream of CONTINUATION
+        // frames must not grow headers_buf without bound (CVE-2024-27316).
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        // HEADERS, no END_HEADERS — opens the continuation window. Payload is
+        // raw HPACK bytes that we never decode (we error before END_HEADERS).
+        conn.process_frame(Frame {
+            typ: F_HEADERS,
+            flags: 0,
+            stream_id: id,
+            payload: vec![0u8; 8 * 1024],
+        })
+        .unwrap();
+        // Keep feeding CONTINUATION fragments with no END_HEADERS; eventually
+        // the aggregate buffer cap fires.
+        let chunk = vec![0u8; 16 * 1024];
+        let mut hit_cap = false;
+        for _ in 0..(MAX_HEADERS_BUF / chunk.len() + 4) {
+            let r = conn.process_frame(Frame {
+                typ: F_CONTINUATION,
+                flags: 0,
+                stream_id: id,
+                payload: chunk.clone(),
+            });
+            if let Err(Error::BadResponse(_)) = r {
+                hit_cap = true;
+                break;
+            }
+            r.unwrap();
+        }
+        assert!(hit_cap, "CONTINUATION flood was not bounded");
+        assert!(conn.streams.get(&id).unwrap().headers_buf.len() <= MAX_HEADERS_BUF);
+    }
+
+    #[test]
+    fn hpack_decompression_bomb_is_rejected() {
+        // A small compressed block that expands to a huge decoded header list
+        // must be rejected. We craft many literal-with-incremental-indexing
+        // entries with a long value; the static dynamic-table eviction means
+        // the *block* stays modest while the decoded list keeps growing.
+        let mut dec = Decoder::new();
+        let mut block: Vec<u8> = Vec::new();
+        // Each entry: 0x40 (literal, incremental index, name idx 0) + name +
+        // value. Use a 1-byte name and a long-ish value; repeat until the
+        // decoded list_size accounting must exceed MAX_DECODED_HEADER_LIST.
+        let name = b"a";
+        let value = vec![b'x'; 4096];
+        // Encode one entry of this shape.
+        let mut entry = Vec::new();
+        entry.push(0x40); // literal w/ incremental indexing, name index 0
+        entry.push(name.len() as u8); // H=0, 7-bit length
+        entry.extend_from_slice(name);
+        // value length 4096 needs the multi-byte 7-bit-prefix int encoding.
+        // 4096 = 127 + 3969 → prefix 0x7f, then 3969 as continuation bytes.
+        encode_int_local(value.len() as u64, 7, 0x00, &mut entry);
+        entry.extend_from_slice(&value);
+        // ~128 entries × (4096+32) ≈ 528 KiB decoded, well over the 256 KiB cap.
+        for _ in 0..200 {
+            block.extend_from_slice(&entry);
+        }
+        let err = dec.decode_block(&block).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    /// Minimal HPACK integer encoder for tests (mirrors `decode_int`).
+    fn encode_int_local(mut value: u64, prefix_bits: u8, first_byte_high: u8, out: &mut Vec<u8>) {
+        let max_prefix = (1u64 << prefix_bits) - 1;
+        if value < max_prefix {
+            out.push(first_byte_high | value as u8);
+            return;
+        }
+        out.push(first_byte_high | max_prefix as u8);
+        value -= max_prefix;
+        while value >= 128 {
+            out.push(((value & 0x7f) as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
     }
 
     // -----------------------------------------------------------------

@@ -211,6 +211,12 @@ pub(crate) mod qpack {
 
     use crate::error::{Error, Result};
 
+    /// Cap on the *decoded* header-list size (sum of `name + value + 32` per
+    /// header, the RFC 7541 §4.1 accounting). Bounds a QPACK decompression
+    /// bomb: a small compressed field section can otherwise expand into a
+    /// huge header list and exhaust memory.
+    const MAX_DECODED_HEADER_LIST: usize = 256 * 1024;
+
     /// RFC 9204 Appendix A — the 99-entry QPACK static table.
     ///
     /// Indexed by the absolute static index; tuples are `(name, value)`.
@@ -476,9 +482,13 @@ pub(crate) mod qpack {
         p += 1 + n2;
 
         let mut out: Fields = Vec::new();
+        // Running total of the decoded header-list size (RFC 7541 §4.1:
+        // `name.len() + value.len() + 32` per entry). Bounds a QPACK
+        // decompression bomb.
+        let mut list_size: usize = 0;
         while p < buf.len() {
             let b = buf[p];
-            if b & 0b1000_0000 != 0 {
+            let entry: (String, String) = if b & 0b1000_0000 != 0 {
                 // Indexed Field Line: 0b1Txxxxxx
                 let t_static = b & 0b0100_0000 != 0;
                 let (idx, used) = decode_int(b, 6, &buf[p + 1..])?;
@@ -491,7 +501,7 @@ pub(crate) mod qpack {
                 let (n, v) = *STATIC_TABLE.get(idx as usize).ok_or_else(|| {
                     Error::BadResponse(format!("qpack: static index out of range: {idx}"))
                 })?;
-                out.push((n.to_string(), v.to_string()));
+                (n.to_string(), v.to_string())
             } else if b & 0b0100_0000 != 0 {
                 // Literal Field Line With Name Reference: 0b01NTxxxx
                 let t_static = b & 0b0001_0000 != 0;
@@ -507,7 +517,7 @@ pub(crate) mod qpack {
                 })?;
                 let value = decode_literal_string_7bit(&buf[p..])?;
                 p += value.1;
-                out.push((name.to_string(), value.0));
+                (name.to_string(), value.0)
             } else if b & 0b0010_0000 != 0 {
                 // Literal Field Line With Literal Name: 0b001NHXXX
                 let huffman = b & 0b0000_1000 != 0;
@@ -530,7 +540,7 @@ pub(crate) mod qpack {
                 p += nlen;
                 let value = decode_literal_string_7bit(&buf[p..])?;
                 p += value.1;
-                out.push((name, value.0));
+                (name, value.0)
             } else {
                 // 0b0000xxxx or 0b0001xxxx — Indexed Field Line With
                 // Post-Base Index, or Literal With Post-Base Name
@@ -538,7 +548,17 @@ pub(crate) mod qpack {
                 return Err(Error::BadResponse(
                     "qpack: post-base reference (dynamic table not supported)".into(),
                 ));
+            };
+            list_size = list_size
+                .saturating_add(entry.0.len())
+                .saturating_add(entry.1.len())
+                .saturating_add(32);
+            if list_size > MAX_DECODED_HEADER_LIST {
+                return Err(Error::BadResponse(
+                    "qpack: decoded header list exceeds limit".into(),
+                ));
             }
+            out.push(entry);
         }
         Ok(out)
     }
@@ -859,7 +879,7 @@ pub(crate) mod qpack {
     /// any code of that length. With 257 symbols this is small enough
     /// to scan linearly.
     pub(crate) fn huffman_decode(input: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(input.len() * 2);
+        let mut out = Vec::with_capacity(input.len().saturating_mul(2));
         let mut acc: u64 = 0;
         let mut acc_len: u8 = 0;
 
@@ -927,6 +947,11 @@ pub(crate) mod qpack {
 
 /// Maximum bytes we'll buffer from the response stream before giving up.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+/// Upper bound on a single HEADERS frame's declared length. A response header
+/// section is tiny; a HEADERS frame claiming megabytes is bogus and must be
+/// rejected *before* we buffer toward `MAX_RESPONSE_BYTES`. Matches the
+/// decoded-header-list cap (256 KiB) the QPACK decoder enforces.
+const MAX_HEADERS_FRAME_LEN: u64 = 256 * 1024;
 /// Maximum total wall-clock time spent in the I/O loop, irrespective of the
 /// per-read timeout from the request. Backstop against pathological servers.
 const MAX_TOTAL_DEADLINE: Duration = Duration::from_secs(300);
@@ -982,12 +1007,19 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
     // pointed the public `crate::tls::*` API at rustls, HTTP/3 still loads
     // its trust anchors through purecrypto. Going through `pc_roots` directly
     // sidesteps the active backend.
-    let roots = crate::tls::pc_roots::load_system_roots()?;
+    // Honor `--cacert <file>` (custom trust anchors) and `-k`/`--insecure`
+    // (`req.verify_tls == false`), mirroring the HTTP/1.1 path's
+    // `tls_opts_from` / `pc_roots::load_from_file`. Fail closed: when
+    // verification is on we still need a usable root store.
+    let roots = match &req.ca_bundle {
+        Some(path) => crate::tls::pc_roots::load_from_file(path)?,
+        None => crate::tls::pc_roots::load_system_roots()?,
+    };
     let tls = purecrypto::tls::Config::builder()
         .tls_only()
         .roots(roots)
         .server_name(req.url.host.clone())
-        .verify_certificates(true)
+        .verify_certificates(req.verify_tls)
         // RFC 9114 §3.1 — HTTP/3 is selected via ALPN identifier "h3".
         .alpn(vec![b"h3".to_vec()])
         .build();
@@ -1332,6 +1364,25 @@ fn try_consume_frame(
         Ok(x) => x,
         Err(_) => return FrameOutcome::NeedMore,
     };
+    // Reject obviously-bogus declared lengths *before* waiting to buffer that
+    // many bytes. A HEADERS section is tiny, and a DATA frame can't carry more
+    // than the remaining response budget.
+    match frame.ty {
+        frame_type::HEADERS if frame.len > MAX_HEADERS_FRAME_LEN => {
+            return FrameOutcome::Err(Error::BadResponse(
+                "http3: HEADERS frame length exceeds limit".into(),
+            ));
+        }
+        frame_type::DATA => {
+            let remaining = MAX_RESPONSE_BYTES.saturating_sub(body.len()) as u64;
+            if frame.len > remaining {
+                return FrameOutcome::Err(Error::BadResponse(
+                    "http3: DATA frame length exceeds response budget".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
     let total = hdr_len.saturating_add(frame.len as usize);
     if buf.len() < total {
         return FrameOutcome::NeedMore;
@@ -1684,5 +1735,56 @@ mod tests {
             Error::UnsupportedScheme(_) => {}
             other => panic!("expected UnsupportedScheme, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn qpack_decompression_bomb_is_rejected() {
+        // A modest compressed field section that decodes to an enormous
+        // header list must be rejected (decompression bomb). We emit many
+        // Literal Field Line With Literal Name entries with a long value.
+        let mut buf = Vec::new();
+        // Field-section prefix: RIC=0, Base=0.
+        qpack::encode_int(0, 8, 0x00, &mut buf);
+        qpack::encode_int(0, 7, 0x00, &mut buf);
+        let name = b"a";
+        let value = vec![b'x'; 1024];
+        for _ in 0..512 {
+            // Literal Field Line With Literal Name, H=0, 3-bit name length.
+            qpack::encode_int(name.len() as u64, 3, 0b0010_0000, &mut buf);
+            buf.extend_from_slice(name);
+            // Value: 7-bit prefix, H=0.
+            qpack::encode_int(value.len() as u64, 7, 0x00, &mut buf);
+            buf.extend_from_slice(&value);
+        }
+        let err = qpack::decode_field_section(&buf).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    #[test]
+    fn oversized_headers_frame_len_is_rejected() {
+        // A HEADERS frame declaring a length far larger than any real header
+        // section must be rejected before we buffer toward MAX_RESPONSE_BYTES.
+        let mut buf = Vec::new();
+        Frame::encode_header(frame_type::HEADERS, MAX_HEADERS_FRAME_LEN + 1, &mut buf);
+        let mut headers = None;
+        let mut body = Vec::new();
+        assert!(matches!(
+            try_consume_frame(&buf, &mut headers, &mut body),
+            FrameOutcome::Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn data_frame_len_past_budget_is_rejected() {
+        // A DATA frame claiming more bytes than the remaining response budget
+        // must be rejected rather than buffered up to the 256 MiB cap.
+        let mut buf = Vec::new();
+        Frame::encode_header(frame_type::DATA, (MAX_RESPONSE_BYTES + 1) as u64, &mut buf);
+        let mut headers = None;
+        let mut body = Vec::new();
+        assert!(matches!(
+            try_consume_frame(&buf, &mut headers, &mut body),
+            FrameOutcome::Err(Error::BadResponse(_))
+        ));
     }
 }
