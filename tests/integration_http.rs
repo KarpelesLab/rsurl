@@ -1025,19 +1025,51 @@ fn cli_upload_file_uses_put_and_octet_stream() {
     assert_eq!(got.2, b"AAA\r\nBBB\n\0CCC");
 }
 
-/// `-T` plus a non-HTTP URL is a usage error (exit code 2) and mentions
-/// the flag in the message so the user knows what to fix.
+/// `-T` plus a non-HTTP, non-FTP URL is a usage error (exit code 2) and
+/// mentions the flag in the message so the user knows what to fix. (FTP/FTPS
+/// uploads are supported and exercised separately.)
 #[test]
-fn cli_upload_file_rejects_non_http() {
+fn cli_upload_file_rejects_unsupported_scheme() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
-        .args(["-T", "/etc/hostname", "ftp://example.invalid/foo"])
+        .args(["-T", "/etc/hostname", "dict://example.invalid/foo"])
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
     assert_eq!(code, Some(2), "expected exit code 2, got {code:?}");
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(err.contains("-T"), "stderr should mention -T: {err}");
+}
+
+/// `-T` with an `ftp://` URL is now a supported upload, not a usage error.
+/// With an unresolvable host it fails at the connect step (exit 7), proving
+/// the FTP-upload path is reached rather than rejected as a usage error.
+#[test]
+fn cli_upload_file_ftp_attempts_transfer() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-T", "/etc/hostname", "ftp://host.invalid/foo"])
+        .output()
+        .expect("spawn rsurl");
+    let code = out.status.code();
+    assert_eq!(
+        code,
+        Some(7),
+        "expected transfer error exit 7, got {code:?}"
+    );
+}
+
+/// `-C -` (curl's automatic-resume form) is rejected at parse time with a
+/// clear usage error, since automatic resume isn't implemented.
+#[test]
+fn cli_continue_at_dash_is_rejected() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-C", "-", "-T", "/etc/hostname", "ftp://host.invalid/foo"])
+        .output()
+        .expect("spawn rsurl");
+    let code = out.status.code();
+    assert_eq!(code, Some(2), "expected usage error exit 2, got {code:?}");
 }
 
 /// Combining `-F` and `-d` (or `-T` and either) must be rejected with a

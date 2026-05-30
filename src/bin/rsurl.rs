@@ -21,7 +21,8 @@
 //!         --form-string <n=v>  like -F but the value is always literal
 //!         --form-escape        percent-encode field names/filenames per
 //!                              RFC 7578 §4.2 instead of backslash-escaping
-//!     -T, --upload-file <f>    PUT the file as the request body
+//!     -T, --upload-file <f>    upload the file (HTTP PUT, or FTP/FTPS STOR)
+//!     -C, --continue-at <off>  resume at byte <off> (FTP sends REST before STOR)
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
 //!     -L, --location           follow 3xx redirects
@@ -107,6 +108,10 @@ struct Args {
     /// `-T`/`--upload-file <file>` — PUT the file as the request body,
     /// default `Content-Type: application/octet-stream`.
     upload_file: Option<String>,
+    /// `-C`/`--continue-at <offset>` — resume a transfer at byte `offset`.
+    /// For FTP uploads this sends `REST <offset>` before `STOR`. The curl
+    /// "automatic" form `-C -` is not supported and is rejected at parse time.
+    continue_at: Option<u64>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -959,12 +964,15 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
     // options (-X, -H, -d, ...) are ignored for them in this milestone.
     if !matches!(parsed_url.scheme.as_str(), "http" | "https") {
-        if args.upload_file.is_some() {
+        if let Some(path) = &args.upload_file {
+            // FTP/FTPS upload: -T <file> ftp://host/remote → STOR (with REST
+            // resume when -C <offset> is given). Other non-HTTP schemes don't
+            // support upload yet.
+            if matches!(parsed_url.scheme.as_str(), "ftp" | "ftps") {
+                return run_ftp_upload(&parsed_url, path, args);
+            }
             if !args.silent {
-                eprintln!(
-                    "rsurl: -T is only supported for HTTP(S) URLs in this build; \
-                     FTP upload TBD"
-                );
+                eprintln!("rsurl: -T is only supported for HTTP(S) and FTP(S) URLs in this build");
             }
             return 2;
         }
@@ -1195,6 +1203,19 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             }
             "--form-escape" => a.form_escape = true,
             "-T" | "--upload-file" => a.upload_file = Some(next_val(&mut it, arg)?),
+            "-C" | "--continue-at" => {
+                let v = next_val(&mut it, arg)?;
+                if v == "-" {
+                    return Err(
+                        "-C -: automatic resume is not supported; pass an explicit byte offset"
+                            .into(),
+                    );
+                }
+                a.continue_at = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("-C/--continue-at: not a byte offset: {v:?}"))?,
+                );
+            }
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
             "-e" | "--referer" => a.referer = Some(next_val(&mut it, arg)?),
             "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
@@ -1261,6 +1282,51 @@ fn next_val(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String,
     it.next()
         .cloned()
         .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+/// Upload a local file to an `ftp://`/`ftps://` URL via STOR. With
+/// `-C <offset>` the local source is seeked past `offset` bytes and a
+/// `REST <offset>` is sent so the server resumes/appends from there. Returns a
+/// curl-style exit code (0 ok, 7 on transfer error, 26 on local-read error).
+fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: -T: can't read {path:?}: {e}");
+            }
+            return 26;
+        }
+    };
+
+    // For REST resume, only the tail past `offset` is streamed; the server
+    // already holds the first `offset` bytes.
+    let (body, resume_at): (&[u8], Option<u64>) = match args.continue_at {
+        Some(off) => {
+            let off_usize = off as usize;
+            if off_usize > bytes.len() {
+                if !args.silent {
+                    eprintln!(
+                        "rsurl: -C {off}: offset is past the end of {path:?} ({} bytes)",
+                        bytes.len()
+                    );
+                }
+                return 2;
+            }
+            (&bytes[off_usize..], Some(off))
+        }
+        None => (&bytes[..], None),
+    };
+
+    match rsurl::ftp::store(url, body, resume_at) {
+        Ok(()) => 0,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
 }
 
 fn run_transfer(url: &str, args: &Args) -> u8 {
@@ -1368,8 +1434,10 @@ Options:
       --form-string <n=v>  like -F but value is taken literally (no @, <, ;)
       --form-escape        percent-encode names/filenames per RFC 7578 §4.2
                            (default: backslash-escape, curl-historical)
-  -T, --upload-file <f>    PUT the file as the request body (default
-                           Content-Type: application/octet-stream)
+  -T, --upload-file <f>    upload the file: HTTP PUT (default Content-Type:
+                           application/octet-stream), or FTP/FTPS STOR
+  -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
+                           the automatic form '-C -' is not supported
   -A, --user-agent <ua>    set User-Agent
   -e, --referer <ref>      set Referer
   -L, --location           follow 3xx redirects

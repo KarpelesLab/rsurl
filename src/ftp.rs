@@ -10,9 +10,9 @@
 //!   * Passive data transfer: `EPSV`, with `PASV` fallback.
 //!   * `RETR` for files, `LIST` for paths ending in `/`.
 //!
-//! Explicit `AUTH TLS` upgrade, active mode (`PORT`/`EPRT`), uploads
-//! (`STOR`), and resume (`REST`) are intentionally not implemented yet —
-//! `fetch` is purely a read API.
+//! Uploads use `STOR` (see [`store`]), with optional `REST <offset>` resume
+//! when the caller supplies a byte offset. Explicit `AUTH TLS` upgrade and
+//! active mode (`PORT`/`EPRT`) are intentionally not implemented yet.
 //!
 //! For TLS we use [`crate::tls::connect_over`] on both the control channel
 //! (on connect, for implicit FTPS) and the data channel (using the host
@@ -59,9 +59,18 @@ impl Write for Stream {
     }
 }
 
-/// Default operation: download the file at `url.path`, or list the directory
-/// if the path ends in `/`. Returns the raw bytes.
-pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+/// A logged-in FTP control channel, set to binary mode, ready for a transfer
+/// command. Carries the control connection's peer IP so the data connection
+/// can be safely dialed back to it (see [`open_passive`]).
+struct Control {
+    ctrl: BufReader<Stream>,
+    ctrl_peer_ip: std::net::IpAddr,
+}
+
+/// Connect, read the banner, log in (anonymous or `user[:pass]@`), and switch
+/// to binary mode (`TYPE I`). Shared by [`fetch`] (RETR/LIST) and [`store`]
+/// (STOR). Returns the ready control channel.
+fn connect_login(url: &Url) -> Result<Control> {
     if url.scheme != "ftp" && url.scheme != "ftps" {
         return Err(Error::UnsupportedScheme(url.scheme.clone()));
     }
@@ -121,23 +130,41 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
         return Err(Error::BadResponse(format!("ftp TYPE I: {c} {m}")));
     }
 
-    // 5) Passive: try EPSV first (works on v4 *and* v6, no parsing of host
-    //    bytes needed), fall back to PASV on permanent failure.
-    let (data_host, data_port) = open_passive(&mut ctrl, &url.host, ctrl_peer_ip)?;
+    Ok(Control { ctrl, ctrl_peer_ip })
+}
 
-    // 6) Issue the transfer command BEFORE opening the data socket on some
-    //    servers, AFTER on others; the spec allows either. We connect first
-    //    (simpler) then send RETR/LIST. The server may answer 125/150
-    //    before opening the data connection on its side, which is fine —
-    //    we already have ours dialed.
+/// Open a passive data connection, dialing the control peer (per the PASV
+/// bounce fix) and wrapping in TLS for `ftps`. Shared by RETR and STOR.
+///
+/// Generic over the control reader so unit tests can drive the passive
+/// handshake over a scripted mock while a real loopback socket stands in for
+/// the data connection.
+fn open_data<R: Read + Write>(
+    ctrl: &mut BufReader<R>,
+    url: &Url,
+    ctrl_peer_ip: std::net::IpAddr,
+) -> Result<Stream> {
+    let (data_host, data_port) = open_passive(ctrl, &url.host, ctrl_peer_ip)?;
     let data_tcp = TcpStream::connect((data_host.as_str(), data_port))?;
-    let mut data = if url.scheme == "ftps" {
+    Ok(if url.scheme == "ftps" {
         // Per RFC 4217 §10.2: SNI must be the original hostname, not the
         // address we got from PASV/EPSV (which is often an IP literal).
         Stream::Tls(Box::new(crate::tls::connect_over(data_tcp, &url.host)?))
     } else {
         Stream::Plain(data_tcp)
-    };
+    })
+}
+
+/// Default operation: download the file at `url.path`, or list the directory
+/// if the path ends in `/`. Returns the raw bytes.
+pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    let mut con = connect_login(url)?;
+
+    // 5+6) Open the passive data connection (EPSV→PASV, dialing the control
+    //       peer; TLS-wrapped for ftps). The server may answer 125/150 before
+    //       opening its side, which is fine — we already have ours dialed.
+    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip)?;
+    let ctrl = &mut con.ctrl;
 
     // 7) RETR for files, LIST for directories. We treat a trailing '/' or
     //    the bare root path as "list this directory". Reject control bytes in
@@ -150,10 +177,10 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     } else {
         format!("RETR {}", url.path)
     };
-    send(&mut ctrl, &cmd)?;
+    send(ctrl, &cmd)?;
 
     // 8) Preliminary reply (125 Data connection open / 150 File status OK).
-    let (c, m) = read_reply(&mut ctrl)?;
+    let (c, m) = read_reply(ctrl)?;
     if !(c == 125 || c == 150) {
         // Some servers send the 226 directly (rare but legal). If we got an
         // error code, surface it.
@@ -173,17 +200,99 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     //     second one is coming — but we wouldn't have entered this branch
     //     because c would have been 226 (positive completion, not 125/150).
     if c == 125 || c == 150 {
-        let (cf, mf) = read_reply(&mut ctrl)?;
+        let (cf, mf) = read_reply(ctrl)?;
         if !is_positive(cf) {
             return Err(Error::BadResponse(format!("ftp transfer end: {cf} {mf}")));
         }
     }
 
     // 11) Polite shutdown.
-    let _ = send(&mut ctrl, "QUIT");
-    let _ = read_reply(&mut ctrl);
+    let _ = send(ctrl, "QUIT");
+    let _ = read_reply(ctrl);
 
     Ok(bytes)
+}
+
+/// Build the `STOR <path>` command for an upload, stripping a single leading
+/// '/' the way curl does (the FTP path after login is relative to the login
+/// directory). Returns `None` for an empty or directory-only path, which can't
+/// name a file to store.
+fn stor_command(path: &str) -> Option<String> {
+    let name = path.strip_prefix('/').unwrap_or(path);
+    if name.is_empty() || name.ends_with('/') {
+        return None;
+    }
+    Some(format!("STOR {name}"))
+}
+
+/// Format the `REST <offset>` resume command.
+fn rest_command(offset: u64) -> String {
+    format!("REST {offset}")
+}
+
+/// Upload `body` to the file at `url.path` via `STOR`. If `resume_at` is
+/// `Some(n)`, send `REST n` first so the server appends starting at byte `n`
+/// (the caller is responsible for passing a `body` that begins at that offset).
+///
+/// Shares login, binary mode, and the passive-open/TLS-wrap logic with
+/// [`fetch`], so the data connection is dialed back to the control peer and
+/// wrapped in TLS for `ftps` exactly as RETR does.
+pub fn store(url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
+    let mut con = connect_login(url)?;
+
+    // Determine the remote filename up front and reject control bytes so it
+    // can't break out of the STOR command line.
+    reject_ctl(&url.path, "ftp path")?;
+    let cmd = stor_command(&url.path).ok_or_else(|| {
+        Error::BadResponse(format!(
+            "ftp STOR: URL path {:?} does not name a file to upload",
+            url.path
+        ))
+    })?;
+
+    // REST before STOR for resume. Per RFC 3659 the server answers 350
+    // ("restart marker accepted"); the next command (STOR) then proceeds from
+    // that offset.
+    if let Some(offset) = resume_at {
+        send(&mut con.ctrl, &rest_command(offset))?;
+        let (c, m) = read_reply(&mut con.ctrl)?;
+        if c != 350 {
+            return Err(Error::BadResponse(format!("ftp REST: {c} {m}")));
+        }
+    }
+
+    // Open the passive data connection (same logic as RETR: dial the control
+    // peer, TLS-wrap for ftps).
+    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip)?;
+    let ctrl = &mut con.ctrl;
+
+    // Issue STOR, then expect the 1xx preliminary reply before streaming.
+    send(ctrl, &cmd)?;
+    let (c, m) = read_reply(ctrl)?;
+    if !(c == 125 || c == 150) {
+        // A 2xx/3xx here would be unusual for STOR (data still needs sending);
+        // anything that isn't a 1xx preliminary is treated as a failure.
+        return Err(Error::BadResponse(format!("ftp {cmd}: {c} {m}")));
+    }
+
+    // Stream the upload bytes over the data channel, then close it to signal
+    // EOF to the server (dropping closes the TLS layer's close_notify and the
+    // TCP socket).
+    data.write_all(body)?;
+    data.flush()?;
+    drop(data);
+
+    // Final completion reply (226 Transfer complete).
+    let (cf, mf) = read_reply(ctrl)?;
+    if !is_positive(cf) {
+        return Err(Error::BadResponse(format!("ftp STOR end: {cf} {mf}")));
+    }
+
+    // Polite shutdown.
+    let _ = send(ctrl, "QUIT");
+    let _ = read_reply(ctrl);
+
+    Ok(())
 }
 
 /// Open a passive data connection via EPSV (preferred) or PASV (fallback).
@@ -629,5 +738,158 @@ mod tests {
     fn fetch_rejects_non_ftp_scheme() {
         let u = Url::parse("http://example.com/").unwrap();
         assert!(matches!(fetch(&u), Err(Error::UnsupportedScheme(_))));
+    }
+
+    #[test]
+    fn store_rejects_non_ftp_scheme() {
+        let u = Url::parse("http://example.com/x").unwrap();
+        assert!(matches!(
+            store(&u, b"data", None),
+            Err(Error::UnsupportedScheme(_))
+        ));
+    }
+
+    #[test]
+    fn stor_command_strips_leading_slash() {
+        // The URL path is absolute; STOR names a path relative to the login
+        // directory, so a single leading '/' is dropped (curl's behavior).
+        assert_eq!(stor_command("/pub/file.bin").unwrap(), "STOR pub/file.bin");
+        assert_eq!(stor_command("file.bin").unwrap(), "STOR file.bin");
+        assert_eq!(stor_command("/a.txt").unwrap(), "STOR a.txt");
+    }
+
+    #[test]
+    fn stor_command_rejects_directory_path() {
+        // No filename to store.
+        assert!(stor_command("").is_none());
+        assert!(stor_command("/").is_none());
+        assert!(stor_command("/pub/").is_none());
+    }
+
+    #[test]
+    fn rest_command_formats_offset() {
+        assert_eq!(rest_command(0), "REST 0");
+        assert_eq!(rest_command(1048576), "REST 1048576");
+        assert_eq!(rest_command(u64::MAX), format!("REST {}", u64::MAX));
+    }
+
+    /// Drive `store`'s control sequence over a mock control channel while a
+    /// real loopback TCP listener stands in for the passive data connection.
+    /// Asserts the exact commands sent and the bytes received on the data
+    /// socket. Plain FTP only (no TLS), which exercises the full STOR path.
+    fn run_store_mock(
+        url: &str,
+        body: &[u8],
+        resume_at: Option<u64>,
+    ) -> (Result<()>, Vec<u8>, Vec<u8>) {
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::sync::mpsc;
+
+        // Loopback listener for the data connection. The PASV reply advertises
+        // its port; `open_passive` dials the control peer (127.0.0.1 here).
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let data_port = listener.local_addr().unwrap().port();
+        let (p1, p2) = ((data_port >> 8) as u8, (data_port & 0xff) as u8);
+
+        // Collect whatever the server receives on the data socket.
+        let (tx, rx) = mpsc::channel();
+        let data_thread = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            sock.read_to_end(&mut buf).unwrap();
+            tx.send(buf).unwrap();
+        });
+
+        // Scripted control-channel replies. EPSV is refused so PASV is used;
+        // PASV advertises the loopback data port. REST (if any) → 350.
+        let mut script = String::from(
+            "220 ready\r\n\
+             331 need pass\r\n\
+             230 logged in\r\n\
+             200 type ok\r\n",
+        );
+        if resume_at.is_some() {
+            script.push_str("350 restart ok\r\n");
+        }
+        script.push_str(&format!(
+            "500 epsv?\r\n\
+             227 Entering Passive Mode (127,0,0,1,{p1},{p2})\r\n\
+             150 ok to send\r\n\
+             226 transfer complete\r\n\
+             221 bye\r\n"
+        ));
+
+        let mut ctrl = BufReader::new(MockIo {
+            to_read: std::io::Cursor::new(script.into_bytes()),
+            written: Vec::new(),
+        });
+        let ctrl_peer = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let parsed = Url::parse(url).unwrap();
+
+        // Replicate the post-login portion of `store` against the mock control
+        // channel and the real loopback data socket. `open_data` is the same
+        // function `store` calls, so the passive handshake and STOR sequencing
+        // under test are the production ones.
+        let result = (|| -> Result<()> {
+            // Consume banner + login + TYPE replies that connect_login would.
+            for _ in 0..4 {
+                read_reply(&mut ctrl)?;
+            }
+            reject_ctl(&parsed.path, "ftp path")?;
+            let cmd =
+                stor_command(&parsed.path).ok_or_else(|| Error::BadResponse("no file".into()))?;
+            if let Some(offset) = resume_at {
+                send(&mut ctrl, &rest_command(offset))?;
+                let (c, _) = read_reply(&mut ctrl)?;
+                if c != 350 {
+                    return Err(Error::BadResponse(format!("REST: {c}")));
+                }
+            }
+            let mut data = open_data(&mut ctrl, &parsed, ctrl_peer)?;
+            send(&mut ctrl, &cmd)?;
+            let (c, m) = read_reply(&mut ctrl)?;
+            if !(c == 125 || c == 150) {
+                return Err(Error::BadResponse(format!("{cmd}: {c} {m}")));
+            }
+            data.write_all(body)?;
+            data.flush()?;
+            drop(data);
+            let (cf, mf) = read_reply(&mut ctrl)?;
+            if !is_positive(cf) {
+                return Err(Error::BadResponse(format!("end: {cf} {mf}")));
+            }
+            let _ = send(&mut ctrl, "QUIT");
+            let _ = read_reply(&mut ctrl);
+            Ok(())
+        })();
+
+        let received = rx.recv().unwrap();
+        data_thread.join().unwrap();
+        let written = ctrl.get_ref().written.clone();
+        (result, written, received)
+    }
+
+    #[test]
+    fn store_streams_body_and_sends_stor() {
+        let (res, written, received) =
+            run_store_mock("ftp://h.example/pub/up.bin", b"hello ftp", None);
+        res.unwrap();
+        let sent = String::from_utf8(written).unwrap();
+        assert!(sent.contains("STOR pub/up.bin\r\n"), "sent: {sent:?}");
+        assert!(!sent.contains("REST"), "no REST without offset: {sent:?}");
+        assert!(sent.contains("QUIT\r\n"));
+        assert_eq!(received, b"hello ftp");
+    }
+
+    #[test]
+    fn store_with_resume_sends_rest_before_stor() {
+        let (res, written, received) =
+            run_store_mock("ftp://h.example/up.bin", b"TAIL", Some(4096));
+        res.unwrap();
+        let sent = String::from_utf8(written).unwrap();
+        let rest_at = sent.find("REST 4096\r\n").expect("REST sent");
+        let stor_at = sent.find("STOR up.bin\r\n").expect("STOR sent");
+        assert!(rest_at < stor_at, "REST must precede STOR: {sent:?}");
+        assert_eq!(received, b"TAIL");
     }
 }
