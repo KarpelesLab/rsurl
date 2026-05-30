@@ -6,6 +6,13 @@
 //!
 //! Gopher has no length framing: the server writes the response and then
 //! closes the connection, so the client reads to EOF.
+//!
+//! Item-type `7` (search) is supported: a query supplied as the URL's
+//! `?<words>` component is appended to the selector with a TAB separator, so
+//! `gopher://host/7<selector>?<words>` sends `<selector>\t<words>\r\n` on the
+//! wire (RFC 1436 §3.4). This matches curl's behaviour of carrying the search
+//! string in the URL. A literal TAB cannot reach here because the URL parser
+//! rejects control bytes, so the `?<words>` convention is the supported one.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -68,7 +75,7 @@ fn read_capped<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Extract the wire selector from a Gopher URL path.
+/// Build the wire selector line from a Gopher URL path.
 ///
 /// A Gopher URL path is `/<itemtype><selector>` where `<itemtype>` is a single
 /// byte and the selector is everything after it. The item-type byte is *not*
@@ -80,25 +87,79 @@ fn read_capped<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
 /// * `"/0foo"` → `"foo"` (text file selector).
 /// * `"/1docs/index"` → `"docs/index"` (directory selector).
 ///
-/// The selector is written verbatim into a `\r\n`-terminated request line,
-/// so a raw CR, LF, NUL, or other control byte in the URL would let an
-/// attacker inject a second request or otherwise corrupt the wire framing.
-/// Such selectors are rejected with [`Error::InvalidUrl`].
-fn selector_from_path(path: &str) -> Result<&str> {
+/// # Item-type 7 (search)
+///
+/// For a search item the client sends `<selector>\t<search-words>` (RFC 1436
+/// §3.4). curl carries the search words in the URL, so we treat the URL's
+/// query component (everything after the first `?`) as the search words and
+/// join them to the selector with a TAB:
+///
+/// * `"/7find?cats"` → `"find\tcats"`.
+/// * `"/7?cats"` → `"\tcats"` (empty selector, just a query).
+///
+/// The split on `?` happens regardless of item type, so `?` is reserved as the
+/// search separator for every Gopher URL. A non-search selector with no `?`
+/// gets no trailing TAB. A literal TAB cannot reach here — the URL parser
+/// rejects control bytes — so `?<words>` is the only supported convention.
+///
+/// The result is written verbatim into a `\r\n`-terminated request line, so a
+/// raw CR, LF, NUL, or other control byte in the selector or search words
+/// would let an attacker inject a second request or corrupt the wire framing.
+/// The TAB we insert as the separator is allowed; any other control byte
+/// (including a CR/LF/NUL inside the search words) is rejected with
+/// [`Error::InvalidUrl`]. The item-type byte is not validated because it is
+/// dropped before it can reach the wire.
+fn selector_from_path(path: &str) -> Result<String> {
     // Strip leading slash if present.
     let without_slash = path.strip_prefix('/').unwrap_or(path);
     // Drop the item-type byte (first char), if any.
     let mut chars = without_slash.chars();
-    let selector = match chars.next() {
+    let after_type = match chars.next() {
         Some(_) => chars.as_str(),
         None => "",
     };
+
+    // Determine the selector and an optional search query.
+    //
+    // A `?` is the curl-style separator: everything after the first `?` is the
+    // search words. As a fallback we also accept a selector that already
+    // carries a literal TAB separator (`<selector>\t<words>`) — the TAB is then
+    // the separator that is already in place. The `?` form takes precedence so
+    // a `?` always wins when both are present.
+    let (selector, query) = match after_type.split_once('?') {
+        Some((sel, q)) => (sel, Some(q)),
+        None => match after_type.split_once('\t') {
+            Some((sel, q)) => (sel, Some(q)),
+            None => (after_type, None),
+        },
+    };
+
     if selector.bytes().any(|b| b.is_ascii_control()) {
         return Err(Error::InvalidUrl(format!(
             "gopher: control byte in selector of path '{path}'"
         )));
     }
-    Ok(selector)
+
+    match query {
+        Some(q) => {
+            // The query is joined back with a single TAB separator, so embedded
+            // CR/LF/NUL/etc. would still corrupt framing or inject a second
+            // request line — reject them. A further TAB inside the query is a
+            // control byte and is likewise rejected; only the one separator TAB
+            // we insert is permitted.
+            if q.bytes().any(|b| b.is_ascii_control()) {
+                return Err(Error::InvalidUrl(format!(
+                    "gopher: control byte in search query of path '{path}'"
+                )));
+            }
+            let mut line = String::with_capacity(selector.len() + 1 + q.len());
+            line.push_str(selector);
+            line.push('\t');
+            line.push_str(q);
+            Ok(line)
+        }
+        None => Ok(selector.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -142,6 +203,73 @@ mod tests {
     fn selector_rejects_nul_and_control_bytes() {
         assert!(selector_from_path("/0foo\0bar").is_err());
         assert!(selector_from_path("/0foo\x07bar").is_err());
+    }
+
+    #[test]
+    fn search_type7_joins_selector_and_query_with_tab() {
+        // The canonical curl convention: `/7<selector>?<words>` →
+        // `<selector>\t<words>` on the wire.
+        assert_eq!(selector_from_path("/7find?cats").unwrap(), "find\tcats");
+    }
+
+    #[test]
+    fn search_query_with_empty_selector() {
+        // `/7?cats` → empty selector, just `\tcats`.
+        assert_eq!(selector_from_path("/7?cats").unwrap(), "\tcats");
+    }
+
+    #[test]
+    fn search_query_works_for_any_item_type() {
+        // The `?` separator is honoured regardless of item type.
+        assert_eq!(selector_from_path("/1dir?term").unwrap(), "dir\tterm");
+    }
+
+    #[test]
+    fn search_query_with_multiple_words() {
+        // The query is taken verbatim (no percent-decoding), spaces and all are
+        // already rejected by the URL parser, but `+`-joined words pass through.
+        assert_eq!(
+            selector_from_path("/7find?big+cats").unwrap(),
+            "find\tbig+cats"
+        );
+    }
+
+    #[test]
+    fn non_search_selector_has_no_trailing_tab() {
+        // A selector with no `?` must not gain a TAB.
+        let line = selector_from_path("/0foo").unwrap();
+        assert_eq!(line, "foo");
+        assert!(!line.contains('\t'));
+    }
+
+    #[test]
+    fn search_only_first_question_mark_is_the_separator() {
+        // A second `?` is part of the query, not a new separator.
+        assert_eq!(selector_from_path("/7a?b?c").unwrap(), "a\tb?c");
+    }
+
+    #[test]
+    fn search_literal_tab_selector_still_works() {
+        // A selector that already carries the TAB separator (`<sel>\t<words>`)
+        // is preserved as a valid search line — the TAB is the separator.
+        assert_eq!(selector_from_path("/7find\tcats").unwrap(), "find\tcats");
+    }
+
+    #[test]
+    fn search_query_rejects_crlf_and_nul() {
+        // Control bytes in the search words would inject a second request line
+        // or corrupt framing just like in the selector.
+        assert!(selector_from_path("/7find?a\r\nb").is_err());
+        assert!(selector_from_path("/7find?a\nb").is_err());
+        assert!(selector_from_path("/7find?a\rb").is_err());
+        assert!(selector_from_path("/7find?a\0b").is_err());
+    }
+
+    #[test]
+    fn search_query_rejects_embedded_tab() {
+        // Only the separator TAB we insert is allowed; a TAB inside the query
+        // is a control byte and is rejected.
+        assert!(selector_from_path("/7find?a\tb").is_err());
     }
 
     #[test]

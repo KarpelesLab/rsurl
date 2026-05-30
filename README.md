@@ -31,7 +31,7 @@ Early, in active development.
 | FTP / FTPS (RFC 959, 4217) | working | RETR + LIST, STOR upload (`-T`) with REST resume (`-C`), EPSV with PASV fallback, implicit FTPS |
 | FILE (RFC 8089) | working | rejects non-local hosts |
 | DICT (RFC 2229) | working | DEFINE, MATCH, SHOW DATABASES |
-| GOPHER / GOPHERS (RFC 1436) | working | reads to EOF, item-type 7 search deferred |
+| GOPHER / GOPHERS (RFC 1436) | working | reads to EOF; item-type 7 search via `?<words>` (sends `selector\t<words>`) |
 | IMAP / IMAPS (RFC 9051) | working | LOGIN + LIST / SELECT+FETCH / UID FETCH BODY[] |
 | LDAP / LDAPS (RFC 4511) | working | simple bind + search → LDIF; subset of filter syntax |
 | MQTT / MQTTS (v3.1.1) | working | CONNECT, SUBSCRIBE, receive one PUBLISH (QoS 0) |
