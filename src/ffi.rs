@@ -23,9 +23,23 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{c_char, c_int, c_long, CStr};
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
 use crate::http::{Request, Response};
+
+/// Unwind barrier for the C ABI: a Rust panic crossing an `extern "C"`
+/// boundary is undefined behavior, so every exported function runs its body
+/// through `catch_unwind` and converts a caught panic into `default`.
+///
+/// `AssertUnwindSafe` is sound here because the closures only touch a single
+/// handle behind a raw pointer (no shared `&mut` state observed after a
+/// panic) and any panic aborts the operation before returning a value to C;
+/// the handle is left in a valid—if possibly partially-updated—state, which
+/// is the same guarantee callers already get from an error return.
+fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    panic::catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
+}
 
 /// Opaque handle. Never dereferenced from C.
 pub enum RSURL {}
@@ -113,31 +127,37 @@ fn handle_ref<'a>(h: *const RSURL) -> Option<&'a Handle> {
 /// never on this platform). Free with `rsurl_easy_cleanup`.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_init() -> *mut RSURL {
-    let boxed = Box::new(Handle::new());
-    Box::into_raw(boxed) as *mut RSURL
+    ffi_guard(ptr::null_mut(), || {
+        let boxed = Box::new(Handle::new());
+        Box::into_raw(boxed) as *mut RSURL
+    })
 }
 
 /// Free an easy handle. NULL is a no-op.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_cleanup(handle: *mut RSURL) {
-    if handle.is_null() {
-        return;
-    }
-    // SAFETY: handle came from rsurl_easy_init's Box::into_raw.
-    unsafe {
-        drop(Box::from_raw(handle as *mut Handle));
-    }
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        // SAFETY: handle came from rsurl_easy_init's Box::into_raw.
+        unsafe {
+            drop(Box::from_raw(handle as *mut Handle));
+        }
+    })
 }
 
 /// Reset all options on a handle but keep it allocated. Clears any previous
 /// response data.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_reset(handle: *mut RSURL) -> RsurlCode {
-    let Some(h) = handle_mut(handle) else {
-        return RsurlCode::InvalidHandle;
-    };
-    *h = Handle::new();
-    RsurlCode::Ok
+    ffi_guard(RsurlCode::Network, || {
+        let Some(h) = handle_mut(handle) else {
+            return RsurlCode::InvalidHandle;
+        };
+        *h = Handle::new();
+        RsurlCode::Ok
+    })
 }
 
 /// Set an option taking a NUL-terminated `const char*`.
@@ -155,38 +175,40 @@ pub unsafe extern "C" fn rsurl_easy_setopt_str(
     option: c_int,
     value: *const c_char,
 ) -> RsurlCode {
-    let Some(h) = handle_mut(handle) else {
-        return RsurlCode::InvalidHandle;
-    };
-    let s = if value.is_null() {
-        None
-    } else {
-        // SAFETY: caller asserts value is a valid NUL-terminated C string.
-        match unsafe { CStr::from_ptr(value) }.to_str() {
-            Ok(s) => Some(s.to_string()),
-            Err(_) => return RsurlCode::InvalidArg,
-        }
-    };
-    let Some(opt) = opt_from_int(option) else {
-        return RsurlCode::UnknownOption;
-    };
-    match opt {
-        RsurlOpt::Url => h.url = s,
-        RsurlOpt::CustomRequest => h.method = s,
-        RsurlOpt::UserAgent => h.user_agent = s,
-        RsurlOpt::Header => match s {
-            Some(line) => {
-                let Some((k, v)) = line.split_once(':') else {
-                    return RsurlCode::InvalidArg;
-                };
-                h.headers.push((k.trim().to_string(), v.trim().to_string()));
+    ffi_guard(RsurlCode::Network, || {
+        let Some(h) = handle_mut(handle) else {
+            return RsurlCode::InvalidHandle;
+        };
+        let s = if value.is_null() {
+            None
+        } else {
+            // SAFETY: caller asserts value is a valid NUL-terminated C string.
+            match unsafe { CStr::from_ptr(value) }.to_str() {
+                Ok(s) => Some(s.to_string()),
+                Err(_) => return RsurlCode::InvalidArg,
             }
-            None => h.headers.clear(),
-        },
-        RsurlOpt::PostFieldsString => h.body = s.map(|s| s.into_bytes()),
-        RsurlOpt::ConnectTimeout | RsurlOpt::Timeout => return RsurlCode::InvalidArg,
-    }
-    RsurlCode::Ok
+        };
+        let Some(opt) = opt_from_int(option) else {
+            return RsurlCode::UnknownOption;
+        };
+        match opt {
+            RsurlOpt::Url => h.url = s,
+            RsurlOpt::CustomRequest => h.method = s,
+            RsurlOpt::UserAgent => h.user_agent = s,
+            RsurlOpt::Header => match s {
+                Some(line) => {
+                    let Some((k, v)) = line.split_once(':') else {
+                        return RsurlCode::InvalidArg;
+                    };
+                    h.headers.push((k.trim().to_string(), v.trim().to_string()));
+                }
+                None => h.headers.clear(),
+            },
+            RsurlOpt::PostFieldsString => h.body = s.map(|s| s.into_bytes()),
+            RsurlOpt::ConnectTimeout | RsurlOpt::Timeout => return RsurlCode::InvalidArg,
+        }
+        RsurlCode::Ok
+    })
 }
 
 /// Set an option taking a `long` (e.g. timeouts).
@@ -196,19 +218,21 @@ pub extern "C" fn rsurl_easy_setopt_long(
     option: c_int,
     value: c_long,
 ) -> RsurlCode {
-    let Some(h) = handle_mut(handle) else {
-        return RsurlCode::InvalidHandle;
-    };
-    let Some(opt) = opt_from_int(option) else {
-        return RsurlCode::UnknownOption;
-    };
-    let secs = if value <= 0 { None } else { Some(value as u64) };
-    match opt {
-        RsurlOpt::ConnectTimeout => h.connect_timeout_secs = secs,
-        RsurlOpt::Timeout => h.timeout_secs = secs,
-        _ => return RsurlCode::InvalidArg,
-    }
-    RsurlCode::Ok
+    ffi_guard(RsurlCode::Network, || {
+        let Some(h) = handle_mut(handle) else {
+            return RsurlCode::InvalidHandle;
+        };
+        let Some(opt) = opt_from_int(option) else {
+            return RsurlCode::UnknownOption;
+        };
+        let secs = if value <= 0 { None } else { Some(value as u64) };
+        match opt {
+            RsurlOpt::ConnectTimeout => h.connect_timeout_secs = secs,
+            RsurlOpt::Timeout => h.timeout_secs = secs,
+            _ => return RsurlCode::InvalidArg,
+        }
+        RsurlCode::Ok
+    })
 }
 
 fn opt_from_int(v: c_int) -> Option<RsurlOpt> {
@@ -228,61 +252,68 @@ fn opt_from_int(v: c_int) -> Option<RsurlOpt> {
 /// response stored on the handle.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
-    let Some(h) = handle_mut(handle) else {
-        return RsurlCode::InvalidHandle;
-    };
-    let Some(url) = h.url.as_deref() else {
-        return RsurlCode::InvalidArg;
-    };
-    let method = h.method.clone().unwrap_or_else(|| {
-        if h.body.is_some() {
-            "POST".to_string()
-        } else {
-            "GET".to_string()
-        }
-    });
+    ffi_guard(RsurlCode::Network, || {
+        let Some(h) = handle_mut(handle) else {
+            return RsurlCode::InvalidHandle;
+        };
+        let Some(url) = h.url.as_deref() else {
+            return RsurlCode::InvalidArg;
+        };
+        let method = h.method.clone().unwrap_or_else(|| {
+            if h.body.is_some() {
+                "POST".to_string()
+            } else {
+                "GET".to_string()
+            }
+        });
 
-    let mut req = match Request::new(&method, url) {
-        Ok(r) => r,
-        Err(crate::Error::UnsupportedScheme(_)) => return RsurlCode::Unsupported,
-        Err(_) => return RsurlCode::InvalidArg,
-    };
-    for (k, v) in &h.headers {
-        req = req.header(k, v);
-    }
-    if let Some(ua) = &h.user_agent {
-        req = req.header("User-Agent", ua);
-    }
-    if let Some(body) = h.body.clone() {
-        req = req.body(body);
-    }
+        let mut req = match Request::new(&method, url) {
+            Ok(r) => r,
+            Err(crate::Error::UnsupportedScheme(_)) => return RsurlCode::Unsupported,
+            Err(_) => return RsurlCode::InvalidArg,
+        };
+        for (k, v) in &h.headers {
+            req = req.header(k, v);
+        }
+        if let Some(ua) = &h.user_agent {
+            req = req.header("User-Agent", ua);
+        }
+        if let Some(body) = h.body.clone() {
+            req = req.body(body);
+        }
 
-    match req.send() {
-        Ok(resp) => {
-            h.header_buf = resp
-                .headers
-                .iter()
-                .map(|(k, v)| {
-                    let mut s = format!("{k}: {v}").into_bytes();
-                    s.push(0);
-                    s
-                })
-                .collect();
-            h.last_response = Some(resp);
-            RsurlCode::Ok
+        match req.send() {
+            Ok(resp) => {
+                h.header_buf = resp
+                    .headers
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut s = format!("{k}: {v}").into_bytes();
+                        s.push(0);
+                        s
+                    })
+                    .collect();
+                h.last_response = Some(resp);
+                RsurlCode::Ok
+            }
+            Err(crate::Error::UnsupportedScheme(_)) => RsurlCode::Unsupported,
+            Err(crate::Error::Io(_)) | Err(crate::Error::UnexpectedEof) => RsurlCode::Network,
+            Err(crate::Error::BadResponse(_)) | Err(crate::Error::H2NotNegotiated) => {
+                RsurlCode::BadResponse
+            }
+            Err(crate::Error::InvalidUrl(_)) => RsurlCode::InvalidArg,
         }
-        Err(crate::Error::UnsupportedScheme(_)) => RsurlCode::Unsupported,
-        Err(crate::Error::Io(_)) | Err(crate::Error::UnexpectedEof) => RsurlCode::Network,
-        Err(crate::Error::BadResponse(_)) | Err(crate::Error::H2NotNegotiated) => {
-            RsurlCode::BadResponse
-        }
-        Err(crate::Error::InvalidUrl(_)) => RsurlCode::InvalidArg,
-    }
+    })
 }
 
 /// Borrow a pointer to the response body and its length. Pointer remains
 /// valid until the next perform/reset/cleanup. `out_ptr` is set to NULL and
 /// `out_len` to 0 if no response is available.
+///
+/// The returned buffer is **raw response bytes plus a length**; it is **not**
+/// NUL-terminated and may contain embedded NUL bytes. C callers must use the
+/// `*out_len` value and must **not** pass `*out_ptr` to `strlen`, `printf`,
+/// or any function that treats it as a NUL-terminated C string.
 ///
 /// # Safety
 ///
@@ -295,72 +326,84 @@ pub unsafe extern "C" fn rsurl_easy_response_body(
     out_ptr: *mut *const u8,
     out_len: *mut usize,
 ) -> RsurlCode {
-    let Some(h) = handle_ref(handle) else {
-        return RsurlCode::InvalidHandle;
-    };
-    if out_ptr.is_null() || out_len.is_null() {
-        return RsurlCode::InvalidArg;
-    }
-    match &h.last_response {
-        Some(resp) => unsafe {
-            *out_ptr = resp.body.as_ptr();
-            *out_len = resp.body.len();
-        },
-        None => unsafe {
-            *out_ptr = ptr::null();
-            *out_len = 0;
-        },
-    }
-    RsurlCode::Ok
+    ffi_guard(RsurlCode::Network, || {
+        let Some(h) = handle_ref(handle) else {
+            return RsurlCode::InvalidHandle;
+        };
+        if out_ptr.is_null() || out_len.is_null() {
+            return RsurlCode::InvalidArg;
+        }
+        match &h.last_response {
+            Some(resp) => unsafe {
+                *out_ptr = resp.body.as_ptr();
+                *out_len = resp.body.len();
+            },
+            None => unsafe {
+                *out_ptr = ptr::null();
+                *out_len = 0;
+            },
+        }
+        RsurlCode::Ok
+    })
 }
 
 /// Return the response HTTP status code, or 0 if no response is available.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_long {
-    handle_ref(handle)
-        .and_then(|h| h.last_response.as_ref())
-        .map(|r| r.status as c_long)
-        .unwrap_or(0)
+    ffi_guard(0, || {
+        handle_ref(handle)
+            .and_then(|h| h.last_response.as_ref())
+            .map(|r| r.status as c_long)
+            .unwrap_or(0)
+    })
 }
 
 /// Borrow a pointer to a NUL-terminated `"Name: value"` header line by index.
 /// Returns NULL if `index` is out of range or no response is available.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_response_header(handle: *const RSURL, index: usize) -> *const c_char {
-    let Some(h) = handle_ref(handle) else {
-        return ptr::null();
-    };
-    h.header_buf
-        .get(index)
-        .map(|b| b.as_ptr() as *const c_char)
-        .unwrap_or(ptr::null())
+    ffi_guard(ptr::null(), || {
+        let Some(h) = handle_ref(handle) else {
+            return ptr::null();
+        };
+        h.header_buf
+            .get(index)
+            .map(|b| b.as_ptr() as *const c_char)
+            .unwrap_or(ptr::null())
+    })
 }
 
 /// Return the number of response headers available.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_response_header_count(handle: *const RSURL) -> usize {
-    handle_ref(handle).map(|h| h.header_buf.len()).unwrap_or(0)
+    ffi_guard(0, || {
+        handle_ref(handle).map(|h| h.header_buf.len()).unwrap_or(0)
+    })
 }
 
 /// Return a static, NUL-terminated human-readable string for a status code.
 #[no_mangle]
 pub extern "C" fn rsurl_strerror(code: c_int) -> *const c_char {
-    let s: &'static [u8] = match code {
-        0 => b"ok\0",
-        1 => b"invalid handle\0",
-        2 => b"unknown option\0",
-        3 => b"invalid argument\0",
-        4 => b"no response available\0",
-        5 => b"network error\0",
-        6 => b"bad response\0",
-        7 => b"unsupported scheme or feature\0",
-        _ => b"unknown error\0",
-    };
-    s.as_ptr() as *const c_char
+    ffi_guard(ptr::null(), || {
+        let s: &'static [u8] = match code {
+            0 => b"ok\0",
+            1 => b"invalid handle\0",
+            2 => b"unknown option\0",
+            3 => b"invalid argument\0",
+            4 => b"no response available\0",
+            5 => b"network error\0",
+            6 => b"bad response\0",
+            7 => b"unsupported scheme or feature\0",
+            _ => b"unknown error\0",
+        };
+        s.as_ptr() as *const c_char
+    })
 }
 
 /// Return the rsurl version as a NUL-terminated string.
 #[no_mangle]
 pub extern "C" fn rsurl_version() -> *const c_char {
-    concat!("rsurl/", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+    ffi_guard(ptr::null(), || {
+        concat!("rsurl/", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+    })
 }
