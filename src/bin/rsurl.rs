@@ -10,7 +10,10 @@
 //!     -s, --silent             suppress error messages
 //!     -X, --request <method>   override HTTP method
 //!     -H, --header <line>      add a request header (repeatable)
-//!     -d, --data <body>        send body and switch method to POST
+//!     -d, --data <body>        POST body (urlencoded); @file reads from disk
+//!         --data-raw <body>    like -d but no @file interpretation
+//!         --data-binary <body> like -d but no newline stripping when @file
+//!         --data-urlencode <s> URL-encode <s> before sending; @file allowed
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
 //!     -L, --location           follow 3xx redirects
@@ -50,7 +53,11 @@ struct Args {
     silent: bool,
     method: Option<String>,
     headers: Vec<(String, String)>,
-    data: Option<String>,
+    /// One entry per `-d` / `--data-raw` / `--data-binary` / `--data-urlencode`
+    /// on the command line, in order. Final body is the concatenation of
+    /// each part's encoded bytes joined with `b"&"`. See [`DataPart`] and
+    /// [`assemble_form_body`].
+    data_parts: Vec<DataPart>,
     user_agent: Option<String>,
     referer: Option<String>,
     /// Most recent HTTP version flag (--http2, --http1.1) seen on the CLI.
@@ -82,6 +89,37 @@ struct Args {
     /// `--noproxy <hosts>` — comma-separated host suffixes that bypass
     /// the proxy. A single `*` bypasses everything.
     noproxy: Option<String>,
+}
+
+/// One body chunk supplied on the command line via `-d` and friends.
+///
+/// Curl semantics — kept here as documentation because they vary subtly
+/// between flags:
+///
+/// * `-d` / `--data` — value goes verbatim **unless** it starts with `@`,
+///   in which case the rest is a file path. File contents are read and
+///   every CR (`\r`), LF (`\n`), and NUL byte is stripped — curl's
+///   historical behaviour for "post a file as a form value".
+/// * `--data-raw` — same as `-d` minus the `@file` magic. The leading
+///   `@` is taken literally. This is what you reach for when posting
+///   user-controlled strings that may legitimately start with `@`.
+/// * `--data-binary` — `@file` allowed but **no** newline stripping. Use
+///   this for actual binary payloads (or text whose newlines matter).
+/// * `--data-urlencode` — five sub-forms, parsed in [`encode_urlencoded`]:
+///   `content`, `=content`, `name=content`, `@file`, `name@file`.
+///
+/// Multiple data flags accumulate; the final body joins each part with
+/// `&`. The Content-Type defaults to `application/x-www-form-urlencoded`
+/// across the whole assembly.
+#[derive(Debug, Clone)]
+enum DataPart {
+    /// `-d` / `--data` (`at_file_ok = true`, strips CR/LF/NUL when reading)
+    /// or `--data-raw` (`at_file_ok = false`).
+    Plain { value: String, at_file_ok: bool },
+    /// `--data-binary`. `@file` reads the file as-is, no stripping.
+    Binary { value: String },
+    /// `--data-urlencode`. Parsed against the five curl sub-forms.
+    UrlEncoded { value: String },
 }
 
 fn main() -> ExitCode {
@@ -248,6 +286,117 @@ fn apply_explicit_cookies(jar: &mut CookieJar, data: &str, request_url: &Url) {
     }
 }
 
+/// Read the file at `path`, returning its bytes. Used by `-d @file`,
+/// `--data-binary @file`, and `--data-urlencode @file`.
+fn read_at_file(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("can't read {path:?}: {e}"))
+}
+
+/// Strip every CR (`\r`), LF (`\n`), and NUL (`\0`) byte from `data`.
+/// Matches curl's `-d @file` newline-stripping behaviour, which exists so
+/// that copying a multi-line config value into a form field doesn't
+/// accidentally embed line breaks.
+fn strip_newlines(data: Vec<u8>) -> Vec<u8> {
+    data.into_iter()
+        .filter(|&b| b != b'\r' && b != b'\n' && b != 0)
+        .collect()
+}
+
+/// Percent-encode `bytes` per `application/x-www-form-urlencoded`: unreserved
+/// chars (alnum, `-`, `.`, `_`, `~`) pass through, space becomes `+`, and
+/// everything else becomes `%HH` with uppercase hex. Matches curl's
+/// `--data-urlencode` encoder.
+fn percent_encode_form(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => write!(out, "%{b:02X}").expect("write to String"),
+        }
+    }
+    out
+}
+
+/// Resolve one `--data-urlencode` argument against curl's five sub-forms
+/// and return the bytes to splice into the body (without any join glue).
+///
+/// | Input            | Output                                                |
+/// |------------------|-------------------------------------------------------|
+/// | `content`        | `percent(content)`                                    |
+/// | `=content`       | `percent(content)` (leading `=` strips into empty name) |
+/// | `name=content`   | `name=percent(content)` (name kept verbatim)          |
+/// | `@file`          | `percent(read(file))`                                 |
+/// | `name@file`      | `name=percent(read(file))`                            |
+///
+/// Note that for the `name=` and `name@` forms, the name itself is **not**
+/// encoded — this matches curl. Callers who need an encoded name must
+/// either pre-encode it or use `=content` and append `name=` manually.
+fn encode_urlencoded(spec: &str) -> Result<Vec<u8>, String> {
+    // Split into (name_prefix, body_bytes). Look for the first `=` or `@`
+    // that determines the form. `=` takes precedence over `@`.
+    if let Some(eq) = spec.find('=') {
+        let (name, rest) = spec.split_at(eq);
+        let value = &rest[1..]; // drop the '='
+        let encoded = percent_encode_form(value.as_bytes());
+        if name.is_empty() {
+            return Ok(encoded.into_bytes());
+        }
+        return Ok(format!("{name}={encoded}").into_bytes());
+    }
+    if let Some(at) = spec.find('@') {
+        let (name, rest) = spec.split_at(at);
+        let path = &rest[1..]; // drop the '@'
+        let bytes = read_at_file(path)?;
+        let encoded = percent_encode_form(&bytes);
+        if name.is_empty() {
+            return Ok(encoded.into_bytes());
+        }
+        return Ok(format!("{name}={encoded}").into_bytes());
+    }
+    Ok(percent_encode_form(spec.as_bytes()).into_bytes())
+}
+
+/// Resolve every `DataPart` into bytes and join with `&`. Returns
+/// `Ok(None)` if no data flags were given; `Ok(Some(bytes))` otherwise.
+/// File-read errors become a printable string for the caller.
+fn assemble_form_body(parts: &[DataPart]) -> Result<Option<Vec<u8>>, String> {
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let mut out: Vec<u8> = Vec::new();
+    for part in parts {
+        if !out.is_empty() {
+            out.push(b'&');
+        }
+        match part {
+            DataPart::Plain { value, at_file_ok } => {
+                if *at_file_ok {
+                    if let Some(path) = value.strip_prefix('@') {
+                        out.extend_from_slice(&strip_newlines(read_at_file(path)?));
+                        continue;
+                    }
+                }
+                out.extend_from_slice(value.as_bytes());
+            }
+            DataPart::Binary { value } => {
+                if let Some(path) = value.strip_prefix('@') {
+                    out.extend_from_slice(&read_at_file(path)?);
+                } else {
+                    out.extend_from_slice(value.as_bytes());
+                }
+            }
+            DataPart::UrlEncoded { value } => {
+                out.extend_from_slice(&encode_urlencoded(value)?);
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
 fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     let parsed_url = match Url::parse(url) {
         Ok(u) => u,
@@ -265,10 +414,22 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         return run_transfer(url, args);
     }
 
+    // Assemble the body up front so we know whether to default the method
+    // to POST. Errors from file I/O surface as exit code 2 ("usage").
+    let body = match assemble_form_body(&args.data_parts) {
+        Ok(b) => b,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            return 2;
+        }
+    };
+
     let method = args.method.clone().unwrap_or_else(|| {
         if args.head {
             "HEAD".to_string()
-        } else if args.data.is_some() {
+        } else if body.is_some() {
             "POST".to_string()
         } else {
             "GET".to_string()
@@ -294,8 +455,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(rf) = &args.referer {
         req = req.header("Referer", rf);
     }
-    if let Some(body) = args.data.as_deref() {
-        let body_bytes = body.as_bytes().to_vec();
+    if let Some(body_bytes) = body {
         if !args
             .headers
             .iter()
@@ -439,7 +599,20 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                     .ok_or_else(|| format!("malformed header: {h:?}"))?;
                 a.headers.push((k.trim().to_string(), v.trim().to_string()));
             }
-            "-d" | "--data" | "--data-raw" => a.data = Some(next_val(&mut it, arg)?),
+            "-d" | "--data" => a.data_parts.push(DataPart::Plain {
+                value: next_val(&mut it, arg)?,
+                at_file_ok: true,
+            }),
+            "--data-raw" => a.data_parts.push(DataPart::Plain {
+                value: next_val(&mut it, arg)?,
+                at_file_ok: false,
+            }),
+            "--data-binary" => a.data_parts.push(DataPart::Binary {
+                value: next_val(&mut it, arg)?,
+            }),
+            "--data-urlencode" => a.data_parts.push(DataPart::UrlEncoded {
+                value: next_val(&mut it, arg)?,
+            }),
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
             "-e" | "--referer" => a.referer = Some(next_val(&mut it, arg)?),
             "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
@@ -601,7 +774,12 @@ Options:
   -s, --silent             suppress error messages
   -X, --request <method>   override HTTP method
   -H, --header <line>      add a request header (repeatable)
-  -d, --data <body>        send body and switch method to POST
+  -d, --data <body>        POST body (urlencoded); @file reads from disk
+                           and strips CR/LF. Repeatable; joined with '&'.
+      --data-raw <body>    like -d but '@' is taken literally
+      --data-binary <body> like -d but @file is read verbatim (no strip)
+      --data-urlencode <s> percent-encode <s> before sending. Forms:
+                             text  =text  name=text  @file  name@file
   -A, --user-agent <ua>    set User-Agent
   -e, --referer <ref>      set Referer
   -L, --location           follow 3xx redirects
@@ -626,4 +804,178 @@ Options:
   -V, --version            print version
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- percent_encode_form --------------------------------------------
+
+    #[test]
+    fn percent_encode_form_passes_unreserved() {
+        assert_eq!(percent_encode_form(b"abcXYZ012-._~"), "abcXYZ012-._~");
+    }
+
+    #[test]
+    fn percent_encode_form_space_becomes_plus() {
+        assert_eq!(percent_encode_form(b"hello world"), "hello+world");
+    }
+
+    #[test]
+    fn percent_encode_form_special_chars_become_hex() {
+        // = & + / ? % # are all encoded; '+' is %2B specifically (so the
+        // wire encoding survives a re-decode that maps '+' back to space).
+        assert_eq!(percent_encode_form(b"=&+/?%#"), "%3D%26%2B%2F%3F%25%23",);
+    }
+
+    #[test]
+    fn percent_encode_form_high_bytes_use_uppercase_hex() {
+        assert_eq!(percent_encode_form(&[0xC3, 0xA9]), "%C3%A9"); // "é"
+    }
+
+    // ---- strip_newlines -------------------------------------------------
+
+    #[test]
+    fn strip_newlines_removes_crlf_and_nul() {
+        let got = strip_newlines(b"a\r\nb\nc\0d".to_vec());
+        assert_eq!(got, b"abcd");
+    }
+
+    #[test]
+    fn strip_newlines_keeps_other_whitespace() {
+        // Tabs and spaces are preserved — curl only strips the three bytes.
+        let got = strip_newlines(b"a\tb c\r\n".to_vec());
+        assert_eq!(got, b"a\tb c");
+    }
+
+    // ---- encode_urlencoded ----------------------------------------------
+
+    #[test]
+    fn encode_urlencoded_plain_content() {
+        // "content" → percent("content")
+        let got = encode_urlencoded("hello world").unwrap();
+        assert_eq!(got, b"hello+world");
+    }
+
+    #[test]
+    fn encode_urlencoded_leading_eq_strips_name() {
+        // "=content" → percent("content") with no name prefix.
+        let got = encode_urlencoded("=hi there").unwrap();
+        assert_eq!(got, b"hi+there");
+    }
+
+    #[test]
+    fn encode_urlencoded_name_value() {
+        // "name=content" → "name=percent(content)" (name verbatim)
+        let got = encode_urlencoded("name=hello world").unwrap();
+        assert_eq!(got, b"name=hello+world");
+    }
+
+    #[test]
+    fn encode_urlencoded_at_file_reads_and_encodes() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("rsurl-urlencode-at-file.txt");
+        std::fs::write(&tmp, b"hello world").unwrap();
+        let spec = format!("@{}", tmp.display());
+        let got = encode_urlencoded(&spec).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(got, b"hello+world");
+    }
+
+    #[test]
+    fn encode_urlencoded_name_at_file_reads_and_encodes() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("rsurl-urlencode-name-at.txt");
+        std::fs::write(&tmp, b"value with spaces").unwrap();
+        let spec = format!("k@{}", tmp.display());
+        let got = encode_urlencoded(&spec).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(got, b"k=value+with+spaces");
+    }
+
+    #[test]
+    fn encode_urlencoded_eq_wins_over_at() {
+        // "x=y@notafile" — the '=' takes precedence, so this is a name=value
+        // form with literal value "y@notafile". File is never opened.
+        let got = encode_urlencoded("x=y@notafile").unwrap();
+        assert_eq!(got, b"x=y%40notafile");
+    }
+
+    // ---- assemble_form_body --------------------------------------------
+
+    #[test]
+    fn assemble_empty_is_none() {
+        assert!(assemble_form_body(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn assemble_joins_with_ampersand() {
+        let parts = vec![
+            DataPart::Plain {
+                value: "a=1".into(),
+                at_file_ok: true,
+            },
+            DataPart::Plain {
+                value: "b=2".into(),
+                at_file_ok: true,
+            },
+        ];
+        assert_eq!(assemble_form_body(&parts).unwrap().unwrap(), b"a=1&b=2");
+    }
+
+    #[test]
+    fn assemble_plain_at_file_strips_newlines() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("rsurl-assemble-plain-at.txt");
+        std::fs::write(&tmp, b"a\r\nb\n").unwrap();
+        let parts = vec![DataPart::Plain {
+            value: format!("@{}", tmp.display()),
+            at_file_ok: true,
+        }];
+        let got = assemble_form_body(&parts).unwrap().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(got, b"ab");
+    }
+
+    #[test]
+    fn assemble_binary_at_file_keeps_newlines() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push("rsurl-assemble-binary-at.txt");
+        std::fs::write(&tmp, b"a\r\nb\n").unwrap();
+        let parts = vec![DataPart::Binary {
+            value: format!("@{}", tmp.display()),
+        }];
+        let got = assemble_form_body(&parts).unwrap().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(got, b"a\r\nb\n");
+    }
+
+    #[test]
+    fn assemble_data_raw_treats_at_literally() {
+        // --data-raw with @file: the leading '@' is part of the value.
+        let parts = vec![DataPart::Plain {
+            value: "@literal".into(),
+            at_file_ok: false,
+        }];
+        assert_eq!(assemble_form_body(&parts).unwrap().unwrap(), b"@literal");
+    }
+
+    #[test]
+    fn assemble_mixes_data_modes() {
+        let parts = vec![
+            DataPart::Plain {
+                value: "n=1".into(),
+                at_file_ok: true,
+            },
+            DataPart::Binary {
+                value: "rawbytes".into(),
+            },
+            DataPart::UrlEncoded {
+                value: "k=hello world".into(),
+            },
+        ];
+        let got = assemble_form_body(&parts).unwrap().unwrap();
+        assert_eq!(got, b"n=1&rawbytes&k=hello+world");
+    }
 }

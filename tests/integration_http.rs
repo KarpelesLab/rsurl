@@ -630,3 +630,154 @@ fn pool_retries_when_pooled_connection_is_stale() {
     // by the time the second request tried to reuse it.
     assert_eq!(server.accept_count.load(Ordering::SeqCst), 2);
 }
+
+// ---------------------------------------------------------------------------
+// CLI subprocess tests for the curl-parity body flags
+// ---------------------------------------------------------------------------
+//
+// These spawn the actual `rsurl` binary against an in-process test server.
+// The binary path comes from `CARGO_BIN_EXE_rsurl`, set automatically by
+// Cargo for integration tests on a crate that declares a `[[bin]]` target.
+// We need a subprocess (rather than calling code directly) because the CLI
+// flag-parsing layer is the unit under test here.
+
+/// `(method, content_type, body_bytes)` captured from one request.
+type CapturedRequest = (String, Option<String>, Vec<u8>);
+type CapturedSlot = std::sync::Arc<std::sync::Mutex<Option<CapturedRequest>>>;
+
+/// Helper: take ownership of the next captured request body sent by the
+/// in-process server. Blocks until the handler has run.
+fn capture_one_request() -> (TestServer, CapturedSlot) {
+    use std::sync::{Arc, Mutex};
+    let slot: CapturedSlot = Arc::new(Mutex::new(None));
+    let slot2 = Arc::clone(&slot);
+    let server = TestServer::start(move |req: SReq| {
+        let ct = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone());
+        *slot2.lock().unwrap() = Some((req.method.clone(), ct, req.body.clone()));
+        SResp::ok("ok")
+    });
+    (server, slot)
+}
+
+/// `rsurl --data-binary @file` must transmit the file bytes verbatim,
+/// including CRLF and bare LF — those are the bytes curl preserves under
+/// `--data-binary` (and would strip under `-d`).
+#[test]
+fn cli_data_binary_at_file_keeps_newlines() {
+    use std::io::Write;
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("rsurl-data-binary-{}.bin", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(b"a\r\nb\n").unwrap();
+    }
+
+    let arg = format!("@{}", tmp.display());
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["--data-binary", &arg, &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&tmp);
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(got.0, "POST");
+    assert_eq!(
+        got.1.as_deref(),
+        Some("application/x-www-form-urlencoded"),
+        "default Content-Type for --data-binary should match -d"
+    );
+    assert_eq!(got.2, b"a\r\nb\n", "CRLF/LF must survive --data-binary");
+}
+
+/// Drive every documented sub-form of `--data-urlencode` and assert the
+/// joined body is exactly what curl would emit: `content` and `=content`
+/// percent-encode the bytes; `name=content` keeps the name plain and
+/// encodes only the value; `@file` / `name@file` read the file then encode.
+#[test]
+fn cli_data_urlencode_all_five_forms() {
+    use std::io::Write;
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("rsurl-urlencode-{}.txt", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        // Bytes that exercise the encoder: space → '+', '&' → "%26".
+        f.write_all(b"x y&z").unwrap();
+    }
+    let at = format!("@{}", tmp.display());
+    let name_at = format!("g@{}", tmp.display());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "--data-urlencode",
+            "hello world",
+            "--data-urlencode",
+            "=raw value",
+            "--data-urlencode",
+            "k=v with space",
+            "--data-urlencode",
+            &at,
+            "--data-urlencode",
+            &name_at,
+            &server.url("/post"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&tmp);
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(got.0, "POST");
+    let body = String::from_utf8(got.2).expect("ascii body");
+    // Joined left-to-right with '&', each part the curl-canonical encoding.
+    // file content "x y&z" → "x+y%26z".
+    assert_eq!(
+        body, "hello+world&raw+value&k=v+with+space&x+y%26z&g=x+y%26z",
+        "every --data-urlencode sub-form must match curl's encoding"
+    );
+}
+
+/// `-d a=1 -d b=2 -d c=3` concatenates with `&` exactly the way curl does;
+/// each repetition appends one more form value. This is the canonical
+/// "I'd rather repeat the flag than escape an ampersand on the shell line"
+/// idiom.
+#[test]
+fn cli_multiple_d_join_with_ampersand() {
+    use std::process::Command;
+    let (server, slot) = capture_one_request();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-d", "a=1", "-d", "b=2", "-d", "c=3", &server.url("/post")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "rsurl exited non-zero: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let got = slot.lock().unwrap().clone().expect("handler ran");
+    assert_eq!(got.0, "POST");
+    assert_eq!(got.2, b"a=1&b=2&c=3");
+}
