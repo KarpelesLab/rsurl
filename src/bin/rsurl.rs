@@ -21,7 +21,7 @@
 //!         --form-string <n=v>  like -F but the value is always literal
 //!         --form-escape        percent-encode field names/filenames per
 //!                              RFC 7578 §4.2 instead of backslash-escaping
-//!     -T, --upload-file <f>    upload the file (HTTP PUT, or FTP/FTPS STOR)
+//!     -T, --upload-file <f>    upload the file (HTTP PUT, FTP/FTPS STOR, or TFTP WRQ)
 //!     -C, --continue-at <off>  resume at byte <off> (FTP sends REST before STOR)
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
@@ -971,8 +971,14 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             if matches!(parsed_url.scheme.as_str(), "ftp" | "ftps") {
                 return run_ftp_upload(&parsed_url, path, args);
             }
+            // TFTP upload: -T <file> tftp://host/remote → WRQ.
+            if parsed_url.scheme == "tftp" {
+                return run_tftp_upload(&parsed_url, path, args);
+            }
             if !args.silent {
-                eprintln!("rsurl: -T is only supported for HTTP(S) and FTP(S) URLs in this build");
+                eprintln!(
+                    "rsurl: -T is only supported for HTTP(S), FTP(S), and TFTP URLs in this build"
+                );
             }
             return 2;
         }
@@ -1329,6 +1335,31 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     }
 }
 
+/// Upload a local file to a `tftp://` URL via WRQ (RFC 1350 write side).
+/// Returns a curl-style exit code (0 ok, 7 on transfer error, 26 on
+/// local-read error).
+fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: -T: can't read {path:?}: {e}");
+            }
+            return 26;
+        }
+    };
+
+    match rsurl::tftp::store(url, &bytes) {
+        Ok(()) => 0,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
+}
+
 fn run_transfer(url: &str, args: &Args) -> u8 {
     match rsurl::transfer(url) {
         Ok(bytes) => {
@@ -1435,7 +1466,7 @@ Options:
       --form-escape        percent-encode names/filenames per RFC 7578 §4.2
                            (default: backslash-escape, curl-historical)
   -T, --upload-file <f>    upload the file: HTTP PUT (default Content-Type:
-                           application/octet-stream), or FTP/FTPS STOR
+                           application/octet-stream), FTP/FTPS STOR, or TFTP WRQ
   -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
                            the automatic form '-C -' is not supported
   -A, --user-agent <ua>    set User-Agent

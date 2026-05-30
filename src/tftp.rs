@@ -5,9 +5,10 @@
 //! operation is a read (RRQ) of `url.path` in octet mode, reassembling
 //! 512-byte (or negotiated) blocks until a short block signals end.
 //!
-//! Only the read side (RRQ) is implemented. Option negotiation (RFC 2347)
-//! is not done; we send a plain RRQ in `octet` mode and accept 512-byte
-//! DATA blocks. Writes (WRQ) are not supported.
+//! Both the read side (RRQ) and the write side (WRQ) are implemented. Option
+//! negotiation (RFC 2347) is not done; we send a plain RRQ/WRQ in `octet` mode,
+//! accept 512-byte DATA blocks on read, and send 512-byte DATA blocks on write
+//! (a short final block — possibly empty — terminates the upload).
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
@@ -17,7 +18,6 @@ use crate::url::Url;
 
 /// TFTP opcodes (RFC 1350 §5).
 const OP_RRQ: u16 = 1;
-#[allow(dead_code)]
 const OP_WRQ: u16 = 2;
 const OP_DATA: u16 = 3;
 const OP_ACK: u16 = 4;
@@ -43,15 +43,36 @@ struct DataPacket<'a> {
     data: &'a [u8],
 }
 
-/// Build a Read Request packet:
-/// `\x00\x01<filename>\x00octet\x00`.
-fn build_rrq(filename: &str) -> Vec<u8> {
+/// Build a request packet for the given opcode (RRQ or WRQ):
+/// `<2-byte opcode><filename>\x00octet\x00`.
+fn build_request(opcode: u16, filename: &str) -> Vec<u8> {
     let mut p = Vec::with_capacity(2 + filename.len() + 1 + 5 + 1);
-    p.extend_from_slice(&OP_RRQ.to_be_bytes());
+    p.extend_from_slice(&opcode.to_be_bytes());
     p.extend_from_slice(filename.as_bytes());
     p.push(0);
     p.extend_from_slice(b"octet");
     p.push(0);
+    p
+}
+
+/// Build a Read Request packet:
+/// `\x00\x01<filename>\x00octet\x00`.
+fn build_rrq(filename: &str) -> Vec<u8> {
+    build_request(OP_RRQ, filename)
+}
+
+/// Build a Write Request packet:
+/// `\x00\x02<filename>\x00octet\x00`.
+fn build_wrq(filename: &str) -> Vec<u8> {
+    build_request(OP_WRQ, filename)
+}
+
+/// Build a DATA packet: `\x00\x03<2-byte block#><payload>`.
+fn build_data(block: u16, payload: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(4 + payload.len());
+    p.extend_from_slice(&OP_DATA.to_be_bytes());
+    p.extend_from_slice(&block.to_be_bytes());
+    p.extend_from_slice(payload);
     p
 }
 
@@ -87,6 +108,17 @@ fn parse_data(buf: &[u8]) -> Result<DataPacket<'_>> {
     })
 }
 
+/// Parse an ACK packet (opcode 4). Returns the acknowledged block number.
+fn parse_ack(buf: &[u8]) -> Result<u16> {
+    if buf.len() < 4 {
+        return Err(Error::BadResponse("tftp: short ACK packet".into()));
+    }
+    if parse_opcode(buf) != Some(OP_ACK) {
+        return Err(Error::BadResponse("tftp: not an ACK packet".into()));
+    }
+    Ok(u16::from_be_bytes([buf[2], buf[3]]))
+}
+
 /// Parse an ERROR packet (opcode 5). Returns the human-readable message
 /// (trimmed of the trailing NUL if present). The error code itself is
 /// discarded; the message is what users want to see.
@@ -114,11 +146,13 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| Error::BadResponse(format!("tftp: cannot resolve {host}:{port}")))
 }
 
-/// RRQ the file at `url.path` and return the reassembled bytes.
-pub fn fetch(url: &Url) -> Result<Vec<u8>> {
-    // Strip the leading '/' to get the TFTP filename. Anything past a '?' (a
-    // query, which TFTP doesn't actually have) is left in place — TFTP servers
-    // will just see it as part of the filename.
+/// Extract and validate the TFTP filename from `url.path`.
+///
+/// Strips the leading '/' to get the TFTP filename. Anything past a '?' (a
+/// query, which TFTP doesn't actually have) is left in place — TFTP servers
+/// will just see it as part of the filename. Rejects an empty filename or one
+/// containing a NUL (which would corrupt the request packet's framing).
+fn filename_of(url: &Url) -> Result<&str> {
     let filename = url.path.strip_prefix('/').unwrap_or(&url.path);
     if filename.is_empty() {
         return Err(Error::InvalidUrl(format!(
@@ -129,6 +163,12 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     if filename.as_bytes().contains(&0) {
         return Err(Error::InvalidUrl("tftp: filename contains NUL".into()));
     }
+    Ok(filename)
+}
+
+/// RRQ the file at `url.path` and return the reassembled bytes.
+pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    let filename = filename_of(url)?;
 
     let server = resolve(&url.host, url.port)?;
     let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -242,6 +282,152 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
                         ));
                     }
                 };
+            }
+            Some(OP_ERROR) => {
+                let msg = parse_error(pkt)?;
+                return Err(Error::BadResponse(format!("tftp: {msg}")));
+            }
+            Some(op) => {
+                return Err(Error::BadResponse(format!("tftp: unexpected opcode {op}")));
+            }
+            None => {
+                return Err(Error::BadResponse("tftp: packet too short".into()));
+            }
+        }
+    }
+}
+
+/// WRQ-upload `data` to the file at `url.path`.
+///
+/// Sends a Write Request, waits for the server's ACK of block 0 (latching its
+/// TID exactly as the read path does), then drives a lockstep DATA/ACK loop:
+/// send DATA block N, wait for ACK N (retransmitting on timeout), advance. A
+/// final block shorter than [`BLOCK_SIZE`] — possibly empty when `data` is an
+/// exact multiple of 512 — terminates the transfer per RFC 1350 §6.
+pub fn store(url: &Url, data: &[u8]) -> Result<()> {
+    let filename = filename_of(url)?;
+
+    // Cap uploads at the same ceiling as downloads. TFTP block numbers are a
+    // u16, so a 512-byte stream can address at most 65535 blocks before the
+    // first wrap; the 256 MiB cap stays well within a single wrap.
+    if data.len() > MAX_TOTAL_BYTES {
+        return Err(Error::BadResponse(format!(
+            "tftp: upload exceeds {MAX_TOTAL_BYTES} bytes"
+        )));
+    }
+
+    let server = resolve(&url.host, url.port)?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(READ_TIMEOUT))?;
+
+    let wrq = build_wrq(filename);
+
+    // The server picks a fresh ephemeral port (its TID) for its first reply
+    // (ACK 0 or, if it negotiated options we didn't ask for, an OACK). We latch
+    // that port from the first valid reply and reject anything from elsewhere.
+    let mut peer: Option<SocketAddr> = None;
+
+    let mut buf = [0u8; 4 + BLOCK_SIZE + 16];
+
+    // The packet we retransmit on timeout, and where we send it. We start by
+    // (re)sending the WRQ to the server's well-known port; once we've latched
+    // the peer TID, retransmits target that instead.
+    let mut last_packet: Vec<u8> = wrq;
+    let mut last_dest: SocketAddr = server;
+
+    socket.send_to(&last_packet, last_dest)?;
+    let mut retries: u32 = 0;
+
+    // `block` is the block number we're currently waiting to have ACKed. While
+    // we're still waiting for ACK 0 (the WRQ's acknowledgement) `block` is 0 and
+    // `payload_start` is 0 (no payload sent yet). After ACK 0 we send block 1,
+    // and so on. `sent_final` records that we've transmitted the short final
+    // block, so the matching ACK ends the transfer.
+    let mut block: u16 = 0;
+    // Offset into `data` of the block we last sent (only meaningful once
+    // `block >= 1`).
+    let mut sent_offset: usize = 0;
+    let mut sent_final = false;
+
+    loop {
+        let (n, from) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(e) => {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) {
+                    if retries >= MAX_RETRIES {
+                        return Err(Error::UnexpectedEof);
+                    }
+                    retries += 1;
+                    socket.send_to(&last_packet, last_dest)?;
+                    continue;
+                }
+                return Err(Error::Io(e));
+            }
+        };
+
+        // TID validation, mirroring the read path: once latched, only the
+        // peer's TID is accepted; before that, the source IP must match the
+        // host we sent the WRQ to (the port will differ).
+        if let Some(p) = peer {
+            if from != p {
+                continue;
+            }
+        } else if from.ip() != server.ip() {
+            continue;
+        }
+
+        let pkt = &buf[..n];
+        match parse_opcode(pkt) {
+            Some(OP_ACK) => {
+                let acked = parse_ack(pkt)?;
+
+                // Ignore an ACK that doesn't acknowledge the block we're
+                // waiting on. A stale/duplicate ACK (e.g. the server re-acking
+                // block N-1) must not advance us, or we'd skip a block.
+                if acked != block {
+                    continue;
+                }
+
+                // Latch onto the peer's TID on the first valid reply.
+                if peer.is_none() {
+                    peer = Some(from);
+                }
+
+                // The final block has now been acknowledged: we're done.
+                if sent_final {
+                    return Ok(());
+                }
+
+                // Advance to the next block. After ACK 0 we've sent nothing
+                // yet; otherwise step past the block we just sent.
+                let next_offset = if block == 0 {
+                    0
+                } else {
+                    sent_offset + BLOCK_SIZE
+                };
+                let next_block = match block.checked_add(1) {
+                    Some(b) => b,
+                    None => {
+                        return Err(Error::BadResponse(
+                            "tftp: block number wrapped; refusing oversized transfer".into(),
+                        ));
+                    }
+                };
+
+                let end = (next_offset + BLOCK_SIZE).min(data.len());
+                let payload = &data[next_offset..end];
+                let dgram = build_data(next_block, payload);
+                socket.send_to(&dgram, from)?;
+
+                block = next_block;
+                sent_offset = next_offset;
+                sent_final = payload.len() < BLOCK_SIZE;
+                last_packet = dgram;
+                last_dest = from;
+                retries = 0;
             }
             Some(OP_ERROR) => {
                 let msg = parse_error(pkt)?;
@@ -372,5 +558,299 @@ mod tests {
         let pkt = [0x00, 0x05, 0x00, 0x01, 0xFF, 0x00];
         let m = parse_error(&pkt).unwrap();
         assert!(m.contains('\u{FFFD}'));
+    }
+
+    // ---- write side (WRQ) ----
+
+    #[test]
+    fn wrq_builds_in_octet_mode() {
+        let p = build_wrq("hello.txt");
+        // opcode 2, filename, 0, "octet", 0
+        assert_eq!(p[0..2], [0x00, 0x02]);
+        assert_eq!(&p[2..2 + b"hello.txt".len()], b"hello.txt");
+        let after_name = 2 + b"hello.txt".len();
+        assert_eq!(p[after_name], 0);
+        assert_eq!(&p[after_name + 1..after_name + 1 + 5], b"octet");
+        assert_eq!(*p.last().unwrap(), 0);
+        assert_eq!(p.len(), 2 + 9 + 1 + 5 + 1);
+    }
+
+    #[test]
+    fn wrq_and_rrq_share_framing_only_opcode_differs() {
+        let r = build_rrq("f");
+        let w = build_wrq("f");
+        assert_eq!(r[0..2], [0x00, 0x01]);
+        assert_eq!(w[0..2], [0x00, 0x02]);
+        assert_eq!(&r[2..], &w[2..]);
+    }
+
+    #[test]
+    fn data_packet_builds_header_and_payload() {
+        let p = build_data(1, b"abc");
+        // opcode 3, block 1, payload
+        assert_eq!(p, vec![0x00, 0x03, 0x00, 0x01, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn data_packet_block_number_big_endian() {
+        let p = build_data(0x0102, b"");
+        assert_eq!(p, vec![0x00, 0x03, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn data_packet_full_block_is_516_bytes() {
+        let payload = vec![0x5Au8; BLOCK_SIZE];
+        let p = build_data(7, &payload);
+        assert_eq!(p.len(), 4 + BLOCK_SIZE);
+        assert_eq!(p[0..4], [0x00, 0x03, 0x00, 0x07]);
+        assert_eq!(&p[4..], &payload[..]);
+    }
+
+    #[test]
+    fn parse_ack_extracts_block_number() {
+        assert_eq!(parse_ack(&[0x00, 0x04, 0x00, 0x00]).unwrap(), 0);
+        assert_eq!(parse_ack(&[0x00, 0x04, 0x00, 0x01]).unwrap(), 1);
+        assert_eq!(parse_ack(&[0x00, 0x04, 0xFF, 0xFF]).unwrap(), 0xFFFF);
+        // Trailing junk after the 4-byte header is ignored.
+        assert_eq!(parse_ack(&[0x00, 0x04, 0x12, 0x34, 0xAA]).unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn parse_ack_rejects_short_header() {
+        assert!(parse_ack(&[]).is_err());
+        assert!(parse_ack(&[0x00, 0x04]).is_err());
+        assert!(parse_ack(&[0x00, 0x04, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_ack_rejects_wrong_opcode() {
+        // a DATA packet is not an ACK
+        assert!(parse_ack(&[0x00, 0x03, 0x00, 0x01]).is_err());
+    }
+
+    /// The block-splitting math the send loop performs, factored out so the
+    /// final-block termination rule can be unit-tested without a socket. Returns
+    /// the (block#, payload-slice) pairs in order, exactly as `store` would emit
+    /// them after each ACK.
+    fn split_blocks(data: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut out = Vec::new();
+        let mut block: u16 = 0;
+        let mut offset = 0usize;
+        loop {
+            let next_offset = if block == 0 { 0 } else { offset + BLOCK_SIZE };
+            let next_block = block.checked_add(1).expect("no wrap in test sizes");
+            let end = (next_offset + BLOCK_SIZE).min(data.len());
+            let payload = &data[next_offset..end];
+            out.push((next_block, payload));
+            block = next_block;
+            offset = next_offset;
+            if payload.len() < BLOCK_SIZE {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn split_blocks_short_single_block() {
+        let data = b"hello";
+        let blocks = split_blocks(data);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, 1);
+        assert_eq!(blocks[0].1, b"hello");
+    }
+
+    #[test]
+    fn split_blocks_empty_input_sends_one_empty_block() {
+        // An empty file still requires one (empty, short) DATA block to mark EOF.
+        let blocks = split_blocks(b"");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0], (1u16, &b""[..]));
+    }
+
+    #[test]
+    fn split_blocks_exact_multiple_appends_trailing_empty_block() {
+        // Exactly one full block: a trailing empty block is required so the
+        // peer can tell the transfer ended (RFC 1350 §6).
+        let data = vec![0xABu8; BLOCK_SIZE];
+        let blocks = split_blocks(&data);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, 1);
+        assert_eq!(blocks[0].1.len(), BLOCK_SIZE);
+        assert_eq!(blocks[1].0, 2);
+        assert_eq!(blocks[1].1.len(), 0);
+    }
+
+    #[test]
+    fn split_blocks_two_full_blocks_plus_empty() {
+        let data = vec![1u8; 2 * BLOCK_SIZE];
+        let blocks = split_blocks(&data);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].0, 1);
+        assert_eq!(blocks[1].0, 2);
+        assert_eq!(blocks[2].0, 3);
+        assert_eq!(blocks[2].1.len(), 0);
+    }
+
+    #[test]
+    fn split_blocks_partial_final_block_no_trailing_empty() {
+        // One full block + a short block: the short block terminates; no extra
+        // empty block.
+        let mut data = vec![0u8; BLOCK_SIZE];
+        data.extend_from_slice(b"tail");
+        let blocks = split_blocks(&data);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1].0, 2);
+        assert_eq!(blocks[1].1, b"tail");
+    }
+
+    #[test]
+    fn split_blocks_reassemble_matches_input() {
+        // Sanity: concatenating every block's payload reproduces the input.
+        for &len in &[0usize, 1, 511, 512, 513, 1024, 1500, 4096] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let blocks = split_blocks(&data);
+            let joined: Vec<u8> = blocks.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+            assert_eq!(joined, data, "len {len}");
+        }
+    }
+
+    // ---- end-to-end write over loopback UDP, with TID validation ----
+
+    use std::net::UdpSocket;
+    use std::thread;
+
+    /// Minimal in-test TFTP server that accepts a WRQ and collects the upload.
+    /// Replies from a *fresh* socket (a new TID) so the client must latch and
+    /// validate it. When `inject_foreign_tid` is set, after latching it sends a
+    /// spurious ACK 1 from an unrelated socket (a bogus TID); the client must
+    /// discard that and only honour ACKs from the latched TID, or the collected
+    /// bytes would diverge from the payload.
+    fn run_mock_wrq_server(server: UdpSocket, inject_foreign_tid: bool) -> Vec<u8> {
+        // Receive the WRQ on the well-known socket. `from` is the client's
+        // address (its TID); replies go back there.
+        let mut buf = [0u8; 4 + BLOCK_SIZE + 16];
+        let (n, from) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(parse_opcode(&buf[..n]), Some(OP_WRQ));
+
+        // A new socket → new TID for all real replies.
+        let tid_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tid_sock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Real ACK 0 from our TID, latching it on the client side.
+        tid_sock.send_to(&build_ack(0), from).unwrap();
+
+        let foreign = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut injected = false;
+
+        let mut collected = Vec::new();
+        let mut expected: u16 = 1;
+        loop {
+            let (n, peer) = tid_sock.recv_from(&mut buf).unwrap();
+            let d = parse_data(&buf[..n]).unwrap();
+            assert_eq!(d.block, expected);
+            collected.extend_from_slice(d.data);
+
+            // After receiving the first DATA, fire a bogus ACK from a foreign
+            // TID. The client must ignore it; we then send the legitimate ACK.
+            if inject_foreign_tid && !injected {
+                foreign.send_to(&build_ack(d.block), peer).unwrap();
+                injected = true;
+            }
+
+            tid_sock.send_to(&build_ack(d.block), peer).unwrap();
+            let last = d.data.len() < BLOCK_SIZE;
+            expected = expected.wrapping_add(1);
+            if last {
+                break;
+            }
+        }
+        collected
+    }
+
+    fn test_url(port: u16, path: &str) -> Url {
+        Url {
+            scheme: "tftp".into(),
+            userinfo: None,
+            host: "127.0.0.1".into(),
+            port,
+            path: path.into(),
+        }
+    }
+
+    fn upload_roundtrip_inner(payload: Vec<u8>, inject_foreign_tid: bool) {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_port = server.local_addr().unwrap().port();
+        let handle = thread::spawn(move || run_mock_wrq_server(server, inject_foreign_tid));
+
+        let url = test_url(server_port, "/upload.bin");
+        store(&url, &payload).unwrap();
+        let got = handle.join().unwrap();
+        assert_eq!(got, payload);
+    }
+
+    fn upload_roundtrip(payload: Vec<u8>) {
+        upload_roundtrip_inner(payload, false);
+    }
+
+    #[test]
+    fn store_uploads_short_file() {
+        upload_roundtrip(b"hello, tftp world".to_vec());
+    }
+
+    #[test]
+    fn store_uploads_empty_file() {
+        upload_roundtrip(Vec::new());
+    }
+
+    #[test]
+    fn store_uploads_exact_multiple_of_block() {
+        upload_roundtrip(vec![0x7Eu8; BLOCK_SIZE]);
+    }
+
+    #[test]
+    fn store_uploads_multi_block_file() {
+        let payload: Vec<u8> = (0..(2 * BLOCK_SIZE + 100))
+            .map(|i| (i % 256) as u8)
+            .collect();
+        upload_roundtrip(payload);
+    }
+
+    #[test]
+    fn store_ignores_foreign_tid_acks() {
+        // A multi-block upload where the server injects a bogus ACK from an
+        // unrelated TID. The client must reject it and complete cleanly.
+        let payload: Vec<u8> = (0..(2 * BLOCK_SIZE + 7)).map(|i| (i % 256) as u8).collect();
+        upload_roundtrip_inner(payload, true);
+    }
+
+    #[test]
+    fn store_rejects_empty_filename() {
+        let url = test_url(69, "/");
+        assert!(matches!(store(&url, b"x"), Err(Error::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn store_surfaces_server_error_packet() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_port = server.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(parse_opcode(&buf[..n]), Some(OP_WRQ));
+            // Reply with ERROR (code 2 = access violation).
+            let err = [0x00, 0x05, 0x00, 0x02, b'n', b'o', 0x00];
+            server.send_to(&err, from).unwrap();
+        });
+
+        let url = test_url(server_port, "/denied");
+        let err = store(&url, b"data").unwrap_err();
+        match err {
+            Error::BadResponse(m) => assert!(m.contains("no"), "got {m}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+        handle.join().unwrap();
     }
 }
