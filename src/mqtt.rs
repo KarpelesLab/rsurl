@@ -35,6 +35,14 @@ const PKT_SUBACK: u8 = 9;
 const PKT_PINGRESP: u8 = 13;
 const PKT_DISCONNECT: u8 = 14;
 
+/// Hard cap on a single packet's declared "remaining length". The MQTT varint
+/// allows up to 268_435_455 (256 MiB), but a forged broker (or a MITM on
+/// plaintext `mqtt://`) could declare that maximum in a 5-byte fixed header and
+/// make us allocate ~256 MiB before any body bytes arrive — cheap memory
+/// exhaustion across reconnects. Match the 64 MiB cap used elsewhere in the
+/// crate (ldap, imap, websocket, gopher, rtsp).
+const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
+
 /// CONNECT, SUBSCRIBE to the topic in `url.path`, return the payload of the
 /// first PUBLISH received, then DISCONNECT.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
@@ -414,6 +422,9 @@ fn read_packet<R: Read>(r: &mut R) -> Result<(u8, Vec<u8>)> {
     read_exact_or_eof(r, &mut hdr)?;
     let ctype = hdr[0] >> 4;
     let rem = read_remaining_length(r)?;
+    if rem > MAX_PACKET_BYTES {
+        return Err(Error::BadResponse("mqtt: packet too large".into()));
+    }
     let mut body = vec![0u8; rem];
     if rem > 0 {
         read_exact_or_eof(r, &mut body)?;
@@ -565,6 +576,23 @@ mod tests {
         let bad = [0xFF, 0xFF, 0xFF, 0xFF];
         let mut cur = std::io::Cursor::new(&bad[..]);
         assert!(read_remaining_length(&mut cur).is_err());
+    }
+
+    #[test]
+    fn read_packet_rejects_oversized_remaining_length() {
+        // A PUBLISH fixed header declaring a remaining length just above the
+        // MAX_PACKET_BYTES cap must be rejected *before* the body buffer is
+        // allocated, rather than eagerly reserving ~64 MiB+ for a body that may
+        // never arrive (memory-exhaustion DoS via a forged/MITM broker).
+        let mut hdr = vec![PKT_PUBLISH << 4];
+        write_remaining_length(&mut hdr, MAX_PACKET_BYTES + 1);
+        // No body bytes follow: if the cap weren't enforced we'd allocate the
+        // huge buffer and only then hit EOF.
+        let mut cur = std::io::Cursor::new(hdr);
+        match read_packet(&mut cur) {
+            Err(Error::BadResponse(m)) => assert!(m.contains("too large"), "got {m}"),
+            other => panic!("expected BadResponse(too large), got {other:?}"),
+        }
     }
 
     #[test]
