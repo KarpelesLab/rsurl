@@ -162,6 +162,17 @@ fn run(mut sock: Stream, url: &Url) -> Result<Vec<u8>> {
         sock.flush()?;
         let resp = buf.read_response(&mut sock, &tag)?;
         require_ok(&resp, &tag, "STARTTLS")?;
+        // Security (CVE-2011-0411 class STARTTLS plaintext injection): the
+        // `LineReader` buffers socket reads in chunks, so any bytes a MITM
+        // pipelines *after* the STARTTLS `OK` line are still sitting in the
+        // buffer. They were received as PLAINTEXT before the handshake; reading
+        // them after the upgrade would treat attacker-staged data as trusted
+        // post-TLS server responses. Discarding is unsafe — abort instead.
+        if !buf.is_clear() {
+            return Err(Error::BadResponse(
+                "STARTTLS: server pipelined data before TLS handshake".into(),
+            ));
+        }
         // Tagged OK means the server is ready; everything after is TLS.
         sock.start_tls(&url.host)?;
         // RFC 2595: discard the pre-TLS capability list and re-probe, since
@@ -680,6 +691,15 @@ impl LineReader {
         Self { buf: Vec::new() }
     }
 
+    /// True when no unconsumed bytes remain in the internal buffer. Used to
+    /// detect a STARTTLS buffered-plaintext injection (CVE-2011-0411 class):
+    /// any bytes a MITM pipelines after the STARTTLS `OK` would otherwise sit
+    /// in `self.buf` and be read — as trusted plaintext — after the TLS
+    /// upgrade. The caller must verify this is clear before `start_tls`.
+    fn is_clear(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     /// Read raw bytes until we have at least one complete CRLF-terminated
     /// line in `self.buf`, then pop it (without the trailing CRLF). Returns
     /// an empty string + error if the socket closes mid-line.
@@ -1150,6 +1170,39 @@ mod tests {
         let sent = io.sent();
         assert!(sent.contains("a001 CAPABILITY\r\n"), "{sent:?}");
         assert!(sent.contains("a002 STARTTLS\r\n"), "{sent:?}");
+    }
+
+    #[test]
+    fn starttls_rejects_pipelined_plaintext_injection() {
+        // CVE-2011-0411 class: a MITM appends a forged response right after the
+        // STARTTLS `OK`, in the same plaintext flight. After reading the OK
+        // line, those leftover bytes remain buffered in the LineReader, so
+        // `is_clear()` must be false and the production guard in `run()` aborts
+        // the upgrade instead of trusting them post-TLS.
+        let script = b"a001 OK Begin TLS negotiation now\r\n\
+                       * CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n\
+                       a002 OK injected\r\n";
+        let mut src: &[u8] = script;
+        let mut lr = LineReader::new();
+        let resp = lr.read_response(&mut src, "a001").expect("starttls ok");
+        assert!(require_ok(&resp, "a001", "STARTTLS").is_ok());
+        // The forged bytes are still buffered — the guard must trip.
+        assert!(
+            !lr.is_clear(),
+            "expected pipelined plaintext to remain buffered after STARTTLS OK"
+        );
+    }
+
+    #[test]
+    fn starttls_clear_when_server_waits_for_handshake() {
+        // A conforming server sends nothing after the STARTTLS OK until the
+        // TLS handshake, so the buffer is fully drained and `is_clear()` holds.
+        let script = b"a001 OK Begin TLS negotiation now\r\n";
+        let mut src: &[u8] = script;
+        let mut lr = LineReader::new();
+        let resp = lr.read_response(&mut src, "a001").expect("starttls ok");
+        assert!(require_ok(&resp, "a001", "STARTTLS").is_ok());
+        assert!(lr.is_clear(), "no pipelined data: reader must be clear");
     }
 
     // -- LineReader literal handling --------------------------------------
