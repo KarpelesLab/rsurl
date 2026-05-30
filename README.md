@@ -29,7 +29,7 @@ Early, in active development.
 | Cookies (`-b` / `-c`) | working | RFC 6265 jar; Netscape `cookies.txt` I/O, curl-compatible |
 | HTTP proxy (`-x`) | working | absolute-form for plain HTTP, `CONNECT` tunnel for HTTPS, Basic auth, `--noproxy` / `*_PROXY` env vars |
 | HTTPS via purecrypto | working | TLS 1.2/1.3, system roots, full cert verification |
-| HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; connection- and stream-level flow control (WINDOW_UPDATE, INITIAL_WINDOW_SIZE deltas); process-wide connection pool reuses a warm conn across requests, advancing stream ids 1/3/5 (sequential reuse; concurrent multiplexing not yet wired) |
+| HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; connection- and stream-level flow control (WINDOW_UPDATE, INITIAL_WINDOW_SIZE deltas); process-wide connection pool reuses a warm conn across requests, advancing stream ids 1/3/5 (sequential reuse). True concurrent multiplexing — many in-flight streams on one connection, interleaved frame I/O, non-blocking body sends with no head-of-line stall, queueing at `SETTINGS_MAX_CONCURRENT_STREAMS`, per-stream RST + GOAWAY demux — is available as the `rsurl::send_multiplexed` library API (see below); the CLI still issues one request at a time |
 | HTTP/3 over QUIC (RFC 9114) | working\*\* | reachable via `--http3` (try h3, fall back to HTTP/2/1.1 on a QUIC transport failure) and `--http3-only` (force h3, no fallback). QUIC + frame layer + QPACK static/dynamic tables and Huffman decoder; advertises a non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (blocked-streams 0), applies the peer's encoder-stream inserts and resolves dynamic / post-base field-line refs, acks sections on the decoder stream; the request encoder still emits literals only; honors `--cacert`/`-k` |
 | FTP / FTPS (RFC 959, 4217) | working | RETR + LIST, STOR upload (`-T`) with REST resume (`-C`) or APPE append (`-a`), EPSV with PASV fallback, implicit FTPS |
 | FILE (RFC 8089) | working | rejects non-local hosts |
@@ -47,6 +47,46 @@ Early, in active development.
 
 \* HTTP/2 verified live against nghttp2.org and cloudflare.com from the implementation
 worktree. Available via `--http2` (force) or auto-negotiated via ALPN.
+
+### HTTP/2 concurrent multiplexing (`send_multiplexed`)
+
+`rsurl::send_multiplexed(reqs: Vec<Request>, trace) -> Vec<Result<Response>>`
+fans out a batch of requests to **one** `https://` origin concurrently over a
+**single** HTTP/2 connection, returning one result per request in input order:
+
+```rust
+use rsurl::{Request, send_multiplexed};
+
+let reqs = vec![
+    Request::get("https://nghttp2.org/").unwrap(),
+    Request::get("https://nghttp2.org/httpbin/get").unwrap(),
+];
+let results = send_multiplexed(reqs, &mut std::io::sink());
+for r in results {
+    println!("{}", r.unwrap().status);
+}
+```
+
+How it works: the batch opens a stream per request up to the peer's
+`SETTINGS_MAX_CONCURRENT_STREAMS` (queueing the rest), then drives all streams
+from one frame loop. Request bodies are sent **non-blocking** — each pump pass
+writes whatever the connection and per-stream send windows allow across every
+stream, so a body that exhausts its window yields to the others and resumes when
+a `WINDOW_UPDATE` arrives (no head-of-line blocking). Inbound frames are
+demultiplexed to their stream by id; each request gets its own `Response`. A
+single stream's `RST_STREAM` (or per-stream protocol error) fails only that
+request while the others complete; a `GOAWAY` fails streams above the advertised
+last-stream-id and lets the lower ones finish. The connection is returned to the
+pool when still usable. Mixed-origin, non-`https`, or non-pool-eligible (`-k` /
+`--cacert`) batches fall back to issuing each request sequentially, still
+returning correct in-order results. The `-v` trace labels lines per stream
+(`> [stream 3] GET …`, `< [stream 3] HTTP/2 200`) so interleaved output stays
+readable.
+
+The **CLI deliberately does not** auto-multiplex multiple URLs: it processes
+URLs one at a time so the shared cookie jar, per-URL output ordering, and
+per-URL exit codes stay exactly curl-compatible. Concurrent multiplexing is
+exposed as the library API above rather than forced into the CLI loop.
 
 \*\* HTTP/3 verified live end-to-end against `quic.nginx.org` and `www.google.com`
 (QUIC handshake completed, request sent, real `HTTP/3 200` + headers + body

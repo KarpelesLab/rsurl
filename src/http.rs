@@ -759,6 +759,28 @@ pub(crate) fn h3_should_fall_back(e: &Error) -> bool {
     }
 }
 
+/// Issue several HTTP/2 requests **concurrently over a single connection**
+/// using true stream multiplexing, returning one result per request in input
+/// order.
+///
+/// This is the library entry point for HTTP/2 concurrent multiplexing. All
+/// requests must target the **same `https://` origin** (scheme/host/port);
+/// the batch opens one connection and drives every request's stream together
+/// in a single interleaved frame loop, so a slow body or response on one
+/// stream does not stall the others. See [`crate::http2::send_multiplexed`]
+/// for the full contract, including the graceful fallbacks: a mixed-origin /
+/// non-https / non-pool-eligible batch (or a server that won't negotiate
+/// `h2`) is issued sequentially instead, still returning correct, in-order
+/// results.
+///
+/// Redirects and cookies are **not** applied here — this is raw protocol
+/// dispatch over one connection, intended for callers that want to fan out
+/// independent requests to one host. For the redirect/cookie-aware single
+/// request path, use [`Request::send`] and friends.
+pub fn send_multiplexed(reqs: Vec<Request>, trace: &mut dyn Write) -> Vec<Result<Response>> {
+    crate::http2::send_multiplexed(reqs, trace)
+}
+
 fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // HTTP version routing:
     //

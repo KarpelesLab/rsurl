@@ -8,14 +8,18 @@
 //! Scope of this implementation:
 //!
 //! - Multiplexed streams within one connection (RFC 9113 §5.1). A single
-//!   `Connection` is structurally capable of carrying many concurrent
-//!   streams, and `send()` reuses a pooled `Connection` across calls: a
-//!   process-wide pool keyed on `(scheme, host, port)` parks idle
-//!   post-handshake connections so a follow-up request to the same authority
-//!   skips the TCP + TLS + h2-preface handshake and simply opens the next
-//!   odd stream id (1, 3, 5, …) on the warm connection. We drive one request
-//!   at a time over a pooled connection (sequential reuse) rather than firing
-//!   concurrent streams; the bulk of the win is amortizing the handshake.
+//!   `Connection` carries many streams, and `send()` reuses a pooled
+//!   `Connection` across calls: a process-wide pool keyed on
+//!   `(scheme, host, port)` parks idle post-handshake connections so a
+//!   follow-up request to the same authority skips the TCP + TLS + h2-preface
+//!   handshake and simply opens the next odd stream id (1, 3, 5, …) on the warm
+//!   connection. The single-request `send()` path drives one request at a time
+//!   over a pooled connection (sequential reuse). For TRUE concurrency,
+//!   `send_multiplexed()` issues a batch of requests to one origin over a
+//!   single connection, opening up to `SETTINGS_MAX_CONCURRENT_STREAMS` streams
+//!   at once, sending their bodies non-blockingly (no head-of-line stall across
+//!   streams), and demultiplexing the interleaved responses from one frame
+//!   loop. See `run_multiplexed` / `pump_pending_sends`.
 //! - ALPN is offered as `h2`. If the server does not select it, we still
 //!   attempt the HTTP/2 preface (a server that didn't agree will close us
 //!   or respond with a GOAWAY, which we surface as `BadResponse`).
@@ -1473,6 +1477,23 @@ struct Stream {
     body: Vec<u8>,
     /// True once the peer's END_STREAM has been observed.
     end_stream_recv: bool,
+    /// Outbound request body not yet written, with a cursor into it. Used by
+    /// the multiplexed driver's non-blocking sender (`pump_pending_sends`):
+    /// when a stream's send window is exhausted we leave the unsent suffix
+    /// here and move on to other streams, resuming when WINDOW_UPDATE arrives.
+    /// `None` once the whole body has been flushed (and END_STREAM emitted).
+    /// The single-stream `send_request_on` path never populates this — it
+    /// writes the body inline with its own blocking loop.
+    pending_body: Option<PendingBody>,
+}
+
+/// A request body that is being streamed out across multiple `pump`
+/// iterations because flow control would not let it all go at once.
+struct PendingBody {
+    /// The full request body bytes.
+    bytes: Vec<u8>,
+    /// How many bytes of `bytes` have already been written to the wire.
+    sent: usize,
 }
 
 impl Stream {
@@ -1486,6 +1507,7 @@ impl Stream {
             response_headers: None,
             body: Vec::new(),
             end_stream_recv: false,
+            pending_body: None,
         }
     }
 
@@ -1786,6 +1808,422 @@ impl<S: Read + Write> Connection<S> {
                 DispatchOutcome::Done(_) => {
                     // Some other stream finished; loop continues.
                 }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent multiplexing driver.
+    //
+    // The single-stream path above (`send_request_on` + `drive_until_stream_done`)
+    // blocks on one stream at a time. The methods below instead keep many
+    // streams in flight on ONE connection and drive them all from a single
+    // frame loop, so a slow body on one stream cannot stall the others
+    // (no head-of-line blocking on send).
+    // -----------------------------------------------------------------------
+
+    /// Write the HEADERS (+ CONTINUATION) frames for `req` on `stream_id` and
+    /// stage its request body for later, non-blocking transmission.
+    ///
+    /// Unlike [`send_request_on`], this NEVER blocks on flow control: the body
+    /// is parked in the stream's `pending_body` and drained incrementally by
+    /// [`pump_pending_sends`] as send-window budget becomes available across
+    /// all streams. Returns immediately after the HEADERS are on the wire (the
+    /// caller flushes once after staging every stream in a batch).
+    ///
+    /// `send_request_on` is the verb name; this is `stage_request_on` because
+    /// it only commits the request headers, deferring the body.
+    fn stage_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
+        let header_block = build_header_block(&mut self.encoder, req);
+        let has_body = !req.body.is_empty();
+        let max_frame_size = self.peer.max_frame_size as usize;
+        let header_frames =
+            fragment_header_block(stream_id, &header_block, max_frame_size, !has_body);
+        for f in &header_frames {
+            write_frame(&mut self.tls, f)?;
+        }
+        let s = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| Error::BadResponse(format!("stream {stream_id} not found")))?;
+        s.state = s.state.send_data(!has_body)?;
+        if has_body {
+            s.pending_body = Some(PendingBody {
+                bytes: req.body.clone(),
+                sent: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Write as much pending request-body DATA as the connection and per-stream
+    /// send windows currently allow, across EVERY stream with bytes left to
+    /// send. This is the non-blocking heart of multiplexed sending: each call
+    /// makes whatever forward progress the windows permit and returns; it never
+    /// waits on a WINDOW_UPDATE. When a stream's body is fully flushed its
+    /// `pending_body` is cleared and END_STREAM is emitted on the final DATA
+    /// frame. Returns whether any byte was written (so the caller knows to
+    /// flush the transport).
+    ///
+    /// Streams are visited in ascending id order for deterministic, fair-ish
+    /// scheduling (lower ids — issued first — drain first), and to keep the
+    /// `-v` trace stable across runs.
+    fn pump_pending_sends(&mut self, trace: &mut dyn Write) -> Result<bool> {
+        let mut wrote = false;
+        let max_frame_size = self.peer.max_frame_size as usize;
+        // Snapshot the ids with work to do so we don't borrow `self.streams`
+        // while mutating it inside the loop.
+        let mut ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| s.pending_body.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+
+        for id in ids {
+            // The stream is present (we just collected it) and is never removed
+            // mid-pump, so look it up once and drain it until the window stalls
+            // or its body is exhausted.
+            if !self.streams.contains_key(&id) {
+                continue;
+            }
+            loop {
+                // Recompute the budget each iteration — the conn window is
+                // shared, so an earlier stream's writes shrink it for later
+                // ones within this same pass.
+                let s = self.streams.get(&id).unwrap();
+                let budget = s.send_budget(&self.conn_send_window);
+                let (remaining_len, sent) = match s.pending_body.as_ref() {
+                    Some(pb) => (pb.bytes.len() - pb.sent, pb.sent),
+                    None => break, // body fully sent
+                };
+                if remaining_len == 0 {
+                    // Defensive: an empty pending body is cleared below; this
+                    // shouldn't happen because we never stage an empty body.
+                    self.streams.get_mut(&id).unwrap().pending_body = None;
+                    break;
+                }
+                let n = next_data_chunk_size(max_frame_size, budget, remaining_len);
+                if n == 0 {
+                    // Window exhausted for this stream right now — move on to
+                    // the next one rather than blocking (no head-of-line stall).
+                    break;
+                }
+                let is_last = n == remaining_len;
+                let chunk: Vec<u8> = {
+                    let pb = self
+                        .streams
+                        .get(&id)
+                        .unwrap()
+                        .pending_body
+                        .as_ref()
+                        .unwrap();
+                    pb.bytes[sent..sent + n].to_vec()
+                };
+                let data_frame = Frame {
+                    typ: F_DATA,
+                    flags: if is_last { FLAG_END_STREAM } else { 0 },
+                    stream_id: id,
+                    payload: chunk,
+                };
+                write_frame(&mut self.tls, &data_frame)?;
+                self.conn_send_window.consume(n);
+                let s = self.streams.get_mut(&id).unwrap();
+                s.send_window.consume(n);
+                s.state = s.state.send_data(is_last)?;
+                let pb = s.pending_body.as_mut().unwrap();
+                pb.sent += n;
+                if is_last {
+                    s.pending_body = None;
+                    let _ = writeln!(trace, "* [stream {id}] request body sent");
+                }
+                wrote = true;
+                if is_last {
+                    break;
+                }
+            }
+        }
+        Ok(wrote)
+    }
+
+    /// Run `reqs` concurrently over this single connection, returning one
+    /// result per request, in the same order as `reqs`.
+    ///
+    /// Design:
+    /// - Open a stream per request up to the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`,
+    ///   queueing the rest. Each opened stream writes its HEADERS immediately;
+    ///   request bodies are staged and streamed out non-blockingly.
+    /// - A SINGLE frame loop alternates between pumping outbound body DATA
+    ///   (whatever the windows allow, across all streams) and reading one
+    ///   inbound frame, dispatching it to its stream by id. As each in-flight
+    ///   stream completes, the next queued request is started, keeping at most
+    ///   `MAX_CONCURRENT_STREAMS` streams open.
+    /// - Demultiplexing: every request gets its own `Response`. A single
+    ///   stream's RST_STREAM (or per-stream protocol error) fails ONLY that
+    ///   request; the others keep running. A connection-level failure
+    ///   (transport error, conn-level protocol error) fails all not-yet-
+    ///   completed requests. On GOAWAY, streams with id above the peer's
+    ///   advertised last-stream-id are failed while lower ones finish, and no
+    ///   queued request is started beyond the GOAWAY boundary.
+    ///
+    /// The single-request `send` / `run_one_request` path is untouched; this is
+    /// purely additive.
+    fn run_multiplexed(
+        &mut self,
+        reqs: &[Request],
+        trace: &mut dyn Write,
+    ) -> Vec<Result<Response>> {
+        let n = reqs.len();
+        // Per-request slot: `None` while in flight or queued, `Some` once a
+        // terminal result (Ok response / Err) is known.
+        let mut results: Vec<Option<Result<Response>>> = (0..n).map(|_| None).collect();
+        // Map live stream id -> request index, so a completed/failed stream
+        // routes its outcome back to the right slot.
+        let mut id_to_idx: HashMap<u32, usize> = HashMap::new();
+        // Indices not yet started, in order. We start them as slots free up.
+        let mut queue: VecDeque<usize> = (0..n).collect();
+
+        // Helper closure-free start: open a stream for request `idx` and write
+        // its HEADERS. On failure to open (e.g. GOAWAY boundary,
+        // MAX_CONCURRENT, id exhaustion) record the error for that request.
+        // We inline this rather than use a closure so it can borrow `self`.
+
+        // Prime: start as many as the concurrency limit allows.
+        self.start_queued(&mut queue, &mut id_to_idx, &mut results, reqs, trace);
+        // Flush the HEADERS we just wrote, plus any body bytes we can send.
+        match self.pump_pending_sends(trace) {
+            Ok(_) => {}
+            Err(e) => {
+                // A write failure here is connection-fatal: fail everything
+                // still outstanding and bail.
+                self.fail_all_outstanding(&id_to_idx, &mut results, &queue, &e);
+                return collect_results(results);
+            }
+        }
+        if let Err(e) = self.tls.flush() {
+            let e = Error::Io(e);
+            self.fail_all_outstanding(&id_to_idx, &mut results, &queue, &e);
+            return collect_results(results);
+        }
+
+        // Single frame loop: keep going until every request has a result.
+        while results.iter().any(Option::is_none) {
+            // If nothing is in flight but the queue is non-empty, we couldn't
+            // open any stream (e.g. all blocked by GOAWAY) — drain the queue
+            // as failures to avoid spinning forever.
+            if id_to_idx.is_empty() {
+                if queue.is_empty() {
+                    break;
+                }
+                // Try once more to start queued work; if still nothing opens,
+                // fail the rest.
+                self.start_queued(&mut queue, &mut id_to_idx, &mut results, reqs, trace);
+                if id_to_idx.is_empty() {
+                    while let Some(idx) = queue.pop_front() {
+                        if results[idx].is_none() {
+                            results[idx] = Some(Err(Error::BadResponse(
+                                "no usable stream to issue request (GOAWAY?)".into(),
+                            )));
+                        }
+                    }
+                    break;
+                }
+                if self.flush_pending(trace).is_err() {
+                    break;
+                }
+            }
+
+            // Read and dispatch one inbound frame.
+            let outcome = match self.read_and_dispatch() {
+                Ok(o) => o,
+                Err(e) => {
+                    // Distinguish a per-stream RST (carried as BadResponse from
+                    // `process_rst`) from a connection-fatal error. `process_rst`
+                    // sets the offending stream to Closed before returning Err,
+                    // so we can detect a single closed-but-unfinished stream and
+                    // fail just that request, then keep the loop running.
+                    if let Some(idx) = self.take_stream_error(&mut id_to_idx) {
+                        results[idx] = Some(Err(e));
+                        // After a per-stream error a slot may have freed up.
+                        self.start_queued(&mut queue, &mut id_to_idx, &mut results, reqs, trace);
+                        if let Err(fe) = self.flush_pending(trace) {
+                            self.fail_all_outstanding(&id_to_idx, &mut results, &queue, &fe);
+                            break;
+                        }
+                        continue;
+                    }
+                    // Connection-fatal: fail everything still outstanding.
+                    self.fail_all_outstanding(&id_to_idx, &mut results, &queue, &e);
+                    break;
+                }
+            };
+
+            // GOAWAY may have doomed some high-id streams (state forced to
+            // Closed by `process_conn_frame`). Reap any that the peer abandoned.
+            if self.goaway_received.is_some() {
+                self.fail_goaway_doomed(&mut id_to_idx, &mut results);
+            }
+
+            if let DispatchOutcome::Done(done_id) = outcome {
+                if let Some(idx) = id_to_idx.remove(&done_id) {
+                    let stream = self
+                        .streams
+                        .remove(&done_id)
+                        .expect("Done stream must still be registered");
+                    results[idx] = Some(build_response_from_stream_labelled(
+                        stream,
+                        Some(done_id),
+                        trace,
+                    ));
+                    // A slot freed up — start the next queued request.
+                    self.start_queued(&mut queue, &mut id_to_idx, &mut results, reqs, trace);
+                }
+            }
+
+            // Make outbound progress on every loop turn: a WINDOW_UPDATE we
+            // just processed may have unblocked a stalled body.
+            if self.flush_pending(trace).is_err() {
+                let e = Error::BadResponse("write error pumping multiplexed sends".into());
+                self.fail_all_outstanding(&id_to_idx, &mut results, &queue, &e);
+                break;
+            }
+        }
+
+        self.prune_completed_streams();
+        collect_results(results)
+    }
+
+    /// Pump pending sends and flush the transport. Small wrapper so the loop
+    /// reads cleanly.
+    fn flush_pending(&mut self, trace: &mut dyn Write) -> Result<()> {
+        self.pump_pending_sends(trace)?;
+        self.tls.flush().map_err(Error::Io)
+    }
+
+    /// Start queued requests until we hit the concurrency limit or run out.
+    /// For each started request, open a stream, write its HEADERS, stage its
+    /// body, and record the id→index mapping. Open failures are recorded as
+    /// per-request errors (the request simply doesn't run).
+    fn start_queued(
+        &mut self,
+        queue: &mut VecDeque<usize>,
+        id_to_idx: &mut HashMap<u32, usize>,
+        results: &mut [Option<Result<Response>>],
+        reqs: &[Request],
+        trace: &mut dyn Write,
+    ) {
+        while !queue.is_empty() {
+            // Respect the peer's concurrency cap based on currently-open streams.
+            if (self.streams.len() as u64) >= self.peer.max_concurrent_streams as u64 {
+                break;
+            }
+            let idx = *queue.front().unwrap();
+            let id = match self.open_stream() {
+                Ok(id) => id,
+                Err(e) => {
+                    // Can't open any more right now (GOAWAY boundary / id space
+                    // / concurrency). If it's the concurrency limit we just
+                    // stop; otherwise the request fails. Distinguish by retry:
+                    // a GOAWAY/exhaustion error is permanent for this request.
+                    queue.pop_front();
+                    results[idx] = Some(Err(e));
+                    continue;
+                }
+            };
+            queue.pop_front();
+            let req = &reqs[idx];
+            trace_request_labelled(req, id, trace);
+            if let Err(e) = self.stage_request_on(id, req) {
+                // HEADERS write failed — record the error and drop the stream.
+                self.streams.remove(&id);
+                results[idx] = Some(Err(e));
+                continue;
+            }
+            id_to_idx.insert(id, idx);
+        }
+    }
+
+    /// On a dispatch error, if exactly one open stream was just forced to
+    /// `Closed` (the RST_STREAM target) and it has no complete response, treat
+    /// the error as scoped to that one stream: return its request index and
+    /// drop it from the live map. Returns `None` if the error is not cleanly
+    /// attributable to a single stream (caller treats it as connection-fatal).
+    fn take_stream_error(&mut self, id_to_idx: &mut HashMap<u32, usize>) -> Option<usize> {
+        let mut culprit: Option<u32> = None;
+        for (&id, s) in self.streams.iter() {
+            if !id_to_idx.contains_key(&id) {
+                continue;
+            }
+            let complete = matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
+                && s.end_stream_recv
+                && s.response_headers.is_some();
+            if matches!(s.state, StreamState::Closed) && !complete {
+                if culprit.is_some() {
+                    // More than one candidate — ambiguous, treat as fatal.
+                    return None;
+                }
+                culprit = Some(id);
+            }
+        }
+        let id = culprit?;
+        let idx = id_to_idx.remove(&id)?;
+        self.streams.remove(&id);
+        Some(idx)
+    }
+
+    /// After a GOAWAY, any in-flight stream with id above the peer's
+    /// last-stream-id is abandoned: `process_conn_frame` already forced its
+    /// state to `Closed`. Fail the matching requests and drop those streams,
+    /// but only when they have no complete response of their own.
+    fn fail_goaway_doomed(
+        &mut self,
+        id_to_idx: &mut HashMap<u32, usize>,
+        results: &mut [Option<Result<Response>>],
+    ) {
+        let last = match self.goaway_received {
+            Some(l) => l,
+            None => return,
+        };
+        let doomed: Vec<u32> = id_to_idx
+            .keys()
+            .copied()
+            .filter(|id| *id > last)
+            .filter(|id| {
+                // Don't clobber a stream that actually completed.
+                match self.streams.get(id) {
+                    Some(s) => !(s.end_stream_recv && s.response_headers.is_some()),
+                    None => true,
+                }
+            })
+            .collect();
+        for id in doomed {
+            if let Some(idx) = id_to_idx.remove(&id) {
+                self.streams.remove(&id);
+                results[idx] = Some(Err(Error::BadResponse(format!(
+                    "stream {id} abandoned by GOAWAY (last-stream-id={last})"
+                ))));
+            }
+        }
+    }
+
+    /// Fail every request that has no result yet: all in-flight streams plus
+    /// everything still queued. Used when the connection itself is lost.
+    fn fail_all_outstanding(
+        &self,
+        id_to_idx: &HashMap<u32, usize>,
+        results: &mut [Option<Result<Response>>],
+        queue: &VecDeque<usize>,
+        err: &Error,
+    ) {
+        for &idx in id_to_idx.values() {
+            if results[idx].is_none() {
+                results[idx] = Some(Err(clone_error(err)));
+            }
+        }
+        for &idx in queue.iter() {
+            if results[idx].is_none() {
+                results[idx] = Some(Err(clone_error(err)));
             }
         }
     }
@@ -2571,8 +3009,20 @@ fn run_one_request<S: Read + Write>(
 /// Translate a fully-received `Stream` into the public `Response` type.
 /// Extracts the `:status` pseudo-header, drops any other pseudo-headers
 /// (none are defined for responses but be conservative), and inherits the
-/// accumulated body.
+/// accumulated body. The `<` trace lines are unlabelled (single-stream path);
+/// the multiplexed driver uses [`build_response_from_stream_labelled`].
 fn build_response_from_stream(stream: Stream, trace: &mut dyn Write) -> Result<Response> {
+    build_response_from_stream_labelled(stream, None, trace)
+}
+
+/// Like [`build_response_from_stream`] but prefixes every `<` / `*` trace line
+/// with `[stream N]` so concurrently-multiplexed responses stay readable when
+/// their frames interleave on the wire.
+fn build_response_from_stream_labelled(
+    stream: Stream,
+    label_id: Option<u32>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     let headers = stream
         .response_headers
         .ok_or_else(|| Error::BadResponse("response ended before any HEADERS frame".into()))?;
@@ -2596,14 +3046,18 @@ fn build_response_from_stream(stream: Stream, trace: &mut dyn Write) -> Result<R
     // Response `<` trace, mirroring the HTTP/1.1 reader: a status line carrying
     // the HTTP/2 version + numeric status, then each header field in received
     // order (lowercase, as h2 delivers them), then a closing blank `< `.
-    let _ = writeln!(trace, "< HTTP/2 {status}");
+    let tag = match label_id {
+        Some(id) => format!("[stream {id}] "),
+        None => String::new(),
+    };
+    let _ = writeln!(trace, "< {tag}HTTP/2 {status}");
     for (k, v) in &clean_headers {
-        let _ = writeln!(trace, "< {k}: {v}");
+        let _ = writeln!(trace, "< {tag}{k}: {v}");
     }
-    let _ = writeln!(trace, "< ");
+    let _ = writeln!(trace, "< {tag}");
 
     let wire_len = stream.body.len();
-    let _ = writeln!(trace, "* Received {wire_len} body bytes");
+    let _ = writeln!(trace, "* {tag}Received {wire_len} body bytes");
 
     // Shared with HTTP/1.1 and HTTP/3: peel off any `Content-Encoding`
     // layer rsurl knows how to decode (gzip / deflate / x-gzip / identity).
@@ -2740,6 +3194,174 @@ fn is_connection_specific_header(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" // unless value is exactly "trailers"; we conservatively drop.
     )
+}
+
+/// Like [`trace_request`] but labels every `>` line with `[stream N]` so the
+/// interleaved request lines of a multiplexed batch stay attributable.
+fn trace_request_labelled(req: &Request, id: u32, trace: &mut dyn Write) {
+    let (pseudo, fields) = request_header_fields(req);
+    let _ = writeln!(
+        trace,
+        "> [stream {id}] {} {} HTTP/2",
+        pseudo.method, pseudo.path
+    );
+    let _ = writeln!(trace, "> [stream {id}] Host: {}", pseudo.authority);
+    for (k, v) in &fields {
+        let _ = writeln!(trace, "> [stream {id}] {k}: {v}");
+    }
+    let _ = writeln!(trace, "> [stream {id}] ");
+}
+
+/// Collapse the per-request `Option<Result<...>>` slots into a `Vec<Result<...>>`.
+/// Every slot must be filled by the time the driver returns; an unfilled slot
+/// is an internal bug, surfaced as a `BadResponse` rather than a panic.
+fn collect_results(results: Vec<Option<Result<Response>>>) -> Vec<Result<Response>> {
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                Err(Error::BadResponse(
+                    "internal: multiplexed request produced no result".into(),
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Best-effort clone of an [`Error`] so a single connection-level failure can
+/// be reported on every outstanding request. `Error` isn't `Clone` because it
+/// wraps `io::Error`; we reconstruct an equivalent value (preserving the
+/// `io::ErrorKind` for the `Io` case) so callers still get a faithful kind and
+/// message.
+fn clone_error(e: &Error) -> Error {
+    match e {
+        Error::InvalidUrl(s) => Error::InvalidUrl(s.clone()),
+        Error::UnsupportedScheme(s) => Error::UnsupportedScheme(s.clone()),
+        Error::Io(io_err) => Error::Io(io::Error::new(io_err.kind(), io_err.to_string())),
+        Error::BadResponse(s) => Error::BadResponse(s.clone()),
+        Error::UnexpectedEof => Error::UnexpectedEof,
+        Error::H2NotNegotiated => Error::H2NotNegotiated,
+        Error::Ssh(s) => Error::Ssh(s.clone()),
+    }
+}
+
+/// Issue `reqs` concurrently over a SINGLE HTTP/2 connection and return one
+/// result per request, in input order.
+///
+/// All requests MUST share the same origin (scheme/host/port) and be
+/// `https://` (HTTP/2 over TLS). This is the precondition for multiplexing —
+/// the whole point is one connection. Violations are handled gracefully rather
+/// than panicking:
+///
+/// - An empty `reqs` returns an empty `Vec`.
+/// - A non-`https` request, or any request whose origin differs from the
+///   first, makes the batch fall back to issuing **every** request
+///   sequentially via [`send`] (each on its own pooled connection). The
+///   results are still correct and in order; you just don't get multiplexing.
+/// - If the common origin is not pool-eligible (i.e. `-k` /
+///   `--insecure` or a custom `--cacert`), we likewise fall back to
+///   sequential [`send`] — the same TLS-posture isolation rule the pool
+///   enforces (a verify-off session must never be reused for a verify-on
+///   caller).
+/// - If the server doesn't negotiate ALPN `h2` on the shared connection, we
+///   fall back to sequential [`send`] (which itself does the h2→h1.1 dance).
+///
+/// On the happy path: one TCP+TLS handshake, N concurrent streams, interleaved
+/// frame I/O, demultiplexed responses. A single stream's `RST_STREAM` /
+/// per-stream protocol error fails only that request; the rest still complete.
+/// A connection-level failure (transport error, GOAWAY beyond a stream's id)
+/// fails the affected subset. The successful connection is returned to the pool
+/// when still usable.
+pub fn send_multiplexed(reqs: Vec<Request>, trace: &mut dyn Write) -> Vec<Result<Response>> {
+    if reqs.is_empty() {
+        return Vec::new();
+    }
+
+    // Determine the common origin and whether the batch is multiplex-eligible.
+    let first = &reqs[0];
+    let same_origin_https = first.url.scheme == "https"
+        && reqs.iter().all(|r| {
+            r.url.scheme == first.url.scheme
+                && r.url.host == first.url.host
+                && r.url.port == first.url.port
+        });
+    let all_eligible = reqs.iter().all(pool_eligible);
+
+    if !same_origin_https || !all_eligible {
+        // Preconditions not met — fall back to issuing each request on its own
+        // (pooled) connection, sequentially. Still correct, just not multiplexed.
+        let _ = writeln!(
+            trace,
+            "* multiplexing preconditions not met (mixed origin / non-https / non-pool-eligible TLS); issuing requests sequentially"
+        );
+        return reqs.into_iter().map(|r| send(r, trace)).collect();
+    }
+
+    let key = PoolKey::from_request(first);
+
+    // Try a pooled connection first; fall back to a cold dial. We do NOT pump
+    // the batch over a pooled conn that turns out unusable mid-flight — instead
+    // we cold-dial a fresh one and run the whole batch there (a half-consumed
+    // batch is hard to reason about; a clean re-run is simpler and correct
+    // because none of these requests have been observed as sent yet).
+    let pooled = {
+        let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
+        guard.checkout(&key)
+    };
+    if let Some(arc) = pooled {
+        let mut conn_guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        if conn_guard.is_usable() {
+            let _ = writeln!(
+                trace,
+                "* Reusing existing connection from pool (multiplexed)"
+            );
+            let results = conn_guard.run_multiplexed(&reqs, trace);
+            // Re-pool only if every request completed without disturbing the
+            // wire (no error result) and the conn is still structurally usable.
+            let clean = results.iter().all(Result::is_ok) && conn_guard.is_usable();
+            drop(conn_guard);
+            if clean {
+                let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
+                guard.release(key, arc);
+                let _ = writeln!(trace, "* Connection kept alive (pooled)");
+            } else {
+                let _ = writeln!(trace, "* Connection closed");
+            }
+            return results;
+        }
+        // Unusable on checkout: drop it and cold-dial below.
+        drop(conn_guard);
+        let _ = writeln!(
+            trace,
+            "* Pooled connection unusable (connection closed); reconnecting"
+        );
+    }
+
+    // Cold-dial path.
+    let mut fresh = match dial_h2(first, trace) {
+        Ok(c) => c,
+        Err(e) => {
+            // The shared handshake failed (e.g. ALPN didn't select h2). Fall
+            // back to sequential `send` so each request gets the standard
+            // h2→h1.1 negotiation rather than failing the whole batch.
+            let _ = writeln!(
+                trace,
+                "* HTTP/2 connection for multiplexing failed ({e}); issuing requests sequentially"
+            );
+            return reqs.into_iter().map(|r| send(r, trace)).collect();
+        }
+    };
+    let results = fresh.run_multiplexed(&reqs, trace);
+    let clean = results.iter().all(Result::is_ok) && fresh.is_usable();
+    if clean {
+        let arc = Arc::new(Mutex::new(fresh));
+        let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
+        guard.release(key, arc);
+        let _ = writeln!(trace, "* Connection kept alive (pooled)");
+    } else {
+        let _ = writeln!(trace, "* Connection closed");
+    }
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -4765,5 +5387,307 @@ mod tests {
                 .any(|f| f.typ == F_SETTINGS && f.flags & FLAG_ACK != 0),
             "SETTINGS must be ACKed"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Concurrent multiplexing (`run_multiplexed`).
+    //
+    // These drive several requests over one `Connection<FakeTls>` whose
+    // inbound wire is pre-seeded with interleaved server frames, then assert
+    // each request's `Response` is demultiplexed back to the right slot.
+    // -----------------------------------------------------------------
+
+    /// Synthesize an RST_STREAM frame for `id` carrying `code`.
+    fn synth_rst(id: u32, code: u32) -> Frame {
+        Frame {
+            typ: F_RST_STREAM,
+            flags: 0,
+            stream_id: id,
+            payload: code.to_be_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn multiplex_two_requests_demuxes_interleaved_frames() {
+        // Two GET requests → streams 1 and 3. Seed the server's frames
+        // INTERLEAVED across the two streams: h1-headers, h3-headers,
+        // h1-data-part, h3-data(END), h1-data-rest(END). The driver must route
+        // each fragment to its own stream and return the right body to the
+        // right request regardless of interleave order.
+        let inbound = vec![
+            synth_status_200_headers(1, false),
+            synth_status_200_headers(3, false),
+            synth_data(1, b"one-", false),
+            synth_data(3, b"THREE", true),
+            synth_data(1, b"part", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+
+        let reqs = vec![
+            h2_get("https://example.com/a"),
+            h2_get("https://example.com/b"),
+        ];
+        let results = conn.run_multiplexed(&reqs, &mut std::io::sink());
+        assert_eq!(results.len(), 2);
+
+        let r0 = results[0].as_ref().expect("req 0 ok");
+        let r1 = results[1].as_ref().expect("req 1 ok");
+        assert_eq!(r0.status, 200);
+        assert_eq!(r0.body, b"one-part", "stream 1 body");
+        assert_eq!(r1.status, 200);
+        assert_eq!(r1.body, b"THREE", "stream 3 body");
+
+        // Both HEADERS the client wrote went out on streams 1 and 3.
+        let header_ids: Vec<u32> = drain_wire_out(&conn)
+            .into_iter()
+            .filter(|f| f.typ == F_HEADERS)
+            .map(|f| f.stream_id)
+            .collect();
+        assert_eq!(header_ids, vec![1, 3]);
+        // The streams were reaped.
+        assert!(conn.streams.is_empty());
+    }
+
+    #[test]
+    fn multiplex_reversed_interleave_still_demuxes() {
+        // Same as above but the server completes stream 3 entirely before it
+        // even opens stream 1's body — order independence.
+        let inbound = vec![
+            synth_status_200_headers(3, false),
+            synth_data(3, b"bbb", true),
+            synth_status_200_headers(1, false),
+            synth_data(1, b"aaaa", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let reqs = vec![
+            h2_get("https://example.com/a"),
+            h2_get("https://example.com/b"),
+        ];
+        let results = conn.run_multiplexed(&reqs, &mut std::io::sink());
+        assert_eq!(results[0].as_ref().unwrap().body, b"aaaa");
+        assert_eq!(results[1].as_ref().unwrap().body, b"bbb");
+    }
+
+    #[test]
+    fn multiplex_queues_third_request_at_max_concurrent_two() {
+        // MAX_CONCURRENT_STREAMS = 2: only streams 1 and 3 may be open at once.
+        // The third request must wait until one of the first two completes,
+        // then open on stream 5. We seed the responses so stream 1 finishes
+        // first (freeing a slot for stream 5), then 3, then 5.
+        let inbound = vec![
+            // Stream 1 completes first.
+            synth_status_200_headers(1, false),
+            synth_data(1, b"first", true),
+            // Then stream 3.
+            synth_status_200_headers(3, false),
+            synth_data(3, b"second", true),
+            // Stream 5 (the queued one) only opens after 1 frees a slot.
+            synth_status_200_headers(5, false),
+            synth_data(5, b"third", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        conn.peer.max_concurrent_streams = 2;
+
+        let reqs = vec![
+            h2_get("https://example.com/1"),
+            h2_get("https://example.com/2"),
+            h2_get("https://example.com/3"),
+        ];
+        let results = conn.run_multiplexed(&reqs, &mut std::io::sink());
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap().body, b"first");
+        assert_eq!(results[1].as_ref().unwrap().body, b"second");
+        assert_eq!(results[2].as_ref().unwrap().body, b"third");
+
+        // The client must have written HEADERS on streams 1, 3 first, and
+        // only later on 5 — i.e. no more than two were open before stream 1
+        // completed. We assert the *order* of HEADERS writes: 1, 3, then 5.
+        let header_ids: Vec<u32> = drain_wire_out(&conn)
+            .into_iter()
+            .filter(|f| f.typ == F_HEADERS)
+            .map(|f| f.stream_id)
+            .collect();
+        assert_eq!(
+            header_ids,
+            vec![1, 3, 5],
+            "stream 5 must be opened only after a slot freed"
+        );
+    }
+
+    #[test]
+    fn multiplex_one_stream_rst_others_succeed() {
+        // Stream 1 is reset by the server; stream 3 completes normally. The
+        // reset request gets an Err, the other its Response — the RST must not
+        // kill the whole batch.
+        let inbound = vec![
+            synth_status_200_headers(3, false),
+            synth_rst(1, 0x8), // CANCEL
+            synth_data(3, b"alive", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let reqs = vec![
+            h2_get("https://example.com/doomed"),
+            h2_get("https://example.com/ok"),
+        ];
+        let results = conn.run_multiplexed(&reqs, &mut std::io::sink());
+        assert_eq!(results.len(), 2);
+        assert!(
+            matches!(results[0], Err(Error::BadResponse(_))),
+            "reset stream must yield an error, got {:?}",
+            results[0]
+        );
+        let ok = results[1].as_ref().expect("stream 3 should succeed");
+        assert_eq!(ok.body, b"alive");
+    }
+
+    #[test]
+    fn multiplex_flow_control_no_head_of_line_block() {
+        // A tiny INITIAL_WINDOW_SIZE (4 octets) forces request bodies to be
+        // split. Two POSTs with 10-byte bodies each: stream 1 can only put 4
+        // bytes out before stalling, but stream 3 must still make progress (and
+        // vice versa) — the non-blocking pump interleaves them. After the
+        // server grants WINDOW_UPDATEs, both bodies finish and both responses
+        // come back.
+        let mut req1 = Request::new("POST", "https://example.com/u1").unwrap();
+        req1.body = (0..10u8).collect();
+        let mut req3 = Request::new("POST", "https://example.com/u3").unwrap();
+        req3.body = (100..110u8).collect();
+
+        // Inbound: first the per-stream WINDOW_UPDATEs that unblock the bodies
+        // (interleaved across both streams), then the responses. The driver
+        // pumps sends after each inbound frame, so the grants let both bodies
+        // drain without one blocking the other.
+        let inbound = vec![
+            window_update_frame(1, 6),  // stream 1: 4 + 6 = 10 → done
+            window_update_frame(3, 6),  // stream 3: 4 + 6 = 10 → done
+            window_update_frame(0, 12), // conn: enough for both remainders
+            synth_status_200_headers(1, false),
+            synth_data(1, b"r1", true),
+            synth_status_200_headers(3, false),
+            synth_data(3, b"r3", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        // Small per-stream send window; conn window large enough initially for
+        // the first 4+4 octets (8 < 65535).
+        conn.peer.initial_window_size = 4;
+
+        let reqs = vec![req1.clone(), req3.clone()];
+        let results = conn.run_multiplexed(&reqs, &mut std::io::sink());
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap().body, b"r1");
+        assert_eq!(results[1].as_ref().unwrap().body, b"r3");
+
+        // Verify both bodies went out fully and interleaved: the first DATA on
+        // each stream was 4 bytes (the initial window), proving neither waited
+        // for the other to finish before starting.
+        let data: Vec<Frame> = drain_wire_out(&conn)
+            .into_iter()
+            .filter(|f| f.typ == F_DATA)
+            .collect();
+        // Reassemble per-stream payloads and confirm completeness.
+        let mut s1 = Vec::new();
+        let mut s3 = Vec::new();
+        for f in &data {
+            if f.stream_id == 1 {
+                s1.extend_from_slice(&f.payload);
+            } else if f.stream_id == 3 {
+                s3.extend_from_slice(&f.payload);
+            }
+        }
+        assert_eq!(s1, req1.body);
+        assert_eq!(s3, req3.body);
+        // The first chunk on stream 1 was capped to the 4-octet window.
+        let first_s1 = data.iter().find(|f| f.stream_id == 1).unwrap();
+        assert_eq!(
+            first_s1.payload.len(),
+            4,
+            "stream 1 first DATA capped to window"
+        );
+        let first_s3 = data.iter().find(|f| f.stream_id == 3).unwrap();
+        assert_eq!(
+            first_s3.payload.len(),
+            4,
+            "stream 3 first DATA capped to window"
+        );
+    }
+
+    #[test]
+    fn multiplex_goaway_fails_high_streams_lower_completes() {
+        // MAX_CONCURRENT_STREAMS=3 so streams 1, 3, 5 all open up front.
+        // The server completes stream 1, then sends GOAWAY(last-stream-id=3):
+        // stream 3 may still finish, but stream 5 (id > 3) is abandoned and
+        // must fail. Stream 1 already completed.
+        let mut goaway_payload = Vec::new();
+        goaway_payload.extend_from_slice(&3u32.to_be_bytes()); // last-stream-id = 3
+        goaway_payload.extend_from_slice(&0u32.to_be_bytes()); // NO_ERROR
+        let goaway = Frame {
+            typ: F_GOAWAY,
+            flags: 0,
+            stream_id: 0,
+            payload: goaway_payload,
+        };
+        let inbound = vec![
+            synth_status_200_headers(1, false),
+            synth_data(1, b"one", true),
+            goaway,
+            synth_status_200_headers(3, false),
+            synth_data(3, b"three", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        conn.peer.max_concurrent_streams = 3;
+
+        let reqs = vec![
+            h2_get("https://example.com/1"),
+            h2_get("https://example.com/3"),
+            h2_get("https://example.com/5"),
+        ];
+        let results = conn.run_multiplexed(&reqs, &mut std::io::sink());
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].as_ref().unwrap().body,
+            b"one",
+            "stream 1 completes"
+        );
+        assert_eq!(
+            results[1].as_ref().unwrap().body,
+            b"three",
+            "stream 3 (<= last-stream-id) completes"
+        );
+        assert!(
+            matches!(results[2], Err(Error::BadResponse(_))),
+            "stream 5 (> last-stream-id) must be abandoned, got {:?}",
+            results[2]
+        );
+    }
+
+    #[test]
+    fn multiplex_verbose_trace_labels_streams() {
+        // The -v trace must label request/response lines per stream id so the
+        // interleaved output stays readable.
+        let inbound = vec![
+            synth_status_200_headers(1, false),
+            synth_data(1, b"x", true),
+            synth_status_200_headers(3, false),
+            synth_data(3, b"y", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let reqs = vec![
+            h2_get("https://example.com/a"),
+            h2_get("https://example.com/b"),
+        ];
+        let mut trace: Vec<u8> = Vec::new();
+        let _ = conn.run_multiplexed(&reqs, &mut trace);
+        let t = String::from_utf8(trace).unwrap();
+        assert!(t.contains("> [stream 1] GET /a HTTP/2"), "trace:\n{t}");
+        assert!(t.contains("> [stream 3] GET /b HTTP/2"), "trace:\n{t}");
+        assert!(t.contains("< [stream 1] HTTP/2 200"), "trace:\n{t}");
+        assert!(t.contains("< [stream 3] HTTP/2 200"), "trace:\n{t}");
+    }
+
+    #[test]
+    fn send_multiplexed_empty_returns_empty() {
+        let mut sink = std::io::sink();
+        let out = send_multiplexed(Vec::new(), &mut sink);
+        assert!(out.is_empty());
     }
 }
