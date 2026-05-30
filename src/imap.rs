@@ -1,7 +1,8 @@
 //! IMAP and IMAPS support.
 //!
 //! Specs: RFC 9051 (IMAP4rev2), RFC 3501 (IMAP4rev1), RFC 8314 (implicit TLS
-//! on port 993 for IMAPS), RFC 5092 (`imap:` URL scheme).
+//! on port 993 for IMAPS), RFC 5092 (`imap:` URL scheme), RFC 2595 (STARTTLS
+//! over IMAP), RFC 4616 (SASL `PLAIN`).
 //!
 //! IMAP URLs look like `imap://user@host/INBOX;UID=42` — the path/parameters
 //! select a mailbox and optionally a single message to FETCH. For IMAPS,
@@ -14,10 +15,17 @@
 //!   * `imap[s]://[user[:pass]@]host[:port]/MAILBOX`   → SELECT, FETCH 1:* (UID)
 //!   * `imap[s]://[user[:pass]@]host[:port]/MAILBOX;UID=N` → SELECT, UID FETCH N BODY[]
 //!
-//! Deferred: STARTTLS, CAPABILITY-based feature switching, SASL/AUTHENTICATE,
-//! IDLE, search/sort, message sets beyond a single UID, namespace handling,
-//! literal+ on the client side, mailbox name encoding (UTF-7/UTF-8 quoted
-//! string promotion), multi-line continuation requests.
+//! After the greeting we probe `CAPABILITY` (or read it from a greeting
+//! `[CAPABILITY ...]` response code), use it to drive STARTTLS upgrade on a
+//! plaintext `imap://` connection (re-issuing CAPABILITY afterwards per
+//! RFC 2595), and pick an authentication mechanism: `AUTHENTICATE PLAIN`,
+//! `AUTHENTICATE LOGIN`, or the plain `LOGIN` command (the latter only when
+//! the server does not advertise `LOGINDISABLED`).
+//!
+//! Deferred: IDLE, search/sort, message sets beyond a single UID, namespace
+//! handling, literal+ on the client side, mailbox name encoding (UTF-7/UTF-8
+//! quoted string promotion), multi-line continuation requests, SASL mechanisms
+//! beyond PLAIN/LOGIN (CRAM-MD5, SCRAM, XOAUTH2, ...).
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -25,6 +33,7 @@ use std::net::TcpStream;
 use crate::error::{Error, Result};
 use crate::tls::{connect_over, TlsStream};
 use crate::url::Url;
+use crate::websocket::base64_encode;
 
 /// Upper bound on a single server-declared IMAP literal (`{N}`). The size is
 /// chosen by the server, and `read_exact` would otherwise `Vec::with_capacity`
@@ -32,65 +41,99 @@ use crate::url::Url;
 /// matches the crate's other body caps (e.g. `rtsp`, `websocket`).
 const MAX_LITERAL_BYTES: usize = 64 * 1024 * 1024;
 
-/// LOGIN (using userinfo or fall back to anonymous), SELECT the mailbox from
-/// `url.path`, then either LIST mailboxes or FETCH a specific message and
-/// return the raw RFC 5322 message bytes (or the LIST output).
+/// LOGIN/AUTHENTICATE (using userinfo or fall back to anonymous), SELECT the
+/// mailbox from `url.path`, then either LIST mailboxes or FETCH a specific
+/// message and return the raw RFC 5322 message bytes (or the LIST output).
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
         "imap" => {
             let sock = TcpStream::connect((url.host.as_str(), url.port))?;
-            run(PlainStream(sock), url)
+            run(Stream::Plain(sock), url)
         }
         "imaps" => {
             let sock = TcpStream::connect((url.host.as_str(), url.port))?;
             let tls = connect_over(sock, &url.host)?;
-            run(TlsRw(tls), url)
+            run(Stream::Tls(Box::new(tls)), url)
         }
         other => Err(Error::UnsupportedScheme(other.to_string())),
     }
 }
 
-/// Tiny trait shim so we can write one `run<S: ImapIo>(...)` and use it for
-/// both `TcpStream` and `TlsStream<TcpStream>` without dragging in a bunch of
-/// trait-object machinery. Both are blocking `Read + Write`.
-trait ImapIo: Read + Write {}
+/// Read+Write transport, either plain TCP or TLS-wrapped. Modelling it as an
+/// enum (rather than a generic `S: Read + Write`) is what lets STARTTLS upgrade
+/// the connection *in place*: we `std::mem::replace` the `Plain` arm with a
+/// `Tls` arm wrapping the very same `TcpStream`.
+///
+/// `Tls` is boxed because the active TLS backend can be either purecrypto
+/// (small) or rustls (~1 KiB), and clippy flags the resulting variant-size
+/// mismatch against the bare `TcpStream` arm (mirrors `pop3::IoAdapter`).
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+    /// Transient state only ever observed inside [`Stream::start_tls`] while we
+    /// move the inner `TcpStream` out to hand it to the TLS handshake.
+    Poisoned,
+}
 
-struct PlainStream(TcpStream);
-impl Read for PlainStream {
+impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        match self {
+            Stream::Plain(s) => s.read(buf),
+            Stream::Tls(s) => s.read(buf),
+            Stream::Poisoned => Err(io::Error::other("imap: stream poisoned")),
+        }
     }
 }
-impl Write for PlainStream {
+
+impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        match self {
+            Stream::Plain(s) => s.write(buf),
+            Stream::Tls(s) => s.write(buf),
+            Stream::Poisoned => Err(io::Error::other("imap: stream poisoned")),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        match self {
+            Stream::Plain(s) => s.flush(),
+            Stream::Tls(s) => s.flush(),
+            Stream::Poisoned => Err(io::Error::other("imap: stream poisoned")),
+        }
     }
 }
-impl ImapIo for PlainStream {}
 
-struct TlsRw(TlsStream<TcpStream>);
-impl Read for TlsRw {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+impl Stream {
+    /// True for a plaintext (non-TLS) transport.
+    fn is_plain(&self) -> bool {
+        matches!(self, Stream::Plain(_))
     }
-}
-impl Write for TlsRw {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
-impl ImapIo for TlsRw {}
 
-fn run<S: ImapIo>(mut sock: S, url: &Url) -> Result<Vec<u8>> {
+    /// Upgrade a plaintext connection to TLS in place (RFC 2595 STARTTLS). The
+    /// existing TCP stream is handed to [`connect_over`] verifying `host` as the
+    /// SNI / certificate name, exactly as `imaps://` does. No-op (and an error)
+    /// if the connection is already TLS.
+    fn start_tls(&mut self, host: &str) -> Result<()> {
+        let plain = match std::mem::replace(self, Stream::Poisoned) {
+            Stream::Plain(s) => s,
+            // Restore and bail: nothing to upgrade.
+            other => {
+                *self = other;
+                return Err(Error::BadResponse(
+                    "imap: STARTTLS requested on a non-plaintext connection".into(),
+                ));
+            }
+        };
+        let tls = connect_over(plain, host)?;
+        *self = Stream::Tls(Box::new(tls));
+        Ok(())
+    }
+}
+
+fn run(mut sock: Stream, url: &Url) -> Result<Vec<u8>> {
     let mut buf = LineReader::new();
 
-    // Read the unsolicited greeting. Must start with `* OK`.
+    // Read the unsolicited greeting. Must start with `* OK` (or `* PREAUTH`,
+    // in which case the session is already authenticated).
     let greeting = buf.read_response(&mut sock, "*")?;
     let first = greeting.lines().next().unwrap_or("");
     if !first.starts_with("* OK") && !first.starts_with("* PREAUTH") {
@@ -98,25 +141,51 @@ fn run<S: ImapIo>(mut sock: S, url: &Url) -> Result<Vec<u8>> {
             "imap greeting was not OK: {first}"
         )));
     }
+    let preauth = first.starts_with("* PREAUTH");
 
     let mut tagger = Tagger::new();
 
-    // LOGIN, if we have credentials.
-    if let Some(userinfo) = url.userinfo.as_deref() {
-        let (user, pass) = split_userinfo(userinfo);
+    // CAPABILITY discovery. The greeting may carry it inline as a
+    // `[CAPABILITY ...]` response code; otherwise ask explicitly.
+    let mut caps = parse_capability_code(first)
+        .or_else(|| parse_capability_line(&greeting))
+        .map(Caps::from_tokens)
+        .unwrap_or_default();
+    if caps.is_empty() {
+        caps = request_capability(&mut sock, &mut buf, &mut tagger)?;
+    }
+
+    // STARTTLS upgrade for plaintext connections that advertise it (RFC 2595).
+    if sock.is_plain() && caps.has("STARTTLS") {
         let tag = tagger.next();
-        let cmd = format!(
-            "{tag} LOGIN {} {}\r\n",
-            quote_imap_string(user),
-            quote_imap_string(pass)
-        );
-        sock.write_all(cmd.as_bytes())?;
+        sock.write_all(format!("{tag} STARTTLS\r\n").as_bytes())?;
         sock.flush()?;
         let resp = buf.read_response(&mut sock, &tag)?;
-        require_ok(&resp, &tag, "LOGIN")?;
+        require_ok(&resp, &tag, "STARTTLS")?;
+        // Tagged OK means the server is ready; everything after is TLS.
+        sock.start_tls(&url.host)?;
+        // RFC 2595: discard the pre-TLS capability list and re-probe, since
+        // capabilities (e.g. LOGINDISABLED, AUTH=*) commonly change post-TLS.
+        caps = request_capability(&mut sock, &mut buf, &mut tagger)?;
+    }
+
+    // Authenticate, if we have credentials and aren't already PREAUTH.
+    if !preauth {
+        if let Some(userinfo) = url.userinfo.as_deref() {
+            let (user, pass) = split_userinfo(userinfo);
+            // Security: never interpolate URL-derived control bytes into a
+            // command (CRLF injection / command smuggling). Credentials are
+            // never logged.
+            reject_ctl(user, "imap user")?;
+            reject_ctl(pass, "imap password")?;
+            authenticate(&mut sock, &mut buf, &mut tagger, &caps, user, pass)?;
+        }
     }
 
     let (mailbox, uid) = parse_path(&url.path);
+    if let Some(mbox) = mailbox.as_deref() {
+        reject_ctl(mbox, "imap mailbox")?;
+    }
 
     let body = match (mailbox.as_deref(), uid) {
         // Plain `/` (or empty) and no UID: list mailboxes.
@@ -180,8 +249,239 @@ fn run<S: ImapIo>(mut sock: S, url: &Url) -> Result<Vec<u8>> {
     Ok(body)
 }
 
-fn select_mailbox<S: ImapIo>(
+/// Issue `CAPABILITY` and parse the untagged `* CAPABILITY ...` reply.
+fn request_capability<S: Read + Write>(
     sock: &mut S,
+    buf: &mut LineReader,
+    tagger: &mut Tagger,
+) -> Result<Caps> {
+    let tag = tagger.next();
+    sock.write_all(format!("{tag} CAPABILITY\r\n").as_bytes())?;
+    sock.flush()?;
+    let resp = buf.read_response(sock, &tag)?;
+    require_ok(&resp, &tag, "CAPABILITY")?;
+    Ok(parse_capability_line(&resp)
+        .map(Caps::from_tokens)
+        .unwrap_or_default())
+}
+
+/// Authentication-mechanism selection, mirroring curl's preference order.
+///
+/// The plaintext `LOGIN` command is only used when the server does not
+/// advertise `LOGINDISABLED` — and is never attempted when `LOGINDISABLED` is
+/// present (RFC 3501 §6.2.3), which a compliant server sets on any connection
+/// where cleartext `LOGIN` would be unsafe (i.e. before STARTTLS).
+#[derive(Debug, PartialEq, Eq)]
+enum AuthMethod {
+    /// `AUTHENTICATE PLAIN` with the RFC 4616 initial response.
+    SaslPlain,
+    /// `AUTHENTICATE LOGIN` across continuation prompts.
+    SaslLogin,
+    /// The plain `LOGIN` command.
+    LoginCommand,
+}
+
+/// Pick an auth method from the advertised capabilities. Returns `None` if the
+/// server leaves us with no usable mechanism (e.g. only `LOGINDISABLED` and no
+/// SASL we support).
+fn choose_auth(caps: &Caps) -> Option<AuthMethod> {
+    if caps.has("AUTH=PLAIN") {
+        return Some(AuthMethod::SaslPlain);
+    }
+    if caps.has("AUTH=LOGIN") {
+        return Some(AuthMethod::SaslLogin);
+    }
+    if caps.has("LOGINDISABLED") {
+        // No SASL we support, and the cleartext LOGIN command is forbidden.
+        return None;
+    }
+    Some(AuthMethod::LoginCommand)
+}
+
+fn authenticate<S: Read + Write>(
+    sock: &mut S,
+    buf: &mut LineReader,
+    tagger: &mut Tagger,
+    caps: &Caps,
+    user: &str,
+    pass: &str,
+) -> Result<()> {
+    match choose_auth(caps) {
+        Some(AuthMethod::SaslPlain) => auth_plain(sock, buf, tagger, user, pass),
+        Some(AuthMethod::SaslLogin) => auth_login_sasl(sock, buf, tagger, user, pass),
+        Some(AuthMethod::LoginCommand) => login_command(sock, buf, tagger, user, pass),
+        None => Err(Error::BadResponse(
+            "imap: server offers no usable authentication mechanism \
+             (LOGINDISABLED and no AUTH=PLAIN/LOGIN); a STARTTLS/imaps \
+             connection may be required"
+                .into(),
+        )),
+    }
+}
+
+/// `AUTHENTICATE PLAIN` with an initial response (RFC 4616): the SASL message
+/// is `authzid \0 authcid \0 passwd`; we send an empty authzid, so the cleartext
+/// is `\0user\0pass`, base64-encoded.
+fn auth_plain<S: Read + Write>(
+    sock: &mut S,
+    buf: &mut LineReader,
+    tagger: &mut Tagger,
+    user: &str,
+    pass: &str,
+) -> Result<()> {
+    let tag = tagger.next();
+    let initial = sasl_plain_initial(user, pass);
+    // We send the initial response on the same line (IMAP4rev2 / SASL-IR). This
+    // line carries credentials — never log it.
+    let cmd = format!("{tag} AUTHENTICATE PLAIN {initial}\r\n");
+    sock.write_all(cmd.as_bytes())?;
+    sock.flush()?;
+    let resp = buf.read_response(sock, &tag)?;
+    require_ok(&resp, &tag, "AUTHENTICATE PLAIN")
+}
+
+/// `AUTHENTICATE LOGIN` (non-standard but widely supported): the server sends
+/// two base64 continuation prompts (conventionally "Username:" then
+/// "Password:"); we answer each with the base64 of the username then password.
+fn auth_login_sasl<S: Read + Write>(
+    sock: &mut S,
+    buf: &mut LineReader,
+    tagger: &mut Tagger,
+    user: &str,
+    pass: &str,
+) -> Result<()> {
+    let tag = tagger.next();
+    sock.write_all(format!("{tag} AUTHENTICATE LOGIN\r\n").as_bytes())?;
+    sock.flush()?;
+
+    // First continuation request → send base64(username).
+    let cont = buf.read_response(sock, &tag)?;
+    if is_tagged_done(&cont, &tag) {
+        // Server completed/failed without prompting (unexpected for LOGIN).
+        return require_ok(&cont, &tag, "AUTHENTICATE LOGIN");
+    }
+    sock.write_all(format!("{}\r\n", base64_encode(user.as_bytes())).as_bytes())?;
+    sock.flush()?;
+
+    // Second continuation request → send base64(password).
+    let cont = buf.read_response(sock, &tag)?;
+    if is_tagged_done(&cont, &tag) {
+        return require_ok(&cont, &tag, "AUTHENTICATE LOGIN");
+    }
+    sock.write_all(format!("{}\r\n", base64_encode(pass.as_bytes())).as_bytes())?;
+    sock.flush()?;
+
+    let resp = buf.read_response(sock, &tag)?;
+    require_ok(&resp, &tag, "AUTHENTICATE LOGIN")
+}
+
+/// The classic `LOGIN <user> <pass>` command (RFC 3501 §6.2.3).
+fn login_command<S: Read + Write>(
+    sock: &mut S,
+    buf: &mut LineReader,
+    tagger: &mut Tagger,
+    user: &str,
+    pass: &str,
+) -> Result<()> {
+    let tag = tagger.next();
+    let cmd = format!(
+        "{tag} LOGIN {} {}\r\n",
+        quote_imap_string(user),
+        quote_imap_string(pass)
+    );
+    sock.write_all(cmd.as_bytes())?;
+    sock.flush()?;
+    let resp = buf.read_response(sock, &tag)?;
+    require_ok(&resp, &tag, "LOGIN")
+}
+
+/// Build the base64 of the RFC 4616 PLAIN initial response, `\0user\0pass`.
+fn sasl_plain_initial(user: &str, pass: &str) -> String {
+    let mut raw = Vec::with_capacity(user.len() + pass.len() + 2);
+    raw.push(0);
+    raw.extend_from_slice(user.as_bytes());
+    raw.push(0);
+    raw.extend_from_slice(pass.as_bytes());
+    base64_encode(&raw)
+}
+
+/// True if `resp`'s final line is the tagged completion for `tag` (i.e. not a
+/// `+ ...` continuation request).
+fn is_tagged_done(resp: &str, tag: &str) -> bool {
+    let last = resp.lines().rev().find(|l| !l.is_empty()).unwrap_or("");
+    last.starts_with(&format!("{tag} ")) || last == tag
+}
+
+/// Parsed, normalized IMAP capability set. Stored uppercased so lookups are
+/// case-insensitive (RFC 9051 capability names are case-insensitive).
+#[derive(Default)]
+struct Caps {
+    set: Vec<String>,
+}
+
+impl Caps {
+    fn from_tokens<I, S>(tokens: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let set = tokens
+            .into_iter()
+            .map(|t| t.as_ref().to_ascii_uppercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        Self { set }
+    }
+
+    fn has(&self, cap: &str) -> bool {
+        let needle = cap.to_ascii_uppercase();
+        self.set.contains(&needle)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+}
+
+/// Pull capability tokens out of a `[CAPABILITY ...]` response code embedded in
+/// a line (e.g. the greeting `* OK [CAPABILITY IMAP4rev2 STARTTLS] ready`).
+fn parse_capability_code(line: &str) -> Option<Vec<String>> {
+    let start = line.find('[')?;
+    let end = line[start..].find(']')? + start;
+    let inside = &line[start + 1..end];
+    let mut toks = inside.split_whitespace();
+    if !toks.next()?.eq_ignore_ascii_case("CAPABILITY") {
+        return None;
+    }
+    let caps: Vec<String> = toks.map(|s| s.to_string()).collect();
+    if caps.is_empty() {
+        None
+    } else {
+        Some(caps)
+    }
+}
+
+/// Pull capability tokens out of an untagged `* CAPABILITY ...` line anywhere in
+/// `resp`.
+fn parse_capability_line(resp: &str) -> Option<Vec<String>> {
+    for line in resp.lines() {
+        if let Some(rest) = line.strip_prefix("* ") {
+            let mut toks = rest.split_whitespace();
+            if let Some(first) = toks.next() {
+                if first.eq_ignore_ascii_case("CAPABILITY") {
+                    let caps: Vec<String> = toks.map(|s| s.to_string()).collect();
+                    if !caps.is_empty() {
+                        return Some(caps);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn select_mailbox(
+    sock: &mut Stream,
     buf: &mut LineReader,
     tagger: &mut Tagger,
     mbox: &str,
@@ -204,6 +504,20 @@ fn require_ok(resp: &str, tag: &str, what: &str) -> Result<()> {
     } else {
         Err(Error::BadResponse(format!("imap {what} failed: {last}")))
     }
+}
+
+/// Reject a URL-derived string containing CR, LF, NUL, or any other ASCII
+/// control byte before it's interpolated into an IMAP command. This blocks
+/// CRLF/command injection through the userinfo or mailbox name. `what` names
+/// the field for the error message — note credentials themselves are never
+/// echoed.
+fn reject_ctl(s: &str, what: &str) -> Result<()> {
+    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+        return Err(Error::BadResponse(format!(
+            "imap: {what} contains illegal control byte {b:#04x}"
+        )));
+    }
+    Ok(())
 }
 
 /// Return every untagged response line whose data item matches `kind`
@@ -422,6 +736,10 @@ impl LineReader {
     /// Like [`read_response`], but also returns each literal block we saw, in
     /// the order they were sent. Used for `UID FETCH BODY[]` so we can hand
     /// the raw message bytes back without re-parsing the merged text.
+    ///
+    /// Also returns when the server sends a continuation request (a line
+    /// starting with `+ `), which is how SASL `AUTHENTICATE` exchanges prompt
+    /// for the next base64 chunk. The continuation line is included in `text`.
     fn read_response_with_literals<S: Read>(
         &mut self,
         sock: &mut S,
@@ -451,10 +769,14 @@ impl LineReader {
                 continue;
             }
 
-            // Tagged response? Continuation request (`+ ...`)? Untagged? Only
-            // a line that starts with our tag plus a space (or is exactly the
-            // tag) ends the response.
             let trimmed = line.trim_end();
+            // Continuation request (`+ ...` / bare `+`): the server is waiting
+            // for our next line (SASL prompt). Hand control back to the caller.
+            if trimmed == "+" || trimmed.starts_with("+ ") {
+                return Ok((text, literals));
+            }
+            // Tagged response? Only a line that starts with our tag plus a
+            // space (or is exactly the tag) ends the response.
             if trimmed.starts_with(&format!("{tag} ")) || trimmed == tag {
                 return Ok((text, literals));
             }
@@ -502,6 +824,19 @@ mod tests {
         assert_eq!(split_userinfo("alice"), ("alice", ""));
         assert_eq!(split_userinfo("alice:"), ("alice", ""));
         assert_eq!(split_userinfo(":only-pass"), ("", "only-pass"));
+    }
+
+    // -- control-byte rejection --------------------------------------------
+
+    #[test]
+    fn reject_ctl_flags_control_bytes() {
+        assert!(reject_ctl("alice", "imap user").is_ok());
+        assert!(reject_ctl("p@ss:word!", "imap password").is_ok());
+        assert!(reject_ctl("INBOX/Sent", "imap mailbox").is_ok());
+        assert!(reject_ctl("alice\r\na001 DELETE INBOX", "imap user").is_err());
+        assert!(reject_ctl("alice\npass", "imap user").is_err());
+        assert!(reject_ctl("alice\0", "imap user").is_err());
+        assert!(reject_ctl("alice\x7f", "imap user").is_err()); // DEL
     }
 
     // -- path parsing ------------------------------------------------------
@@ -614,6 +949,209 @@ mod tests {
         assert_eq!(t.next(), "a003");
     }
 
+    // -- capability parsing ------------------------------------------------
+
+    #[test]
+    fn capability_code_from_greeting() {
+        let line = "* OK [CAPABILITY IMAP4rev2 STARTTLS LOGINDISABLED] ready";
+        let toks = parse_capability_code(line).expect("caps from code");
+        let caps = Caps::from_tokens(toks);
+        assert!(caps.has("IMAP4rev2"));
+        assert!(caps.has("starttls")); // case-insensitive
+        assert!(caps.has("LOGINDISABLED"));
+        assert!(!caps.has("AUTH=PLAIN"));
+    }
+
+    #[test]
+    fn capability_code_absent_or_wrong_keyword() {
+        assert!(parse_capability_code("* OK ready, no brackets").is_none());
+        assert!(parse_capability_code("* OK [UIDVALIDITY 1] hi").is_none());
+        assert!(parse_capability_code("* OK [CAPABILITY] empty").is_none());
+    }
+
+    #[test]
+    fn capability_line_parsed() {
+        let resp = "* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=LOGIN IDLE\r\n\
+                    a001 OK CAPABILITY completed\r\n";
+        let caps = Caps::from_tokens(parse_capability_line(resp).expect("caps"));
+        assert!(caps.has("IMAP4rev1"));
+        assert!(caps.has("AUTH=PLAIN"));
+        assert!(caps.has("AUTH=LOGIN"));
+        assert!(caps.has("IDLE"));
+        assert!(!caps.has("STARTTLS"));
+    }
+
+    #[test]
+    fn capability_line_missing_returns_none() {
+        let resp = "a001 OK CAPABILITY completed\r\n";
+        assert!(parse_capability_line(resp).is_none());
+    }
+
+    // -- auth method selection ---------------------------------------------
+
+    #[test]
+    fn choose_auth_prefers_sasl_plain() {
+        let caps = Caps::from_tokens(["AUTH=PLAIN", "AUTH=LOGIN", "LOGINDISABLED"]);
+        assert_eq!(choose_auth(&caps), Some(AuthMethod::SaslPlain));
+    }
+
+    #[test]
+    fn choose_auth_falls_back_to_sasl_login() {
+        let caps = Caps::from_tokens(["AUTH=LOGIN", "LOGINDISABLED"]);
+        assert_eq!(choose_auth(&caps), Some(AuthMethod::SaslLogin));
+    }
+
+    #[test]
+    fn choose_auth_falls_back_to_login_command() {
+        let caps = Caps::from_tokens(["IMAP4rev1", "IDLE"]);
+        assert_eq!(choose_auth(&caps), Some(AuthMethod::LoginCommand));
+    }
+
+    #[test]
+    fn choose_auth_login_disabled_without_sasl_is_none() {
+        // No SASL we support, and cleartext LOGIN is forbidden → no method.
+        let caps = Caps::from_tokens(["IMAP4rev1", "LOGINDISABLED"]);
+        assert_eq!(choose_auth(&caps), None);
+    }
+
+    #[test]
+    fn choose_auth_empty_caps_uses_login_command() {
+        let caps = Caps::default();
+        assert_eq!(choose_auth(&caps), Some(AuthMethod::LoginCommand));
+    }
+
+    // -- SASL PLAIN initial response ---------------------------------------
+
+    #[test]
+    fn sasl_plain_initial_is_nul_user_nul_pass_base64() {
+        // RFC 4616: authzid \0 authcid \0 passwd, empty authzid.
+        // base64("\0alice\0secret")
+        let got = sasl_plain_initial("alice", "secret");
+        let expected = base64_encode(b"\x00alice\x00secret");
+        assert_eq!(got, expected);
+        // Sanity: decode-by-hand of the known vector.
+        assert_eq!(got, "AGFsaWNlAHNlY3JldA==");
+    }
+
+    #[test]
+    fn sasl_plain_initial_empty_password() {
+        let got = sasl_plain_initial("bob", "");
+        assert_eq!(got, base64_encode(b"\x00bob\x00"));
+    }
+
+    // -- full auth exchanges against a mock --------------------------------
+
+    /// A mock IMAP transport: feeds scripted server bytes and records
+    /// everything the client wrote, so we can assert on the command flow.
+    struct MockIo {
+        to_read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl MockIo {
+        fn new(script: &[u8]) -> Self {
+            Self {
+                to_read: std::io::Cursor::new(script.to_vec()),
+                written: Vec::new(),
+            }
+        }
+        fn sent(&self) -> String {
+            String::from_utf8_lossy(&self.written).into_owned()
+        }
+    }
+    impl Read for MockIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.to_read.read(buf)
+        }
+    }
+    impl Write for MockIo {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn auth_plain_sends_correct_initial_response() {
+        let mut io = MockIo::new(b"a001 OK authenticated\r\n");
+        let mut lr = LineReader::new();
+        let mut tagger = Tagger::new();
+        auth_plain(&mut io, &mut lr, &mut tagger, "alice", "secret").expect("auth plain ok");
+        let sent = io.sent();
+        assert!(
+            sent.starts_with("a001 AUTHENTICATE PLAIN AGFsaWNlAHNlY3JldA=="),
+            "unexpected client output: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn auth_login_sasl_walks_two_prompts() {
+        // Server prompts twice with `+` continuations, then accepts.
+        let script = b"+ VXNlcm5hbWU6\r\n+ UGFzc3dvcmQ6\r\na001 OK welcome\r\n";
+        let mut io = MockIo::new(script);
+        let mut lr = LineReader::new();
+        let mut tagger = Tagger::new();
+        auth_login_sasl(&mut io, &mut lr, &mut tagger, "bob", "pw").expect("auth login ok");
+        let sent = io.sent();
+        // base64("bob") = Ym9i, base64("pw") = cHc=
+        assert!(sent.contains("a001 AUTHENTICATE LOGIN\r\n"), "{sent:?}");
+        assert!(sent.contains("Ym9i\r\n"), "username b64 missing: {sent:?}");
+        assert!(sent.contains("cHc=\r\n"), "password b64 missing: {sent:?}");
+    }
+
+    #[test]
+    fn login_command_quotes_and_sends() {
+        let mut io = MockIo::new(b"a001 OK logged in\r\n");
+        let mut lr = LineReader::new();
+        let mut tagger = Tagger::new();
+        login_command(&mut io, &mut lr, &mut tagger, "alice", "se cret").expect("login ok");
+        assert_eq!(io.sent(), "a001 LOGIN \"alice\" \"se cret\"\r\n");
+    }
+
+    // -- STARTTLS decision logic (pre-upgrade) -----------------------------
+
+    #[test]
+    fn starttls_offered_drives_upgrade_decision() {
+        // The decision to STARTTLS is "plaintext transport AND caps has
+        // STARTTLS". We test the predicate directly.
+        let caps = Caps::from_tokens(["IMAP4rev1", "STARTTLS", "LOGINDISABLED"]);
+        assert!(caps.has("STARTTLS"));
+        // Pre-TLS, LOGINDISABLED + no SASL means we must not try cleartext.
+        assert_eq!(choose_auth(&caps), None);
+    }
+
+    #[test]
+    fn starttls_command_flow_against_mock() {
+        // Drive request_capability + the STARTTLS command exchange against a
+        // mock, stopping right before the (real) TLS upgrade. We verify the
+        // client emits CAPABILITY then STARTTLS and reads the tagged OKs.
+        let script = b"* CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED\r\n\
+                       a001 OK CAPABILITY completed\r\n\
+                       a002 OK Begin TLS negotiation now\r\n";
+        let mut io = MockIo::new(script);
+        let mut lr = LineReader::new();
+        let mut tagger = Tagger::new();
+
+        // request_capability is generic over Read+Write, so the mock drives the
+        // real production code path here (not a test mirror).
+        let caps = request_capability(&mut io, &mut lr, &mut tagger).expect("caps");
+        assert!(caps.has("STARTTLS"));
+
+        // Issue STARTTLS and confirm the tagged OK (the real code would then
+        // call sock.start_tls()).
+        let tag = tagger.next();
+        io.write_all(format!("{tag} STARTTLS\r\n").as_bytes())
+            .unwrap();
+        let resp = lr.read_response(&mut io, &tag).expect("starttls resp");
+        assert!(require_ok(&resp, &tag, "STARTTLS").is_ok());
+
+        let sent = io.sent();
+        assert!(sent.contains("a001 CAPABILITY\r\n"), "{sent:?}");
+        assert!(sent.contains("a002 STARTTLS\r\n"), "{sent:?}");
+    }
+
     // -- LineReader literal handling --------------------------------------
 
     #[test]
@@ -628,6 +1166,17 @@ mod tests {
         assert_eq!(literals, vec![b"hello".to_vec()]);
         assert!(text.contains("hello"));
         assert!(text.contains("a001 OK"));
+    }
+
+    #[test]
+    fn line_reader_returns_on_continuation() {
+        // A `+` continuation request ends the read so the caller can respond.
+        let wire = b"+ go ahead\r\n";
+        let mut src: &[u8] = wire;
+        let mut lr = LineReader::new();
+        let resp = lr.read_response(&mut src, "a001").expect("cont");
+        assert!(resp.starts_with("+ go ahead"));
+        assert!(!is_tagged_done(&resp, "a001"));
     }
 
     #[test]
