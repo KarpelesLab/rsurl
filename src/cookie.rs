@@ -963,8 +963,15 @@ mod tests {
         // broadcast to every `*.co.uk` host (the classic supercookie). A bare
         // dot-count heuristic would wrongly let this through.
         let mut j = CookieJar::new();
-        j.add_set_cookie(&url("https://www.example.co.uk/"), "evil=1; Domain=co.uk", 0);
-        assert!(j.is_empty(), "Domain=co.uk (public suffix) must be rejected");
+        j.add_set_cookie(
+            &url("https://www.example.co.uk/"),
+            "evil=1; Domain=co.uk",
+            0,
+        );
+        assert!(
+            j.is_empty(),
+            "Domain=co.uk (public suffix) must be rejected"
+        );
     }
 
     #[test]
@@ -987,7 +994,11 @@ mod tests {
         // every `*.github.io` Pages site and must be rejected, while a real
         // registrable domain below it (`user.github.io`) is fine.
         let mut j = CookieJar::new();
-        j.add_set_cookie(&url("https://user.github.io/"), "evil=1; Domain=github.io", 0);
+        j.add_set_cookie(
+            &url("https://user.github.io/"),
+            "evil=1; Domain=github.io",
+            0,
+        );
         assert!(
             j.is_empty(),
             "Domain=github.io (PSL private suffix) must be rejected"
@@ -999,7 +1010,11 @@ mod tests {
             "id=1; Domain=user.github.io",
             0,
         );
-        assert_eq!(j2.len(), 1, "Domain=user.github.io (eTLD+1) must be accepted");
+        assert_eq!(
+            j2.len(),
+            1,
+            "Domain=user.github.io (eTLD+1) must be accepted"
+        );
     }
 
     #[test]

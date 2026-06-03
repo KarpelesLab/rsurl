@@ -497,9 +497,9 @@ pub(crate) mod qpack {
         let start = 1 + used;
         // A length that overflows usize cannot ever be satisfied by more bytes;
         // treat it as a hard error rather than an endless "need more".
-        let end = start.checked_add(slen as usize).ok_or_else(|| {
-            Error::BadResponse("qpack: oversized literal string length".into())
-        })?;
+        let end = start
+            .checked_add(slen as usize)
+            .ok_or_else(|| Error::BadResponse("qpack: oversized literal string length".into()))?;
         if end > buf.len() {
             return Ok(None);
         }
@@ -940,9 +940,12 @@ pub(crate) mod qpack {
                 let (nlen, used) = decode_int(b, 3, &buf[p + 1..])?;
                 p += 1 + used;
                 let nlen = nlen as usize;
-                let nend = p.checked_add(nlen).filter(|&e| e <= buf.len()).ok_or_else(|| {
-                    Error::BadResponse("qpack: truncated/oversized literal name".into())
-                })?;
+                let nend = p
+                    .checked_add(nlen)
+                    .filter(|&e| e <= buf.len())
+                    .ok_or_else(|| {
+                        Error::BadResponse("qpack: truncated/oversized literal name".into())
+                    })?;
                 let name = decode_string_bytes(&buf[p..nend], huffman, "literal name")?;
                 p += nlen;
                 let value = decode_literal_string_7bit(&buf[p..])?;
@@ -1013,9 +1016,7 @@ pub(crate) mod qpack {
         let end = start
             .checked_add(slen as usize)
             .filter(|&e| e <= buf.len())
-            .ok_or_else(|| {
-                Error::BadResponse("qpack: truncated/oversized literal value".into())
-            })?;
+            .ok_or_else(|| Error::BadResponse("qpack: truncated/oversized literal value".into()))?;
         let raw = &buf[start..end];
         let s = if huffman {
             let bytes = huffman_decode(raw)?;
@@ -2056,9 +2057,7 @@ fn try_consume_frame(
     let frame_len = match usize::try_from(frame.len) {
         Ok(n) => n,
         Err(_) => {
-            return FrameOutcome::Err(Error::BadResponse(
-                "http3: frame length too large".into(),
-            ));
+            return FrameOutcome::Err(Error::BadResponse("http3: frame length too large".into()));
         }
     };
     let total = hdr_len.saturating_add(frame_len);
@@ -2444,8 +2443,8 @@ mod tests {
         // Literal Field Line With Literal Name, H=0, name length 1.
         qpack::encode_int(1, 3, 0b0010_0000, &mut buf);
         buf.push(b'a'); // 1-byte literal name
-        // Value: 7-bit prefix, H=0, length = u64::MAX - 1 (won't overflow the
-        // qpack-int decoder, but `start + slen as usize` would wrap usize).
+                        // Value: 7-bit prefix, H=0, length = u64::MAX - 1 (won't overflow the
+                        // qpack-int decoder, but `start + slen as usize` would wrap usize).
         qpack::encode_int(u64::MAX - 1, 7, 0x00, &mut buf);
         // No value bytes follow.
         let t = table_at_max();

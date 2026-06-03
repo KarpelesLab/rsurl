@@ -9,9 +9,9 @@
 //! pure passthrough, so a Unicode host flows through unchanged (and typically
 //! fails to resolve) — the correct "no IDN compiled" behaviour.
 
-use crate::error::Result;
 #[cfg(feature = "idn")]
 use crate::error::Error;
+use crate::error::Result;
 
 /// Return the ASCII/punycode form of `host` when `enabled` and the host is
 /// non-ASCII; otherwise return `host` unchanged.
@@ -39,7 +39,10 @@ pub(crate) fn to_ascii(host: &str, enabled: bool) -> Result<String> {
         // rejecting `:` here is safe.
         if ascii.bytes().any(|b| {
             b < 0x20
-                || matches!(b, 0x7f | b' ' | b'/' | b'\\' | b'@' | b':' | b'?' | b'#' | b'%')
+                || matches!(
+                    b,
+                    0x7f | b' ' | b'/' | b'\\' | b'@' | b':' | b'?' | b'#' | b'%'
+                )
         }) {
             return Err(Error::InvalidUrl(format!(
                 "IDN host encodes to a forbidden authority delimiter: {host}"
@@ -65,7 +68,11 @@ mod tests {
             "localhost",
             "Example.COM", // case preserved: ASCII never touches idna
         ] {
-            assert_eq!(to_ascii(h, true).unwrap(), h, "ASCII host must be untouched: {h}");
+            assert_eq!(
+                to_ascii(h, true).unwrap(),
+                h,
+                "ASCII host must be untouched: {h}"
+            );
         }
     }
 
@@ -89,11 +96,11 @@ mod tests {
     #[test]
     fn rejects_idn_authority_delimiter_injection() {
         for input in [
-            "＠evil.com",          // U+FF20 -> '@'
+            "＠evil.com",            // U+FF20 -> '@'
             "good.com／../evil.com", // U+FF0F -> '/'
-            "good.com：8080",       // U+FF1A -> ':'
-            "evil＃.com",           // U+FF03 -> '#'
-            "x？y.com",             // U+FF1F -> '?'
+            "good.com：8080",        // U+FF1A -> ':'
+            "evil＃.com",            // U+FF03 -> '#'
+            "x？y.com",              // U+FF1F -> '?'
         ] {
             assert!(
                 to_ascii(input, true).is_err(),

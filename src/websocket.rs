@@ -1014,7 +1014,10 @@ mod tests {
         let mut s = MockStream::new(inbound);
 
         let got = read_handshake_head(&mut s, Duration::from_secs(60)).expect("reads header");
-        assert_eq!(&got, head, "must capture exactly the header, no frame bytes");
+        assert_eq!(
+            &got, head,
+            "must capture exactly the header, no frame bytes"
+        );
 
         // The frame bytes must remain in the stream for the frame reader.
         let mut rest = Vec::new();

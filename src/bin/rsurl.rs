@@ -1821,9 +1821,7 @@ fn write_output(resp: &Response, url: &Url, args: &Args) -> io::Result<()> {
                 eprintln!(
                     "Warning: Binary output can mess up your terminal. Use \"--output -\" to tell"
                 );
-                eprintln!(
-                    "Warning: rsurl to output it to your terminal anyway, or consider \"-o"
-                );
+                eprintln!("Warning: rsurl to output it to your terminal anyway, or consider \"-o");
                 eprintln!("Warning: <FILE>\" to save to a file.");
             }
         } else {
