@@ -43,7 +43,7 @@ idn = ["dep:idna"]
 [dependencies]
 # Required regardless of TLS backend: SHA1 + RNG (WebSocket, MQTT), X.509
 # parsing for verbose cert display, and the QUIC stack behind HTTP/3.
-purecrypto = "0.2"
+purecrypto = "0.6.1"
 # rustls-tls backend. `ring` is selected explicitly so cross-platform builds
 # don't pull in cmake/nasm (which the default `aws-lc-rs` provider needs on
 # Windows). `tls12` is opt-in in rustls 0.23; we want it on for parity with
@@ -68,7 +68,7 @@ compcol = { version = "0.4", default-features = false, features = ["std", "gzip"
 # pure-Rust FFI *binding* crates (extern decls against the libc that std
 # already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
-puressh = { version = "0.0.3", default-features = false, features = ["client", "compress"] }
+puressh = { version = "0.0.4", default-features = false, features = ["client", "compress"] }
 # Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
 # `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
 # heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =

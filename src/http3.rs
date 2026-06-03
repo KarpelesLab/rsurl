@@ -1619,11 +1619,16 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         active_connection_id_limit: Some(2),
         ..Default::default()
     };
-    let cfg = QuicConfig {
-        tls,
-        transport_params,
-        require_retry: false,
-        retry_secret: None,
+    // `QuicConfig` is `#[non_exhaustive]` (purecrypto 0.6), so it can't be
+    // built with a struct literal; the documented idiom is `default()` plus
+    // field assignment. `require_retry`/`retry_secret` are server-only and
+    // already default to `false`/`None`, which is what a client wants.
+    #[allow(clippy::field_reassign_with_default)]
+    let cfg = {
+        let mut cfg = QuicConfig::default();
+        cfg.tls = tls;
+        cfg.transport_params = transport_params;
+        cfg
     };
 
     QuicConnection::client(cfg, &req.url.host)
