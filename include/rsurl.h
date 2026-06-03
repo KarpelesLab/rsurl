@@ -19,7 +19,12 @@ extern "C" {
 #endif
 
 /* Opaque easy-handle. Created with rsurl_easy_init, freed with
- * rsurl_easy_cleanup. */
+ * rsurl_easy_cleanup.
+ *
+ * Thread safety: a handle (RSURL*) must not be used concurrently from multiple
+ * threads; use one handle per thread (libcurl easy-handle model). The library
+ * performs no internal synchronization on a handle, so concurrent access to
+ * the same handle from more than one thread is undefined behavior. */
 typedef struct RSURL RSURL;
 
 /* Option identifiers passed to rsurl_easy_setopt_str / _long. */
@@ -41,6 +46,9 @@ typedef enum {
     RSURLE_INVALID_HANDLE  = 1,
     RSURLE_UNKNOWN_OPTION  = 2,
     RSURLE_INVALID_ARG     = 3,
+    /* Reserved: never returned. The response getters report "no response
+     * available" via a NULL/0 out-value together with RSURLE_OK, not this
+     * code. Kept for ABI stability and rsurl_strerror coverage. */
     RSURLE_NO_RESPONSE     = 4,
     RSURLE_NETWORK         = 5,
     RSURLE_BAD_RESPONSE    = 6,
@@ -74,8 +82,12 @@ rsurl_code_t rsurl_easy_perform(RSURL *handle);
 
 /* --- Response inspection ------------------------------------------------ */
 
-/* Borrow the response body. *out_ptr / *out_len are valid until the next
- * rsurl_easy_perform / _reset / _cleanup on this handle. */
+/* Borrow the response body. *out_ptr / *out_len are owned by the handle and
+ * valid only until the next rsurl_easy_perform / _reset / _cleanup on this
+ * handle; holding the pointer across any of those is a use-after-free. The
+ * buffer is raw bytes (not NUL-terminated, may contain embedded NULs): use
+ * *out_len, not strlen. If no response is available, *out_ptr is set to NULL
+ * and *out_len to 0 and the call still returns RSURLE_OK. */
 rsurl_code_t rsurl_easy_response_body(const RSURL *handle,
                                         const uint8_t **out_ptr,
                                         size_t *out_len);
@@ -87,7 +99,11 @@ long rsurl_easy_response_status(const RSURL *handle);
 size_t rsurl_easy_response_header_count(const RSURL *handle);
 
 /* Borrow a NUL-terminated "Name: value" string for header at `index`, or
- * NULL if out of range. Pointer is valid until the next perform/reset/cleanup. */
+ * NULL if out of range / no response available. The returned pointer is owned
+ * by the handle and valid only until the next rsurl_easy_perform / _reset /
+ * _cleanup on this handle; holding it across any of those is a use-after-free.
+ * Do not free it. Copy the bytes out if you need them to outlive the next
+ * operation. */
 const char *rsurl_easy_response_header(const RSURL *handle, size_t index);
 
 /* --- Utility ------------------------------------------------------------ */

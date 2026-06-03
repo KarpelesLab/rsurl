@@ -9,7 +9,7 @@
 //!
 //! ```c
 //! RSURL *h = rsurl_easy_init();
-//! rsurl_easy_setopt(h, RSURLOPT_URL, "http://example.com");
+//! rsurl_easy_setopt_str(h, RSURLOPT_URL, "http://example.com");
 //! rsurl_easy_perform(h);
 //! const uint8_t *body; size_t len;
 //! rsurl_easy_response_body(h, &body, &len);
@@ -19,6 +19,11 @@
 //! All pointer parameters except `handle` may be NULL where stated. Returned
 //! pointers from `rsurl_easy_response_*` borrow from the handle and become
 //! invalid on the next `rsurl_easy_perform` or `rsurl_easy_cleanup`.
+//!
+//! Thread safety: a handle (`RSURL*`) must not be used concurrently from
+//! multiple threads; use one handle per thread (libcurl easy-handle model).
+//! The library performs no internal synchronization on a handle — concurrent
+//! access to the same handle from more than one thread is undefined behavior.
 
 #![allow(non_camel_case_types)]
 
@@ -74,6 +79,9 @@ pub enum RsurlCode {
     InvalidHandle = 1,
     UnknownOption = 2,
     InvalidArg = 3,
+    /// Reserved. Never returned by the API: the response getters signal "no
+    /// response available" via a NULL/0 out-value together with `Ok`, not this
+    /// code. Kept for ABI stability and `rsurl_strerror` coverage.
     NoResponse = 4,
     Network = 5,
     BadResponse = 6,
@@ -113,11 +121,19 @@ impl Handle {
     }
 }
 
+// These mint a `&mut`/`&` from a raw pointer with no synchronization. The C
+// contract (see module docs) is that a single handle is never used concurrently
+// from multiple threads — one handle per thread, libcurl easy-handle model —
+// so no two live borrows of the same `Handle` can exist at once. Violating that
+// contract (sharing a handle across threads without external locking) is
+// undefined behavior.
+
 fn handle_mut<'a>(h: *mut RSURL) -> Option<&'a mut Handle> {
     if h.is_null() {
         return None;
     }
-    // SAFETY: handles are always created from Box::into_raw of a Handle.
+    // SAFETY: handles are always created from Box::into_raw of a Handle, and
+    // the caller upholds the one-handle-per-thread contract (no aliasing).
     Some(unsafe { &mut *(h as *mut Handle) })
 }
 
@@ -125,7 +141,8 @@ fn handle_ref<'a>(h: *const RSURL) -> Option<&'a Handle> {
     if h.is_null() {
         return None;
     }
-    // SAFETY: handles are always created from Box::into_raw of a Handle.
+    // SAFETY: handles are always created from Box::into_raw of a Handle, and
+    // the caller upholds the one-handle-per-thread contract (no aliasing).
     Some(unsafe { &*(h as *const Handle) })
 }
 
@@ -319,9 +336,12 @@ pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
     })
 }
 
-/// Borrow a pointer to the response body and its length. Pointer remains
-/// valid until the next perform/reset/cleanup. `out_ptr` is set to NULL and
-/// `out_len` to 0 if no response is available.
+/// Borrow a pointer to the response body and its length. The returned pointer
+/// is **owned by the handle** and remains valid only until the next
+/// `rsurl_easy_perform`, `rsurl_easy_reset`, or `rsurl_easy_cleanup` on this
+/// handle; holding it across any of those calls is a use-after-free.
+/// `out_ptr` is set to NULL and `out_len` to 0 if no response is available
+/// (the call still returns `Ok` in that case, not `NoResponse`).
 ///
 /// The returned buffer is **raw response bytes plus a length**; it is **not**
 /// NUL-terminated and may contain embedded NUL bytes. C callers must use the
@@ -332,7 +352,9 @@ pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
 ///
 /// `handle` must be a pointer returned by [`rsurl_easy_init`] and not yet
 /// freed by [`rsurl_easy_cleanup`]. `out_ptr` and `out_len` must be non-null
-/// and point to writable storage of the appropriate type.
+/// and point to writable storage of the appropriate type. The borrowed
+/// `*out_ptr` must not be used after the next perform/reset/cleanup on
+/// `handle`.
 #[no_mangle]
 pub unsafe extern "C" fn rsurl_easy_response_body(
     handle: *const RSURL,
@@ -373,6 +395,20 @@ pub extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_long {
 
 /// Borrow a pointer to a NUL-terminated `"Name: value"` header line by index.
 /// Returns NULL if `index` is out of range or no response is available.
+///
+/// The returned pointer is **owned by the handle** (it borrows into the
+/// handle's internal header storage) and is invalidated by the next
+/// `rsurl_easy_perform`, `rsurl_easy_reset`, or `rsurl_easy_cleanup` on this
+/// handle. Holding it across any of those calls — or dereferencing it after
+/// the handle is freed — is a use-after-free. Copy the bytes out if you need
+/// them to outlive the next operation.
+///
+/// # Safety
+///
+/// `handle` must be a pointer returned by [`rsurl_easy_init`] and not yet
+/// freed by [`rsurl_easy_cleanup`]. The returned pointer must not be freed by
+/// the caller and must not be used after the next perform/reset/cleanup on
+/// `handle`.
 #[no_mangle]
 pub extern "C" fn rsurl_easy_response_header(handle: *const RSURL, index: usize) -> *const c_char {
     ffi_guard(ptr::null(), || {
