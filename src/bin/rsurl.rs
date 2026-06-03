@@ -51,7 +51,7 @@
 //!     -V, --version            print version
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -1696,24 +1696,143 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
     }
 }
 
+/// Replace bytes/characters that could drive a terminal emulator with a visible
+/// `\xHH` escape, so attacker-controlled server data printed to a TTY cannot
+/// inject ANSI/OSC control sequences (cursor moves, screen clear, OSC 52
+/// clipboard write, window-title set, etc.) — the classic "curl into a
+/// terminal" attack.
+///
+/// The input is interpreted as UTF-8 so that multi-byte characters survive
+/// intact (their continuation bytes live in 0x80–0xBF and must NOT be escaped
+/// individually). Neutralized: C0 control codepoints `< 0x20` (except `\t`,
+/// which is preserved; `\r`/`\n` are added by the caller, not present in the
+/// data passed here), `DEL` (0x7f), and the C1 control range `0x80`–`0x9f`.
+/// Any byte that is not valid UTF-8 is escaped as `\xHH` as well. Printable
+/// ASCII and ordinary (multi-byte) UTF-8 text pass through unchanged.
+fn sanitize_for_tty(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                push_sanitized_str(s, &mut out);
+                break;
+            }
+            Err(e) => {
+                // Valid prefix up to the error: sanitize as UTF-8 text.
+                let valid_up_to = e.valid_up_to();
+                if valid_up_to > 0 {
+                    // SAFETY: bytes[..valid_up_to] is valid UTF-8 per the error.
+                    let s = unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) };
+                    push_sanitized_str(s, &mut out);
+                }
+                // Escape every byte of the invalid sequence as raw \xHH.
+                let bad = e.error_len().unwrap_or(1);
+                for &b in &rest[valid_up_to..valid_up_to + bad] {
+                    out.extend_from_slice(format!("\\x{b:02x}").as_bytes());
+                }
+                rest = &rest[valid_up_to + bad..];
+            }
+        }
+    }
+    out
+}
+
+/// Append `s` to `out`, replacing terminal-control codepoints with `\xHH`.
+fn push_sanitized_str(s: &str, out: &mut Vec<u8>) {
+    for ch in s.chars() {
+        let cp = ch as u32;
+        let dangerous = (cp < 0x20 && ch != '\t') || (0x7f..=0x9f).contains(&cp);
+        if dangerous {
+            out.extend_from_slice(format!("\\x{cp:02x}").as_bytes());
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+}
+
+/// Heuristic mirroring curl's: treat a body as "binary" (unsafe to dump raw to
+/// a terminal) if it contains a NUL byte. NUL is the canonical signal curl uses
+/// for "this is not text"; refusing on it covers images, archives, executables,
+/// etc. while leaving ordinary UTF-8/text bodies alone.
+fn body_looks_binary(body: &[u8]) -> bool {
+    body.contains(&0)
+}
+
 fn write_output(resp: &Response, url: &Url, args: &Args) -> io::Result<()> {
+    // Track whether we are writing to stdout (vs. a real file via -o/-O) and
+    // whether the user explicitly asked for stdout with `-o -` / `--output -`.
+    // Only stdout-to-a-terminal is ever sanitized/guarded; bytes redirected to
+    // a file or pipe must be delivered exactly as received (don't corrupt
+    // downloads).
+    let mut to_stdout = true;
+    let mut explicit_stdout = false;
     let mut out: Box<dyn Write> = if args.remote_name {
         let name = remote_name_from_url(url).map_err(|e| io::Error::other(e.to_string()))?;
+        to_stdout = false;
         Box::new(File::create(&name)?)
     } else {
         match &args.output {
-            Some(path) if path != "-" => Box::new(File::create(path)?),
-            _ => Box::new(io::stdout().lock()),
+            Some(path) if path != "-" => {
+                to_stdout = false;
+                Box::new(File::create(path)?)
+            }
+            Some(_) => {
+                explicit_stdout = true; // `-o -` / `--output -`
+                Box::new(io::stdout().lock())
+            }
+            None => Box::new(io::stdout().lock()),
         }
     };
+
+    // A terminal sink is the only case we guard. When output is redirected to a
+    // file or pipe, `is_terminal()` is false and every byte is written raw.
+    let is_tty = to_stdout && io::stdout().is_terminal();
+
     if args.include_headers {
-        write!(out, "{} {} {}\r\n", resp.version, resp.status, resp.reason)?;
-        for (k, v) in &resp.headers {
-            write!(out, "{k}: {v}\r\n")?;
+        if is_tty {
+            let line = format!("{} {} ", resp.version, resp.status);
+            out.write_all(line.as_bytes())?;
+            out.write_all(&sanitize_for_tty(resp.reason.as_bytes()))?;
+            out.write_all(b"\r\n")?;
+            for (k, v) in &resp.headers {
+                out.write_all(&sanitize_for_tty(k.as_bytes()))?;
+                out.write_all(b": ")?;
+                out.write_all(&sanitize_for_tty(v.as_bytes()))?;
+                out.write_all(b"\r\n")?;
+            }
+        } else {
+            write!(out, "{} {} {}\r\n", resp.version, resp.status, resp.reason)?;
+            for (k, v) in &resp.headers {
+                write!(out, "{k}: {v}\r\n")?;
+            }
         }
         out.write_all(b"\r\n")?;
     }
-    out.write_all(&resp.body)?;
+
+    if is_tty {
+        // `-o -` is the explicit opt-in to dump raw bytes to the terminal.
+        if explicit_stdout {
+            out.write_all(&resp.body)?;
+        } else if body_looks_binary(&resp.body) {
+            // Refuse to dump binary to the terminal (curl's behavior).
+            if !args.silent {
+                eprintln!(
+                    "Warning: Binary output can mess up your terminal. Use \"--output -\" to tell"
+                );
+                eprintln!(
+                    "Warning: rsurl to output it to your terminal anyway, or consider \"-o"
+                );
+                eprintln!("Warning: <FILE>\" to save to a file.");
+            }
+        } else {
+            // Text body to a TTY: neutralize embedded control sequences.
+            out.write_all(&sanitize_for_tty(&resp.body))?;
+        }
+    } else {
+        out.write_all(&resp.body)?;
+    }
     Ok(())
 }
 
@@ -1812,6 +1931,48 @@ Options:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- sanitize_for_tty -----------------------------------------------
+
+    #[test]
+    fn sanitize_for_tty_passes_plain_ascii_and_utf8() {
+        assert_eq!(sanitize_for_tty(b"hello world"), b"hello world");
+        // Multi-byte UTF-8 (café, 日本語) must survive byte-for-byte.
+        let utf8 = "café 日本語".as_bytes();
+        assert_eq!(sanitize_for_tty(utf8), utf8);
+    }
+
+    #[test]
+    fn sanitize_for_tty_preserves_tab() {
+        assert_eq!(sanitize_for_tty(b"a\tb"), b"a\tb");
+    }
+
+    #[test]
+    fn sanitize_for_tty_neutralizes_escape_sequences() {
+        // ANSI CSI clear-screen: ESC [ 2 J
+        assert_eq!(sanitize_for_tty(b"\x1b[2J"), b"\\x1b[2J");
+        // OSC 52 clipboard write begins with ESC ] -> ESC neutralized, BEL too.
+        assert_eq!(
+            sanitize_for_tty(b"\x1b]52;c;Zm9v\x07"),
+            b"\\x1b]52;c;Zm9v\\x07"
+        );
+        // Bare control bytes and DEL.
+        assert_eq!(sanitize_for_tty(b"\x00\x07\x7f"), b"\\x00\\x07\\x7f");
+        // C1 control range: the codepoint U+009B (single-byte CSI) encodes as
+        // the two UTF-8 bytes 0xC2 0x9B; it must be neutralized as one char.
+        assert_eq!(sanitize_for_tty("\u{9b}".as_bytes()), b"\\x9b");
+        // Invalid UTF-8 bytes are escaped individually (e.g. a lone 0xa0).
+        assert_eq!(sanitize_for_tty(b"\xa0"), b"\\xa0");
+        // But the valid UTF-8 codepoint U+00A0 (NBSP, bytes 0xC2 0xA0) is text
+        // and passes through unchanged.
+        assert_eq!(sanitize_for_tty("\u{a0}".as_bytes()), "\u{a0}".as_bytes());
+    }
+
+    #[test]
+    fn body_looks_binary_detects_nul() {
+        assert!(body_looks_binary(b"\x89PNG\x00\x00"));
+        assert!(!body_looks_binary(b"plain text\n"));
+    }
 
     // ---- percent_encode_form --------------------------------------------
 
