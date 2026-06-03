@@ -2048,7 +2048,20 @@ fn try_consume_frame(
         }
         _ => {}
     }
-    let total = hdr_len.saturating_add(frame.len as usize);
+    // `frame.len` is a QUIC varint (up to 2^62-1). On a 32-bit target a plain
+    // `as usize` cast would truncate the high bits and mis-bound the frame —
+    // harmless for the length-capped HEADERS/DATA arms above, but the
+    // reserved/grease arm has no cap, so reject anything that doesn't fit usize
+    // to keep the cast lossless on every target.
+    let frame_len = match usize::try_from(frame.len) {
+        Ok(n) => n,
+        Err(_) => {
+            return FrameOutcome::Err(Error::BadResponse(
+                "http3: frame length too large".into(),
+            ));
+        }
+    };
+    let total = hdr_len.saturating_add(frame_len);
     if buf.len() < total {
         return FrameOutcome::NeedMore;
     }
@@ -2515,6 +2528,52 @@ mod tests {
         assert!(matches!(
             try_consume_frame(&buf, &mut headers, &mut body, &table),
             FrameOutcome::Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn grease_frame_len_exceeding_usize_is_rejected() {
+        // A reserved/grease frame type (RFC 9114 §7.2.8) has no length cap, so
+        // its declared varint length is the only thing that bounds the frame.
+        // `frame.len` is a u64 QUIC varint; on a 32-bit target a plain
+        // `as usize` cast would truncate the high bits and mis-bound the frame,
+        // desyncing the parser. A length that doesn't fit `usize` must be
+        // rejected rather than truncated. `usize::try_from` can only fail when
+        // `usize` is narrower than 64 bits, so this reject path is exercised on
+        // 32-bit (and smaller) targets; on 64-bit hosts every u64 fits and the
+        // companion `grease_frame_len_within_usize_needs_full_buffer` test
+        // covers the bounding behaviour instead.
+        #[cfg(target_pointer_width = "32")]
+        {
+            let mut buf = Vec::new();
+            // 0x21 is a reserved/grease frame type → the uncapped `_` arm.
+            Frame::encode_header(0x21, 0x1_0000_0001, &mut buf);
+            let mut headers = None;
+            let mut body = Vec::new();
+            let table = qpack::DynamicTable::new();
+            assert!(matches!(
+                try_consume_frame(&buf, &mut headers, &mut body, &table),
+                FrameOutcome::Err(Error::BadResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn grease_frame_len_within_usize_needs_full_buffer() {
+        // A grease frame whose declared length fits `usize` but isn't fully
+        // buffered yet must report `NeedMore` (not consume a truncated count),
+        // confirming the length drives bounding correctly after the
+        // fits-in-usize conversion.
+        let mut buf = Vec::new();
+        // 0x21 is a reserved/grease frame type → the uncapped `_` arm.
+        Frame::encode_header(0x21, 4096, &mut buf);
+        // Only the header is present; the 4096-byte payload is not.
+        let mut headers = None;
+        let mut body = Vec::new();
+        let table = qpack::DynamicTable::new();
+        assert!(matches!(
+            try_consume_frame(&buf, &mut headers, &mut body, &table),
+            FrameOutcome::NeedMore
         ));
     }
 
