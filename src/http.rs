@@ -1503,8 +1503,14 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<Option<u64>> {
         }
         // A value may be a comma list (`5, 5`); split and validate each part.
         for part in v.split(',') {
-            let n: u64 = part
-                .trim()
+            // RFC 9112 §6.3: Content-Length is `1*DIGIT`. Reject a leading
+            // sign or any non-digit content; only surrounding whitespace
+            // (which `trim` removes) is tolerated.
+            let t = part.trim();
+            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Error::BadResponse(format!("bad Content-Length: {v:?}")));
+            }
+            let n: u64 = t
                 .parse()
                 .map_err(|_| Error::BadResponse(format!("bad Content-Length: {v:?}")))?;
             match seen {
@@ -1598,7 +1604,14 @@ fn read_chunked<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
             .split(';')
             .next()
             .unwrap_or("");
-        let size = usize::from_str_radix(size_str.trim(), 16)
+        // RFC 9112 §7.1: chunk-size is `1*HEXDIG`. Reject a leading sign or any
+        // non-hex content; only surrounding CR/LF/space the reader leaves
+        // (removed by `trim`) is tolerated.
+        let s = size_str.trim();
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::BadResponse(format!("bad chunk size: {size_str:?}")));
+        }
+        let size = usize::from_str_radix(s, 16)
             .map_err(|_| Error::BadResponse(format!("bad chunk size: {size_str:?}")))?;
         if body.len().saturating_add(size) > MAX_BODY_BYTES {
             return Err(Error::BadResponse("body too large".into()));
@@ -1810,6 +1823,20 @@ mod tests {
     }
 
     #[test]
+    fn content_length_signed_rejected() {
+        // RFC 9112 §6.3: a leading '+' is not `1*DIGIT`. Accepting it creates a
+        // framing differential vs strict upstreams (CL desync primitive).
+        let h = vec![("Content-Length".to_string(), "+5".to_string())];
+        assert!(parse_content_length(&h).is_err());
+    }
+
+    #[test]
+    fn content_length_plain_digits_ok() {
+        let h = vec![("Content-Length".to_string(), "5".to_string())];
+        assert_eq!(parse_content_length(&h).unwrap(), Some(5));
+    }
+
+    #[test]
     fn read_body_rejects_te_and_cl_together() {
         use std::io::Cursor;
         // A response advertising both chunked TE and a Content-Length is a
@@ -1896,6 +1923,46 @@ mod tests {
         let mut r = BufReader::new(Cursor::new(huge));
         let err = read_chunked(&mut r).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_chunked_rejects_signed_chunk_size() {
+        use std::io::Cursor;
+        // RFC 9112 §7.1: chunk-size is `1*HEXDIG`; a leading '+' must be
+        // rejected (chunked desync primitive vs strict upstreams).
+        let mut r = BufReader::new(Cursor::new(b"+a\r\n".to_vec()));
+        let err = read_chunked(&mut r).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_chunked_rejects_internal_junk_chunk_size() {
+        use std::io::Cursor;
+        // Internal whitespace/junk ("a b") survives `trim` and is not
+        // `1*HEXDIG`, so it must be rejected — `trim` only removes the
+        // surrounding CR/LF the reader leaves, never embedded junk.
+        let mut r = BufReader::new(Cursor::new(b"a b\r\n".to_vec()));
+        let err = read_chunked(&mut r).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_chunked_accepts_plain_hex_chunk_size() {
+        use std::io::Cursor;
+        // "a" (10) and "1f" (31) are valid hex chunk sizes. Feed two chunks
+        // and the terminating zero chunk; the body should concatenate cleanly.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"a\r\n"); // size 10
+        payload.extend_from_slice(b"0123456789\r\n");
+        payload.extend_from_slice(b"1f\r\n"); // size 31
+        payload.extend_from_slice(&[b'x'; 31]);
+        payload.extend_from_slice(b"\r\n");
+        payload.extend_from_slice(b"0\r\n\r\n");
+        let mut r = BufReader::new(Cursor::new(payload));
+        let body = read_chunked(&mut r).unwrap();
+        assert_eq!(body.len(), 10 + 31);
+        assert_eq!(&body[..10], b"0123456789");
+        assert!(body[10..].iter().all(|&b| b == b'x'));
     }
 
     #[test]
