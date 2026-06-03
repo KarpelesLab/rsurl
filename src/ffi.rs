@@ -61,6 +61,9 @@ pub enum RsurlOpt {
     Timeout = 6,
     /// const char* — User-Agent value.
     UserAgent = 7,
+    /// long — convert international (IDN) hostnames to punycode. Non-zero
+    /// (default) on, 0 off (curl `--no-idn`). No-op without the `idn` feature.
+    Idn = 8,
 }
 
 /// Status codes returned by the API.
@@ -85,6 +88,8 @@ struct Handle {
     body: Option<Vec<u8>>,
     connect_timeout_secs: Option<u64>,
     timeout_secs: Option<u64>,
+    /// Convert international (IDN) hostnames to punycode. On by default.
+    idn: bool,
     last_response: Option<Response>,
     /// Stable storage so C callers can read header values as NUL-terminated
     /// strings without us having to allocate per-call.
@@ -101,6 +106,7 @@ impl Handle {
             body: None,
             connect_timeout_secs: None,
             timeout_secs: None,
+            idn: true,
             last_response: None,
             header_buf: Vec::new(),
         }
@@ -205,7 +211,9 @@ pub unsafe extern "C" fn rsurl_easy_setopt_str(
                 None => h.headers.clear(),
             },
             RsurlOpt::PostFieldsString => h.body = s.map(|s| s.into_bytes()),
-            RsurlOpt::ConnectTimeout | RsurlOpt::Timeout => return RsurlCode::InvalidArg,
+            RsurlOpt::ConnectTimeout | RsurlOpt::Timeout | RsurlOpt::Idn => {
+                return RsurlCode::InvalidArg
+            }
         }
         RsurlCode::Ok
     })
@@ -229,6 +237,7 @@ pub extern "C" fn rsurl_easy_setopt_long(
         match opt {
             RsurlOpt::ConnectTimeout => h.connect_timeout_secs = secs,
             RsurlOpt::Timeout => h.timeout_secs = secs,
+            RsurlOpt::Idn => h.idn = value != 0,
             _ => return RsurlCode::InvalidArg,
         }
         RsurlCode::Ok
@@ -244,6 +253,7 @@ fn opt_from_int(v: c_int) -> Option<RsurlOpt> {
         5 => RsurlOpt::ConnectTimeout,
         6 => RsurlOpt::Timeout,
         7 => RsurlOpt::UserAgent,
+        8 => RsurlOpt::Idn,
         _ => return None,
     })
 }
@@ -272,6 +282,7 @@ pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
             Err(crate::Error::UnsupportedScheme(_)) => return RsurlCode::Unsupported,
             Err(_) => return RsurlCode::InvalidArg,
         };
+        req = req.idn(h.idn);
         for (k, v) in &h.headers {
             req = req.header(k, v);
         }

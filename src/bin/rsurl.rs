@@ -35,6 +35,7 @@
 //!     -u, --user <user:pass>   HTTP Basic auth credentials
 //!     -k, --insecure           don't verify the TLS certificate chain
 //!         --cacert <file>      PEM bundle to use instead of system trust
+//!         --no-idn             don't convert international (IDN) hostnames to punycode
 //!         --max-time <secs>    cap on the whole operation's wall time
 //!         --connect-timeout    cap on the TCP connect step
 //!         --http2              require HTTP/2 (ALPN h2); error if unavailable
@@ -85,6 +86,8 @@ struct Args {
     max_redirs: Option<u32>,
     basic_auth: Option<(String, String)>,
     insecure: bool,
+    /// `--no-idn`: do not convert international (IDN) hostnames to punycode.
+    no_idn: bool,
     cacert: Option<String>,
     max_time: Option<u64>,
     connect_timeout: Option<u64>,
@@ -970,7 +973,7 @@ fn assemble_form_body(parts: &[DataPart]) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
-    let parsed_url = match Url::parse(url) {
+    let mut parsed_url = match Url::parse(url) {
         Ok(u) => u,
         Err(e) => {
             if !args.silent {
@@ -979,6 +982,16 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             return 3;
         }
     };
+    // Normalise the host to ASCII/punycode (IDN) unless `--no-idn`. Done once
+    // here so non-HTTP dispatch, proxy-bypass matching, and `-O` output naming
+    // all see the same host the connection will use. (The HTTP path re-parses
+    // the URL string in `Request::new`, so it also gets `req.idn(...)` below.)
+    if let Err(e) = parsed_url.set_idn(!args.no_idn) {
+        if !args.silent {
+            eprintln!("rsurl: {e}");
+        }
+        return 3;
+    }
 
     // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
     // options (-X, -H, -d, ...) are ignored for them in this milestone.
@@ -1024,7 +1037,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
             return run_ssh(&parsed_url, args);
         }
-        return run_transfer(url, args);
+        return run_transfer(&parsed_url, args);
     }
 
     // Assemble the body up front so we know whether to default the method
@@ -1098,6 +1111,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
     if args.insecure {
         req = req.verify_tls(false);
+    }
+    if args.no_idn {
+        req = req.idn(false);
     }
     if let Some(path) = &args.cacert {
         req = req.ca_bundle(path);
@@ -1294,6 +1310,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 a.basic_auth = Some((u, p));
             }
             "-k" | "--insecure" => a.insecure = true,
+            "--no-idn" => a.no_idn = true,
             "--cacert" => a.cacert = Some(next_val(&mut it, arg)?),
             "--max-time" => {
                 let v = next_val(&mut it, arg)?;
@@ -1645,8 +1662,10 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
     }
 }
 
-fn run_transfer(url: &str, args: &Args) -> u8 {
-    match rsurl::transfer(url) {
+fn run_transfer(url: &Url, args: &Args) -> u8 {
+    // `url` is already IDN-normalised by `process_url`; dispatch the parsed URL
+    // directly so the host the caller chose (and `--no-idn`) is honoured.
+    match rsurl::transfer_url(url) {
         Ok(bytes) => {
             let mut out: Box<dyn Write> = match &args.output {
                 Some(path) if path != "-" => match File::create(path) {
@@ -1768,6 +1787,7 @@ Options:
   -u, --user <user:pass>   HTTP Basic auth credentials
   -k, --insecure           don't verify the TLS certificate chain
       --cacert <file>      PEM bundle to use instead of system trust
+      --no-idn             don't convert international (IDN) hostnames to punycode
       --max-time <secs>    cap on the whole operation's wall time
       --connect-timeout <secs>
                            cap on the TCP connect step

@@ -11,12 +11,20 @@ use crate::error::{Error, Result};
 use crate::url::Url;
 
 /// Run the default operation for the URL's scheme and return its payload.
+///
+/// International (IDN) hostnames are normalised to ASCII/punycode here (curl's
+/// default). To opt out, parse with [`Url::parse`], call
+/// [`Url::set_idn(false)`](Url::set_idn), and use [`transfer_url`].
 pub fn transfer(url_str: &str) -> Result<Vec<u8>> {
-    let url = Url::parse(url_str)?;
+    let mut url = Url::parse(url_str)?;
+    url.set_idn(true)?;
     transfer_url(&url)
 }
 
 /// Same as [`transfer`] but starts from an already-parsed URL.
+///
+/// The host is used as given — apply [`Url::set_idn`] first if you want IDN
+/// normalisation (or call [`transfer`], which does it for you).
 pub fn transfer_url(url: &Url) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
         "http" | "https" => crate::Request::get(&format!(

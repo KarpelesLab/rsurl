@@ -76,6 +76,10 @@ pub struct Request {
     /// `NO_PROXY` / `--noproxy`: case-insensitive suffix match against
     /// the request URL host. `*` means "everything bypasses".
     pub(crate) no_proxy: Vec<String>,
+    /// Convert international (IDN) hostnames to ASCII/punycode before use.
+    /// On by default (curl's behaviour); `false` is curl's `--no-idn`. A no-op
+    /// when the crate is built without the `idn` feature.
+    pub(crate) idn: bool,
 }
 
 /// Where to route HTTP(S) traffic through. Parsed from a curl-style proxy
@@ -145,6 +149,7 @@ impl Request {
             max_time: None,
             proxy: None,
             no_proxy: Vec::new(),
+            idn: true,
         })
     }
 
@@ -227,6 +232,14 @@ impl Request {
     /// Toggle TLS chain verification. `false` matches curl `-k`.
     pub fn verify_tls(mut self, on: bool) -> Self {
         self.verify_tls = on;
+        self
+    }
+
+    /// Toggle IDN (international hostname → punycode) conversion. On by
+    /// default; `false` matches curl `--no-idn`. No effect when the crate is
+    /// built without the `idn` feature.
+    pub fn idn(mut self, on: bool) -> Self {
+        self.idn = on;
         self
     }
 
@@ -342,6 +355,10 @@ impl Request {
         mut jar: Option<&mut crate::cookie::CookieJar>,
     ) -> Result<Response> {
         let mut req = self;
+        // Normalise the host to ASCII/punycode (IDN) once up front, so DNS,
+        // the `Host:` header, TLS SNI, and cookie matching all see the same
+        // ASCII host. Redirect targets are normalised the same way below.
+        req.url.set_idn(req.idn)?;
         let deadline = req.max_time.map(|d| std::time::Instant::now() + d);
         let mut hops_left = req.max_redirs;
         loop {
@@ -383,7 +400,11 @@ impl Request {
                 Some(l) => l.to_string(),
                 None => return Ok(resp), // 3xx without Location — give it back.
             };
-            let next_url = crate::url::resolve(&req.url, &location)?;
+            let mut next_url = crate::url::resolve(&req.url, &location)?;
+            // Apply the same IDN normalisation to the redirect target so the
+            // host-change check below and all downstream use compare/operate on
+            // the ASCII form (an absolute `Location` may carry a Unicode host).
+            next_url.set_idn(req.idn)?;
             let _ = writeln!(
                 trace,
                 "* Following redirect to {}",
@@ -777,7 +798,14 @@ pub(crate) fn h3_should_fall_back(e: &Error) -> bool {
 /// dispatch over one connection, intended for callers that want to fan out
 /// independent requests to one host. For the redirect/cookie-aware single
 /// request path, use [`Request::send`] and friends.
-pub fn send_multiplexed(reqs: Vec<Request>, trace: &mut dyn Write) -> Vec<Result<Response>> {
+pub fn send_multiplexed(mut reqs: Vec<Request>, trace: &mut dyn Write) -> Vec<Result<Response>> {
+    // This path has no redirect loop, so normalise each request's host to
+    // ASCII/punycode (IDN) here, before dispatch. Best-effort: an undecodable
+    // internationalised host is left raw and surfaces as a per-request
+    // connect error rather than failing the whole batch.
+    for req in &mut reqs {
+        let _ = req.url.set_idn(req.idn);
+    }
     crate::http2::send_multiplexed(reqs, trace)
 }
 

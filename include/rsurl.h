@@ -30,7 +30,9 @@ typedef enum {
     RSURLOPT_POSTFIELDSSTRING = 4,  /* const char* (UTF-8 body) */
     RSURLOPT_CONNECTTIMEOUT   = 5,  /* long seconds */
     RSURLOPT_TIMEOUT          = 6,  /* long seconds */
-    RSURLOPT_USERAGENT        = 7   /* const char* */
+    RSURLOPT_USERAGENT        = 7,  /* const char* */
+    RSURLOPT_IDN              = 8   /* long: 1 (default) convert IDN hosts to
+                                       punycode, 0 = off (curl --no-idn) */
 } rsurl_option_t;
 
 /* Status codes returned by API functions. */

@@ -151,7 +151,7 @@ downgrades to accept-any. Encrypted private keys reuse the `-u` password
 as the passphrase (there is no interactive prompt in this one-shot CLI).
 
 Supported curl-style flags include `-L`/`--location`, `--max-redirs`,
-`-u`/`--user`, `-k`/`--insecure`, `--cacert`, `--max-time`,
+`-u`/`--user`, `-k`/`--insecure`, `--cacert`, `--no-idn`, `--max-time`,
 `--connect-timeout`, `-O`/`--remote-name`, `-b`/`--cookie` /
 `-c`/`--cookie-jar` for Netscape-format cookie I/O, and `-x`/`--proxy`
 / `--proxy-user` / `--noproxy` for HTTP proxying. Body flags cover
@@ -207,6 +207,17 @@ rustls 0.23 + `ring` instead. The public API across `rsurl::tls` is
 identical between backends, so consumer code does not change. HTTP/3
 always uses purecrypto's TLS regardless of this feature, because the QUIC
 stack it sits on is part of `purecrypto`.
+
+### Internationalized domain names (IDN)
+
+International hostnames are normalized to ASCII/punycode (UTS-46, e.g.
+`müller.example` → `xn--mller-kva.example`) before DNS, the `Host:` header,
+and TLS SNI — matching curl. This is the default `idn` feature, backed by the
+pure-Rust `idna` crate (no C). Turn it off per request with `--no-idn`
+(CLI), `Request::idn(false)` (library), or `RSURLOPT_IDN = 0` (C FFI). To
+drop the capability and the `idna` dependency/tables from the build entirely,
+compile without default features, e.g.
+`cargo build --release --no-default-features --features purecrypto-tls`.
 
 ## License
 

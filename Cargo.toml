@@ -22,7 +22,7 @@ path = "src/bin/rsurl.rs"
 [features]
 # Default keeps the historical behaviour: a single TLS backend layered on
 # purecrypto, no extra C-free guarantees lost.
-default = ["purecrypto-tls"]
+default = ["purecrypto-tls", "idn"]
 # Use purecrypto's TLS stack (purecrypto::tls). No additional deps.
 purecrypto-tls = []
 # Use rustls 0.23 + ring instead. Enable with
@@ -31,6 +31,14 @@ purecrypto-tls = []
 # the cfg cascade in src/tls/mod.rs). HTTP/3 always uses purecrypto's TLS
 # regardless of this feature, because the QUIC stack is bound to it.
 rustls-tls = ["dep:rustls", "dep:rustls-pemfile"]
+# Internationalized Domain Name (IDN) support: normalise Unicode hostnames to
+# ASCII/punycode (UTS-46) before they hit DNS, the `Host:` header, and TLS SNI —
+# matching curl's default. On by default; build with `--no-default-features`
+# (plus a TLS backend) to drop both the code path and the `idna` dependency and
+# its Unicode tables. The runtime `--no-idn` flag / `Request::idn(false)` still
+# compile in either way (they no-op without this feature). `idna` is pure Rust
+# (no C), so the no-C-toolchain guarantee is preserved.
+idn = ["dep:idna"]
 
 [dependencies]
 # Required regardless of TLS backend: SHA1 + RNG (WebSocket, MQTT), X.509
@@ -69,6 +77,11 @@ puressh = { version = "0.0.3", default-features = false, features = ["client", "
 # The PSL data is embedded as pure-Rust tables, so the no-C-toolchain /
 # minimal-dependency guarantee stays intact.
 psl2 = { version = "0.1", default-features = false }
+# IDN / UTS-46 host normalisation (Unicode → punycode), behind the `idn`
+# feature. Pure Rust (no C / no `*-sys` crate); `compiled_data` ships the
+# Unicode tables and keeps `idna::domain_to_ascii` available with
+# `default-features = false`, so no extra transitive deps come along.
+idna = { version = "1", optional = true, default-features = false, features = ["alloc", "compiled_data"] }
 
 [profile.release]
 lto = "thin"

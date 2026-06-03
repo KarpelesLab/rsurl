@@ -161,6 +161,16 @@ impl Url {
             "https" | "ftps" | "imaps" | "pop3s" | "ldaps" | "gophers" | "mqtts" | "wss"
         )
     }
+
+    /// Normalise the host to its ASCII/punycode (IDN, UTS-46) form when
+    /// `enabled`. Idempotent and a no-op for ASCII hosts (IPv4, bracketed
+    /// IPv6, already-punycode names), when disabled, or when the crate is built
+    /// without the `idn` feature. Returns an error only for an undecodable
+    /// internationalised host. See [`crate::idn`].
+    pub fn set_idn(&mut self, enabled: bool) -> Result<()> {
+        self.host = crate::idn::to_ascii(&self.host, enabled)?;
+        Ok(())
+    }
 }
 
 /// Resolve a redirect target. `location` may be an absolute URL, a
@@ -510,6 +520,37 @@ mod tests {
         ] {
             let u = Url::parse(&format!("{s}://h")).unwrap();
             assert!(!u.is_tls(), "{s} should not be tls");
+        }
+    }
+
+    #[cfg(feature = "idn")]
+    #[test]
+    fn set_idn_punycodes_unicode_host() {
+        let mut u = Url::parse("http://münchen.de/weiß").unwrap();
+        u.set_idn(true).unwrap();
+        assert_eq!(u.host, "xn--mnchen-3ya.de");
+        // Only the host is normalised; the path is left as parsed.
+        assert_eq!(u.path, "/weiß");
+    }
+
+    #[test]
+    fn set_idn_disabled_leaves_host_raw() {
+        let mut u = Url::parse("http://münchen.de/").unwrap();
+        u.set_idn(false).unwrap();
+        assert_eq!(u.host, "münchen.de");
+    }
+
+    #[test]
+    fn set_idn_is_noop_for_ascii_and_ip_hosts() {
+        for (raw, host) in [
+            ("http://example.com/", "example.com"),
+            ("http://127.0.0.1:8080/", "127.0.0.1"),
+            ("http://[::1]:8080/", "[::1]"),
+            ("http://xn--mnchen-3ya.de/", "xn--mnchen-3ya.de"),
+        ] {
+            let mut u = Url::parse(raw).unwrap();
+            u.set_idn(true).unwrap();
+            assert_eq!(u.host, host, "ASCII/IP host must be unchanged: {raw}");
         }
     }
 }
