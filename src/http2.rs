@@ -116,6 +116,47 @@ const MAX_HEADERS_BUF: usize = 256 * 1024;
 /// a small compressed block can otherwise expand into a huge header list.
 const MAX_DECODED_HEADER_LIST: usize = 256 * 1024;
 
+// ---------------------------------------------------------------------------
+// Flood / no-progress budgets.
+//
+// The inbound frame loop (`drive_until_stream_done` / `run_multiplexed`) must
+// not be steerable into an unbounded spin or an unbounded cheap-control-frame
+// reply storm by a hostile peer. Flow control alone does not save us: an empty
+// (0-byte) DATA frame with no END_STREAM bills `consume(0)`, appends nothing
+// (so `MAX_RESPONSE_BYTES` never trips) and leaves the stream Open — the loop
+// would spin forever. SETTINGS / PING each force an ACK write+flush, and
+// RST_STREAM is the Rapid-Reset (CVE-2023-44487) primitive — all free to the
+// attacker, all unbounded without an explicit budget.
+//
+// These ceilings are deliberately far above anything a conformant server does
+// over the lifetime of a request batch, but low enough that a tight flood loop
+// trips within milliseconds. Exceeding any of them is treated as a fatal
+// protocol abuse and surfaced as `Error::BadResponse`.
+
+/// Maximum number of consecutive inbound frames that make NO forward progress
+/// before we declare the peer is spinning us and abort. "Progress" is any of:
+/// a DATA byte appended to a response body, a header block completed, or a
+/// WINDOW_UPDATE that raised a send window (see `frame_made_progress`). The
+/// counter resets to 0 on every such frame. Kills the empty-DATA spin and any
+/// other do-nothing frame loop. Generous: a legitimate server interleaves
+/// progress frames long before this.
+const MAX_NO_PROGRESS_FRAMES: u32 = 10_000;
+
+/// Maximum non-ACK SETTINGS frames we will accept on one connection. Each one
+/// costs us an ACK write+flush; a conformant server sends a handful (initial +
+/// the occasional reconfigure). Bounds the SETTINGS-flood reply storm.
+const MAX_SETTINGS_FRAMES: u32 = 2_000;
+
+/// Maximum non-ACK PING frames we will accept on one connection. Each one costs
+/// us a PONG write+flush. Bounds the PING-flood reply storm.
+const MAX_PING_FRAMES: u32 = 2_000;
+
+/// Maximum RST_STREAM frames we will accept on one connection. This is the
+/// Rapid-Reset (CVE-2023-44487) aggregate budget: even though we drive a small
+/// number of streams, an attacker controlling the server can spray RST_STREAM
+/// to churn our state. A legitimate server resets at most a few of our streams.
+const MAX_RST_STREAM_FRAMES: u32 = 2_000;
+
 /// Peer (server) SETTINGS values, with RFC 9113 defaults for any parameter
 /// the peer hasn't sent. We track all six standard parameters even if we
 /// don't yet act on each of them; future tasks will consume more.
@@ -1571,6 +1612,97 @@ struct Connection<S: Read + Write> {
     /// waiting on. While `Some(_)`, the peer is forbidden from interleaving
     /// any other frame (RFC 9113 §6.10).
     expecting_continuation: Option<u32>,
+    /// Per-connection flood / no-progress accounting. Updated by every inbound
+    /// frame via `process_frame`; trips `Error::BadResponse` once any budget is
+    /// exhausted. Shared by both the single-stream and multiplexed loops since
+    /// both funnel through `process_frame`.
+    budget: FloodBudget,
+    /// Set by a frame handler whenever the frame it processed made real forward
+    /// progress (a DATA byte appended, a header block completed, or a
+    /// WINDOW_UPDATE that raised a send window). `process_frame` reads and
+    /// clears it after each dispatch to drive the no-progress counter.
+    made_progress: bool,
+}
+
+/// Per-connection budget counters that bound hostile-peer frame floods. See the
+/// `MAX_*_FRAMES` / `MAX_NO_PROGRESS_FRAMES` constants for the rationale behind
+/// each ceiling.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FloodBudget {
+    /// Consecutive inbound frames that made no forward progress. Reset to 0 on
+    /// any progress frame; aborts at `MAX_NO_PROGRESS_FRAMES`.
+    no_progress: u32,
+    /// Total non-ACK SETTINGS frames received; aborts at `MAX_SETTINGS_FRAMES`.
+    settings: u32,
+    /// Total non-ACK PING frames received; aborts at `MAX_PING_FRAMES`.
+    ping: u32,
+    /// Total RST_STREAM frames received; aborts at `MAX_RST_STREAM_FRAMES`.
+    rst_stream: u32,
+}
+
+impl FloodBudget {
+    /// Bill the cheap-control-frame floods (SETTINGS / PING / RST_STREAM) for
+    /// one inbound frame. `typ`/`flags` are the frame header fields. Called
+    /// *before* dispatch so the budget counts a frame even when its handler
+    /// returns `Err` — critically, `process_rst` returns a per-stream error on
+    /// a successful reset, so billing RST_STREAM here (not after dispatch) is
+    /// what makes the Rapid-Reset (CVE-2023-44487) budget actually bite when
+    /// the peer resets *our* in-flight streams. Only variants that cost us a
+    /// reply or churn stream state are counted; ACKs and benign types are free.
+    fn record_control_frame(&mut self, typ: u8, flags: u8) -> Result<()> {
+        match typ {
+            F_SETTINGS if flags & FLAG_ACK == 0 => {
+                self.settings += 1;
+                if self.settings > MAX_SETTINGS_FRAMES {
+                    return Err(Error::BadResponse(format!(
+                        "http2: peer sent {} SETTINGS frames (flood)",
+                        self.settings
+                    )));
+                }
+            }
+            F_PING if flags & FLAG_ACK == 0 => {
+                self.ping += 1;
+                if self.ping > MAX_PING_FRAMES {
+                    return Err(Error::BadResponse(format!(
+                        "http2: peer sent {} PING frames (flood)",
+                        self.ping
+                    )));
+                }
+            }
+            F_RST_STREAM => {
+                self.rst_stream += 1;
+                if self.rst_stream > MAX_RST_STREAM_FRAMES {
+                    return Err(Error::BadResponse(format!(
+                        "http2: peer sent {} RST_STREAM frames (Rapid-Reset flood)",
+                        self.rst_stream
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// No-progress spin guard. `made_progress` is whether the just-dispatched
+    /// frame reported real forward progress (a DATA byte appended, a header
+    /// block completed, a WINDOW_UPDATE that raised a send window, or a
+    /// terminal `Done`). Any progress frame resets the streak; otherwise the
+    /// streak grows and we abort at `MAX_NO_PROGRESS_FRAMES`. Called after a
+    /// successful dispatch.
+    fn record_progress(&mut self, made_progress: bool) -> Result<()> {
+        if made_progress {
+            self.no_progress = 0;
+        } else {
+            self.no_progress += 1;
+            if self.no_progress > MAX_NO_PROGRESS_FRAMES {
+                return Err(Error::BadResponse(format!(
+                    "http2: peer sent {} consecutive frames with no forward progress (flood)",
+                    self.no_progress
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Result of dispatching one inbound frame.
@@ -1613,6 +1745,8 @@ impl<S: Read + Write> Connection<S> {
             next_stream_id: 1,
             goaway_received: None,
             expecting_continuation: None,
+            budget: FloodBudget::default(),
+            made_progress: false,
         })
     }
 
@@ -2260,10 +2394,29 @@ impl<S: Read + Write> Connection<S> {
             }
         }
 
-        if frame.stream_id == 0 {
-            return self.process_conn_frame(frame);
-        }
-        self.process_stream_frame(frame)
+        // Flood / no-progress accounting. Both the single-stream and
+        // multiplexed loops reach the wire through this method, so accounting
+        // here covers both paths. We snapshot `typ`/`flags` up front so the
+        // budget can be billed without cloning the payload.
+        let frame_typ = frame.typ;
+        let frame_flags = frame.flags;
+        // Cheap-control-frame floods are billed BEFORE dispatch: a successful
+        // RST_STREAM dispatch returns a per-stream `Err`, so billing it here
+        // (rather than after) is what makes the Rapid-Reset budget bite.
+        self.budget.record_control_frame(frame_typ, frame_flags)?;
+        // Handlers signal real forward progress by setting `self.made_progress`
+        // (cleared here before each dispatch); a terminal `Done` outcome also
+        // counts. The no-progress streak is judged only on a successful
+        // dispatch (an error already aborts, or is handled per-stream upstream).
+        self.made_progress = false;
+        let outcome = if frame.stream_id == 0 {
+            self.process_conn_frame(frame)
+        } else {
+            self.process_stream_frame(frame)
+        }?;
+        let progress = self.made_progress || matches!(outcome, DispatchOutcome::Done(_));
+        self.budget.record_progress(progress)?;
+        Ok(outcome)
     }
 
     /// Connection-scoped frames (stream_id == 0): SETTINGS / SETTINGS-ACK,
@@ -2316,6 +2469,9 @@ impl<S: Read + Write> Connection<S> {
             F_WINDOW_UPDATE => {
                 let inc = parse_window_update(&frame.payload)?;
                 self.conn_send_window.apply_window_update(inc)?;
+                // Raising the connection send window can unblock a stalled
+                // body: count as forward progress.
+                self.made_progress = true;
             }
             F_GOAWAY => {
                 // First 4 bytes of payload are the last-stream-id (high bit
@@ -2371,6 +2527,11 @@ impl<S: Read + Write> Connection<S> {
                 let inc = parse_window_update(&frame.payload)?;
                 if let Some(s) = self.streams.get_mut(&frame.stream_id) {
                     s.send_window.apply_window_update(inc)?;
+                    // Raising a live stream's send window can unblock a stalled
+                    // body: count as forward progress. A WINDOW_UPDATE on an
+                    // unknown / closed stream (dropped below) is NOT progress —
+                    // it must not be usable to defeat the no-progress guard.
+                    self.made_progress = true;
                 }
                 // WINDOW_UPDATE on an unknown / closed stream: silently drop.
                 Ok(DispatchOutcome::Continue)
@@ -2471,6 +2632,8 @@ impl<S: Read + Write> Connection<S> {
             s.response_headers = Some(decoded);
             s.state = new_state;
             self.expecting_continuation = None;
+            // A header block completed: forward progress.
+            self.made_progress = true;
         } else {
             s.state = new_state;
             self.expecting_continuation = Some(stream_id);
@@ -2517,6 +2680,8 @@ impl<S: Read + Write> Connection<S> {
                 s.response_headers = Some(decoded);
             }
             self.expecting_continuation = None;
+            // A header block completed: forward progress.
+            self.made_progress = true;
         }
         let done = matches!(
             self.streams.get(&stream_id).unwrap().state,
@@ -2607,11 +2772,20 @@ impl<S: Read + Write> Connection<S> {
                 "response body exceeds size limit".into(),
             ));
         }
+        // A real body byte landed: this frame made forward progress, so it
+        // resets the no-progress flood counter. An empty DATA frame appends
+        // nothing and is (correctly) NOT counted as progress — that is exactly
+        // the empty-DATA spin we are guarding against. (Recorded after the
+        // `s` borrow ends, below.)
+        let appended_body = !payload.is_empty();
         s.body.extend_from_slice(payload);
         if end_stream {
             s.end_stream_recv = true;
         }
         s.state = new_state;
+        if appended_body {
+            self.made_progress = true;
+        }
 
         // Replenish either window if it's dropped below half. Both checks are
         // independent — a single large DATA frame can fire both.
@@ -4504,6 +4678,8 @@ mod tests {
             next_stream_id: 1,
             goaway_received: None,
             expecting_continuation: None,
+            budget: FloodBudget::default(),
+            made_progress: false,
         }
     }
 
@@ -4814,6 +4990,140 @@ mod tests {
             conn.streams.get(&id).unwrap().body.len(),
             MAX_RESPONSE_BYTES - 2
         );
+    }
+
+    #[test]
+    fn empty_data_flood_is_bounded() {
+        // The empty-DATA spin: a 0-byte DATA frame with no END_STREAM bills
+        // consume(0), appends nothing (MAX_RESPONSE_BYTES never trips) and
+        // leaves the stream Open. Without a no-progress guard the frame loop
+        // would accept these forever. We must abort after
+        // MAX_NO_PROGRESS_FRAMES.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        conn.process_frame(synth_status_200_headers(id, false))
+            .unwrap();
+        // The HEADERS above completed a block → progress, so the streak starts
+        // fresh. Feed empty DATA frames until the guard fires.
+        let mut err = None;
+        for _ in 0..(MAX_NO_PROGRESS_FRAMES as usize + 10) {
+            match conn.process_frame(synth_data(id, b"", false)) {
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("empty-DATA flood was not bounded");
+        match err {
+            Error::BadResponse(m) => {
+                assert!(m.contains("no forward progress"), "unexpected message: {m}")
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+        // The stream is still Open with an empty body — proving the abort came
+        // from the flood guard, not from any flow-control / body-cap path.
+        assert_eq!(conn.streams.get(&id).unwrap().body.len(), 0);
+        assert_eq!(conn.streams.get(&id).unwrap().state, StreamState::Open);
+    }
+
+    #[test]
+    fn body_byte_resets_no_progress_counter() {
+        // A single real DATA byte must reset the no-progress streak so a server
+        // that legitimately interleaves small bodies with other frames is never
+        // tripped. Bring the counter near the ceiling, then a 1-byte DATA frame
+        // should let us go another full window of no-progress frames.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        conn.process_frame(synth_status_200_headers(id, false))
+            .unwrap();
+
+        for _ in 0..(MAX_NO_PROGRESS_FRAMES - 1) {
+            conn.process_frame(synth_data(id, b"", false)).unwrap();
+        }
+        assert_eq!(conn.budget.no_progress, MAX_NO_PROGRESS_FRAMES - 1);
+        // One real byte resets the streak.
+        conn.process_frame(synth_data(id, b"x", false)).unwrap();
+        assert_eq!(conn.budget.no_progress, 0);
+        assert_eq!(conn.streams.get(&id).unwrap().body, b"x");
+    }
+
+    #[test]
+    fn settings_flood_is_bounded() {
+        // Every non-ACK SETTINGS forces an ACK write+flush. An unbounded stream
+        // must be rejected after MAX_SETTINGS_FRAMES. Use an empty payload so
+        // each frame is a trivially-valid no-op reconfigure.
+        let mut conn = fake_conn();
+        let mut err = None;
+        for _ in 0..(MAX_SETTINGS_FRAMES as usize + 10) {
+            let f = Frame {
+                typ: F_SETTINGS,
+                flags: 0,
+                stream_id: 0,
+                payload: Vec::new(),
+            };
+            if let Err(e) = conn.process_frame(f) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err.expect("SETTINGS flood was not bounded") {
+            Error::BadResponse(m) => {
+                assert!(m.contains("SETTINGS"), "unexpected message: {m}")
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_flood_is_bounded() {
+        // Every non-ACK PING forces a PONG write+flush; bound it.
+        let mut conn = fake_conn();
+        let mut err = None;
+        for _ in 0..(MAX_PING_FRAMES as usize + 10) {
+            let f = Frame {
+                typ: F_PING,
+                flags: 0,
+                stream_id: 0,
+                payload: vec![0u8; 8],
+            };
+            if let Err(e) = conn.process_frame(f) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err.expect("PING flood was not bounded") {
+            Error::BadResponse(m) => assert!(m.contains("PING"), "unexpected message: {m}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rst_stream_flood_is_bounded() {
+        // Rapid-Reset (CVE-2023-44487): RST_STREAM on unknown streams is
+        // individually harmless (ignored) but must carry an aggregate budget so
+        // a hostile server cannot churn us indefinitely. Target unknown stream
+        // ids so each frame returns Ok(Continue) until the budget trips.
+        let mut conn = fake_conn();
+        let mut err = None;
+        for i in 0..(MAX_RST_STREAM_FRAMES as usize + 10) {
+            // Unknown odd stream id (never opened) → process_rst returns
+            // Continue; only the flood budget can stop the loop.
+            let f = synth_rst((2 * i as u32) + 1001, 0);
+            if let Err(e) = conn.process_frame(f) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err.expect("RST_STREAM flood was not bounded") {
+            Error::BadResponse(m) => {
+                assert!(m.contains("RST_STREAM"), "unexpected message: {m}")
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
     }
 
     #[test]
