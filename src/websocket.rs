@@ -40,7 +40,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use compcol::deflate::Deflate;
 use compcol::limit::LimitedDecoder;
@@ -67,6 +67,14 @@ const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
 
 const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Wall-clock budget for reading the *entire* HTTP/1.1 upgrade-handshake
+/// response header. The per-`read` socket timeout (`set_read_timeout`, ~60 s)
+/// only bounds an individual syscall, so a server that dribbles one byte just
+/// under that timeout could otherwise hold the connection for up to the 64 KiB
+/// header cap × ~60 s — a slowloris-style hold. This deadline caps the whole
+/// header read regardless of how the bytes are paced.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The permessage-deflate offer we put in the upgrade request. We advertise
 /// `client_no_context_takeover` and `server_no_context_takeover` so each
@@ -272,21 +280,7 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
     // Read the response headers byte-by-byte so we don't over-read into the
     // post-handshake WS frame stream. RFC 6455 requires the response end at
     // \r\n\r\n with no extra data, so this is fine.
-    let mut buf: Vec<u8> = Vec::with_capacity(512);
-    loop {
-        let mut b = [0u8; 1];
-        let n = stream.read(&mut b)?;
-        if n == 0 {
-            return Err(Error::UnexpectedEof);
-        }
-        buf.push(b[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-            break;
-        }
-        if buf.len() > 64 * 1024 {
-            return Err(Error::BadResponse("handshake response too large".into()));
-        }
-    }
+    let buf = read_handshake_head(stream, HANDSHAKE_DEADLINE)?;
 
     let head = std::str::from_utf8(&buf)
         .map_err(|_| Error::BadResponse("non-utf8 handshake response".into()))?;
@@ -362,6 +356,43 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
     let pmd = extensions_value.as_deref().and_then(parse_pmd_response);
 
     Ok(pmd)
+}
+
+/// Read the HTTP/1.1 upgrade-handshake response header off `stream`, one byte
+/// at a time, stopping at the `\r\n\r\n` terminator. Reading byte-by-byte is
+/// deliberate: it must not consume any byte past the terminator, since those
+/// bytes are the start of the first WS frame and would be lost.
+///
+/// Three independent limits bound the read:
+///   * the per-`read` socket timeout (set on the stream), which caps a single
+///     syscall;
+///   * a 64 KiB size cap, which bounds memory; and
+///   * `deadline`, a wall-clock budget for the *whole* header read, which
+///     defeats a slowloris-style drip (one byte just under the socket timeout,
+///     repeated up to the size cap) that the other two limits do not catch.
+fn read_handshake_head<S: Read>(stream: &mut S, deadline: Duration) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    let start = Instant::now();
+    loop {
+        let mut b = [0u8; 1];
+        let n = stream.read(&mut b)?;
+        if n == 0 {
+            return Err(Error::UnexpectedEof);
+        }
+        buf.push(b[0]);
+        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+            break;
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(Error::BadResponse("handshake response too large".into()));
+        }
+        if start.elapsed() > deadline {
+            return Err(Error::BadResponse(
+                "handshake response timed out (header read exceeded deadline)".into(),
+            ));
+        }
+    }
+    Ok(buf)
 }
 
 /// Parse a `Sec-WebSocket-Extensions` response value and, if it selects
@@ -952,6 +983,58 @@ mod tests {
             frames.push((opcode, payload));
         }
         frames
+    }
+
+    /// A stream that drips one byte per `read`, sleeping `per_read` first, and
+    /// never emits the `\r\n\r\n` terminator — modelling a slowloris server.
+    /// Used to exercise the wall-clock handshake deadline without a socket.
+    struct DripStream {
+        per_read: Duration,
+    }
+
+    impl Read for DripStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.per_read);
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = b'X'; // never completes "\r\n\r\n"
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn handshake_head_reads_up_to_terminator_without_overreading() {
+        // Response header followed by the first WS frame's bytes. The reader
+        // must stop exactly at \r\n\r\n and leave the frame bytes unread.
+        let head = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        let frame = [0x81u8, 0x02, b'h', b'i'];
+        let mut inbound = head.to_vec();
+        inbound.extend_from_slice(&frame);
+        let mut s = MockStream::new(inbound);
+
+        let got = read_handshake_head(&mut s, Duration::from_secs(60)).expect("reads header");
+        assert_eq!(&got, head, "must capture exactly the header, no frame bytes");
+
+        // The frame bytes must remain in the stream for the frame reader.
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).expect("drain remainder");
+        assert_eq!(rest, frame, "first-frame bytes must not be consumed");
+    }
+
+    #[test]
+    fn handshake_head_deadline_trips_on_slow_drip() {
+        // ~5 ms per byte against a 20 ms deadline: the wall-clock budget must
+        // fire well before the 64 KiB size cap (which would need 64Ki reads).
+        let mut s = DripStream {
+            per_read: Duration::from_millis(5),
+        };
+        let err = read_handshake_head(&mut s, Duration::from_millis(20))
+            .expect_err("slow drip must hit the deadline");
+        match err {
+            Error::BadResponse(m) => assert!(m.contains("timed out"), "unexpected message: {m}"),
+            other => panic!("wrong error: {other:?}"),
+        }
     }
 
     #[test]
