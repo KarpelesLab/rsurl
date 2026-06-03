@@ -518,6 +518,11 @@ fn parse_pasv(text: &str) -> Option<(String, u16)> {
     }
     let host = format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]);
     let port = ((nums[4] as u8 as u16) << 8) | nums[5] as u8 as u16;
+    // Port 0 is not a dialable data port; treat it as a malformed reply
+    // rather than attempting an odd connect.
+    if port == 0 {
+        return None;
+    }
     Some((host, port))
 }
 
@@ -552,7 +557,12 @@ fn parse_epsv(text: &str) -> Option<u16> {
     let s = start?;
     let e = end?;
     let port_str: String = bytes[s..e].iter().collect();
-    port_str.parse().ok()
+    let port: u16 = port_str.parse().ok()?;
+    // Port 0 is not a dialable data port; treat it as a malformed reply.
+    if port == 0 {
+        return None;
+    }
+    Some(port)
 }
 
 /// Split `user[:pass]` into `(user, pass)`, defaulting to anonymous /
@@ -661,6 +671,12 @@ mod tests {
         assert_eq!(port, 65535);
     }
 
+    #[test]
+    fn pasv_rejects_port_zero() {
+        // Both port bytes zero → port 0, which isn't a dialable data port.
+        assert!(parse_pasv("(10,0,0,1,0,0)").is_none());
+    }
+
     /// Scripted in-memory transport: serves `reply_script` to reads and
     /// records everything written so tests can assert on commands sent.
     struct MockIo {
@@ -752,6 +768,12 @@ mod tests {
     fn epsv_rejects_garbage() {
         assert!(parse_epsv("nope").is_none());
         assert!(parse_epsv("(|||abc|)").is_none());
+    }
+
+    #[test]
+    fn epsv_rejects_port_zero() {
+        // A server advertising port 0 isn't dialable; treat it as malformed.
+        assert!(parse_epsv("(|||0|)").is_none());
     }
 
     #[test]
