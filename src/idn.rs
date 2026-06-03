@@ -23,8 +23,29 @@ use crate::error::Error;
 pub(crate) fn to_ascii(host: &str, enabled: bool) -> Result<String> {
     #[cfg(feature = "idn")]
     if enabled && !host.is_ascii() {
-        return idna::domain_to_ascii(host)
-            .map_err(|_| Error::InvalidUrl(format!("invalid IDN host: {host}")));
+        let ascii = idna::domain_to_ascii(host)
+            .map_err(|_| Error::InvalidUrl(format!("invalid IDN host: {host}")))?;
+        // UTS-46 / `domain_to_ascii` runs with UseSTD3ASCIIRules=false, so it
+        // happily maps fullwidth/compatibility code points onto ASCII
+        // authority delimiters (e.g. U+FF20 `＠` → `@`, U+FF0F `／` → `/`,
+        // U+FF1A `：` → `:`). That output is written straight back into
+        // `Url::host` AFTER parse-time validation, so without re-checking it an
+        // attacker can smuggle a delimiter past the parser and trigger
+        // origin/host confusion (DNS, SNI, `Host:` header, proxy request line,
+        // pool key). A legitimate punycode/ASCII hostname is only letters,
+        // digits, hyphens, and dots — none of the bytes below — so reject any
+        // encoded output that still carries one. This branch never sees a
+        // bracketed IPv6 literal (those are ASCII and skip the encoder), so
+        // rejecting `:` here is safe.
+        if ascii.bytes().any(|b| {
+            b < 0x20
+                || matches!(b, 0x7f | b' ' | b'/' | b'\\' | b'@' | b':' | b'?' | b'#' | b'%')
+        }) {
+            return Err(Error::InvalidUrl(format!(
+                "IDN host encodes to a forbidden authority delimiter: {host}"
+            )));
+        }
+        return Ok(ascii);
     }
     let _ = enabled;
     Ok(host.to_string())
@@ -58,5 +79,35 @@ mod tests {
     #[test]
     fn disabled_leaves_unicode_raw() {
         assert_eq!(to_ascii("münchen.de", false).unwrap(), "münchen.de");
+    }
+
+    /// UTS-46 with UseSTD3ASCIIRules=false maps fullwidth/compatibility code
+    /// points onto ASCII authority delimiters. Each of these must be rejected
+    /// after IDN encoding so the delimiter cannot be smuggled past parse-time
+    /// host validation (origin/host-confusion hardening).
+    #[cfg(feature = "idn")]
+    #[test]
+    fn rejects_idn_authority_delimiter_injection() {
+        for input in [
+            "＠evil.com",          // U+FF20 -> '@'
+            "good.com／../evil.com", // U+FF0F -> '/'
+            "good.com：8080",       // U+FF1A -> ':'
+            "evil＃.com",           // U+FF03 -> '#'
+            "x？y.com",             // U+FF1F -> '?'
+        ] {
+            assert!(
+                to_ascii(input, true).is_err(),
+                "IDN delimiter injection must be rejected: {input:?}"
+            );
+        }
+    }
+
+    /// The guard must not break legitimate internationalised or ASCII hosts.
+    #[cfg(feature = "idn")]
+    #[test]
+    fn legitimate_hosts_still_succeed_after_guard() {
+        assert_eq!(to_ascii("münchen.de", true).unwrap(), "xn--mnchen-3ya.de");
+        // Already-ASCII host is untouched.
+        assert_eq!(to_ascii("example.com", true).unwrap(), "example.com");
     }
 }
