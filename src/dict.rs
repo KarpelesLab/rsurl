@@ -127,15 +127,28 @@ fn reject_control_bytes(value: &str, field: &str, path: &str) -> Result<()> {
 /// Returns the code as an integer and the trailing message text.
 fn parse_status(line: &str) -> Result<(u16, &str)> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    if trimmed.len() < 3 {
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 3 {
         return Err(Error::BadResponse(format!(
             "dict: short status line '{trimmed}'"
         )));
     }
-    let (code_str, rest) = trimmed.split_at(3);
-    let code: u16 = code_str
-        .parse()
-        .map_err(|_| Error::BadResponse(format!("dict: non-numeric status '{trimmed}'")))?;
+    // A DICT status code is exactly three ASCII digits. Operating on the byte
+    // slice (rather than `split_at(3)`) avoids panicking when byte index 3
+    // falls inside a multibyte UTF-8 codepoint in hostile server input.
+    let code_bytes = &bytes[..3];
+    if !code_bytes.iter().all(|b| b.is_ascii_digit()) {
+        return Err(Error::BadResponse(format!(
+            "dict: non-numeric status '{trimmed}'"
+        )));
+    }
+    // Safe: the three bytes are ASCII digits, so this is valid UTF-8 and a
+    // char boundary, meaning `trimmed[3..]` is also well-formed.
+    let code: u16 = std::str::from_utf8(code_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| Error::BadResponse(format!("dict: non-numeric status '{trimmed}'")))?;
+    let rest = &trimmed[3..];
     // Skip a single space separator if present.
     let msg = rest.strip_prefix(' ').unwrap_or(rest);
     Ok((code, msg))
@@ -393,6 +406,25 @@ mod tests {
     fn parse_status_rejects_garbage() {
         assert!(parse_status("OK\r\n").is_err());
         assert!(parse_status("ab").is_err());
+    }
+
+    #[test]
+    fn parse_status_does_not_panic_on_multibyte_boundary() {
+        // A hostile server could send a status line where byte index 3 falls
+        // inside a multibyte UTF-8 codepoint (here "é" is two bytes, so byte 3
+        // is mid-character). This must return an error, never panic.
+        let err = parse_status("ééX\r\n").unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)));
+        // A leading multibyte char that does land on a boundary at 3 but is not
+        // a digit must also be rejected cleanly (é = 0xC3 0xA9, plus 'X').
+        assert!(parse_status("éX\r\n").is_err());
+    }
+
+    #[test]
+    fn parse_status_normal_line_still_works() {
+        let (code, msg) = parse_status("220 ok\r\n").unwrap();
+        assert_eq!(code, 220);
+        assert_eq!(msg, "ok");
     }
 
     #[test]
