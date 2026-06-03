@@ -110,7 +110,7 @@ fn connect_handshake<S: Read + Write>(
     pass: Option<&str>,
 ) -> Result<()> {
     let client_id = random_client_id();
-    let connect = build_connect(&client_id, user, pass, 60);
+    let connect = build_connect(&client_id, user, pass, 60)?;
     stream.write_all(&connect)?;
     stream.flush()?;
 
@@ -146,7 +146,7 @@ fn run_publish<S: Read + Write>(
     // PUBACK) for QoS > 0. We always use 1 since this is a single, one-shot
     // publish per connection.
     let packet_id = 1u16;
-    let publish = build_publish(topic, payload, qos, packet_id);
+    let publish = build_publish(topic, payload, qos, packet_id)?;
     stream.write_all(&publish)?;
     stream.flush()?;
 
@@ -191,7 +191,7 @@ fn run_session<S: Read + Write>(
     connect_handshake(stream, user, pass)?;
 
     // SUBSCRIBE with packet id 1, single topic at QoS 0.
-    let subscribe = build_subscribe(1, topic);
+    let subscribe = build_subscribe(1, topic)?;
     stream.write_all(&subscribe)?;
     stream.flush()?;
 
@@ -267,14 +267,38 @@ fn hex_nibble(n: u8) -> char {
     }
 }
 
+/// Reject a URL-derived string containing NUL or any other ASCII control byte
+/// before it's framed into an MQTT packet. MQTT v3.1.1 §1.5.3 forbids NUL
+/// (U+0000) in any UTF-8 string, and control bytes in the username/password
+/// have no legitimate use — rejecting them mirrors the `reject_ctl` guards in
+/// the imap/pop3 modules and avoids smuggling framing bytes onto the wire.
+/// `what` names the field for the error message (credentials are not echoed).
+fn reject_ctl(s: &str, what: &str) -> Result<()> {
+    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+        return Err(Error::BadResponse(format!(
+            "mqtt: {what} contains illegal control byte {b:#04x}"
+        )));
+    }
+    Ok(())
+}
+
 /// Append `s` to `out` prefixed by its UTF-8 byte length as a big-endian u16.
-/// MQTT v3.1.1 caps any single string at 65535 bytes; longer strings are
-/// truncated here defensively (callers control these values).
-fn push_str(out: &mut Vec<u8>, s: &str) {
+/// MQTT v3.1.1 caps any single string at 65535 bytes. A longer string cannot
+/// be framed correctly, so we reject it rather than silently truncate (which
+/// would put a wrong length prefix on the wire and corrupt the packet).
+fn push_str(out: &mut Vec<u8>, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize) as u16;
+    if bytes.len() > u16::MAX as usize {
+        return Err(Error::BadResponse(format!(
+            "mqtt: string of {} bytes exceeds MQTT maximum of {} bytes",
+            bytes.len(),
+            u16::MAX
+        )));
+    }
+    let len = bytes.len() as u16;
     out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&bytes[..len as usize]);
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// Build the full bytes of a CONNECT packet (fixed header + variable header +
@@ -284,10 +308,20 @@ pub(crate) fn build_connect(
     user: Option<&str>,
     pass: Option<&str>,
     keep_alive_secs: u16,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
+    // Reject control bytes in URL-derived credentials before they reach the
+    // wire (NUL is outright illegal in MQTT strings; other control bytes have
+    // no legitimate use). The client id is locally generated, so it's trusted.
+    if let Some(u) = user {
+        reject_ctl(u, "username")?;
+    }
+    if let Some(p) = pass {
+        reject_ctl(p, "password")?;
+    }
+
     // Variable header.
     let mut vh = Vec::new();
-    push_str(&mut vh, "MQTT");
+    push_str(&mut vh, "MQTT")?;
     vh.push(4); // Protocol level: MQTT v3.1.1
     let mut flags: u8 = 0x02; // clean session
     if user.is_some() {
@@ -301,12 +335,12 @@ pub(crate) fn build_connect(
 
     // Payload.
     let mut pl = Vec::new();
-    push_str(&mut pl, client_id);
+    push_str(&mut pl, client_id)?;
     if let Some(u) = user {
-        push_str(&mut pl, u);
+        push_str(&mut pl, u)?;
     }
     if let Some(p) = pass {
-        push_str(&mut pl, p);
+        push_str(&mut pl, p)?;
     }
 
     let mut out = Vec::with_capacity(2 + vh.len() + pl.len());
@@ -314,14 +348,14 @@ pub(crate) fn build_connect(
     write_remaining_length(&mut out, vh.len() + pl.len());
     out.extend_from_slice(&vh);
     out.extend_from_slice(&pl);
-    out
+    Ok(out)
 }
 
 /// Build a SUBSCRIBE for a single `topic` at QoS 0.
-pub(crate) fn build_subscribe(packet_id: u16, topic: &str) -> Vec<u8> {
+pub(crate) fn build_subscribe(packet_id: u16, topic: &str) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     body.extend_from_slice(&packet_id.to_be_bytes());
-    push_str(&mut body, topic);
+    push_str(&mut body, topic)?;
     body.push(0x00); // QoS 0
 
     let mut out = Vec::with_capacity(2 + body.len());
@@ -329,7 +363,7 @@ pub(crate) fn build_subscribe(packet_id: u16, topic: &str) -> Vec<u8> {
     out.push((PKT_SUBSCRIBE << 4) | 0x02); // 0x82
     write_remaining_length(&mut out, body.len());
     out.extend_from_slice(&body);
-    out
+    Ok(out)
 }
 
 /// Reject a topic that is not a valid MQTT *publish* topic name.
@@ -370,9 +404,14 @@ fn validate_publish_topic(topic: &str) -> Result<()> {
 /// remaining length. Variable header: the UTF-8 length-prefixed topic name,
 /// followed — only when `qos > 0` — by the 2-byte packet identifier. Payload:
 /// the body bytes verbatim. For QoS 0 the `packet_id` argument is ignored.
-pub(crate) fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: u16) -> Vec<u8> {
+pub(crate) fn build_publish(
+    topic: &str,
+    payload: &[u8],
+    qos: u8,
+    packet_id: u16,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
-    push_str(&mut body, topic);
+    push_str(&mut body, topic)?;
     if qos > 0 {
         body.extend_from_slice(&packet_id.to_be_bytes());
     }
@@ -384,7 +423,7 @@ pub(crate) fn build_publish(topic: &str, payload: &[u8], qos: u8, packet_id: u16
     out.push((PKT_PUBLISH << 4) | ((qos & 0x03) << 1));
     write_remaining_length(&mut out, body.len());
     out.extend_from_slice(&body);
-    out
+    Ok(out)
 }
 
 /// Parse a PUBACK (type 4) body and return its packet identifier. The body is
@@ -608,7 +647,7 @@ mod tests {
         //   00 03 'a' 'b' 'c'        -- client id
         // Remaining length = 15 = 0x0F
         // Fixed header: 0x10 0x0F
-        let got = build_connect("abc", None, None, 60);
+        let got = build_connect("abc", None, None, 60).unwrap();
         let expected: Vec<u8> = vec![
             0x10, 0x0F, // fixed header: CONNECT, remaining length 15
             0x00, 0x04, b'M', b'Q', b'T', b'T', // protocol name
@@ -622,7 +661,7 @@ mod tests {
 
     #[test]
     fn build_connect_sets_user_and_password_flags() {
-        let got = build_connect("id", Some("u"), Some("p"), 30);
+        let got = build_connect("id", Some("u"), Some("p"), 30).unwrap();
         // Variable header (10):
         //   00 04 M Q T T  04  C2  00 1E
         //     flags = 0x02 | 0x80 (user) | 0x40 (pass) = 0xC2
@@ -642,7 +681,7 @@ mod tests {
         //   fixed: 0x82, rem-length
         //   body: 00 01 (packet id), 00 03 'a' '/' 'b' (topic), 00 (QoS 0)
         //   body length = 2 + 5 + 1 = 8
-        let got = build_subscribe(1, "a/b");
+        let got = build_subscribe(1, "a/b").unwrap();
         let expected: Vec<u8> = vec![0x82, 0x08, 0x00, 0x01, 0x00, 0x03, b'a', b'/', b'b', 0x00];
         assert_eq!(got, expected);
     }
@@ -653,11 +692,11 @@ mod tests {
         //   fixed: 0x30 (type 3, flags 0), rem-length
         //   body: 00 03 't' 'o' 'p' (topic)  'P' 'A' 'Y' (payload)
         //   body length = 5 + 3 = 8
-        let got = build_publish("top", b"PAY", 0, 1);
+        let got = build_publish("top", b"PAY", 0, 1).unwrap();
         let expected: Vec<u8> = vec![0x30, 0x08, 0x00, 0x03, b't', b'o', b'p', b'P', b'A', b'Y'];
         assert_eq!(got, expected);
         // QoS 0 ignores the packet id entirely: changing it does not move bytes.
-        assert_eq!(build_publish("top", b"PAY", 0, 9999), expected);
+        assert_eq!(build_publish("top", b"PAY", 0, 9999).unwrap(), expected);
     }
 
     #[test]
@@ -666,7 +705,7 @@ mod tests {
         //   fixed: 0x32 (type 3, QoS bit = (1<<1)), rem-length
         //   body: 00 03 't' 'o' 'p' (topic)  00 07 (packet id)  'P' 'A' 'Y'
         //   body length = 5 + 2 + 3 = 10
-        let got = build_publish("top", b"PAY", 1, 7);
+        let got = build_publish("top", b"PAY", 1, 7).unwrap();
         let expected: Vec<u8> = vec![
             0x32, 0x0A, 0x00, 0x03, b't', b'o', b'p', 0x00, 0x07, b'P', b'A', b'Y',
         ];
@@ -678,7 +717,7 @@ mod tests {
         // A payload that needs a 2-byte remaining-length varint exercises the
         // framing end to end: build, then re-read with read_packet.
         let payload = vec![0xABu8; 5000];
-        let pkt = build_publish("t", &payload, 0, 1);
+        let pkt = build_publish("t", &payload, 0, 1).unwrap();
         // Fixed header byte then varint then body; feed through the reader.
         let mut cur = std::io::Cursor::new(&pkt);
         let (ctype, body) = read_packet(&mut cur).expect("read PUBLISH");
@@ -715,7 +754,7 @@ mod tests {
         let (c0, _) = read_packet(&mut cur).expect("connect");
         assert_eq!(c0, PKT_CONNECT);
         let publish_start = cur.position() as usize;
-        let expected_publish = build_publish("a/b", b"hello", 1, 1);
+        let expected_publish = build_publish("a/b", b"hello", 1, 1).unwrap();
         assert_eq!(
             &written[publish_start..publish_start + expected_publish.len()],
             expected_publish.as_slice()
@@ -750,6 +789,47 @@ mod tests {
         // Ordinary hierarchical topics are accepted.
         assert!(validate_publish_topic("a/b/c").is_ok());
         assert!(validate_publish_topic("home/kitchen/temp").is_ok());
+    }
+
+    #[test]
+    fn reject_ctl_flags_control_bytes() {
+        assert!(reject_ctl("alice", "username").is_ok());
+        assert!(reject_ctl("p@ss:word!", "password").is_ok());
+        assert!(reject_ctl("alice\0", "password").is_err());
+        assert!(reject_ctl("alice\r\nx", "username").is_err());
+        assert!(reject_ctl("alice\npass", "username").is_err());
+        assert!(reject_ctl("alice\x7f", "password").is_err());
+    }
+
+    #[test]
+    fn build_connect_rejects_control_byte_in_password() {
+        // A NUL (or any control byte) in the password must be refused rather
+        // than framed onto the wire.
+        match build_connect("id", Some("user"), Some("pa\0ss"), 30) {
+            Err(Error::BadResponse(m)) => assert!(m.contains("control byte"), "got {m}"),
+            other => panic!("expected BadResponse(control byte), got {other:?}"),
+        }
+        // A control byte in the username is likewise rejected.
+        assert!(build_connect("id", Some("u\r\nser"), None, 30).is_err());
+    }
+
+    #[test]
+    fn push_str_rejects_overlong_string() {
+        // A string longer than the MQTT 16-bit length prefix can encode must
+        // error instead of silently truncating (which would put a wrong length
+        // on the wire and corrupt every following byte).
+        let mut out = Vec::new();
+        let huge = "x".repeat(u16::MAX as usize + 1);
+        match push_str(&mut out, &huge) {
+            Err(Error::BadResponse(m)) => assert!(m.contains("exceeds"), "got {m}"),
+            other => panic!("expected BadResponse(exceeds), got {other:?}"),
+        }
+        // A string at exactly the maximum is accepted and framed.
+        let mut out2 = Vec::new();
+        let max = "y".repeat(u16::MAX as usize);
+        push_str(&mut out2, &max).unwrap();
+        assert_eq!(&out2[..2], &[0xFF, 0xFF]);
+        assert_eq!(out2.len(), 2 + u16::MAX as usize);
     }
 
     #[test]
