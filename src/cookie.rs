@@ -18,13 +18,14 @@
 //!   <https://curl.se/docs/http-cookies.html> — same one curl itself reads
 //!   and writes, including the `#HttpOnly_` line prefix for HttpOnly entries.
 //!
-//! Intentionally out of scope: IDN normalisation, the full Public Suffix
-//! List, and SameSite enforcement. None of these matter for a CLI tool that
-//! follows a single user-driven redirect chain. A *minimal* eTLD heuristic
-//! is applied (see `is_scopable_cookie_domain`): a subdomain-scoped cookie
-//! domain must carry at least one internal dot, so a bare TLD like
-//! `Domain=com` can't broadcast to every host under it. This is a heuristic,
-//! not a real PSL — `co.uk` and friends still pass.
+//! Intentionally out of scope: IDN normalisation and SameSite enforcement —
+//! neither matters for a CLI tool that follows a single user-driven redirect
+//! chain. The effective-TLD scoping of `Domain=` attributes, however, *is*
+//! enforced against the real Mozilla Public Suffix List (via the `psl2`
+//! crate; see `is_scopable_cookie_domain`): a subdomain-scoped cookie may only
+//! name a registrable domain, so over-broad attributes like `Domain=com`,
+//! `Domain=co.uk`, or `Domain=github.io` are rejected instead of broadcasting
+//! to every host under that suffix.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -373,11 +374,10 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
                     // Domain equals the IP host exactly: still host-only.
                     continue;
                 }
-                // Minimal public-suffix guard (NOT a real PSL): reject a
-                // Domain= that is a single bare label with no internal dot
-                // (e.g. `com`, `localhost`). Such a value would scope the
-                // cookie to every host under a TLD. The dot-count heuristic
-                // is the agreed scope; a full eTLD list is out of scope.
+                // Public-suffix guard (RFC 6265 §5.3 step 5, real PSL): reject a
+                // Domain= that is itself an effective-TLD (`com`, `co.uk`,
+                // `github.io`, `localhost`). Such a value would scope the cookie
+                // to every host under that suffix. Backed by `psl2`.
                 if !is_scopable_cookie_domain(&v) {
                     return None;
                 }
@@ -586,15 +586,28 @@ fn has_jar_separator(s: &str) -> bool {
     s.bytes().any(|b| b == b'\t' || b == b'\r' || b == b'\n')
 }
 
-/// Minimal public-suffix heuristic — **not** a real PSL. A subdomain-scoped
-/// cookie domain must contain at least one internal dot so it names a
-/// registrable domain rather than a bare TLD (`com`) or unqualified label
-/// (`localhost`). This rejects the obvious `Domain=co.uk`-style over-broad
-/// scoping a single-label check can catch; it deliberately does not attempt
-/// the full eTLD list (e.g. `co.uk` itself still passes).
+/// `true` if `domain` is acceptable as a subdomain-scoped cookie `Domain=`
+/// attribute — i.e. it is a *registrable* domain (eTLD+1) and **not** itself a
+/// public suffix (eTLD). Backed by the real Mozilla Public Suffix List via
+/// [`psl2`], so over-broad scopes a dot-count heuristic can't catch are
+/// rejected: `Domain=co.uk`, `Domain=github.io` (PSL private section), and
+/// bare TLDs like `Domain=com` all have no registrable domain and are refused,
+/// while `example.co.uk` / `user.github.io` are accepted.
+///
+/// `psl2::lookup` is the allocation-free core; it requires lowercase ASCII and
+/// returns `None` for anything it can't normalize. We lowercase defensively
+/// (the jar-load path may not have) and treat any unparseable input as a public
+/// suffix — failing closed toward rejection.
 fn is_scopable_cookie_domain(domain: &str) -> bool {
     let d = domain.trim_matches('.');
-    !d.is_empty() && d.contains('.')
+    if d.is_empty() {
+        return false;
+    }
+    let lowered = d.to_ascii_lowercase();
+    match psl2::lookup(&lowered) {
+        Some(dom) => !dom.is_public_suffix(),
+        None => false,
+    }
 }
 
 /// `true` if `host` is an IP-address literal rather than a DNS name. Per
@@ -685,10 +698,10 @@ fn parse_netscape_line(line: &str) -> LineOutcome {
         return LineOutcome::Skip;
     }
     let domain = domain.trim_start_matches('.').to_string();
-    // Minimal public-suffix guard (NOT a real PSL): a subdomain-scoped
-    // (`!host_only`) entry whose domain is a single bare label with no
-    // internal dot (e.g. `.com`) would broadcast to every host under a TLD.
-    // Drop it silently. Host-only entries keep working — they match one host.
+    // Public-suffix guard (real PSL via `psl2`): a subdomain-scoped
+    // (`!host_only`) entry whose domain is itself an effective-TLD (e.g. `.com`,
+    // `.co.uk`) would broadcast to every host under that suffix. Drop it
+    // silently. Host-only entries keep working — they match one host.
     if !host_only && !is_scopable_cookie_domain(&domain) {
         return LineOutcome::Skip;
     }
@@ -923,6 +936,52 @@ mod tests {
             0,
         );
         assert_eq!(j.len(), 1);
+    }
+
+    #[test]
+    fn rejects_multi_label_public_suffix_domain() {
+        // The whole point of using a real PSL: `co.uk` is an effective-TLD, so
+        // `Domain=co.uk` must NOT be accepted — otherwise the cookie would be
+        // broadcast to every `*.co.uk` host (the classic supercookie). A bare
+        // dot-count heuristic would wrongly let this through.
+        let mut j = CookieJar::new();
+        j.add_set_cookie(&url("https://www.example.co.uk/"), "evil=1; Domain=co.uk", 0);
+        assert!(j.is_empty(), "Domain=co.uk (public suffix) must be rejected");
+    }
+
+    #[test]
+    fn accepts_registrable_domain_under_multi_label_suffix() {
+        // `example.co.uk` IS a registrable domain (eTLD+1), so scoping to it is
+        // legitimate and must still work.
+        let mut j = CookieJar::new();
+        j.add_set_cookie(
+            &url("https://www.example.co.uk/"),
+            "id=1; Domain=example.co.uk",
+            0,
+        );
+        assert_eq!(j.len(), 1, "Domain=example.co.uk (eTLD+1) must be accepted");
+    }
+
+    #[test]
+    fn rejects_private_section_public_suffix_domain() {
+        // The PSL private section makes `github.io` an effective-TLD, matching
+        // browser cookie behaviour: `Domain=github.io` is a supercookie across
+        // every `*.github.io` Pages site and must be rejected, while a real
+        // registrable domain below it (`user.github.io`) is fine.
+        let mut j = CookieJar::new();
+        j.add_set_cookie(&url("https://user.github.io/"), "evil=1; Domain=github.io", 0);
+        assert!(
+            j.is_empty(),
+            "Domain=github.io (PSL private suffix) must be rejected"
+        );
+
+        let mut j2 = CookieJar::new();
+        j2.add_set_cookie(
+            &url("https://x.user.github.io/"),
+            "id=1; Domain=user.github.io",
+            0,
+        );
+        assert_eq!(j2.len(), 1, "Domain=user.github.io (eTLD+1) must be accepted");
     }
 
     #[test]

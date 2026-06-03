@@ -61,6 +61,14 @@ compcol = { version = "0.4", default-features = false, features = ["std", "gzip"
 # already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
 puressh = { version = "0.0.3", default-features = false, features = ["client", "compress"] }
+# Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
+# `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
+# heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =
+# false` so we use only psl2's `#![no_std]`, allocation-free `lookup` core: no
+# `idna`, no `alloc` convenience layer, and therefore no extra transitive deps.
+# The PSL data is embedded as pure-Rust tables, so the no-C-toolchain /
+# minimal-dependency guarantee stays intact.
+psl2 = { version = "0.1", default-features = false }
 
 [profile.release]
 lto = "thin"
