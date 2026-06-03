@@ -41,6 +41,13 @@ use crate::websocket::base64_encode;
 /// matches the crate's other body caps (e.g. `rtsp`, `websocket`).
 const MAX_LITERAL_BYTES: usize = 64 * 1024 * 1024;
 
+/// Upper bound on a *whole* server response — the accumulated untagged text
+/// plus every literal block. `MAX_LITERAL_BYTES` only caps a single literal,
+/// so a server could still exhaust memory by streaming endless untagged lines
+/// (or many sub-cap literals) before the tagged terminator. Cap the aggregate
+/// at the same 64 MiB so a hostile/buggy server can't make us buffer forever.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// LOGIN/AUTHENTICATE (using userinfo or fall back to anonymous), SELECT the
 /// mailbox from `url.path`, then either LIST mailboxes or FETCH a specific
 /// message and return the raw RFC 5322 message bytes (or the LIST output).
@@ -771,6 +778,14 @@ impl LineReader {
             let line = self.read_line(sock)?;
             text.push_str(&line);
             text.push_str("\r\n");
+            // Aggregate cap across all untagged lines: a server that streams
+            // endless lines without ever sending the tagged terminator would
+            // otherwise grow `text` (and `self.buf`) without limit.
+            if text.len() > MAX_RESPONSE_BYTES {
+                return Err(Error::BadResponse(format!(
+                    "imap: response exceeds maximum {MAX_RESPONSE_BYTES} bytes"
+                )));
+            }
 
             // If this line ends with a literal marker, slurp that many bytes
             // verbatim and treat them as a continuation of the same logical
@@ -779,6 +794,13 @@ impl LineReader {
                 if n > MAX_LITERAL_BYTES {
                     return Err(Error::BadResponse(format!(
                         "imap: literal size {n} exceeds maximum {MAX_LITERAL_BYTES}"
+                    )));
+                }
+                // Bound the running total too: many individually-sub-cap
+                // literals must not add up past the response cap.
+                if text.len().saturating_add(n) > MAX_RESPONSE_BYTES {
+                    return Err(Error::BadResponse(format!(
+                        "imap: response exceeds maximum {MAX_RESPONSE_BYTES} bytes"
                     )));
                 }
                 let bytes = self.read_exact(sock, n)?;
@@ -1119,6 +1141,43 @@ mod tests {
         assert!(sent.contains("a001 AUTHENTICATE LOGIN\r\n"), "{sent:?}");
         assert!(sent.contains("Ym9i\r\n"), "username b64 missing: {sent:?}");
         assert!(sent.contains("cHc=\r\n"), "password b64 missing: {sent:?}");
+    }
+
+    #[test]
+    fn read_response_aborts_on_endless_untagged_lines() {
+        // A server that streams untagged lines and never sends the tagged
+        // terminator must be cut off at MAX_RESPONSE_BYTES rather than
+        // buffered forever. Build just over the cap from short untagged lines.
+        let line = b"* 1 FETCH (UID 1)\r\n"; // 19 bytes
+        let n = MAX_RESPONSE_BYTES / line.len() + 2;
+        let mut script = Vec::with_capacity(n * line.len());
+        for _ in 0..n {
+            script.extend_from_slice(line);
+        }
+        // No `a001 OK ...` terminator.
+        let mut io = MockIo::new(&script);
+        let mut lr = LineReader::new();
+        match lr.read_response_with_literals(&mut io, "a001") {
+            Err(Error::BadResponse(m)) => assert!(m.contains("maximum"), "got {m}"),
+            other => panic!("expected BadResponse(maximum), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_response_aborts_when_literals_sum_past_cap() {
+        // A literal declared at exactly MAX_LITERAL_BYTES passes the
+        // per-literal check (`n > MAX` is false at equality), but the untagged
+        // line text already pushed brings the running total past
+        // MAX_RESPONSE_BYTES — the aggregate guard must reject it before we
+        // read that huge literal body off the wire.
+        let big = MAX_LITERAL_BYTES;
+        let script = format!("* 1 FETCH (BODY[] {{{big}}}\r\n");
+        let mut io = MockIo::new(script.as_bytes());
+        let mut lr = LineReader::new();
+        match lr.read_response_with_literals(&mut io, "a001") {
+            Err(Error::BadResponse(m)) => assert!(m.contains("maximum"), "got {m}"),
+            other => panic!("expected BadResponse(maximum), got {other:?}"),
+        }
     }
 
     #[test]

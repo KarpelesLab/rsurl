@@ -14,6 +14,14 @@ use crate::error::{Error, Result};
 use crate::tls::{connect_over, TlsStream};
 use crate::url::Url;
 
+/// Upper bound on a multi-line POP3 response body (LIST output or a RETR'd
+/// message). A server that never sends the `.\r\n` terminator — or a single
+/// newline-less line — would otherwise grow our buffer without limit, a cheap
+/// memory-exhaustion DoS. 64 MiB matches the crate's other body caps (e.g.
+/// imap, rtsp, websocket, gopher) and is generous enough for legitimate large
+/// mailboxes and messages.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 /// USER + PASS auth, then either LIST mailboxes (if no message number in
 /// path) or RETR a specific message. Returns the raw bytes (RFC 5322 message
 /// or the textual LIST output).
@@ -214,8 +222,16 @@ impl<R: Read + Write> Session<R> {
     fn read_multiline(&mut self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
+            // Bound each line read: `read_until` is otherwise unbounded, so a
+            // server that sends a single line with no `\n` would make us
+            // allocate forever. Cap the per-line reader at the remaining
+            // response budget plus one byte, so we can distinguish "line is
+            // exactly at the limit" from "line overran the limit".
             let mut line = Vec::new();
-            let n = self.io.read_until(b'\n', &mut line)?;
+            let line_cap = MAX_RESPONSE_BYTES - out.len();
+            let n = (&mut self.io)
+                .take(line_cap as u64 + 1)
+                .read_until(b'\n', &mut line)?;
             if n == 0 {
                 return Err(Error::UnexpectedEof);
             }
@@ -224,6 +240,14 @@ impl<R: Read + Write> Session<R> {
             let is_terminator = matches!(line.as_slice(), b".\r\n" | b".\n");
             if is_terminator {
                 return Ok(out);
+            }
+            // Aggregate cap: refuse to buffer past MAX_RESPONSE_BYTES, whether
+            // the overrun comes from one giant newline-less line or from a
+            // body that never terminates with `.\r\n`.
+            if line.len() > line_cap {
+                return Err(Error::BadResponse(format!(
+                    "pop3: response exceeds maximum {MAX_RESPONSE_BYTES} bytes"
+                )));
             }
             out.extend_from_slice(&line);
         }
@@ -370,6 +394,73 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// Read-only mock that replays a fixed byte stream, then EOFs. Used to
+    /// drive `read_multiline` over the BufReader without a live socket.
+    struct ReplayIo {
+        data: std::io::Cursor<Vec<u8>>,
+    }
+    impl Read for ReplayIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.data.read(buf)
+        }
+    }
+    impl Write for ReplayIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session_replaying(data: Vec<u8>) -> Session<ReplayIo> {
+        Session::new(BufReader::new(ReplayIo {
+            data: std::io::Cursor::new(data),
+        }))
+    }
+
+    #[test]
+    fn read_multiline_returns_body_on_terminator() {
+        let mut s = session_replaying(b"line one\r\nline two\r\n.\r\n".to_vec());
+        let body = s.read_multiline().unwrap();
+        assert_eq!(body, b"line one\r\nline two\r\n");
+    }
+
+    #[test]
+    fn read_multiline_aborts_past_aggregate_cap() {
+        // A body that never sends `.\r\n`: many terminated lines whose total
+        // exceeds MAX_RESPONSE_BYTES must error rather than buffer forever.
+        // Build just over the cap out of 1 KiB lines.
+        let line = {
+            let mut l = vec![b'a'; 1022];
+            l.extend_from_slice(b"\r\n");
+            l
+        };
+        let n_lines = MAX_RESPONSE_BYTES / line.len() + 2;
+        let mut data = Vec::with_capacity(n_lines * line.len());
+        for _ in 0..n_lines {
+            data.extend_from_slice(&line);
+        }
+        // Note: no terminating `.\r\n`.
+        let mut s = session_replaying(data);
+        match s.read_multiline() {
+            Err(Error::BadResponse(m)) => assert!(m.contains("maximum"), "got {m}"),
+            other => panic!("expected BadResponse(maximum), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_multiline_aborts_on_unbounded_single_line() {
+        // A single newline-less line larger than the cap must error, not grow
+        // the buffer without limit.
+        let data = vec![b'x'; MAX_RESPONSE_BYTES + 1024];
+        let mut s = session_replaying(data);
+        match s.read_multiline() {
+            Err(Error::BadResponse(m)) => assert!(m.contains("maximum"), "got {m}"),
+            other => panic!("expected BadResponse(maximum), got {other:?}"),
         }
     }
 
