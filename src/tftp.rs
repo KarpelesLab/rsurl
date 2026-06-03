@@ -11,7 +11,7 @@
 //! (a short final block — possibly empty — terminates the upload).
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::url::Url;
@@ -31,6 +31,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Number of times we resend the last packet on timeout before giving up.
 const MAX_RETRIES: u32 = 3;
+
+/// Hard wall-clock ceiling on a whole transfer. The per-packet `READ_TIMEOUT`
+/// alone can't stop a server that dribbles one valid packet every few seconds
+/// indefinitely, so we also cap the total elapsed time and bail past it.
+const MAX_TOTAL_DURATION: Duration = Duration::from_secs(600);
 
 /// Hard upper bound on a single transfer (256 MiB). TFTP has no built-in
 /// length so we cap to avoid runaway allocation against a hostile server.
@@ -193,8 +198,15 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
     socket.send_to(&last_packet, last_dest)?;
     let mut retries: u32 = 0;
+    let deadline = Instant::now() + MAX_TOTAL_DURATION;
 
     loop {
+        if Instant::now() >= deadline {
+            return Err(Error::BadResponse(format!(
+                "tftp: transfer exceeded {}s deadline",
+                MAX_TOTAL_DURATION.as_secs()
+            )));
+        }
         let (n, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e) => {
@@ -214,11 +226,13 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
             }
         };
 
-        // Once we've latched onto the server's TID, ignore packets from
-        // anywhere else (RFC 1350 §4: "If a source TID does not match, the
+        // TID handling (RFC 1350 §4: "If a source TID does not match, the
         // packet should be discarded as erroneously sent from somewhere
-        // else"). On the very first packet, the source IP must still match
-        // the host we sent to, but the port will differ.
+        // else"). Once we've latched the server's TID we accept only that
+        // exact peer. Before latching, the TID *cannot* be validated — the
+        // server replies from a fresh ephemeral port we don't know yet — so
+        // the first reply is only IP-filtered: its source IP must match the
+        // host we sent the RRQ to, but its source port will differ.
         if let Some(p) = peer {
             if from != p {
                 continue;
@@ -235,10 +249,15 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
                 if data.block != expected_block {
                     // Either a duplicate of an already-acked block (re-ack
                     // it so the sender unblocks) or out-of-order garbage we
-                    // ignore. Re-acking an old block is harmless.
-                    if data.block.wrapping_add(1) == expected_block {
-                        let ack = build_ack(data.block);
-                        socket.send_to(&ack, from)?;
+                    // ignore. Re-acking an old block is harmless — but only
+                    // once the TID is latched: before that, `from` is an
+                    // unvalidated (IP-filtered only) source and we must not
+                    // emit a reply to it. Send the re-ACK to the latched peer.
+                    if let Some(p) = peer {
+                        if data.block.wrapping_add(1) == expected_block {
+                            let ack = build_ack(data.block);
+                            socket.send_to(&ack, p)?;
+                        }
                     }
                     continue;
                 }
@@ -337,6 +356,7 @@ pub fn store(url: &Url, data: &[u8]) -> Result<()> {
 
     socket.send_to(&last_packet, last_dest)?;
     let mut retries: u32 = 0;
+    let deadline = Instant::now() + MAX_TOTAL_DURATION;
 
     // `block` is the block number we're currently waiting to have ACKed. While
     // we're still waiting for ACK 0 (the WRQ's acknowledgement) `block` is 0 and
@@ -350,6 +370,12 @@ pub fn store(url: &Url, data: &[u8]) -> Result<()> {
     let mut sent_final = false;
 
     loop {
+        if Instant::now() >= deadline {
+            return Err(Error::BadResponse(format!(
+                "tftp: transfer exceeded {}s deadline",
+                MAX_TOTAL_DURATION.as_secs()
+            )));
+        }
         let (n, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e) => {
@@ -369,8 +395,10 @@ pub fn store(url: &Url, data: &[u8]) -> Result<()> {
         };
 
         // TID validation, mirroring the read path: once latched, only the
-        // peer's TID is accepted; before that, the source IP must match the
-        // host we sent the WRQ to (the port will differ).
+        // peer's exact TID is accepted. Before latching, the TID cannot be
+        // validated (the server replies from a fresh ephemeral port), so the
+        // first reply is only IP-filtered: its source IP must match the host
+        // we sent the WRQ to, but its source port will differ.
         if let Some(p) = peer {
             if from != p {
                 continue;
