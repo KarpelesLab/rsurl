@@ -83,10 +83,27 @@ pub(crate) fn pem_blocks(pem: &str) -> Vec<String> {
     let mut rest = pem;
     while let Some(start) = rest.find(BEGIN) {
         let after_begin = &rest[start..];
-        let Some(end_rel) = after_begin.find(END) else {
-            break;
+        // Body of this candidate block is everything past its own header.
+        let body = &after_begin[BEGIN.len()..];
+        let Some(end_rel) = body.find(END) else {
+            // This BEGIN has no matching END anywhere after it. Don't abort the
+            // whole scan and discard every later block — skip just past this
+            // BEGIN and keep looking for the next well-formed block.
+            rest = body;
+            continue;
         };
-        let end_abs = start + end_rel + END.len();
+        // If another BEGIN appears before that END, this BEGIN is unterminated
+        // (its body is garbage and the END belongs to a later block). Skip past
+        // this BEGIN and re-scan, so the later block isn't swallowed whole.
+        if let Some(next_begin) = body.find(BEGIN) {
+            if next_begin < end_rel {
+                rest = body;
+                continue;
+            }
+        }
+        // `add_pem` remains the authority on what's actually trusted; we only
+        // slice candidate blocks here.
+        let end_abs = start + BEGIN.len() + end_rel + END.len();
         out.push(rest[start..end_abs].to_string());
         rest = &rest[end_abs..];
     }
@@ -107,5 +124,33 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].contains("AAA"));
         assert!(blocks[1].contains("BBB"));
+    }
+
+    #[test]
+    fn pem_blocks_skips_unterminated_begin() {
+        // [valid][unterminated BEGIN][valid] must still yield BOTH valid blocks
+        // rather than dropping everything after the malformed one.
+        let pem = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n\
+            -----BEGIN CERTIFICATE-----\nTRUNCATED never terminated\n\
+            -----BEGIN CERTIFICATE-----\nBBB\n-----END CERTIFICATE-----\n";
+        let blocks = pem_blocks(pem);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].contains("AAA"));
+        assert!(blocks[1].contains("BBB"));
+        // The unterminated block's body must not leak into a kept block.
+        assert!(!blocks[0].contains("TRUNCATED"));
+        assert!(!blocks[1].contains("TRUNCATED"));
+    }
+
+    #[test]
+    fn pem_blocks_stray_end_does_not_corrupt() {
+        // A stray END before any real block must not be mistaken for part of a
+        // block; the following well-formed block still parses cleanly.
+        let pem = "-----END CERTIFICATE-----\njunk\n\
+            -----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n";
+        let blocks = pem_blocks(pem);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("AAA"));
+        assert!(blocks[0].starts_with("-----BEGIN CERTIFICATE-----"));
     }
 }
