@@ -291,6 +291,17 @@ fn domain_match(request_host: &str, cookie_domain: &str, host_only: bool) -> boo
     if rh == cd {
         return true;
     }
+    // RFC 6265 §5.1.3: the suffix ("ends with .cookie_domain") rule is for
+    // domain names only. If the request host is an IP literal it must match the
+    // cookie domain exactly — a suffix match against an address leaks across
+    // unrelated hosts (e.g. "10.0.0.1".ends_with(".0.0.1") is true, so a cookie
+    // scoped to "0.0.1" would otherwise be sent to 10.0.0.1, 192.0.0.1, ...).
+    // This mirrors the Set-Cookie ingest guard, which forces host-only for IP
+    // request hosts, and closes the same leak for cookies arriving via any
+    // path (including a hostile `cookies.txt`).
+    if is_ip_literal(&rh) {
+        return false;
+    }
     rh.ends_with(&format!(".{cd}"))
 }
 
@@ -698,6 +709,13 @@ fn parse_netscape_line(line: &str) -> LineOutcome {
         return LineOutcome::Skip;
     }
     let domain = domain.trim_start_matches('.').to_string();
+    // IP-literal guard (mirror of the Set-Cookie ingest path, RFC 6265 §5.3
+    // step 5): a subdomain-scoped (`!host_only`) entry whose domain is an IP
+    // literal would suffix-match unrelated hosts — e.g. `domain_match(
+    // "10.0.0.1", "0.0.1", false)` is true because "10.0.0.1".ends_with(
+    // ".0.0.1"). An IP cookie can only ever be host-only, so coerce it rather
+    // than honour the attacker-supplied subdomain scope.
+    let host_only = host_only || is_ip_literal(&domain);
     // Public-suffix guard (real PSL via `psl2`): a subdomain-scoped
     // (`!host_only`) entry whose domain is itself an effective-TLD (e.g. `.com`,
     // `.co.uk`) would broadcast to every host under that suffix. Drop it
@@ -1088,6 +1106,55 @@ mod tests {
         assert!(!is_ip_literal("0.0.1")); // only three octets
         assert!(!is_ip_literal("999.0.0.1")); // 999 isn't a u8
         assert!(!is_ip_literal("localhost"));
+    }
+
+    // A hostile `cookies.txt` line scoped to a numeric suffix domain with
+    // host_only=FALSE (field 2 TRUE) must not be sent to unrelated IP hosts.
+    // The suffix domain-match `domain_match("10.0.0.1", "0.0.1", false)` would
+    // otherwise be true because "10.0.0.1".ends_with(".0.0.1"). The send-path
+    // guard rejects any suffix match when the request host is an IP literal,
+    // mirroring the Set-Cookie ingest guard.
+    #[test]
+    fn netscape_ip_suffix_domain_not_sent_to_unrelated_ip_host() {
+        // Field 2 = TRUE ⇒ host_only = false (subdomain scope requested).
+        let line = "0.0.1\tTRUE\t/\tFALSE\t9999999999\tsid\tsecret";
+        let c = match parse_netscape_line(line) {
+            LineOutcome::Cookie(c) => *c,
+            other => panic!("expected Cookie outcome, got {}", other_label(&other)),
+        };
+        // The crux: it must NOT match a different IP host via suffix.
+        assert!(
+            !domain_match("10.0.0.1", &c.domain, c.host_only),
+            "IP-suffix cookie must not match an unrelated IP host"
+        );
+        assert!(
+            !matches_request(&c, &url("http://10.0.0.1/"), 0),
+            "IP-suffix cookie must not be selected for an unrelated IP host"
+        );
+    }
+
+    // The load-path coercion: a `cookies.txt` line whose domain is itself a
+    // full IP literal with host_only=FALSE is coerced to host-only, so it can
+    // only ever match that exact address (defense in depth alongside the
+    // send-path guard above).
+    #[test]
+    fn netscape_ip_literal_domain_coerced_to_host_only() {
+        let line = "10.0.0.1\tTRUE\t/\tFALSE\t9999999999\tsid\tsecret";
+        match parse_netscape_line(line) {
+            LineOutcome::Cookie(c) => assert!(
+                c.host_only,
+                "full IP-literal domain must be coerced to host-only on load"
+            ),
+            other => panic!("expected Cookie outcome, got {}", other_label(&other)),
+        }
+    }
+
+    fn other_label(o: &LineOutcome) -> &'static str {
+        match o {
+            LineOutcome::Cookie(_) => "Cookie",
+            LineOutcome::Skip => "Skip",
+            LineOutcome::Malformed => "Malformed",
+        }
     }
 
     // FIX 2: a crafted multibyte `Expires=` month token must not panic the
