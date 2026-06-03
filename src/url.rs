@@ -166,7 +166,7 @@ impl Url {
     /// `enabled`. Idempotent and a no-op for ASCII hosts (IPv4, bracketed
     /// IPv6, already-punycode names), when disabled, or when the crate is built
     /// without the `idn` feature. Returns an error only for an undecodable
-    /// internationalised host. See [`crate::idn`].
+    /// internationalised host. See the crate-internal `idn` module.
     pub fn set_idn(&mut self, enabled: bool) -> Result<()> {
         self.host = crate::idn::to_ascii(&self.host, enabled)?;
         Ok(())

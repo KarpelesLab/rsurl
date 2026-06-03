@@ -1908,7 +1908,7 @@ mod tests {
         use std::io::Cursor;
         // Valid status line, then a single header line that never terminates.
         let mut bytes = b"HTTP/1.1 200 OK\r\n".to_vec();
-        bytes.extend(std::iter::repeat(b'a').take(MAX_HEADER_BYTES + 4096));
+        bytes.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES + 4096));
         let mut r = BufReader::new(Cursor::new(bytes));
         let mut trace = Vec::new();
         let err = read_response(&mut r, "GET", &mut trace).unwrap_err();
