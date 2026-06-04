@@ -18,6 +18,9 @@ pub(crate) struct NetConfig {
     pub(crate) connect_timeout: Option<Duration>,
     /// Verify TLS certificates (consumed by the HTTP arm of `transfer_url`).
     pub(crate) verify: bool,
+    /// Try `EPSV` before `PASV` for FTP passive data connections. Cleared by
+    /// curl's `--disable-epsv`; the FTP backend then goes straight to `PASV`.
+    pub(crate) ftp_use_epsv: bool,
 }
 
 impl Default for NetConfig {
@@ -26,6 +29,7 @@ impl Default for NetConfig {
             connector: Arc::new(DirectConnector),
             connect_timeout: Some(Duration::from_secs(30)),
             verify: true,
+            ftp_use_epsv: true,
         }
     }
 }
@@ -52,6 +56,7 @@ pub struct Client {
     verify: bool,
     idn: bool,
     no_proxy: Vec<String>,
+    ftp_use_epsv: bool,
 }
 
 impl Default for Client {
@@ -62,6 +67,7 @@ impl Default for Client {
             verify: true,
             idn: true,
             no_proxy: Vec::new(),
+            ftp_use_epsv: true,
         }
     }
 }
@@ -104,6 +110,13 @@ impl Client {
         self
     }
 
+    /// Try `EPSV` before `PASV` for FTP passive data connections (default
+    /// `true`). Pass `false` for curl's `--disable-epsv`.
+    pub fn ftp_use_epsv(mut self, on: bool) -> Self {
+        self.ftp_use_epsv = on;
+        self
+    }
+
     /// Replace the no-proxy host-suffix list (curl `NO_PROXY`).
     pub fn no_proxy<I, S>(mut self, entries: I) -> Self
     where
@@ -138,6 +151,7 @@ impl Client {
             connector: self.effective_connector(host),
             connect_timeout: self.connect_timeout,
             verify: self.verify,
+            ftp_use_epsv: self.ftp_use_epsv,
         }
     }
 

@@ -159,6 +159,8 @@ struct Args {
     /// `--no-clobber`: never overwrite an existing `-o`/`-O` file; pick a free
     /// `.1`, `.2`, ... suffix instead (curl semantics).
     no_clobber: bool,
+    /// `--disable-epsv`: for FTP, skip `EPSV` and use `PASV` directly.
+    disable_epsv: bool,
     /// `--max-filesize <bytes>`: refuse a download larger than this.
     max_filesize: Option<u64>,
     /// `-w`/`--write-out <format>`: print a formatted summary after transfer.
@@ -2073,6 +2075,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             }),
             "--remove-on-error" => a.remove_on_error = true,
             "--no-clobber" => a.no_clobber = true,
+            "--disable-epsv" => a.disable_epsv = true,
+            // We always use passive mode (active/PORT is unimplemented), so
+            // --ftp-pasv and re-enabling EPSV are accepted as confirmations.
+            "--ftp-pasv" => {}
+            "--epsv" => a.disable_epsv = false,
             "--json" => a.json_parts.push(next_val(&mut it, arg)?),
             "--oauth2-bearer" => a.bearer = Some(next_val(&mut it, arg)?),
             "--aws-sigv4" => a.aws_sigv4 = Some(next_val(&mut it, arg)?),
@@ -2837,7 +2844,8 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
 fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
     let mut c = rsurl::Client::new()
         .verify_tls(!args.insecure)
-        .idn(!args.no_idn);
+        .idn(!args.no_idn)
+        .ftp_use_epsv(!args.disable_epsv);
     if let Some(secs) = args.connect_timeout {
         c = c.connect_timeout(Some(Duration::from_secs(secs)));
     }
@@ -3848,6 +3856,7 @@ Options:
   -4, --ipv4               connect over IPv4 only
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
+      --disable-epsv       FTP: skip EPSV, use PASV directly
   -K, --config <file>      read options from a curl-style config file
       --next  (-:)         start a new request with its own options
   -#, --progress-bar       show progress on streamed file downloads (-o/-O)

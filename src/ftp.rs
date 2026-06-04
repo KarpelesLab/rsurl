@@ -151,8 +151,13 @@ fn open_data<R: Read + Write>(
     ctrl_peer_ip: std::net::IpAddr,
     cfg: &NetConfig,
 ) -> Result<Stream> {
-    let (data_host, data_port) =
-        open_passive(ctrl, &url.host, ctrl_peer_ip, cfg.connector.is_direct())?;
+    let (data_host, data_port) = open_passive(
+        ctrl,
+        &url.host,
+        ctrl_peer_ip,
+        cfg.connector.is_direct(),
+        cfg.ftp_use_epsv,
+    )?;
     let data_tcp = cfg.connect(&data_host, data_port)?;
     Ok(if url.scheme == "ftps" {
         // Per RFC 4217 §10.2: SNI must be the original hostname, not the
@@ -389,20 +394,25 @@ fn open_passive<R: Read + Write>(
     fallback_host: &str,
     ctrl_peer_ip: std::net::IpAddr,
     direct: bool,
+    use_epsv: bool,
 ) -> Result<(String, u16)> {
-    send(ctrl, "EPSV")?;
-    let (c, m) = read_reply(ctrl)?;
-    if c == 229 {
-        let port = parse_epsv(&m)
-            .ok_or_else(|| Error::BadResponse(format!("ftp EPSV: cannot parse reply: {m}")))?;
-        // EPSV doesn't carry a host; reuse the control connection's host
-        // (which is also what curl/RFC 2428 says clients should do).
-        return Ok((fallback_host.to_string(), port));
-    }
-    // 5xx → not supported, try PASV. 4xx → transient, but we still try
-    // PASV: nothing in the EPSV failure precludes PASV working.
-    if !(400..600).contains(&c) {
-        return Err(Error::BadResponse(format!("ftp EPSV: {c} {m}")));
+    // curl `--disable-epsv` skips the EPSV attempt and goes straight to PASV
+    // (useful against servers/NATs where EPSV hangs rather than cleanly fails).
+    if use_epsv {
+        send(ctrl, "EPSV")?;
+        let (c, m) = read_reply(ctrl)?;
+        if c == 229 {
+            let port = parse_epsv(&m)
+                .ok_or_else(|| Error::BadResponse(format!("ftp EPSV: cannot parse reply: {m}")))?;
+            // EPSV doesn't carry a host; reuse the control connection's host
+            // (which is also what curl/RFC 2428 says clients should do).
+            return Ok((fallback_host.to_string(), port));
+        }
+        // 5xx → not supported, try PASV. 4xx → transient, but we still try
+        // PASV: nothing in the EPSV failure precludes PASV working.
+        if !(400..600).contains(&c) {
+            return Err(Error::BadResponse(format!("ftp EPSV: {c} {m}")));
+        }
     }
     send(ctrl, "PASV")?;
     let (c2, m2) = read_reply(ctrl)?;
@@ -741,11 +751,31 @@ mod tests {
             written: Vec::new(),
         });
         let ctrl_peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        let (host, port) = open_passive(&mut io, "ftp.example.com", ctrl_peer, true).unwrap();
+        let (host, port) = open_passive(&mut io, "ftp.example.com", ctrl_peer, true, true).unwrap();
         // Host is the control peer, NOT the 10.0.0.1 from the PASV reply.
         assert_eq!(host, "203.0.113.7");
         // Port is still taken from the (validated) PASV reply.
         assert_eq!(port, 4 * 256 + 5);
+    }
+
+    #[test]
+    fn open_passive_disable_epsv_skips_straight_to_pasv() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // With EPSV disabled the script need only answer PASV — no EPSV is sent.
+        let script = "227 Entering Passive Mode (10,0,0,1,4,5)\r\n";
+        let mut io = BufReader::new(MockIo {
+            to_read: std::io::Cursor::new(script.as_bytes().to_vec()),
+            written: Vec::new(),
+        });
+        let ctrl_peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let (host, port) =
+            open_passive(&mut io, "ftp.example.com", ctrl_peer, true, false).unwrap();
+        assert_eq!(host, "203.0.113.7");
+        assert_eq!(port, 4 * 256 + 5);
+        // The control stream saw PASV and never EPSV.
+        let sent = String::from_utf8_lossy(&io.get_ref().written);
+        assert!(sent.contains("PASV"), "sent: {sent:?}");
+        assert!(!sent.contains("EPSV"), "must not send EPSV: {sent:?}");
     }
 
     #[test]
