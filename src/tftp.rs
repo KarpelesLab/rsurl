@@ -11,6 +11,8 @@
 //! (a short final block — possibly empty — terminates the upload).
 
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+
+use crate::net::udp::open_udp_transport;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -176,14 +178,16 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     fetch_with(url, &crate::net::NetConfig::default())
 }
 
-/// TFTP runs over UDP; a TCP `Connector` cannot carry it. Proxy support
-/// (SOCKS5 UDP ASSOCIATE) arrives in a later phase — for now the connector is
-/// ignored and a direct UDP socket is always used.
-pub(crate) fn fetch_with(url: &Url, _cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
+/// Download over TFTP. A direct UDP socket by default; through a SOCKS5 proxy
+/// when the connector is one (UDP ASSOCIATE). A non-UDP-capable proxy
+/// (http/https/socks4) is rejected. The TID-latching/validation below keys on
+/// the *decapsulated* peer that `recv_from` returns, so spoof protection and
+/// the legitimate mid-transfer TID port-switch both keep working.
+pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let filename = filename_of(url)?;
 
     let server = resolve(&url.host, url.port)?;
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let socket = open_udp_transport(cfg.connector.udp_proxy(), server)?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
 
     let rrq = build_rrq(filename);

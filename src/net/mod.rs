@@ -14,6 +14,7 @@ mod client;
 mod connector;
 mod socks;
 mod stream;
+pub(crate) mod udp;
 
 pub use client::Client;
 pub(crate) use client::NetConfig;
@@ -22,3 +23,4 @@ pub use connector::{
     HttpsProxyConnector, Socks4Connector, Socks5Connector,
 };
 pub use stream::NetStream;
+pub use udp::UdpProxy;

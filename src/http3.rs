@@ -65,9 +65,10 @@
 
 use std::io;
 use std::io::Write;
-use std::net::{ToSocketAddrs, UdpSocket};
+use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
 
+use crate::net::udp::{open_udp_transport, UdpTransport};
 use purecrypto::quic::transport_params::TransportParameters;
 use purecrypto::quic::{QuicConfig, QuicConnection, StreamId};
 
@@ -1457,7 +1458,7 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
     let mut conn = build_client(&req)?;
     let (sock, peer) = open_udp(&req)?;
     let _ = writeln!(trace, "*   Trying {peer} (UDP)...");
-    handshake(&mut conn, &sock, peer, req.read_timeout)?;
+    handshake(&mut conn, &*sock, peer, req.read_timeout)?;
     let _ = writeln!(
         trace,
         "* Connected to {} ({}) port {} (QUIC)",
@@ -1498,11 +1499,11 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
     if !req.body.is_empty() {
         let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
     }
-    pump(&mut conn, &sock, peer, req.read_timeout)?;
+    pump(&mut conn, &*sock, peer, req.read_timeout)?;
 
     read_response(
         &mut conn,
-        &sock,
+        &*sock,
         peer,
         request_stream,
         &req,
@@ -1635,20 +1636,15 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         .map_err(|e| Error::BadResponse(format!("http3: build client: {e:?}")))
 }
 
-fn open_udp(req: &Request) -> Result<(UdpSocket, std::net::SocketAddr)> {
+fn open_udp(req: &Request) -> Result<(Box<dyn UdpTransport>, std::net::SocketAddr)> {
     let host_port = format!("{}:{}", req.url.host, req.url.port);
     let peer = host_port
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| Error::InvalidUrl(req.url.host.clone()))?;
-    // Pick a local socket of the same family as the peer.
-    let bind = if peer.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let sock = UdpSocket::bind(bind)?;
-    sock.connect(peer)?;
+    // Direct UDP, or relayed through a SOCKS5 proxy if the connector is one;
+    // a non-UDP-capable proxy (http/https/socks4) errors here.
+    let sock = open_udp_transport(req.connector.udp_proxy(), peer)?;
     // We do our own deadline accounting in the pump loop; set a short
     // per-recv timeout so we can interleave timer ticks.
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -1660,7 +1656,7 @@ fn open_udp(req: &Request) -> Result<(UdpSocket, std::net::SocketAddr)> {
 /// optionally read one datagram from the socket back into the engine.
 fn pump_once(
     conn: &mut QuicConnection,
-    sock: &UdpSocket,
+    sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
     can_block: bool,
 ) -> Result<bool> {
@@ -1671,7 +1667,7 @@ fn pump_once(
         if dg.is_empty() {
             break;
         }
-        sock.send(&dg)?;
+        sock.send_to(&dg, peer)?;
         sent_anything = true;
     }
 
@@ -1680,8 +1676,11 @@ fn pump_once(
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut got_anything = false;
     if can_block {
-        match sock.recv(&mut buf) {
-            Ok(n) => {
+        match sock.recv_from(&mut buf) {
+            // The QUIC engine routes on the datagram contents, not the UDP
+            // 4-tuple, so we always attribute it to the server `peer` (which
+            // equals the decapsulated source under both transports).
+            Ok((n, _from)) => {
                 conn.feed_datagram_from(peer, &buf[..n])
                     .map_err(|e| Error::BadResponse(format!("http3: feed: {e:?}")))?;
                 got_anything = true;
@@ -1705,7 +1704,7 @@ fn pump_once(
         if dg.is_empty() {
             break;
         }
-        sock.send(&dg)?;
+        sock.send_to(&dg, peer)?;
         sent_anything = true;
     }
 
@@ -1715,7 +1714,7 @@ fn pump_once(
 /// Run the QUIC handshake until `is_handshake_complete()`.
 fn handshake(
     conn: &mut QuicConnection,
-    sock: &UdpSocket,
+    sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
     deadline_hint: Option<Duration>,
 ) -> Result<()> {
@@ -1913,7 +1912,7 @@ fn write_request(
 /// side, before we start reading.
 fn pump(
     conn: &mut QuicConnection,
-    sock: &UdpSocket,
+    sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
     _read_timeout: Option<Duration>,
 ) -> Result<()> {
@@ -1928,7 +1927,7 @@ fn pump(
 /// HEADERS + DATA into a `Response`.
 fn read_response(
     conn: &mut QuicConnection,
-    sock: &UdpSocket,
+    sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
     sid: StreamId,
     req: &Request,

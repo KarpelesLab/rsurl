@@ -54,6 +54,14 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     fn is_direct(&self) -> bool {
         false
     }
+
+    /// How this connector carries UDP datagrams (HTTP/3, TFTP). Most proxies
+    /// cannot tunnel UDP; only a direct dial or a SOCKS5 proxy can. The default
+    /// is [`UdpProxy::Unsupported`](crate::net::UdpProxy), so a custom connector opts in by
+    /// overriding this.
+    fn udp_proxy(&self) -> crate::net::udp::UdpProxy {
+        crate::net::udp::UdpProxy::Unsupported
+    }
 }
 
 /// Open a TCP connection to `host:port`, honoring `timeout` for the connect
@@ -91,6 +99,10 @@ impl Connector for DirectConnector {
 
     fn is_direct(&self) -> bool {
         true
+    }
+
+    fn udp_proxy(&self) -> crate::net::udp::UdpProxy {
+        crate::net::udp::UdpProxy::Direct
     }
 }
 
@@ -149,6 +161,14 @@ impl Connector for Socks5Connector {
         socks::socks5_connect(&mut s, host, port, auth, self.remote_dns)?;
         clear_handshake_timeout(&s)?;
         Ok(Box::new(s))
+    }
+
+    fn udp_proxy(&self) -> crate::net::udp::UdpProxy {
+        crate::net::udp::UdpProxy::Socks5 {
+            host: self.host.clone(),
+            port: self.port,
+            auth: self.auth.clone(),
+        }
     }
 }
 

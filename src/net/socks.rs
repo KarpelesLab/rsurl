@@ -7,7 +7,7 @@
 //! de-facto SOCKS4/4a specification.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 use crate::error::{Error, Result};
 
@@ -76,15 +76,11 @@ pub(crate) fn socks4_connect<S: Read + Write>(
     }
 }
 
-/// SOCKS5 / SOCKS5h `CONNECT` (RFC 1928) with optional username/password auth
-/// (RFC 1929). With `remote_dns` (5h) the hostname is sent as a domain
-/// (ATYP=3) for the proxy to resolve; otherwise it is resolved locally.
-pub(crate) fn socks5_connect<S: Read + Write>(
+/// SOCKS5 greeting + method selection + optional RFC 1929 username/password
+/// auth. Shared by `CONNECT` (TCP) and `UDP ASSOCIATE`.
+pub(crate) fn socks5_negotiate<S: Read + Write>(
     stream: &mut S,
-    host: &str,
-    port: u16,
     auth: Option<(&str, &str)>,
-    remote_dns: bool,
 ) -> Result<()> {
     // Greeting: offer NO-AUTH, plus USERNAME/PASSWORD when we have creds.
     let greeting: &[u8] = if auth.is_some() {
@@ -104,7 +100,7 @@ pub(crate) fn socks5_connect<S: Read + Write>(
         )));
     }
     match sel[1] {
-        0x00 => {} // no authentication required
+        0x00 => Ok(()), // no authentication required
         0x02 => {
             let (user, pass) = auth.ok_or_else(|| {
                 Error::BadResponse("socks5: proxy requires auth but none was provided".into())
@@ -129,21 +125,29 @@ pub(crate) fn socks5_connect<S: Read + Write>(
                     "socks5: username/password authentication failed".into(),
                 ));
             }
+            Ok(())
         }
-        0xFF => {
-            return Err(Error::BadResponse(
-                "socks5: proxy offered no acceptable authentication method".into(),
-            ))
-        }
-        other => {
-            return Err(Error::BadResponse(format!(
-                "socks5: proxy selected unsupported method {other:#04x}"
-            )))
-        }
+        0xFF => Err(Error::BadResponse(
+            "socks5: proxy offered no acceptable authentication method".into(),
+        )),
+        other => Err(Error::BadResponse(format!(
+            "socks5: proxy selected unsupported method {other:#04x}"
+        ))),
     }
+}
 
-    // CONNECT request: VER CMD RSV ATYP DST.ADDR DST.PORT.
-    let mut req = vec![0x05u8, 0x01, 0x00];
+/// Send a SOCKS5 request (`cmd`: 0x01 CONNECT / 0x03 UDP ASSOCIATE) for
+/// `host:port` and parse the bound address (`BND.ADDR:BND.PORT`) from the
+/// reply, consuming exactly the variable-length address. A domain `BND.ADDR`
+/// (illegal in a reply) is rejected. `remote_dns` sends the host as a domain.
+pub(crate) fn socks5_request<S: Read + Write>(
+    stream: &mut S,
+    cmd: u8,
+    host: &str,
+    port: u16,
+    remote_dns: bool,
+) -> Result<SocketAddr> {
+    let mut req = vec![0x05u8, cmd, 0x00];
     if remote_dns {
         if host.len() > 255 {
             return Err(Error::BadResponse(
@@ -173,38 +177,55 @@ pub(crate) fn socks5_connect<S: Read + Write>(
     stream.write_all(&req)?;
     stream.flush()?;
 
-    // Reply: VER REP RSV ATYP BND.ADDR BND.PORT. We must consume the variable
-    // BND.ADDR exactly, by ATYP, so the stream is left at the payload.
+    // Reply: VER REP RSV ATYP BND.ADDR BND.PORT.
     let mut head = [0u8; 4];
     stream.read_exact(&mut head)?;
     if head[0] != 0x05 {
         return Err(Error::BadResponse(format!(
-            "socks5: bad version {:#04x} in connect reply",
+            "socks5: bad version {:#04x} in reply",
             head[0]
         )));
     }
     if head[1] != 0x00 {
         return Err(Error::BadResponse(format!(
-            "socks5: connect failed ({})",
+            "socks5: request failed ({})",
             socks5_reply_msg(head[1])
         )));
     }
-    let bnd_len = match head[3] {
-        0x01 => 4,
-        0x04 => 16,
-        0x03 => {
-            let mut l = [0u8; 1];
-            stream.read_exact(&mut l)?;
-            l[0] as usize
+    let ip = match head[3] {
+        0x01 => {
+            let mut a = [0u8; 4];
+            stream.read_exact(&mut a)?;
+            IpAddr::V4(a.into())
+        }
+        0x04 => {
+            let mut a = [0u8; 16];
+            stream.read_exact(&mut a)?;
+            IpAddr::V6(a.into())
         }
         other => {
             return Err(Error::BadResponse(format!(
-                "socks5: unknown ATYP {other:#04x} in connect reply"
+                "socks5: unexpected ATYP {other:#04x} in reply (domain not allowed)"
             )))
         }
     };
-    let mut bnd = vec![0u8; bnd_len + 2]; // BND.ADDR + BND.PORT
-    stream.read_exact(&mut bnd)?;
+    let mut p = [0u8; 2];
+    stream.read_exact(&mut p)?;
+    Ok(SocketAddr::new(ip, u16::from_be_bytes(p)))
+}
+
+/// SOCKS5 / SOCKS5h `CONNECT` (RFC 1928): negotiate, request a TCP tunnel to
+/// `host:port`. After it returns the stream is a transparent pipe to the
+/// target.
+pub(crate) fn socks5_connect<S: Read + Write>(
+    stream: &mut S,
+    host: &str,
+    port: u16,
+    auth: Option<(&str, &str)>,
+    remote_dns: bool,
+) -> Result<()> {
+    socks5_negotiate(stream, auth)?;
+    socks5_request(stream, 0x01, host, port, remote_dns)?;
     Ok(())
 }
 
