@@ -2481,3 +2481,24 @@ fn cli_write_out_phase_timers() {
     );
     assert!(nums[1] <= nums[2] + 1e-6, "starttransfer<=total: {line:?}");
 }
+
+/// `-w %header{Name}` emits a named response header; `%{ssl_verify_result}`
+/// reports 0 after a successful transfer.
+#[test]
+fn cli_write_out_header_var() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| SResp::ok("body").header("X-Test", "abc123"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "[%header{X-Test}|%{ssl_verify_result}]",
+            &server.url("/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[abc123|0]");
+}

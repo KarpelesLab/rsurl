@@ -3067,6 +3067,10 @@ fn run_write_out(
             "size_header" => size_header.to_string(),
             "num_headers" => resp.headers.len().to_string(),
             "content_type" => resp.header("content-type").unwrap_or("").to_string(),
+            // We only reach write-out after a successful transfer; a TLS
+            // verification failure aborts earlier, so this is always 0 (curl
+            // also reports 0 for non-TLS schemes).
+            "ssl_verify_result" => "0".to_string(),
             "url_effective" => {
                 let default = matches!(
                     (url.scheme.as_str(), url.port),
@@ -3095,7 +3099,7 @@ fn run_write_out(
     let mut chars = fmt.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '%' => match chars.peek() {
+            '%' => match chars.peek().copied() {
                 Some('{') => {
                     chars.next();
                     let mut name = String::new();
@@ -3110,6 +3114,20 @@ fn run_write_out(
                 Some('%') => {
                     chars.next();
                     out.push('%');
+                }
+                // %header{Name}: emit a named response header (curl 7.84+).
+                _ if chars.clone().take(7).collect::<String>() == "header{" => {
+                    for _ in 0..7 {
+                        chars.next();
+                    }
+                    let mut name = String::new();
+                    for nc in chars.by_ref() {
+                        if nc == '}' {
+                            break;
+                        }
+                        name.push(nc);
+                    }
+                    out.push_str(resp.header(name.trim()).unwrap_or(""));
                 }
                 _ => out.push('%'),
             },
@@ -3697,8 +3715,9 @@ Options:
   -w, --write-out <fmt>    after the transfer, print <fmt> with %{{vars}}
                            expanded (http_code, size_download, content_type,
                            url_effective, time_total, time_connect,
-                           time_appconnect, time_pretransfer, time_starttransfer;
-                           phase timers are HTTP/1.1-only, else 0.000000)
+                           time_appconnect, time_pretransfer, time_starttransfer,
+                           ssl_verify_result, %header{{Name}}; phase timers are
+                           HTTP/1.1-only, else 0.000000)
       --url <url>          add a URL (repeatable; same as a positional arg)
   -n, --netrc              read credentials from ~/.netrc (when no -u)
       --netrc-file <file>  read credentials from <file> (implies -n)
