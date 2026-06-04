@@ -30,9 +30,20 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   `--fail-with-body`, `--proto`/`--proto-default`, `--location-trusted`,
   `--post301/302/303`, `--connect-to`.
 - **M7 URL globbing**: `{a,b}`, `[1-100]`/`[a-z]` (`:step`, zero-pad), `-g`, `#N`.
+- **M6 (connection control, partial)**: `--connect-to`, `--unix-socket`.
 - **M2 (TLS, partial)**: `--tlsv1.x` / `--tls-max` version pinning (both backends).
+- **M9 (new protocols, partial)**: **SMTP/SMTPS** (EHLO/STARTTLS/AUTH/MAIL/RCPT/
+  DATA via `--mail-from`/`--mail-rcpt`) and **TELNET** (IAC-stripping). New
+  schemes: `smtp`(25)/`smtps`(465)/`telnet`(23).
 - Recognized-but-not-yet-enforced (need foundations): `-E/--cert`,
   `--limit-rate`, `-y`/`-Y`, `-#` — warn transparently.
+
+**Remaining (large / multi-session):** M1 streaming I/O (XL) and the M5
+features that depend on it (live progress, real `--limit-rate`/`-y`/`-Y`,
+write-out phase timers, early `--max-filesize`); M3 Digest/NTLM/Negotiate/
+SigV4 auth; M8 `-Z` parallel CLI; M9 SMB/RTMP; M10 protocol depth (FTP active
+mode, RTSP RTP, LDAP writes); M11 polish (exit-code sweep, man page, libcurl
+C API).
 
 **Next highest-leverage step: M1 streaming I/O** — it unblocks live progress,
 real `--limit-rate`/`-y`/`-Y`, early `--max-filesize`, write-out phase timers,
