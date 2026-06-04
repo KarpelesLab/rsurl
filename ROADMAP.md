@@ -13,6 +13,31 @@ invocations, keeping rsurl's defining constraints intact.
 - **Security defaults stay strict.** Every new feature ships verified (full CI
   gate: build, `clippy -D warnings`, fmt, doc, both TLS backends, tests).
 
+## Progress log
+
+Delivered on `feature/pluggable-network` (all CI-gate-clean):
+
+- **Pluggable network**: `Connector`/`UdpProxy` traits, `Client`/`Session`,
+  built-in HTTP/HTTPS/SOCKS4/4a/5/5h proxies incl. **SOCKS5 UDP ASSOCIATE** for
+  HTTP/3 & TFTP, and `--unix-socket` (M6 partial).
+- **Curl flags — Tier A/B/C + quick wins**: `-f`, `-S`, `-G`, `-r`,
+  `--compressed`, `-D`, `-R`, `--create-dirs`, `--max-filesize`, `--url`, `-U`,
+  socks shorthands, `-w/--write-out` (subset; phase timers pending M1),
+  `-n/--netrc`(+file), `-J`, `--retry` + `--retry-delay/-max-time/-connrefused/
+  -all-errors`, `-4/-6`, `--resolve`, `-K/--config`, `--next`, getopt-style
+  **bundled short flags** (`-sS`, `-ofile`).
+- **M4 (HTTP breadth, partial)**: `-z/--time-cond`, `-e ;auto`, `--output-dir`,
+  `--fail-with-body`, `--proto`/`--proto-default`, `--location-trusted`,
+  `--post301/302/303`, `--connect-to`.
+- **M7 URL globbing**: `{a,b}`, `[1-100]`/`[a-z]` (`:step`, zero-pad), `-g`, `#N`.
+- **M2 (TLS, partial)**: `--tlsv1.x` / `--tls-max` version pinning (both backends).
+- Recognized-but-not-yet-enforced (need foundations): `-E/--cert`,
+  `--limit-rate`, `-y`/`-Y`, `-#` — warn transparently.
+
+**Next highest-leverage step: M1 streaming I/O** — it unblocks live progress,
+real `--limit-rate`/`-y`/`-Y`, early `--max-filesize`, write-out phase timers,
+and large/infinite transfers. Then M3 auth, M9 SMTP, M8 parallel.
+
 ## Where we are today
 
 Protocols: HTTP/1.1, HTTP/2, HTTP/3, FTP/FTPS, SFTP, SCP, IMAP(S), POP3(S),
