@@ -191,6 +191,14 @@ struct Args {
     proto_default: Option<String>,
     /// `-e`/`--referer` `;auto`: send Referer from the previous URL on redirect.
     auto_referer: bool,
+    /// `--retry-delay <s>`: fixed delay between retries (else exponential).
+    retry_delay: Option<u64>,
+    /// `--retry-max-time <s>`: cap on total time spent retrying.
+    retry_max_time: Option<u64>,
+    /// `--retry-connrefused`: also retry on connection-refused.
+    retry_connrefused: bool,
+    /// `--retry-all-errors`: retry on any error.
+    retry_all_errors: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1506,9 +1514,13 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             }
             (None, false) => attempt_req.send(),
         };
+        // Stop retrying once --retry-max-time elapses.
+        let within_budget = args
+            .retry_max_time
+            .is_none_or(|m| started.elapsed().as_secs() < m);
         match result {
             // A transient HTTP status is retried up to `--retry` times.
-            Ok(r) if is_retryable_status(r.status) && attempt < args.retry => {
+            Ok(r) if is_retryable_status(r.status) && attempt < args.retry && within_budget => {
                 attempt += 1;
                 if show_errors(args) {
                     eprintln!(
@@ -1516,15 +1528,15 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
                         r.status, attempt, args.retry
                     );
                 }
-                std::thread::sleep(retry_delay(attempt));
+                std::thread::sleep(next_retry_delay(attempt, args));
             }
             Ok(r) => break r,
-            Err(e) if attempt < args.retry => {
+            Err(e) if attempt < args.retry && within_budget && should_retry_err(&e, args) => {
                 attempt += 1;
                 if show_errors(args) {
                     eprintln!("rsurl: {e} — retry {}/{}", attempt, args.retry);
                 }
-                std::thread::sleep(retry_delay(attempt));
+                std::thread::sleep(next_retry_delay(attempt, args));
             }
             Err(e) => {
                 if show_errors(args) {
@@ -1797,6 +1809,22 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "--retry requires a count".to_string())?
             }
+            "--retry-delay" => {
+                a.retry_delay = Some(
+                    next_val(&mut it, arg)?
+                        .parse()
+                        .map_err(|_| "--retry-delay requires seconds".to_string())?,
+                )
+            }
+            "--retry-max-time" => {
+                a.retry_max_time = Some(
+                    next_val(&mut it, arg)?
+                        .parse()
+                        .map_err(|_| "--retry-max-time requires seconds".to_string())?,
+                )
+            }
+            "--retry-connrefused" => a.retry_connrefused = true,
+            "--retry-all-errors" => a.retry_all_errors = true,
             "-4" | "--ipv4" => a.ipv4 = true,
             "-6" | "--ipv6" => a.ipv6 = true,
             "-#" | "--progress-bar" => a.progress_bar = true,
@@ -1852,6 +1880,34 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
         .unwrap_or(60)
         .min(60);
     std::time::Duration::from_secs(secs)
+}
+
+/// The delay before the next retry: `--retry-delay` if set, else exponential.
+fn next_retry_delay(attempt: u32, args: &Args) -> std::time::Duration {
+    match args.retry_delay {
+        Some(s) => std::time::Duration::from_secs(s),
+        None => retry_delay(attempt),
+    }
+}
+
+/// Whether a transport error is retryable. curl retries timeouts by default;
+/// connection-refused only with `--retry-connrefused`; everything with
+/// `--retry-all-errors`.
+fn should_retry_err(e: &rsurl::Error, args: &Args) -> bool {
+    if args.retry_all_errors {
+        return true;
+    }
+    match e {
+        rsurl::Error::Io(io) => {
+            let k = io.kind();
+            matches!(
+                k,
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) || (args.retry_connrefused && k == std::io::ErrorKind::ConnectionRefused)
+        }
+        rsurl::Error::UnexpectedEof => true,
+        _ => false,
+    }
 }
 
 /// Resolve credentials for `host` from the netrc file (`--netrc-file` or
@@ -2845,6 +2901,10 @@ Options:
       --netrc-file <file>  read credentials from <file> (implies -n)
   -J, --remote-header-name with -O, name the file from Content-Disposition
       --retry <n>          retry transient failures up to <n> times
+      --retry-delay <s>    fixed delay between retries (else exponential)
+      --retry-max-time <s> give up retrying after <s> seconds total
+      --retry-connrefused  also retry on connection refused
+      --retry-all-errors   retry on any error
   -z, --time-cond <t>      If-Modified-Since (or If-Unmodified-Since for
                            a leading '-'); a filename uses its mtime
       --output-dir <dir>   directory to prepend to -o/-O output names
@@ -2870,6 +2930,39 @@ Options:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proto_allowed_evaluates_specs() {
+        assert!(proto_allowed("https", "=https,http"));
+        assert!(!proto_allowed("ftp", "=https,http"));
+        assert!(proto_allowed("http", "all"));
+        assert!(!proto_allowed("ftp", "-ftp"));
+        assert!(proto_allowed("https", "-ftp"));
+        assert!(proto_allowed("https", "+https"));
+    }
+
+    #[test]
+    fn epoch_httpdate_roundtrips() {
+        // Sun, 06 Nov 1994 08:49:37 GMT == 784111777
+        assert_eq!(
+            epoch_to_httpdate(784111777),
+            "Sun, 06 Nov 1994 08:49:37 GMT"
+        );
+        assert_eq!(
+            httpdate_to_epoch("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784111777)
+        );
+        assert_eq!(epoch_to_httpdate(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn short_bundles_expand() {
+        let got = expand_short_bundles(&["-sS".into(), "-ofile".into(), "u".into()]);
+        assert_eq!(got, vec!["-s", "-S", "-o", "file", "u"]);
+        // long options and bare dash pass through
+        let got2 = expand_short_bundles(&["--silent".into(), "-".into()]);
+        assert_eq!(got2, vec!["--silent", "-"]);
+    }
 
     // ---- sanitize_for_tty -----------------------------------------------
 
