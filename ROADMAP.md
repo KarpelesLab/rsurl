@@ -38,12 +38,21 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 - Recognized-but-not-yet-enforced (need foundations): `-E/--cert`,
   `--limit-rate`, `-y`/`-Y`, `-#` — warn transparently.
 
-**Remaining (large / multi-session):** M1 streaming I/O (XL) and the M5
-features that depend on it (live progress, real `--limit-rate`/`-y`/`-Y`,
-write-out phase timers, early `--max-filesize`); M3 Digest/NTLM/Negotiate/
-SigV4 auth; M8 `-Z` parallel CLI; M9 SMB/RTMP; M10 protocol depth (FTP active
-mode, RTSP RTP, LDAP writes); M11 polish (exit-code sweep, man page, libcurl
-C API).
+- **M1 streaming I/O (keystone, partial)**: `Request::send_download` streams the
+  HTTP/1.1 body to a sink (redirect-following, cookies); HTTP/2/3, proxied,
+  compressed, and empty bodies fall back to buffered.
+- **M5 (partial, on streaming)**: enforced `--max-filesize` (early abort),
+  `--limit-rate`, and `-#` progress for file downloads; `-w %{size_download}`.
+- **M3 (partial)**: **HTTP Digest** auth (`--digest`, MD5/SHA-256 + qop=auth)
+  and `--oauth2-bearer`.
+- **M8**: `-Z/--parallel` + `--parallel-max` concurrent transfers.
+
+**Remaining (large / multi-session):** the rest of M1 (stream HTTP/2-3 and the
+file-transfer protocols; streaming decompression); M3 NTLM / Negotiate (needs
+pure-Rust Kerberos) / AWS-SigV4; M5 `-y`/`-Y` low-speed abort and write-out
+phase timers (need timing instrumentation threaded through `Response`); M9
+SMB/RTMP; M10 protocol depth (FTP active mode, RTSP RTP, LDAP writes); M11
+polish (exit-code sweep, man page, libcurl-shaped C API).
 
 **Next highest-leverage step: M1 streaming I/O** — it unblocks live progress,
 real `--limit-rate`/`-y`/`-Y`, early `--max-filesize`, write-out phase timers,
