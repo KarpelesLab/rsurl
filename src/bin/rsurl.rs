@@ -214,6 +214,9 @@ struct Args {
     /// `--tlsv1.x` / `--tls-max`: TLS version floor / ceiling.
     tls_min: Option<rsurl::tls::ProtocolVersion>,
     tls_max: Option<rsurl::tls::ProtocolVersion>,
+    /// `--mail-from <addr>` / `--mail-rcpt <addr>`: SMTP envelope.
+    mail_from: Option<String>,
+    mail_rcpt: Vec<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1471,6 +1474,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         if parsed_url.scheme == "rtsp" {
             return run_rtsp(&parsed_url, args);
         }
+        if matches!(parsed_url.scheme.as_str(), "smtp" | "smtps") {
+            return run_smtp(&parsed_url, args);
+        }
         // MQTT: a request body (`-d`/`--data*` or `-T`) switches from the
         // default subscribe (`run_transfer`) to publish, matching curl. With
         // no body we fall through to the subscribe transfer below.
@@ -1990,6 +1996,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 a.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_2)
             }
             "--tlsv1.3" => a.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_3),
+            "--mail-from" => a.mail_from = Some(next_val(&mut it, arg)?),
+            "--mail-rcpt" => a.mail_rcpt.push(next_val(&mut it, arg)?),
             "--tls-max" => {
                 let v = next_val(&mut it, arg)?;
                 a.tls_max = Some(match v.as_str() {
@@ -2632,6 +2640,76 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
     Ok(c)
 }
 
+/// Send a message over SMTP/SMTPS: `--mail-from`, `--mail-rcpt` (repeatable),
+/// and the body from `-T file` or `-d`.
+fn run_smtp(url: &Url, args: &Args) -> u8 {
+    let Some(from) = args.mail_from.as_deref() else {
+        if show_errors(args) {
+            eprintln!("rsurl: smtp requires --mail-from");
+        }
+        return 2;
+    };
+    if args.mail_rcpt.is_empty() {
+        if show_errors(args) {
+            eprintln!("rsurl: smtp requires at least one --mail-rcpt");
+        }
+        return 2;
+    }
+    let body: Vec<u8> = if let Some(path) = &args.upload_file {
+        match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: read {path}: {e}");
+                }
+                return 2;
+            }
+        }
+    } else if !args.data_parts.is_empty() {
+        match assemble_request_body(args) {
+            Ok(Some((b, _, _))) => b,
+            _ => Vec::new(),
+        }
+    } else {
+        if show_errors(args) {
+            eprintln!("rsurl: smtp needs a message body (-T <file> or -d)");
+        }
+        return 2;
+    };
+    let (user, pass) = match url.userinfo.as_deref() {
+        Some(ui) => match ui.split_once(':') {
+            Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
+            None => (Some(ui.to_string()), None),
+        },
+        None => (None, None),
+    };
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            return 5;
+        }
+    };
+    match client.smtp_send(
+        url,
+        &body,
+        from,
+        &args.mail_rcpt,
+        user.as_deref(),
+        pass.as_deref(),
+    ) {
+        Ok(()) => 0,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
+}
+
 fn run_transfer(url: &Url, args: &Args) -> u8 {
     // `url` is already IDN-normalised by `process_url`; dispatch the parsed URL
     // directly so the host the caller chose (and `--no-idn`) is honoured. The
@@ -3166,6 +3244,8 @@ Options:
       --cacert <file>      PEM bundle to use instead of system trust
       --tlsv1.2/1.3        require at least this TLS version (floor)
       --tls-max <ver>      cap the TLS version (1.2 or 1.3)
+      --mail-from <addr>   SMTP envelope sender (smtp://host, body via -T/-d)
+      --mail-rcpt <addr>   SMTP envelope recipient (repeatable)
       --no-idn             don't convert international (IDN) hostnames to punycode
       --max-time <secs>    cap on the whole operation's wall time
       --connect-timeout <secs>

@@ -13,6 +13,7 @@ mod error;
 mod http;
 mod idn;
 mod pool;
+mod smtp;
 mod transfer;
 mod url;
 

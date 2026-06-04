@@ -172,4 +172,23 @@ impl Client {
     pub fn transfer_url(&self, url: &Url) -> Result<Vec<u8>> {
         crate::transfer::transfer_url_with(url, &self.net_config_for(&url.host))
     }
+
+    /// Send a message over SMTP/SMTPS (curl `--mail-from`/`--mail-rcpt` + body).
+    pub fn smtp_send(
+        &self,
+        url: &Url,
+        body: &[u8],
+        from: &str,
+        rcpts: &[String],
+        user: Option<&str>,
+        pass: Option<&str>,
+    ) -> Result<()> {
+        let opts = crate::smtp::SmtpOptions {
+            from,
+            rcpts,
+            user,
+            pass,
+        };
+        crate::smtp::send(url, body, &opts, &self.net_config_for(&url.host))
+    }
 }

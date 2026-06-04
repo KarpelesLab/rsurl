@@ -266,6 +266,8 @@ fn default_port(scheme: &str) -> Option<u16> {
         "mqtts" => 8883,
         "pop3" => 110,
         "pop3s" => 995,
+        "smtp" => 25,
+        "smtps" => 465,
         "rtsp" => 554,
         "tftp" => 69,
         "sftp" | "scp" => 22,

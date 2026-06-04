@@ -2041,3 +2041,96 @@ fn cli_unix_socket_transport() {
     handle.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// End-to-end SMTP send against a minimal mock server: EHLO → MAIL → RCPT →
+/// DATA → body → QUIT. Asserts the envelope and dot-unstuffed body.
+#[test]
+fn cli_smtp_send() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cap = Arc::clone(&captured);
+    let handle = std::thread::spawn(move || {
+        fn line(r: &mut BufReader<std::net::TcpStream>) -> String {
+            let mut l = String::new();
+            r.read_line(&mut l).unwrap();
+            l.trim_end().to_string()
+        }
+        let (s, _) = listener.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        w.write_all(b"220 mock ESMTP\r\n").unwrap();
+        let ehlo = line(&mut r);
+        cap.lock().unwrap().push(ehlo);
+        w.write_all(b"250-mock\r\n250 AUTH PLAIN\r\n").unwrap();
+        let mf = line(&mut r);
+        cap.lock().unwrap().push(mf);
+        w.write_all(b"250 ok\r\n").unwrap();
+        let rcpt = line(&mut r);
+        cap.lock().unwrap().push(rcpt);
+        w.write_all(b"250 ok\r\n").unwrap();
+        let _data = line(&mut r); // DATA
+        w.write_all(b"354 go ahead\r\n").unwrap();
+        // Read body until the lone "." line.
+        let mut body = String::new();
+        loop {
+            let mut l = String::new();
+            r.read_line(&mut l).unwrap();
+            if l == ".\r\n" || l == ".\n" {
+                break;
+            }
+            body.push_str(&l);
+        }
+        cap.lock()
+            .unwrap()
+            .push(format!("BODY:{}", body.trim_end()));
+        w.write_all(b"250 queued\r\n").unwrap();
+        let _ = line(&mut r); // QUIT
+        w.write_all(b"221 bye\r\n").unwrap();
+        let _ = r.read(&mut [0u8; 1]);
+    });
+
+    let mut msg = std::env::temp_dir();
+    msg.push(format!("rsurl-smtp-{}.txt", std::process::id()));
+    std::fs::write(&msg, b"Subject: hi\r\n\r\nHello over SMTP\r\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--mail-from",
+            "alice@example.com",
+            "--mail-rcpt",
+            "bob@example.com",
+            "-T",
+            msg.to_str().unwrap(),
+            &format!("smtp://127.0.0.1:{}", addr.port()),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&msg);
+    handle.join().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let c = captured.lock().unwrap();
+    assert!(c.iter().any(|l| l.starts_with("EHLO ")), "got: {c:?}");
+    assert!(
+        c.iter().any(|l| l == "MAIL FROM:<alice@example.com>"),
+        "got: {c:?}"
+    );
+    assert!(
+        c.iter().any(|l| l == "RCPT TO:<bob@example.com>"),
+        "got: {c:?}"
+    );
+    assert!(
+        c.iter().any(|l| l.contains("Hello over SMTP")),
+        "got: {c:?}"
+    );
+}
