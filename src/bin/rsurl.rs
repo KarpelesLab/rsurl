@@ -250,49 +250,65 @@ enum FormExtra {
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    let args = match parse_args(&raw) {
-        Ok(a) => a,
+    // -K/--config: splice config-file options into the argument stream.
+    let expanded = match expand_config(&raw, 0) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("rsurl: {e}");
-            eprintln!("try 'rsurl --help'");
             return ExitCode::from(2);
         }
     };
+    // --next / -: separate independent operations, each with its own options.
+    let segments = split_operations(&expanded);
+    let mut ops: Vec<Args> = Vec::with_capacity(segments.len());
+    for seg in &segments {
+        match parse_args(seg) {
+            Ok(a) => ops.push(a),
+            Err(e) => {
+                eprintln!("rsurl: {e}");
+                eprintln!("try 'rsurl --help'");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
-    if args.urls.is_empty() {
+    if ops.iter().all(|a| a.urls.is_empty()) {
         print_usage();
         return ExitCode::from(2);
     }
 
-    // Cookie jar: built once and shared across every URL on the command
-    // line, so Set-Cookie from URL N is visible to URL N+1, just like curl.
-    // We only allocate one if the user asked for cookie behaviour.
-    let mut jar: Option<CookieJar> = match build_initial_jar(&args) {
+    // One cookie jar shared across all operations (curl carries it over
+    // --next). Build it from the first operation that configures cookies.
+    let jar_op = ops
+        .iter()
+        .find(|a| a.cookie_in.is_some() || a.cookie_jar.is_some())
+        .unwrap_or(&ops[0]);
+    let mut jar: Option<CookieJar> = match build_initial_jar(jar_op) {
         Ok(j) => j,
         Err(e) => {
-            if show_errors(&args) {
+            if show_errors(jar_op) {
                 eprintln!("rsurl: {e}");
             }
             return ExitCode::from(2);
         }
     };
 
-    // Run each URL; remember the last non-zero code (matches curl's
-    // behaviour of returning the most recent error).
+    // Run each operation's URLs; remember the last non-zero exit code.
     let mut last_failure: u8 = 0;
-    for url in &args.urls {
-        let code = process_url(url, &args, jar.as_mut());
-        if code != 0 {
-            last_failure = code;
+    for op in &ops {
+        for url in &op.urls {
+            let code = process_url(url, op, jar.as_mut());
+            if code != 0 {
+                last_failure = code;
+            }
         }
     }
 
-    // Final save (after every transfer) so cookies set on the last hop
-    // make it to disk. Failure here is reported but does not override an
-    // earlier non-zero exit code — curl behaves the same way.
-    if let (Some(j), Some(path)) = (jar.as_ref(), args.cookie_jar.as_deref()) {
+    // Final jar save, to the first operation that asked for one.
+    if let (Some(j), Some(op)) = (jar.as_ref(), ops.iter().find(|a| a.cookie_jar.is_some())) {
+        let path = op.cookie_jar.as_deref().unwrap();
         if let Err(e) = j.save_netscape(path) {
-            if show_errors(&args) {
+            if show_errors(op) {
                 eprintln!("rsurl: writing cookie jar {path}: {e}");
             }
             if last_failure == 0 {
@@ -301,6 +317,82 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::from(last_failure)
+}
+
+/// Split a token stream into independent operations at `--next` / `-:`.
+fn split_operations(toks: &[String]) -> Vec<Vec<String>> {
+    let mut segs: Vec<Vec<String>> = vec![Vec::new()];
+    for t in toks {
+        if t == "--next" || t == "-:" {
+            segs.push(Vec::new());
+        } else {
+            segs.last_mut().unwrap().push(t.clone());
+        }
+    }
+    segs
+}
+
+/// Recursively expand `-K`/`--config <file>` into the token stream. Each config
+/// line is `option [= | : | space] value` (curl format); `#` starts a comment,
+/// option names need no leading dashes.
+fn expand_config(toks: &[String], depth: u32) -> Result<Vec<String>, String> {
+    if depth > 16 {
+        return Err("config files nested too deeply".into());
+    }
+    let mut out = Vec::new();
+    let mut it = toks.iter();
+    while let Some(t) = it.next() {
+        if t == "-K" || t == "--config" {
+            let path = it
+                .next()
+                .ok_or_else(|| "--config requires a file".to_string())?;
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("config file {path}: {e}"))?;
+            let inner = expand_config(&parse_config_text(&text), depth + 1)?;
+            out.extend(inner);
+        } else {
+            out.push(t.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Tokenize a curl-style config file into CLI arguments.
+fn parse_config_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (opt, val) = match line.find(|c: char| c.is_whitespace() || c == '=' || c == ':') {
+            Some(i) => {
+                let rest = line[i..]
+                    .trim_start()
+                    .strip_prefix(['=', ':'])
+                    .unwrap_or_else(|| line[i..].trim_start())
+                    .trim_start();
+                (&line[..i], Some(rest))
+            }
+            None => (line, None),
+        };
+        let opt_norm = if opt.starts_with('-') {
+            opt.to_string()
+        } else if opt.chars().count() == 1 {
+            format!("-{opt}")
+        } else {
+            format!("--{opt}")
+        };
+        out.push(opt_norm);
+        if let Some(v) = val.filter(|v| !v.is_empty()) {
+            let v = v
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(v);
+            out.push(v.to_string());
+        }
+    }
+    out
 }
 
 /// Build the initial jar from `-b`/`-c`.
@@ -2463,6 +2555,8 @@ Options:
   -4, --ipv4               connect over IPv4 only
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
+  -K, --config <file>      read options from a curl-style config file
+      --next  (-:)         start a new request with its own options
   -h, --help               print this help
   -V, --version            print version
 "

@@ -1755,3 +1755,44 @@ fn cli_resolve_overrides_dns() {
     );
     assert_eq!(out.stdout, b"resolved");
 }
+
+/// `--next` runs a second request with its own options; both bodies are output.
+#[test]
+fn cli_next_runs_multiple_operations() {
+    use std::process::Command;
+    let a = TestServer::start(|_r: SReq| SResp::ok("AAA"));
+    let b = TestServer::start(|_r: SReq| SResp::ok("BBB"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", &a.url("/"), "--next", "-s", &b.url("/")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"AAABBB");
+}
+
+/// `-K/--config` reads options (incl. the URL) from a curl-style config file.
+#[test]
+fn cli_config_file_supplies_options() {
+    use std::io::Write;
+    use std::process::Command;
+    let server = TestServer::start(|_r: SReq| SResp::ok("from-config"));
+    let mut cfg = std::env::temp_dir();
+    cfg.push(format!("rsurl-cfg-{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&cfg).unwrap();
+        writeln!(f, "# a comment").unwrap();
+        writeln!(f, "silent").unwrap();
+        writeln!(f, "url = \"{}\"", server.url("/")).unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-K", cfg.to_str().unwrap()])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&cfg);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"from-config");
+}
