@@ -260,6 +260,9 @@ enum FormExtra {
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Expand bundled short flags (-sS → -s -S) and attached values
+    // (-ofile → -o file) so the rest of the pipeline sees one option per token.
+    let raw = expand_short_bundles(&raw);
     // -K/--config: splice config-file options into the argument stream.
     let expanded = match expand_config(&raw, 0) {
         Ok(v) => v,
@@ -356,6 +359,63 @@ fn warn_unsupported(ops: &[Args]) {
     {
         eprintln!("rsurl: warning: -y/-Y speed limits are recognized but not enforced");
     }
+}
+
+/// True if the short flag `c` consumes a value (so in a bundle the rest of the
+/// token, or the next argv token, is that value).
+fn short_flag_takes_value(c: char) -> bool {
+    matches!(
+        c,
+        'o' | 'X'
+            | 'H'
+            | 'd'
+            | 'F'
+            | 'T'
+            | 'A'
+            | 'e'
+            | 'u'
+            | 'b'
+            | 'c'
+            | 'x'
+            | 'E'
+            | 'r'
+            | 'D'
+            | 'w'
+            | 'C'
+            | 'y'
+            | 'Y'
+            | 'U'
+            | 'K'
+    )
+}
+
+/// Expand bundled short options the way getopt/curl do: `-sSv` → `-s -S -v`,
+/// `-ofile` → `-o file`, `-sSofile` → `-s -S -o file`. Long options (`--x`),
+/// bare `-`, and two-char tokens pass through unchanged.
+fn expand_short_bundles(tokens: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for t in tokens {
+        let is_bundle = t.len() > 2 && t.starts_with('-') && !t.starts_with("--");
+        if !is_bundle {
+            out.push(t.clone());
+            continue;
+        }
+        let chars: Vec<char> = t[1..].chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            out.push(format!("-{c}"));
+            if short_flag_takes_value(c) {
+                let rest: String = chars[i + 1..].iter().collect();
+                if !rest.is_empty() {
+                    out.push(rest); // attached value; next argv token otherwise
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Split a token stream into independent operations at `--next` / `-:`.

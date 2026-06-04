@@ -1796,3 +1796,26 @@ fn cli_config_file_supplies_options() {
     );
     assert_eq!(out.stdout, b"from-config");
 }
+
+/// Bundled short flags and attached values: `-sSo FILE` = `-s -S -o FILE`.
+#[test]
+fn cli_bundled_short_flags() {
+    use std::process::Command;
+    let server = TestServer::start(|_r: SReq| SResp::ok("bundled"));
+    let dir = std::env::temp_dir().join(format!("rsurl-bundle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let outfile = dir.join("o.txt");
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .arg(format!("-sSo{}", outfile.display()))
+        .arg(server.url("/"))
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "-s should silence stdout");
+    assert_eq!(std::fs::read(&outfile).unwrap(), b"bundled");
+    let _ = std::fs::remove_dir_all(&dir);
+}
