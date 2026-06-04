@@ -2570,3 +2570,66 @@ fn cli_json_flag_sets_content_type_and_accept() {
     assert_eq!(hv("content-type"), Some("application/json"));
     assert_eq!(hv("accept"), Some("application/json"));
 }
+
+/// `--no-clobber` never overwrites an existing -o target; it picks `.1`.
+#[test]
+fn cli_no_clobber_picks_suffix() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| SResp::ok("fresh"));
+    let base = tmp_out_path("noclobber");
+    std::fs::write(&base, b"original").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--no-clobber",
+            "-o",
+            base.to_str().unwrap(),
+            &server.url("/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    // The original file is untouched; the download landed in "<base>.1".
+    assert_eq!(std::fs::read(&base).unwrap(), b"original");
+    let alt = std::path::PathBuf::from(format!("{}.1", base.to_str().unwrap()));
+    assert_eq!(std::fs::read(&alt).unwrap(), b"fresh");
+    let _ = std::fs::remove_file(&base);
+    let _ = std::fs::remove_file(&alt);
+}
+
+/// `--remove-on-error` deletes the partial file when a download fails mid-body.
+#[test]
+fn cli_remove_on_error_deletes_partial() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf);
+        // Promise 100 bytes, send 10, then drop the connection mid-body.
+        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789");
+        let _ = sock.flush();
+        // socket closes here → client sees a short/truncated body → error.
+    });
+    let out_path = tmp_out_path("removeonerr");
+    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--remove-on-error",
+            "-o",
+            out_path.to_str().unwrap(),
+            &format!("http://{addr}/x"),
+        ])
+        .status()
+        .expect("spawn rsurl");
+    let _ = handle.join();
+    assert!(!status.success(), "truncated body should fail");
+    assert!(
+        !out_path.exists(),
+        "--remove-on-error must delete the partial file"
+    );
+    let _ = std::fs::remove_file(&out_path);
+}

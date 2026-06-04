@@ -154,6 +154,11 @@ struct Args {
     remote_time: bool,
     /// `--create-dirs`: create missing parent directories of `-o`.
     create_dirs: bool,
+    /// `--remove-on-error`: delete a partial `-o`/`-O` file if the transfer fails.
+    remove_on_error: bool,
+    /// `--no-clobber`: never overwrite an existing `-o`/`-O` file; pick a free
+    /// `.1`, `.2`, ... suffix instead (curl semantics).
+    no_clobber: bool,
     /// `--max-filesize <bytes>`: refuse a download larger than this.
     max_filesize: Option<u64>,
     /// `-w`/`--write-out <format>`: print a formatted summary after transfer.
@@ -2066,6 +2071,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 value: next_val(&mut it, arg)?,
                 at_file_ok: true,
             }),
+            "--remove-on-error" => a.remove_on_error = true,
+            "--no-clobber" => a.no_clobber = true,
             "--json" => a.json_parts.push(next_val(&mut it, arg)?),
             "--oauth2-bearer" => a.bearer = Some(next_val(&mut it, arg)?),
             "--aws-sigv4" => a.aws_sigv4 = Some(next_val(&mut it, arg)?),
@@ -3454,8 +3461,8 @@ fn run_http_download(
     } else {
         args.output.clone().unwrap_or_default()
     };
-    let file = match create_output_file(&name, args) {
-        Ok(f) => f,
+    let (file, out_path) = match create_output_file_tracked(&name, args) {
+        Ok(pair) => pair,
         Err(e) => {
             if show_errors(args) {
                 eprintln!("rsurl: open {name}: {e}");
@@ -3512,6 +3519,12 @@ fn run_http_download(
             0
         }
         Err(e) => {
+            // --remove-on-error: drop the (partial) file. Close the handle
+            // first — Windows refuses to unlink a file that's still open.
+            if args.remove_on_error {
+                drop(sink);
+                let _ = std::fs::remove_file(&out_path);
+            }
             if e.to_string().contains(MAX_FILESIZE_SENTINEL) {
                 if show_errors(args) {
                     eprintln!("rsurl: Maximum file size exceeded");
@@ -3536,15 +3549,35 @@ fn run_http_download(
     }
 }
 
-/// Create `path` for writing, first creating parent directories when
-/// `--create-dirs` is set (curl semantics).
-fn create_output_file(path: &str, args: &Args) -> io::Result<File> {
-    // --output-dir is prepended to -o/-O names (absolute paths are left alone,
-    // matching std::path::Path::join semantics).
+/// Resolve the on-disk path for an `-o`/`-O` name: prepend `--output-dir`
+/// (absolute paths are left alone), then, under `--no-clobber`, append the
+/// first free `.1`, `.2`, ... suffix so an existing file is never overwritten.
+fn resolve_output_path(path: &str, args: &Args) -> std::path::PathBuf {
     let full = match &args.output_dir {
         Some(dir) => std::path::Path::new(dir).join(path),
         None => std::path::PathBuf::from(path),
     };
+    if !args.no_clobber || !full.exists() {
+        return full;
+    }
+    let base = full.as_os_str().to_owned();
+    for n in 1u32.. {
+        let mut candidate = base.clone();
+        candidate.push(format!(".{n}"));
+        let candidate = std::path::PathBuf::from(candidate);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("u32 range exhausted picking a --no-clobber name")
+}
+
+/// Create the output file for `path`, first creating parent directories when
+/// `--create-dirs` is set (curl semantics). Returns the file and the resolved
+/// path actually opened (which `--no-clobber` may have renamed), so callers can
+/// e.g. delete it under `--remove-on-error`.
+fn create_output_file_tracked(path: &str, args: &Args) -> io::Result<(File, std::path::PathBuf)> {
+    let full = resolve_output_path(path, args);
     if args.create_dirs {
         if let Some(parent) = full.parent() {
             if !parent.as_os_str().is_empty() {
@@ -3555,7 +3588,14 @@ fn create_output_file(path: &str, args: &Args) -> io::Result<File> {
         // curl creates the --output-dir itself even without --create-dirs.
         std::fs::create_dir_all(dir)?;
     }
-    File::create(full)
+    let file = File::create(&full)?;
+    Ok((file, full))
+}
+
+/// As [`create_output_file_tracked`], discarding the resolved path. Used by the
+/// callers that don't need to delete the file afterward.
+fn create_output_file(path: &str, args: &Args) -> io::Result<File> {
+    create_output_file_tracked(path, args).map(|(f, _)| f)
 }
 
 /// `-D`/`--dump-header`: write the status line and response headers to `path`,
@@ -3773,6 +3813,8 @@ Options:
   -D, --dump-header <file> write response headers to <file>
   -R, --remote-time        set the saved file's mtime from Last-Modified
       --create-dirs        create missing directories for -o
+      --remove-on-error    delete a partial -o/-O file if the transfer fails
+      --no-clobber         never overwrite an existing -o/-O file (use .1, .2…)
       --max-filesize <n>   refuse a download larger than <n> bytes
   -w, --write-out <fmt>    after the transfer, print <fmt> with %{{vars}}
                            expanded (http_code, size_download, content_type,
