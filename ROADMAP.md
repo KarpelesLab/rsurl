@@ -46,6 +46,10 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   FTP/FTPS and `file://` stream the source directly (no full-body buffer), the
   rest fetch-then-write through the same sink — all gaining `--limit-rate`/`-#`/
   `--max-filesize`/`-y`/`-Y`/`--remove-on-error`/`--no-clobber` and `-w`.
+  **Streaming decompression**: a single gzip/zstd/br layer over a
+  Content-Length body decodes straight off the wire (budget-bounded), no
+  compressed-body buffer; deflate (zlib/raw ambiguity), multi-layer, chunked,
+  and unknown codings keep the buffered decode.
 - **M5 (partial, on streaming)**: enforced `--max-filesize` (early abort),
   `--limit-rate`, `-#` progress, and **`-y`/`-Y` low-speed abort** (exit 28) for
   file downloads; **`--remove-on-error`**, **`--no-clobber`**; `-w

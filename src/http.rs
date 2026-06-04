@@ -677,13 +677,51 @@ impl Request {
                 // 3xx without Location — treat as the final response.
             }
 
-            // Final response. A `Content-Encoding` means we must decode, which
-            // needs the whole body — buffer that case; otherwise stream.
-            let encoded = head
+            // Final response. A `Content-Encoding` means we must decode.
+            let content_encoding = head
                 .headers
                 .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"));
-            if encoded {
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                .map(|(_, v)| v.clone());
+            if let Some(ce) = content_encoding {
+                // Fast path: a single gzip/zstd/br layer over a Content-Length
+                // body decodes straight off the wire (bounded by the decoder's
+                // budget) without buffering the compressed body. deflate (zlib
+                // vs raw ambiguity), multi-layer, chunked, and unknown codings
+                // fall through to the buffered decode below.
+                let chunked = head.headers.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
+                });
+                let has_body = !(req.method.eq_ignore_ascii_case("HEAD")
+                    || (100..200).contains(&head.status)
+                    || head.status == 204
+                    || head.status == 304);
+                if has_body && !chunked {
+                    if let (Some(codec), Some(len)) = (
+                        crate::compress::single_streamable_layer(&ce),
+                        parse_content_length(&head.headers)?,
+                    ) {
+                        if len > MAX_BODY_BYTES as u64 {
+                            return Err(Error::BadResponse(format!("body too large: {len}")));
+                        }
+                        let n = crate::compress::stream_decode(
+                            bufrd.by_ref().take(len),
+                            codec,
+                            sink,
+                            MAX_BODY_BYTES as u64,
+                        )?;
+                        let _ = writeln!(trace, "* Stream-decoded {n} body bytes ({codec:?})");
+                        return Ok(Response {
+                            status: head.status,
+                            reason: head.reason,
+                            version: head.version,
+                            headers: crate::compress::strip_after_decode(head.headers),
+                            body: Vec::new(),
+                            timing,
+                        });
+                    }
+                }
+                // Buffered fallback (deflate / multi-layer / chunked / unknown).
                 let body = read_body(
                     &mut bufrd,
                     &head.headers,

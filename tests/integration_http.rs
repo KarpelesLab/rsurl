@@ -2788,8 +2788,11 @@ fn cli_ftp_create_dirs_upload() {
 }
 
 /// `file://` download to a file streams the local file through the sink and -w
-/// reports the byte count.
+/// reports the byte count. Unix-only: building a `file://` URL from a Windows
+/// path (drive letter + backslashes) isn't portable, and the feature is the
+/// same code path on every platform — this just exercises it via the CLI.
 #[test]
+#[cfg(unix)]
 fn cli_file_scheme_download_to_file() {
     use std::process::Command;
     let mut src = std::env::temp_dir();
@@ -2815,5 +2818,55 @@ fn cli_file_scheme_download_to_file() {
     assert_eq!(std::fs::read(&out_path).unwrap(), b"LOCAL-FILE-CONTENTS");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "19");
     let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// A gzip-encoded, Content-Length-framed download decodes straight off the wire
+/// (streaming decompression), writing the plaintext to the output file.
+#[test]
+fn cli_streaming_gzip_decode_to_file() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    // gzip("STREAM-GZIP-DECODE-OK") — 41 bytes, generated with `gzip -c`.
+    let gz: [u8; 41] = [
+        31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 11, 14, 9, 114, 117, 244, 213, 117, 143, 242, 12, 208,
+        117, 113, 117, 246, 119, 113, 213, 245, 247, 6, 0, 182, 187, 1, 85, 21, 0, 0, 0,
+    ];
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gz.len()
+        );
+        let _ = sock.write_all(head.as_bytes());
+        let _ = sock.write_all(&gz);
+        let _ = sock.flush();
+    });
+    let out_path = tmp_out_path("gz-stream");
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-o",
+            out_path.to_str().unwrap(),
+            "-w",
+            "%{size_download}",
+            &format!("http://{addr}/g"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    let _ = handle.join();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&out_path).unwrap(), b"STREAM-GZIP-DECODE-OK");
+    // size_download is the decoded byte count (21).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "21");
     let _ = std::fs::remove_file(&out_path);
 }

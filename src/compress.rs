@@ -239,6 +239,67 @@ fn uncompress(src: &[u8], budget: u64) -> Result<Vec<u8>> {
         .map_err(|e| Error::BadResponse(format!("compress decode failed: {e}")))
 }
 
+/// A single content coding that can be decoded directly off a byte stream
+/// (no buffered retry). Excludes `deflate` (its zlib-vs-raw ambiguity needs a
+/// buffered fallback) and `compress`/multi-layer/unknown encodings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamCodec {
+    Gzip,
+    Zstd,
+    Brotli,
+}
+
+/// If `content_encoding` is exactly one streamable layer (gzip / zstd / br,
+/// case-insensitive, with optional surrounding whitespace), return its codec so
+/// the caller can decode straight off the wire. Anything else — `deflate`,
+/// `compress`, `identity`, an unknown token, or more than one layer — returns
+/// `None`, and the caller should fall back to the buffered [`decode_body`].
+pub(crate) fn single_streamable_layer(content_encoding: &str) -> Option<StreamCodec> {
+    let mut layers = content_encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let only = layers.next()?;
+    if layers.next().is_some() {
+        return None; // more than one layer
+    }
+    if only.eq_ignore_ascii_case("gzip") || only.eq_ignore_ascii_case("x-gzip") {
+        Some(StreamCodec::Gzip)
+    } else if only.eq_ignore_ascii_case("zstd") {
+        Some(StreamCodec::Zstd)
+    } else if only.eq_ignore_ascii_case("br") {
+        Some(StreamCodec::Brotli)
+    } else {
+        None
+    }
+}
+
+/// Decode a single-codec stream from `reader` to `sink`, capping the
+/// decompressed output at `budget` bytes via compcol's [`LimitedDecoder`] (the
+/// decompression-bomb guard). Returns the number of plaintext bytes written.
+pub(crate) fn stream_decode<R: Read, W: std::io::Write + ?Sized>(
+    reader: R,
+    codec: StreamCodec,
+    sink: &mut W,
+    budget: u64,
+) -> Result<u64> {
+    fn copy<A: Algorithm, R: Read, W: std::io::Write + ?Sized>(
+        reader: R,
+        sink: &mut W,
+        budget: u64,
+    ) -> std::io::Result<u64> {
+        let dec = LimitedDecoder::new(A::decoder(), budget);
+        let mut r = DecoderReader::new(reader, dec);
+        std::io::copy(&mut r, sink)
+    }
+    let res = match codec {
+        StreamCodec::Gzip => copy::<Gzip, _, _>(reader, sink, budget),
+        StreamCodec::Zstd => copy::<Zstd, _, _>(reader, sink, budget),
+        StreamCodec::Brotli => copy::<Brotli, _, _>(reader, sink, budget),
+    };
+    res.map_err(|e| Error::BadResponse(format!("{codec:?} stream decode failed: {e}")))
+}
+
 /// Strip `Content-Encoding` and `Content-Length` from a response header
 /// list after a successful in-place body decode. Returns the new headers.
 ///
@@ -572,5 +633,51 @@ mod tests {
         let out = strip_after_decode(h);
         let names: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, ["Content-Type", "Server"]);
+    }
+
+    #[test]
+    fn single_streamable_layer_matches_only_single_known_codecs() {
+        assert_eq!(single_streamable_layer("gzip"), Some(StreamCodec::Gzip));
+        assert_eq!(single_streamable_layer(" X-Gzip "), Some(StreamCodec::Gzip));
+        assert_eq!(single_streamable_layer("zstd"), Some(StreamCodec::Zstd));
+        assert_eq!(single_streamable_layer("br"), Some(StreamCodec::Brotli));
+        // deflate is excluded (zlib/raw ambiguity needs a buffered retry).
+        assert_eq!(single_streamable_layer("deflate"), None);
+        // compress, identity, unknown, and multi-layer are not streamable.
+        assert_eq!(single_streamable_layer("compress"), None);
+        assert_eq!(single_streamable_layer("identity"), None);
+        assert_eq!(single_streamable_layer("snappy"), None);
+        assert_eq!(single_streamable_layer("gzip, br"), None);
+    }
+
+    #[test]
+    fn stream_decode_roundtrips_each_codec() {
+        let payload = b"the quick brown fox jumps over the lazy dog, twice over.";
+        for (codec, blob) in [
+            (StreamCodec::Gzip, gz(payload)),
+            (StreamCodec::Zstd, zstd(payload)),
+            (StreamCodec::Brotli, brotli(payload)),
+        ] {
+            let mut out = Vec::new();
+            let n = stream_decode(
+                blob.as_slice(),
+                codec,
+                &mut out,
+                crate::http::MAX_BODY_BYTES as u64,
+            )
+            .expect("stream decode");
+            assert_eq!(out, payload, "{codec:?}");
+            assert_eq!(n, payload.len() as u64, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn stream_decode_enforces_budget() {
+        // A tiny gzip frame that expands past a 4-byte budget must error rather
+        // than write an unbounded amount (decompression-bomb guard).
+        let blob = gz(&[b'A'; 4096]);
+        let mut out = Vec::new();
+        let err = stream_decode(blob.as_slice(), StreamCodec::Gzip, &mut out, 4);
+        assert!(err.is_err(), "decode past budget must fail");
     }
 }
