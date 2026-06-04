@@ -1661,13 +1661,13 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
             return run_ssh(&parsed_url, args);
         }
-        // FTP/FTPS download to a file streams the data channel straight to disk
-        // (enforcing --limit-rate / -# / --max-filesize / -y / -Y /
-        // --remove-on-error) instead of buffering the whole body in memory.
-        let ftp_to_file = matches!(parsed_url.scheme.as_str(), "ftp" | "ftps")
-            && (args.remote_name || args.output.as_deref().is_some_and(|p| p != "-"));
-        if ftp_to_file {
-            return run_ftp_download(&parsed_url, args);
+        // Any non-HTTP download to a file goes through the streaming sink, which
+        // enforces --limit-rate / -# / --max-filesize / -y / -Y /
+        // --remove-on-error and supports -w. FTP/FTPS and file:// truly stream
+        // (no full-body buffer); the rest fetch-then-write through the sink.
+        let to_file = args.remote_name || args.output.as_deref().is_some_and(|p| p != "-");
+        if to_file {
+            return run_stream_download(&parsed_url, args);
         }
         return run_transfer(&parsed_url, args);
     }
@@ -3072,11 +3072,12 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
     }
 }
 
-/// Streaming FTP/FTPS download to a file: copies the data channel straight to
-/// disk through a [`DownloadSink`], so `--limit-rate`, `-#`, `--max-filesize`,
-/// `-y`/`-Y`, `--no-clobber`, and `--remove-on-error` all apply without holding
-/// the whole file in memory.
-fn run_ftp_download(url: &Url, args: &Args) -> u8 {
+/// Streaming non-HTTP download to a file: writes the payload through a
+/// [`DownloadSink`], so `--limit-rate`, `-#`, `--max-filesize`, `-y`/`-Y`,
+/// `--no-clobber`, and `--remove-on-error` all apply. FTP/FTPS and file://
+/// stream the source directly (no full-body buffer); other schemes fetch then
+/// write through the same sink, so the flags still take effect.
+fn run_stream_download(url: &Url, args: &Args) -> u8 {
     let client = match transfer_client(url, args) {
         Ok(c) => c,
         Err(e) => {
@@ -3143,9 +3144,10 @@ fn run_ftp_download(url: &Url, args: &Args) -> u8 {
     }
     match result {
         Ok(_) => {
-            // FTP has no HTTP response, but curl still honors -w: report
-            // %{size_download}, %{time_total}, %{url_effective}, etc. against a
-            // synthetic empty response (http_code renders 0, as curl does).
+            // Non-HTTP schemes have no HTTP response, but curl still honors -w:
+            // report %{size_download}, %{time_total}, %{url_effective}, etc.
+            // against a synthetic empty response (http_code renders 0, as curl
+            // does for non-HTTP transfers).
             if args.write_out.is_some() {
                 let resp = rsurl::Response {
                     status: 0,

@@ -92,6 +92,7 @@ pub(crate) fn transfer_url_to_with(
 ) -> Result<u64> {
     match url.scheme.as_str() {
         "ftp" | "ftps" => crate::ftp::fetch_to_with(url, cfg, sink),
+        "file" => crate::file::fetch_to(url, sink),
         _ => {
             let bytes = transfer_url_with(url, cfg)?;
             sink.write_all(&bytes)?;

@@ -41,10 +41,11 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 
 - **M1 streaming I/O (keystone, partial)**: `Request::send_download` streams the
   HTTP/1.1 body to a sink (redirect-following, cookies); HTTP/2/3, proxied,
-  compressed, and empty bodies fall back to buffered. **FTP/FTPS downloads to a
-  file** stream the data channel straight to disk (`ftp::fetch_to_with` /
-  `Client::transfer_url_to`), enforcing `--limit-rate`/`-#`/`--max-filesize`/
-  `-y`/`-Y`/`--remove-on-error`.
+  compressed, and empty bodies fall back to buffered. **Every non-HTTP download
+  to a file** now goes through the streaming sink (`Client::transfer_url_to`):
+  FTP/FTPS and `file://` stream the source directly (no full-body buffer), the
+  rest fetch-then-write through the same sink — all gaining `--limit-rate`/`-#`/
+  `--max-filesize`/`-y`/`-Y`/`--remove-on-error`/`--no-clobber` and `-w`.
 - **M5 (partial, on streaming)**: enforced `--max-filesize` (early abort),
   `--limit-rate`, `-#` progress, and **`-y`/`-Y` low-speed abort** (exit 28) for
   file downloads; **`--remove-on-error`**, **`--no-clobber`**; `-w

@@ -2786,3 +2786,34 @@ fn cli_ftp_create_dirs_upload() {
     assert_eq!(g.1, b"UPLOAD-PAYLOAD");
     let _ = std::fs::remove_file(&tmp);
 }
+
+/// `file://` download to a file streams the local file through the sink and -w
+/// reports the byte count.
+#[test]
+fn cli_file_scheme_download_to_file() {
+    use std::process::Command;
+    let mut src = std::env::temp_dir();
+    src.push(format!("rsurl-file-src-{}.txt", std::process::id()));
+    std::fs::write(&src, b"LOCAL-FILE-CONTENTS").unwrap();
+    let out_path = tmp_out_path("file-dl");
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-o",
+            out_path.to_str().unwrap(),
+            "-w",
+            "%{size_download}",
+            &format!("file://{}", src.to_str().unwrap()),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&out_path).unwrap(), b"LOCAL-FILE-CONTENTS");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "19");
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out_path);
+}

@@ -11,6 +11,14 @@ use crate::url::Url;
 
 /// Read the file at `url.path` and return its contents.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    fetch_to(url, &mut buf)?;
+    Ok(buf)
+}
+
+/// Stream the file at `url.path` to `sink`, returning the byte count. Avoids
+/// buffering a large local file in memory (the streaming core of [`fetch`]).
+pub(crate) fn fetch_to(url: &Url, sink: &mut dyn std::io::Write) -> Result<u64> {
     // RFC 8089 §2: only empty host or "localhost" refer to the local machine.
     if !url.host.is_empty() && !url.host.eq_ignore_ascii_case("localhost") {
         return Err(Error::BadResponse(format!(
@@ -30,7 +38,8 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
         )));
     }
 
-    Ok(fs::read(path)?)
+    let mut f = fs::File::open(path)?;
+    Ok(std::io::copy(&mut f, sink)?)
 }
 
 #[cfg(test)]
