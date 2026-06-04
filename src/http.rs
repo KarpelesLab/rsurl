@@ -1,8 +1,10 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::net::{connector_from_proxy_url, Connector, DirectConnector, NetStream};
 use crate::url::Url;
 
 const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
@@ -67,10 +69,9 @@ pub struct Request {
     /// `--max-time`. `None` means no cap beyond `connect_timeout` /
     /// `read_timeout`.
     pub(crate) max_time: Option<Duration>,
-    /// Optional outbound HTTP proxy. When set, plain `http://` traffic
-    /// uses absolute-form request lines and `Proxy-Authorization:`; HTTPS
-    /// traffic is tunnelled via `CONNECT` before the TLS handshake.
-    /// `socks5://`, `https://` (TLS-to-proxy), and PAC are out of scope.
+    /// Optional outbound HTTP proxy (the legacy absolute-form / `CONNECT`
+    /// path). Set for `http://` proxies; `socks*`/`https://` proxies and
+    /// caller-supplied transports go through [`Request::connector`] instead.
     pub(crate) proxy: Option<ProxyConfig>,
     /// List of host suffixes that bypass the proxy. Matches curl's
     /// `NO_PROXY` / `--noproxy`: case-insensitive suffix match against
@@ -80,6 +81,11 @@ pub struct Request {
     /// On by default (curl's behaviour); `false` is curl's `--no-idn`. A no-op
     /// when the crate is built without the `idn` feature.
     pub(crate) idn: bool,
+    /// The transport used to reach the origin. Defaults to a direct TCP dial
+    /// ([`DirectConnector`]). A non-direct connector (SOCKS/HTTPS proxy or a
+    /// caller-supplied implementation) routes the request through it and, in
+    /// this milestone, forces HTTP/1.1 with pooling disabled.
+    pub(crate) connector: Arc<dyn Connector>,
 }
 
 /// Where to route HTTP(S) traffic through. Parsed from a curl-style proxy
@@ -150,6 +156,7 @@ impl Request {
             proxy: None,
             no_proxy: Vec::new(),
             idn: true,
+            connector: Arc::new(DirectConnector),
         })
     }
 
@@ -261,14 +268,33 @@ impl Request {
         self
     }
 
-    /// Route through an outbound HTTP proxy. `spec` is curl-style:
-    /// `http://[user:pass@]host:port`, or bare `host:port` which is
-    /// treated as `http://`. For HTTPS targets the proxy tunnel is
-    /// established via `CONNECT host:port` before the TLS handshake;
-    /// for plain HTTP the proxy receives an absolute-form request line.
+    /// Route through an outbound proxy. `spec` is curl-style:
+    /// `scheme://[user:pass@]host:port`, or bare `host:port` (treated as
+    /// `http://`). Recognised schemes: `http`, `https`, `socks4`, `socks4a`,
+    /// `socks5`, `socks5h`.
+    ///
+    /// `http://` proxies use the absolute-form / `CONNECT` path. The other
+    /// schemes install a [`Connector`] (see [`Request::connector`]); in this
+    /// milestone they force HTTP/1.1 and disable connection pooling.
     pub fn proxy(mut self, spec: &str) -> Result<Self> {
-        self.proxy = Some(ProxyConfig::parse(spec)?);
+        let is_http_proxy = match spec.split_once("://") {
+            Some((scheme, _)) => scheme.eq_ignore_ascii_case("http"),
+            None => true, // bare host:port == http://
+        };
+        if is_http_proxy {
+            self.proxy = Some(ProxyConfig::parse(spec)?);
+        } else {
+            self.connector = connector_from_proxy_url(spec)?;
+        }
         Ok(self)
+    }
+
+    /// Use a caller-supplied transport for this request. Overrides the default
+    /// direct TCP dial; a non-direct connector forces HTTP/1.1 and disables
+    /// pooling in this milestone. See [`crate::net::Connector`].
+    pub fn connector(mut self, connector: Arc<dyn Connector>) -> Self {
+        self.connector = connector;
+        self
     }
 
     /// Override (or add) proxy `user:pass` credentials independently of
@@ -505,6 +531,11 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
         }
         _ => {}
     }
+    // A custom/SOCKS/https-proxy connector handles its own dialing and is not
+    // pool-compatible; route it through the boxed HTTP/1.1 path.
+    if !req.connector.is_direct() {
+        return send_plain_via_connector(req, trace);
+    }
     // Pool reuse is only safe for direct connections. Via-proxy we'd be
     // sharing one socket across many origins via absolute-form lines, which
     // works on paper but mixes badly with `Proxy-Authorization:` per-origin
@@ -532,6 +563,63 @@ fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     write_request(bufrd.get_mut(), &req, via_plain_http_proxy(&req), trace)?;
     let resp = read_response(&mut bufrd, &req.method, trace)?;
     finalize_plain(bufrd, &req, &resp, may_pool, trace);
+    Ok(resp)
+}
+
+/// Dial the origin through `req.connector` and return a configured boxed
+/// stream. The connector establishes a transparent pipe to `host:port`
+/// (via SOCKS or `CONNECT`), so the caller then speaks origin-form HTTP.
+fn connector_connect(req: &Request, trace: &mut dyn Write) -> Result<Box<dyn NetStream>> {
+    let _ = writeln!(
+        trace,
+        "*   Connecting to {}:{} via {:?}",
+        req.url.host, req.url.port, req.connector
+    );
+    let stream = req
+        .connector
+        .connect(&req.url.host, req.url.port, req.connect_timeout)?;
+    stream.set_read_timeout(req.read_timeout)?;
+    stream.set_write_timeout(req.read_timeout)?;
+    Ok(stream)
+}
+
+/// HTTP/1.1 over a caller-supplied / proxy connector (plaintext target). No
+/// pooling; the connector tunnels straight to the origin so we use origin-form.
+fn send_plain_via_connector(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    let stream = connector_connect(&req, trace)?;
+    let mut bufrd = BufReader::new(stream);
+    write_request(bufrd.get_mut(), &req, false, trace)?;
+    let resp = read_response(&mut bufrd, &req.method, trace)?;
+    Ok(resp)
+}
+
+/// HTTPS over a caller-supplied / proxy connector. The connector yields a pipe
+/// to the origin; we run the origin's TLS handshake over it, then HTTP/1.1.
+/// `--http2`/`--http3` "only" preferences are rejected (not yet supported on
+/// this path).
+fn send_https_via_connector(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    match req.http_version_pref {
+        HttpVersionPref::Http2Only => {
+            return Err(Error::UnsupportedScheme(
+                "HTTP/2 (--http2) over a custom connector or SOCKS/HTTPS proxy is not supported"
+                    .into(),
+            ));
+        }
+        HttpVersionPref::Http3Only => {
+            return Err(Error::UnsupportedScheme(
+                "HTTP/3 (--http3-only) over a custom connector or SOCKS/HTTPS proxy is not supported"
+                    .into(),
+            ));
+        }
+        _ => {}
+    }
+    let stream = connector_connect(&req, trace)?;
+    let opts = tls_opts_from(&req, &[])?;
+    let tls = crate::tls::connect_over_tls(stream, &req.url.host, opts)?;
+    write_tls_info(&tls, trace);
+    let mut bufrd = BufReader::new(tls);
+    write_request(bufrd.get_mut(), &req, false, trace)?;
+    let resp = read_response(&mut bufrd, &req.method, trace)?;
     Ok(resp)
 }
 
@@ -810,6 +898,12 @@ pub fn send_multiplexed(mut reqs: Vec<Request>, trace: &mut dyn Write) -> Vec<Re
 }
 
 fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    // A custom/SOCKS/https-proxy connector dials the origin itself; HTTP/2 and
+    // HTTP/3 do their own direct connect and aren't wired to it yet, so we
+    // route the connector through the boxed HTTP/1.1 path.
+    if !req.connector.is_direct() {
+        return send_https_via_connector(req, trace);
+    }
     // HTTP version routing:
     //
     // * `Http2Only`: dispatch to the HTTP/2 backend; its `Error::H2NotNegotiated`

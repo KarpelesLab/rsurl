@@ -1448,3 +1448,102 @@ fn cli_http3_with_fallback_unresolvable_fails_cleanly() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("panicked"), "must not panic; stderr: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// Pluggable connectors / SOCKS proxy (phase 2)
+// ---------------------------------------------------------------------------
+
+/// A caller-supplied [`rsurl::net::Connector`] that ignores the requested
+/// host:port and always dials a fixed address. Proves the request rode the
+/// custom transport (the URL host `origin.invalid` would never resolve).
+#[test]
+fn custom_connector_overrides_transport() {
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct FixedConnector {
+        addr: SocketAddr,
+    }
+    impl rsurl::net::Connector for FixedConnector {
+        fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _timeout: Option<Duration>,
+        ) -> rsurl::Result<Box<dyn rsurl::net::NetStream>> {
+            Ok(Box::new(TcpStream::connect(self.addr)?))
+        }
+    }
+
+    let server = TestServer::start(|_req: SReq| SResp::ok("via-connector"));
+    let resp = Request::get("http://origin.invalid/")
+        .unwrap()
+        .connector(Arc::new(FixedConnector { addr: server.addr }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"via-connector");
+}
+
+/// End-to-end plain HTTP through a mock SOCKS5h proxy: the proxy performs the
+/// RFC 1928 no-auth handshake, accepts the domain-form CONNECT, then serves a
+/// canned HTTP/1.1 response. `socks5h://` keeps DNS on the proxy so the
+/// unresolvable `origin.invalid` host works.
+#[test]
+fn http_via_socks5h_proxy() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind socks mock");
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // Greeting: VER, NMETHODS, METHODS...
+        let mut head = [0u8; 2];
+        s.read_exact(&mut head).unwrap();
+        let mut methods = vec![0u8; head[1] as usize];
+        s.read_exact(&mut methods).unwrap();
+        s.write_all(&[0x05, 0x00]).unwrap(); // select NO-AUTH
+                                             // CONNECT request: VER CMD RSV ATYP DST.ADDR DST.PORT
+        let mut req = [0u8; 4];
+        s.read_exact(&mut req).unwrap();
+        assert_eq!(req[3], 0x03, "socks5h should send a domain ATYP");
+        let mut dlen = [0u8; 1];
+        s.read_exact(&mut dlen).unwrap();
+        let mut domain = vec![0u8; dlen[0] as usize];
+        s.read_exact(&mut domain).unwrap();
+        assert_eq!(&domain, b"origin.invalid");
+        let mut port = [0u8; 2];
+        s.read_exact(&mut port).unwrap();
+        // Success reply with BND 0.0.0.0:0.
+        s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        // Drain the HTTP request, then serve a canned response.
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if s.read(&mut byte).unwrap() == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .unwrap();
+        s.flush().unwrap();
+    });
+
+    let resp = Request::get("http://origin.invalid/")
+        .unwrap()
+        .proxy(&format!("socks5h://{addr}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(2))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"hello");
+    handle.join().unwrap();
+}

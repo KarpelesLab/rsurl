@@ -29,7 +29,11 @@ pub struct HttpProxyIntent {
 /// A pluggable transport: connect to `host:port` and return a plaintext byte
 /// stream. TLS (when the scheme needs it) is layered on top by the caller, so
 /// implementations are transport-only.
-pub trait Connector: Send + Sync {
+///
+/// The `Debug` bound lets a connector live inside a `#[derive(Debug)]` type
+/// such as [`crate::Request`]; a `#[derive(Debug)]` on your implementation
+/// satisfies it.
+pub trait Connector: Send + Sync + std::fmt::Debug {
     /// Establish a connection to `host:port`. `timeout`, when set, bounds the
     /// connect phase (and any proxy handshake).
     fn connect(
