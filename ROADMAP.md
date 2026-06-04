@@ -68,7 +68,8 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   PASV directly), **`--ftp-create-dirs`** (MKD missing upload dirs), and
   **active mode `-P`/`--ftp-port`** (`EPRT` with IPv4 `PORT` fallback;
   direct-only; verifies the data callback comes from the control peer); FTP
-  upload now honors `-x` proxy via the `Client`.
+  upload now honors `-x` proxy via the `Client`. **RTSP interleaved RTP/RTCP**
+  reception after `PLAY` (`Session::read_interleaved`, idle- and byte-bounded).
 - **M11 (partial)**: centralized **curl-compatible exit codes** for transfer
   errors (1/3/6/7/8/28/47/52/79); a **`man/rsurl.1`** man page; an expanded
   **libcurl-shaped C ABI** (`rsurl_easy_*` with `RSURLOPT_` for URL, method,
@@ -76,12 +77,10 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   ssl_verifypeer, proxy, referer, range, cookie, xoauth2_bearer,
   accept_encoding**).
 
-**Remaining:**
-- **RTSP interleaved RTP/RTCP after `PLAY`** — an architectural mismatch with
-  the one-shot CLI model: an interleaved media stream has no clean termination,
-  so reading it would hang on a live source (curl only does this inside its
-  long-running `--interleaved` workflows). The control-channel handshake
-  (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN) is fully implemented.
+**Remaining:** none in scope. Every curl feature feasible under the no-C
+invariant and a good fit for a one-shot CLI is implemented and tested. The
+interleaved-media hang risk is handled with an idle window + byte cap rather
+than punting the feature.
 
 **Out of scope under the no-C invariant or current architecture** (documented,
 not "remaining" — verified against what curl itself requires):
@@ -98,10 +97,9 @@ These are intentionally not pursued.
 
 **Status:** every curl feature that is feasible under the no-C invariant and a
 good fit for a one-shot CLI is now implemented and tested — including streaming
-response bodies for HTTP/1.1, HTTP/2, HTTP/3, FTP/FTPS, and `file://`. The only
-remaining roadmap item is RTSP interleaved-media reception, which is an
-architectural mismatch with the one-shot model (it would hang on a live
-stream); plus the documented no-C/architecture exclusions below.
+response bodies for HTTP/1.1, HTTP/2, HTTP/3, FTP/FTPS, and `file://`, and RTSP
+interleaved RTP/RTCP reception. The only items not implemented are the
+documented no-C/architecture exclusions below.
 
 ## Where we are today
 

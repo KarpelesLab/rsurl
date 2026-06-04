@@ -12,10 +12,12 @@
 //! transport offered on `SETUP` is the widely supported interleaved form
 //! `RTP/AVP/TCP;unicast;interleaved=0-1`.
 //!
-//! It does **not** implement interleaved RTP media reception over the control
-//! connection, PAUSE/RECORD/GET_PARAMETER, or any form of authentication —
-//! the goal here is a correct control-channel handshake (SETUP returns a
-//! Session, PLAY succeeds with it), not media transport.
+//! After `PLAY`, [`Session::read_interleaved`] receives interleaved RTP/RTCP
+//! frames (RFC 7826 §14: `$` channel length payload) delivered on the control
+//! connection, writing each payload to a sink until the stream closes, an idle
+//! window elapses (so a live stream can't hang a one-shot capture), or a byte
+//! cap is hit. PAUSE/RECORD/GET_PARAMETER and authentication are not
+//! implemented.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Duration;
@@ -29,6 +31,15 @@ const DEFAULT_PORT: u16 = 554;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Idle bound for interleaved RTP/RTCP reception after `PLAY`: if no frame
+/// arrives within this window we stop, so a one-shot capture terminates instead
+/// of blocking forever on a live stream.
+const INTERLEAVED_IDLE: Duration = Duration::from_secs(2);
+
+/// Cap on interleaved media captured in one `PLAY` (64 MiB) — a one-shot
+/// safety bound, mirroring the buffered-body caps elsewhere.
+const MAX_INTERLEAVED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default interleaved (RTP-over-TCP) transport offered on `SETUP`. The
 /// control connection multiplexes channels 0 and 1; this is the form most
@@ -152,6 +163,40 @@ impl Session {
         Ok(resp)
     }
 
+    /// Receive interleaved RTP/RTCP frames delivered on the control connection
+    /// after `PLAY` (RFC 7826 §14: each frame is `$`, a 1-byte channel, a
+    /// 2-byte big-endian length, then that many payload bytes). Each frame's
+    /// payload is written to `sink`. Returns the total payload byte count.
+    ///
+    /// Stops cleanly on connection close, when no frame arrives within
+    /// `INTERLEAVED_IDLE` (so a live stream can't hang a one-shot capture), when
+    /// `MAX_INTERLEAVED_BYTES` is reached, or on the first non-`$` byte (an
+    /// interleaved RTSP message, which this minimal receiver does not parse).
+    pub fn read_interleaved(&mut self, sink: &mut dyn Write) -> Result<u64> {
+        self.stream.set_read_timeout(Some(INTERLEAVED_IDLE))?;
+        let mut total: u64 = 0;
+        loop {
+            let mut hdr = [0u8; 4];
+            if !fill(&mut *self.stream, &mut hdr)? {
+                break; // EOF or idle — done.
+            }
+            if hdr[0] != b'$' {
+                break; // Not interleaved media; stop.
+            }
+            let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
+            let mut payload = vec![0u8; len];
+            if !fill(&mut *self.stream, &mut payload)? {
+                break; // Truncated frame — stop.
+            }
+            sink.write_all(&payload)?;
+            total += len as u64;
+            if total >= MAX_INTERLEAVED_BYTES {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     /// `OPTIONS` — query the methods the server supports. No session needed.
     pub fn options(&mut self) -> Result<RtspResponse> {
         self.request("OPTIONS", &[])
@@ -235,7 +280,12 @@ pub fn run_method(url: &Url, method: &str) -> Result<Vec<u8>> {
             session.options()?;
             session.describe()?;
             session.setup()?;
-            session.play().map(|r| r.body)
+            // After PLAY, capture any interleaved RTP/RTCP the server delivers
+            // on the control connection (bounded by an idle window + byte cap)
+            // and return it as the payload — that's the media a `PLAY` yields.
+            let mut out = session.play()?.body;
+            session.read_interleaved(&mut out)?;
+            Ok(out)
         }
         "TEARDOWN" => {
             session.options()?;
@@ -248,6 +298,29 @@ pub fn run_method(url: &Url, method: &str) -> Result<Vec<u8>> {
             "rtsp: unsupported method {other:?} (expected OPTIONS, DESCRIBE, SETUP, PLAY, or TEARDOWN)"
         ))),
     }
+}
+
+/// Read exactly `buf.len()` bytes, returning `false` (rather than erroring)
+/// when the stream closes (EOF) or goes idle (read timeout) — the two clean
+/// ways an interleaved capture ends. A genuine I/O error still propagates.
+fn fill(stream: &mut dyn NetStream, buf: &mut [u8]) -> Result<bool> {
+    let mut off = 0;
+    while off < buf.len() {
+        match stream.read(&mut buf[off..]) {
+            Ok(0) => return Ok(false), // EOF
+            Ok(n) => off += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(false); // idle past the read timeout
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok(true)
 }
 
 /// Reject any ASCII control byte (including CR, LF, and NUL) in a
@@ -641,6 +714,53 @@ mod tests {
         });
         let u = url(&format!("rtsp://127.0.0.1:{port}/stream"));
         (u, handle)
+    }
+
+    #[test]
+    fn read_interleaved_collects_rtp_payloads() {
+        // A server that, once connected, sends two interleaved frames
+        // ($ chan len payload) and closes. read_interleaved must concatenate the
+        // two payloads and stop cleanly at EOF.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // $ | channel 0 | len 4 | "RTPA"
+            sock.write_all(&[0x24, 0x00, 0x00, 0x04]).unwrap();
+            sock.write_all(b"RTPA").unwrap();
+            // $ | channel 1 | len 5 | "RTCP!"
+            sock.write_all(&[0x24, 0x01, 0x00, 0x05]).unwrap();
+            sock.write_all(b"RTCP!").unwrap();
+            sock.flush().unwrap();
+            // Drop the socket → EOF, so read_interleaved returns promptly.
+        });
+        let u = url(&format!("rtsp://127.0.0.1:{port}/stream"));
+        let mut session = Session::connect(&u).unwrap();
+        let mut out = Vec::new();
+        let n = session.read_interleaved(&mut out).unwrap();
+        handle.join().unwrap();
+        assert_eq!(out, b"RTPARTCP!");
+        assert_eq!(n, 9);
+    }
+
+    #[test]
+    fn read_interleaved_stops_on_non_dollar_byte() {
+        // A non-'$' leading byte (e.g. an interleaved RTSP message) ends the
+        // capture without consuming or mis-parsing it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.write_all(b"RTSP/1.0 200 OK\r\n\r\n").unwrap();
+            sock.flush().unwrap();
+        });
+        let u = url(&format!("rtsp://127.0.0.1:{port}/stream"));
+        let mut session = Session::connect(&u).unwrap();
+        let mut out = Vec::new();
+        let n = session.read_interleaved(&mut out).unwrap();
+        handle.join().unwrap();
+        assert_eq!(n, 0);
+        assert!(out.is_empty());
     }
 
     #[test]
