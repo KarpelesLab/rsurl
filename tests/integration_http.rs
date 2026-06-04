@@ -641,6 +641,15 @@ fn pool_retries_when_pooled_connection_is_stale() {
 // We need a subprocess (rather than calling code directly) because the CLI
 // flag-parsing layer is the unit under test here.
 
+/// A unique temp path for `-o` in CLI tests. `/dev/null` is Unix-only, so tests
+/// that only need a discard sink use this cross-platform path instead. rsurl
+/// creates/overwrites it; callers should remove it when done.
+fn tmp_out_path(tag: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("rsurl-{tag}-{}.out", std::process::id()));
+    p
+}
+
 /// `(method, content_type, body_bytes)` captured from one request.
 type CapturedRequest = (String, Option<String>, Vec<u8>);
 type CapturedSlot = std::sync::Arc<std::sync::Mutex<Option<CapturedRequest>>>;
@@ -1399,14 +1408,15 @@ fn cli_http3_only_unresolvable_fails_cleanly() {
         .args(["--http3-only", "https://host.invalid/"])
         .output()
         .expect("spawn rsurl");
-    let code = out.status.code();
-    assert_eq!(
-        code,
-        Some(6),
-        "unresolvable host should exit 6 (CURLE_COULDNT_RESOLVE_HOST), got {code:?}"
+    // The exact code is environment-dependent: a resolver that returns NXDOMAIN
+    // yields 6 (couldn't resolve), but a runner whose resolver maps the bogus
+    // host to an address makes the QUIC attempt fail instead (a different
+    // non-zero code). What must hold everywhere: a clean non-zero exit, no panic.
+    assert!(
+        !out.status.success(),
+        "unresolvable host must fail, got {:?}",
+        out.status
     );
-    // It must not have crashed (a panic yields no exit code on unix, or a
-    // SIGABRT/SIGSEGV-derived code), and the error must be a clean message.
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("panicked"), "must not panic; stderr: {err}");
 }
@@ -1430,8 +1440,9 @@ fn cli_http3_only_rejects_plaintext_http() {
 }
 
 /// `--http3` (with fallback) against an unresolvable host fails cleanly too:
-/// the QUIC attempt can't resolve, falls through to the Auto h2/1.1 path, and
-/// that also can't resolve — so the whole thing exits 6 without panicking.
+/// the QUIC attempt fails, falls through to the Auto h2/1.1 path, and that
+/// fails as well — so the whole thing exits non-zero without panicking. (The
+/// exact code is environment-dependent; see the `--http3-only` test.)
 #[test]
 fn cli_http3_with_fallback_unresolvable_fails_cleanly() {
     use std::process::Command;
@@ -1439,11 +1450,10 @@ fn cli_http3_with_fallback_unresolvable_fails_cleanly() {
         .args(["--http3", "https://host.invalid/"])
         .output()
         .expect("spawn rsurl");
-    let code = out.status.code();
-    assert_eq!(
-        code,
-        Some(6),
-        "unresolvable host should exit 6 (CURLE_COULDNT_RESOLVE_HOST), got {code:?}"
+    assert!(
+        !out.status.success(),
+        "unresolvable host must fail, got {:?}",
+        out.status
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("panicked"), "must not panic; stderr: {err}");
@@ -1645,11 +1655,12 @@ fn cli_get_moves_data_to_query() {
 fn cli_write_out_expands_vars() {
     use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("hello"));
+    let out_path = tmp_out_path("wo-vars");
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
         .args([
             "-s",
             "-o",
-            "/dev/null",
+            out_path.to_str().unwrap(),
             "-w",
             "%{http_code} %{size_download}",
             &server.url("/"),
@@ -1657,6 +1668,7 @@ fn cli_write_out_expands_vars() {
         .output()
         .expect("spawn rsurl");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "200 5");
+    let _ = std::fs::remove_file(&out_path);
 }
 
 /// `-n`/`--netrc-file` supplies Basic credentials for the host when `-u` and
@@ -2455,11 +2467,12 @@ fn cli_compat_noop_flags_accepted() {
 fn cli_write_out_phase_timers() {
     use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("hello"));
+    let out_path = tmp_out_path("wo-timers");
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
         .args([
             "-s",
             "-o",
-            "/dev/null",
+            out_path.to_str().unwrap(),
             "-w",
             "%{time_connect} %{time_starttransfer} %{time_total}",
             &server.url("/"),
@@ -2480,6 +2493,7 @@ fn cli_write_out_phase_timers() {
         "connect<=starttransfer: {line:?}"
     );
     assert!(nums[1] <= nums[2] + 1e-6, "starttransfer<=total: {line:?}");
+    let _ = std::fs::remove_file(&out_path);
 }
 
 /// `-w %header{Name}` emits a named response header; `%{ssl_verify_result}`
@@ -2488,11 +2502,12 @@ fn cli_write_out_phase_timers() {
 fn cli_write_out_header_var() {
     use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("body").header("X-Test", "abc123"));
+    let out_path = tmp_out_path("wo-header");
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
         .args([
             "-s",
             "-o",
-            "/dev/null",
+            out_path.to_str().unwrap(),
             "-w",
             "[%header{X-Test}|%{ssl_verify_result}]",
             &server.url("/"),
@@ -2501,6 +2516,7 @@ fn cli_write_out_header_var() {
         .expect("spawn rsurl");
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[abc123|0]");
+    let _ = std::fs::remove_file(&out_path);
 }
 
 /// A connection refused on an HTTP URL exits 7 (CURLE_COULDNT_CONNECT), and a
