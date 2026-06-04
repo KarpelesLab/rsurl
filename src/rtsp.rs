@@ -18,17 +18,16 @@
 //! Session, PLAY succeeds with it), not media transport.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::net::{NetConfig, NetStream};
 use crate::url::Url;
 
 const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_PORT: u16 = 554;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Default interleaved (RTP-over-TCP) transport offered on `SETUP`. The
@@ -69,7 +68,7 @@ impl RtspResponse {
 /// `CSeq` is parsed and verified against the request's; a mismatch is an
 /// error.
 pub struct Session {
-    stream: TcpStream,
+    stream: Box<dyn NetStream>,
     /// Absolute request-URI used on every request line.
     uri: String,
     /// Next CSeq value to emit. Starts at 1, increments per request.
@@ -86,6 +85,11 @@ impl Session {
     /// `reject_control_bytes`) so they cannot forge the request line or
     /// inject headers on the control connection.
     pub fn connect(url: &Url) -> Result<Self> {
+        Self::connect_with(url, &NetConfig::default())
+    }
+
+    /// Like [`Session::connect`] but dialing through an explicit transport.
+    pub(crate) fn connect_with(url: &Url, cfg: &NetConfig) -> Result<Self> {
         // `url.host` and `url.path` are interpolated raw into the request
         // line and the absolute URI. A bare CR, LF, NUL, or other control
         // byte would let an attacker forge the request line or inject extra
@@ -93,12 +97,7 @@ impl Session {
         reject_control_bytes(&url.host, "host")?;
         reject_control_bytes(&url.path, "path")?;
 
-        let addr = format!("{}:{}", url.host, url.port);
-        let sock = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| Error::InvalidUrl(url.host.clone()))?;
-        let stream = TcpStream::connect_timeout(&sock, CONNECT_TIMEOUT)?;
+        let stream = cfg.connect(&url.host, url.port)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
@@ -124,11 +123,10 @@ impl Session {
         self.cseq += 1;
         let request = build_request(method, &self.uri, cseq, extra_headers);
 
-        let mut writer = &self.stream;
-        writer.write_all(request.as_bytes())?;
-        writer.flush()?;
+        self.stream.write_all(request.as_bytes())?;
+        self.stream.flush()?;
 
-        let reader = BufReader::new(&self.stream);
+        let reader = BufReader::new(&mut self.stream);
         let resp = read_response(reader)?;
 
         // Verify the echoed CSeq matches what we sent.
@@ -204,7 +202,11 @@ impl Session {
 /// Default operation: issue an RTSP `DESCRIBE` and return the response body
 /// (typically an SDP document).
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
-    let mut session = Session::connect(url)?;
+    fetch_with(url, &NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
+    let mut session = Session::connect_with(url, cfg)?;
     session.describe().map(|r| r.body)
 }
 

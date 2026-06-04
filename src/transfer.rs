@@ -26,6 +26,14 @@ pub fn transfer(url_str: &str) -> Result<Vec<u8>> {
 /// The host is used as given — apply [`Url::set_idn`] first if you want IDN
 /// normalisation (or call [`transfer`], which does it for you).
 pub fn transfer_url(url: &Url) -> Result<Vec<u8>> {
+    transfer_url_with(url, &crate::net::NetConfig::default())
+}
+
+/// `transfer_url` with an explicit network configuration (connector / proxy).
+/// Used by [`crate::Client`]; the public [`transfer_url`] is the default-config
+/// wrapper. `sftp`/`scp` (SSH) and `file` ignore the connector in this
+/// milestone; `tftp` gains UDP-proxy support in a later phase.
+pub(crate) fn transfer_url_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
         "http" | "https" => crate::Request::get(&format!(
             "{}://{}{}{}",
@@ -40,22 +48,25 @@ pub fn transfer_url(url: &Url) -> Result<Vec<u8>> {
             },
             url.path
         ))?
+        .connector(cfg.connector.clone())
+        .verify_tls(cfg.verify)
         .send()
         .map(|r| r.body),
-        "ftp" | "ftps" => crate::ftp::fetch(url),
-        "dict" => crate::dict::fetch(url),
+        "ftp" | "ftps" => crate::ftp::fetch_with(url, cfg),
+        "dict" => crate::dict::fetch_with(url, cfg),
         "file" => crate::file::fetch(url),
-        "gopher" | "gophers" => crate::gopher::fetch(url),
-        "imap" | "imaps" => crate::imap::fetch(url),
-        "ldap" | "ldaps" => crate::ldap::fetch(url),
-        "mqtt" | "mqtts" => crate::mqtt::fetch(url),
-        "pop3" | "pop3s" => crate::pop3::fetch(url),
-        "rtsp" => crate::rtsp::fetch(url),
+        "gopher" | "gophers" => crate::gopher::fetch_with(url, cfg),
+        "imap" | "imaps" => crate::imap::fetch_with(url, cfg),
+        "ldap" | "ldaps" => crate::ldap::fetch_with(url, cfg),
+        "mqtt" | "mqtts" => crate::mqtt::fetch_with(url, cfg),
+        "pop3" | "pop3s" => crate::pop3::fetch_with(url, cfg),
+        "rtsp" => crate::rtsp::fetch_with(url, cfg),
         "sftp" | "scp" => {
             // Library default: derive the user from the URL/`$USER`, take any
             // password from the URL userinfo, and use TOFU known_hosts (no
             // `-k`). The CLI calls `ssh::fetch_traced` directly so it can also
-            // thread `-u`, `--key`, and `-k`.
+            // thread `-u`, `--key`, and `-k`. SSH does not honor a custom
+            // connector yet.
             let user = crate::ssh::resolve_user(url, None)?;
             let (_, password) = crate::ssh::userinfo_password(url);
             let opts = crate::ssh::SshOptions {
@@ -64,8 +75,8 @@ pub fn transfer_url(url: &Url) -> Result<Vec<u8>> {
             };
             crate::ssh::fetch(url, &opts, &user)
         }
-        "tftp" => crate::tftp::fetch(url),
-        "ws" | "wss" => crate::websocket::fetch(url),
+        "tftp" => crate::tftp::fetch_with(url, cfg),
+        "ws" | "wss" => crate::websocket::fetch_with(url, cfg),
         other => Err(Error::UnsupportedScheme(other.to_string())),
     }
 }

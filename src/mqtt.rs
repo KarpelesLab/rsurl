@@ -46,6 +46,10 @@ const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
 /// CONNECT, SUBSCRIBE to the topic in `url.path`, return the payload of the
 /// first PUBLISH received, then DISCONNECT.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &crate::net::NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let topic = url.path.strip_prefix('/').unwrap_or(&url.path);
     if topic.is_empty() {
         return Err(Error::InvalidUrl(format!(
@@ -56,8 +60,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 
     let (user, pass) = split_userinfo(url.userinfo.as_deref());
 
-    let addr = format!("{}:{}", url.host, url.port);
-    let tcp = TcpStream::connect(&addr)?;
+    let tcp = cfg.connect(&url.host, url.port)?;
     if url.is_tls() {
         let mut stream = crate::tls::connect_over(tcp, &url.host)?;
         run_session(&mut stream, topic, user, pass)

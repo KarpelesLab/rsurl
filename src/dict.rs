@@ -5,7 +5,6 @@
 //! `dict://server/word` (define against any database).
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -199,13 +198,17 @@ fn read_text_block<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> Result<()> 
 /// Connect, issue the DICT request encoded in `url.path`, and return the
 /// human-readable text response.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &crate::net::NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let request = parse_path(&url.path)?;
 
-    let stream = TcpStream::connect((url.host.as_str(), url.port))?;
+    let stream = cfg.connect(&url.host, url.port)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
-    let mut writer = stream.try_clone()?;
+    let mut writer = stream.try_clone_box()?;
     let mut reader = BufReader::new(stream);
 
     // 1. Banner: must start with 220 OK.

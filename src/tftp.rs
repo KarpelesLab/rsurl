@@ -173,6 +173,13 @@ fn filename_of(url: &Url) -> Result<&str> {
 
 /// RRQ the file at `url.path` and return the reassembled bytes.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &crate::net::NetConfig::default())
+}
+
+/// TFTP runs over UDP; a TCP `Connector` cannot carry it. Proxy support
+/// (SOCKS5 UDP ASSOCIATE) arrives in a later phase — for now the connector is
+/// ignored and a direct UDP socket is always used.
+pub(crate) fn fetch_with(url: &Url, _cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let filename = filename_of(url)?;
 
     let server = resolve(&url.host, url.port)?;

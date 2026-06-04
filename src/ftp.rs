@@ -21,19 +21,17 @@
 //! often carries an IP literal that wouldn't match the server cert).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 
 use crate::error::{Error, Result};
+use crate::net::{NetConfig, NetStream};
 use crate::tls::TlsStream;
 use crate::url::Url;
 
-/// A duplex byte stream that's either a plain TCP socket or a TLS-wrapped
-/// TCP socket. Lets us drive the same FTP state machine over both schemes
-/// without trait objects (which would conflict with `TlsStream`'s generic
-/// parameter and `BufReader`'s wrapping).
+/// A duplex byte stream that's either a plain (possibly proxied) socket or a
+/// TLS-wrapped one. Lets us drive the same FTP state machine over both schemes.
 enum Stream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(Box<dyn NetStream>),
+    Tls(Box<TlsStream<Box<dyn NetStream>>>),
 }
 
 impl Read for Stream {
@@ -71,19 +69,26 @@ struct Control {
 /// Connect, read the banner, log in (anonymous or `user[:pass]@`), and switch
 /// to binary mode (`TYPE I`). Shared by [`fetch`] (RETR/LIST) and [`store`]
 /// (STOR). Returns the ready control channel.
-fn connect_login(url: &Url) -> Result<Control> {
+fn connect_login(url: &Url, cfg: &NetConfig) -> Result<Control> {
     if url.scheme != "ftp" && url.scheme != "ftps" {
         return Err(Error::UnsupportedScheme(url.scheme.clone()));
     }
 
-    // 1) Control channel.
-    let tcp = TcpStream::connect((url.host.as_str(), url.port))?;
-    // Remember the control connection's peer address. PASV replies carry a
-    // server-chosen data-connection IP which we deliberately ignore (a hostile
-    // control server could point it at an internal service — the classic FTP
-    // "bounce"/SSRF). curl's safe default is to dial the data connection to the
-    // control connection's peer, using only the server-supplied port.
-    let ctrl_peer_ip = tcp.peer_addr()?.ip();
+    // 1) Control channel, dialed through the configured transport.
+    let tcp = cfg.connect(&url.host, url.port)?;
+    // Remember the control connection's peer address. For a *direct* dial PASV
+    // replies carry a server-chosen data IP which we deliberately ignore (a
+    // hostile control server could point it at an internal service — the
+    // classic FTP "bounce"/SSRF); curl's safe default is to dial the data
+    // connection to the control peer using only the server-supplied port. When
+    // a proxy/custom connector is in play the proxy is the trust boundary and
+    // `peer_addr` is the proxy (or unavailable), so we instead reach the
+    // PASV/EPSV-advertised endpoint through the connector (see `open_data`).
+    let ctrl_peer_ip = if cfg.connector.is_direct() {
+        tcp.peer_addr()?.ip()
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    };
     let control = if url.scheme == "ftps" {
         Stream::Tls(Box::new(crate::tls::connect_over(tcp, &url.host)?))
     } else {
@@ -144,9 +149,11 @@ fn open_data<R: Read + Write>(
     ctrl: &mut BufReader<R>,
     url: &Url,
     ctrl_peer_ip: std::net::IpAddr,
+    cfg: &NetConfig,
 ) -> Result<Stream> {
-    let (data_host, data_port) = open_passive(ctrl, &url.host, ctrl_peer_ip)?;
-    let data_tcp = TcpStream::connect((data_host.as_str(), data_port))?;
+    let (data_host, data_port) =
+        open_passive(ctrl, &url.host, ctrl_peer_ip, cfg.connector.is_direct())?;
+    let data_tcp = cfg.connect(&data_host, data_port)?;
     Ok(if url.scheme == "ftps" {
         // Per RFC 4217 §10.2: SNI must be the original hostname, not the
         // address we got from PASV/EPSV (which is often an IP literal).
@@ -159,12 +166,16 @@ fn open_data<R: Read + Write>(
 /// Default operation: download the file at `url.path`, or list the directory
 /// if the path ends in `/`. Returns the raw bytes.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
-    let mut con = connect_login(url)?;
+    fetch_with(url, &NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
+    let mut con = connect_login(url, cfg)?;
 
     // 5+6) Open the passive data connection (EPSV→PASV, dialing the control
     //       peer; TLS-wrapped for ftps). The server may answer 125/150 before
     //       opening its side, which is fine — we already have ours dialed.
-    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip)?;
+    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, cfg)?;
     let ctrl = &mut con.ctrl;
 
     // 7) RETR for files, LIST for directories. We treat a trailing '/' or
@@ -273,7 +284,13 @@ fn rest_command(offset: u64) -> String {
 /// [`fetch`], so the data connection is dialed back to the control peer and
 /// wrapped in TLS for `ftps` exactly as RETR does.
 pub fn store(url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
-    upload(url, body, UploadMode::Stor, resume_at)
+    upload(
+        url,
+        body,
+        UploadMode::Stor,
+        resume_at,
+        &NetConfig::default(),
+    )
 }
 
 /// Append `body` to the file at `url.path` via `APPE`, creating it if absent.
@@ -283,7 +300,7 @@ pub fn store(url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
 /// and the full `body` is always sent. Otherwise shares login, binary mode,
 /// and the passive-open/TLS-wrap logic with [`fetch`] and [`store`].
 pub fn append(url: &Url, body: &[u8]) -> Result<()> {
-    upload(url, body, UploadMode::Appe, None)
+    upload(url, body, UploadMode::Appe, None, &NetConfig::default())
 }
 
 /// Shared upload driver for `STOR` and `APPE`. Logs in, optionally sends
@@ -292,8 +309,14 @@ pub fn append(url: &Url, body: &[u8]) -> Result<()> {
 ///
 /// `resume_at` is honored only for [`UploadMode::Stor`]; `APPE` ignores it
 /// (the public [`append`] entry point always passes `None`).
-fn upload(url: &Url, body: &[u8], mode: UploadMode, resume_at: Option<u64>) -> Result<()> {
-    let mut con = connect_login(url)?;
+fn upload(
+    url: &Url,
+    body: &[u8],
+    mode: UploadMode,
+    resume_at: Option<u64>,
+    cfg: &NetConfig,
+) -> Result<()> {
+    let mut con = connect_login(url, cfg)?;
 
     // Determine the remote filename up front and reject control bytes so it
     // can't break out of the STOR/APPE command line.
@@ -321,7 +344,7 @@ fn upload(url: &Url, body: &[u8], mode: UploadMode, resume_at: Option<u64>) -> R
 
     // Open the passive data connection (same logic as RETR: dial the control
     // peer, TLS-wrap for ftps).
-    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip)?;
+    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, cfg)?;
     let ctrl = &mut con.ctrl;
 
     // Issue STOR/APPE, then expect the 1xx preliminary reply before streaming.
@@ -365,6 +388,7 @@ fn open_passive<R: Read + Write>(
     ctrl: &mut BufReader<R>,
     fallback_host: &str,
     ctrl_peer_ip: std::net::IpAddr,
+    direct: bool,
 ) -> Result<(String, u16)> {
     send(ctrl, "EPSV")?;
     let (c, m) = read_reply(ctrl)?;
@@ -385,12 +409,19 @@ fn open_passive<R: Read + Write>(
     if c2 != 227 {
         return Err(Error::BadResponse(format!("ftp PASV: {c2} {m2}")));
     }
-    // Parse the reply only for its PORT — the server-supplied IP is ignored to
-    // prevent an FTP bounce/SSRF. We dial the control connection's peer instead
-    // (curl's safe default; also keeps PASV consistent with EPSV above).
-    let (_ignored_host, port) = parse_pasv(&m2)
+    // For a direct dial, the server-supplied IP is ignored to prevent an FTP
+    // bounce/SSRF: we dial the control connection's peer instead (curl's safe
+    // default). Through a proxy/custom connector the proxy is the trust
+    // boundary and cannot reach the control peer's IP directly, so we use the
+    // server-advertised data host and let the connector reach it.
+    let (advertised_host, port) = parse_pasv(&m2)
         .ok_or_else(|| Error::BadResponse(format!("ftp PASV: cannot parse: {m2}")))?;
-    Ok((ctrl_peer_ip.to_string(), port))
+    let host = if direct {
+        ctrl_peer_ip.to_string()
+    } else {
+        advertised_host
+    };
+    Ok((host, port))
 }
 
 /// Write a single FTP command followed by CRLF, using the BufReader's
@@ -710,7 +741,7 @@ mod tests {
             written: Vec::new(),
         });
         let ctrl_peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        let (host, port) = open_passive(&mut io, "ftp.example.com", ctrl_peer).unwrap();
+        let (host, port) = open_passive(&mut io, "ftp.example.com", ctrl_peer, true).unwrap();
         // Host is the control peer, NOT the 10.0.0.1 from the PASV reply.
         assert_eq!(host, "203.0.113.7");
         // Port is still taken from the (validated) PASV reply.
@@ -980,7 +1011,7 @@ mod tests {
                     }
                 }
             }
-            let mut data = open_data(&mut ctrl, &parsed, ctrl_peer)?;
+            let mut data = open_data(&mut ctrl, &parsed, ctrl_peer, &NetConfig::default())?;
             send(&mut ctrl, &cmd)?;
             let (c, m) = read_reply(&mut ctrl)?;
             if !(c == 125 || c == 150) {

@@ -27,8 +27,8 @@
 //! quoted string promotion), multi-line continuation requests, SASL mechanisms
 //! beyond PLAIN/LOGIN (CRAM-MD5, SCRAM, XOAUTH2, ...).
 
+use crate::net::NetStream;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::tls::{connect_over, TlsStream};
@@ -52,13 +52,17 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// mailbox from `url.path`, then either LIST mailboxes or FETCH a specific
 /// message and return the raw RFC 5322 message bytes (or the LIST output).
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &crate::net::NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
         "imap" => {
-            let sock = TcpStream::connect((url.host.as_str(), url.port))?;
+            let sock = cfg.connect(&url.host, url.port)?;
             run(Stream::Plain(sock), url)
         }
         "imaps" => {
-            let sock = TcpStream::connect((url.host.as_str(), url.port))?;
+            let sock = cfg.connect(&url.host, url.port)?;
             let tls = connect_over(sock, &url.host)?;
             run(Stream::Tls(Box::new(tls)), url)
         }
@@ -75,10 +79,10 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 /// (small) or rustls (~1 KiB), and clippy flags the resulting variant-size
 /// mismatch against the bare `TcpStream` arm (mirrors `pop3::IoAdapter`).
 enum Stream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(Box<dyn NetStream>),
+    Tls(Box<TlsStream<Box<dyn NetStream>>>),
     /// Transient state only ever observed inside [`Stream::start_tls`] while we
-    /// move the inner `TcpStream` out to hand it to the TLS handshake.
+    /// move the inner stream out to hand it to the TLS handshake.
     Poisoned,
 }
 

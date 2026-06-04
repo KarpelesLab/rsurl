@@ -15,10 +15,10 @@
 //! `(&...)`, `(|...)`, `(!...)`.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::net::{NetConfig, NetStream};
 use crate::tls::{connect_over, TlsStream};
 use crate::url::Url;
 
@@ -797,7 +797,6 @@ fn encode_filter(out: &mut Vec<u8>, f: &Filter) {
 // Wire I/O — bind / search / unbind
 // =============================================================================
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Upper bound on a single LDAP message body length decoded from the wire.
@@ -809,8 +808,8 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Wrap a Read+Write transport so we can hold either a raw TCP stream or a
 /// TLS-wrapped one behind the same code path.
 enum Transport {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(Box<dyn NetStream>),
+    Tls(Box<TlsStream<Box<dyn NetStream>>>),
 }
 
 impl Read for Transport {
@@ -1105,6 +1104,10 @@ fn base64_encode(input: &[u8]) -> String {
 /// Bind (anonymous unless userinfo is set), run the search described by
 /// `url.path` + query, and return the search results serialized as LDIF.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
     if url.scheme != "ldap" && url.scheme != "ldaps" {
         return Err(Error::UnsupportedScheme(url.scheme.clone()));
     }
@@ -1127,8 +1130,8 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     reject_ctl(&bind_name, "bind DN")?;
     reject_ctl(&bind_pass, "bind password")?;
 
-    // Connect.
-    let sock = connect_with_timeout(&url.host, url.port)?;
+    // Connect through the configured transport.
+    let sock = cfg.connect(&url.host, url.port)?;
     sock.set_read_timeout(Some(IO_TIMEOUT)).ok();
     sock.set_write_timeout(Some(IO_TIMEOUT)).ok();
     let mut transport = if url.is_tls() {
@@ -1218,21 +1221,6 @@ fn split_message(body: &[u8]) -> Result<(i64, u8, &[u8])> {
     let mid = r.read_integer_i64()?;
     let op = r.read_tlv()?;
     Ok((mid, op.tag, op.value))
-}
-
-fn connect_with_timeout(host: &str, port: u16) -> Result<TcpStream> {
-    use std::net::ToSocketAddrs;
-    let addrs: Vec<_> = (host, port).to_socket_addrs().map_err(Error::Io)?.collect();
-    let mut last_err: Option<std::io::Error> = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-            Ok(s) => return Ok(s),
-            Err(e) => last_err = Some(e),
-        }
-    }
-    Err(Error::Io(last_err.unwrap_or_else(|| {
-        std::io::Error::other("no addresses resolved")
-    })))
 }
 
 // =============================================================================

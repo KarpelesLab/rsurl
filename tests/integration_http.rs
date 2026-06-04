@@ -1547,3 +1547,55 @@ fn http_via_socks5h_proxy() {
     assert_eq!(resp.body, b"hello");
     handle.join().unwrap();
 }
+
+/// A non-HTTP scheme (gopher) routed through `Client` + a custom connector.
+/// Proves the phase-3 wiring threads the connector into the protocol backends.
+#[test]
+fn client_custom_connector_drives_gopher() {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind gopher mock");
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // Read the gopher request line (selector + CRLF).
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if s.read(&mut byte).unwrap() == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n") {
+                break;
+            }
+        }
+        s.write_all(b"1Welcome\tfake\texample.com\t70\r\n.\r\n")
+            .unwrap();
+        // gopher is close-delimited; drop the socket to signal EOF.
+    });
+
+    #[derive(Debug)]
+    struct Fixed {
+        addr: SocketAddr,
+    }
+    impl rsurl::net::Connector for Fixed {
+        fn connect(
+            &self,
+            _host: &str,
+            _port: u16,
+            _t: Option<Duration>,
+        ) -> rsurl::Result<Box<dyn rsurl::net::NetStream>> {
+            Ok(Box::new(TcpStream::connect(self.addr)?))
+        }
+    }
+
+    let body = rsurl::Client::new()
+        .connector(Arc::new(Fixed { addr }))
+        .transfer("gopher://origin.invalid/1sel")
+        .unwrap();
+    assert!(body.starts_with(b"1Welcome"));
+    handle.join().unwrap();
+}

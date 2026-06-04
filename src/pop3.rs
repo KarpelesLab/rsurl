@@ -7,8 +7,8 @@
 //! For POP3S, connect with TLS from the start via
 //! [`crate::tls::connect_over`].
 
+use crate::net::NetStream;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 
 use crate::error::{Error, Result};
 use crate::tls::{connect_over, TlsStream};
@@ -26,6 +26,10 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// path) or RETR a specific message. Returns the raw bytes (RFC 5322 message
 /// or the textual LIST output).
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &crate::net::NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let userinfo = url
         .userinfo
         .as_deref()
@@ -35,7 +39,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     let action = parse_path(&url.path)
         .ok_or_else(|| Error::InvalidUrl(format!("pop3 path: {}", url.path)))?;
 
-    let tcp = TcpStream::connect((url.host.as_str(), url.port))?;
+    let tcp = cfg.connect(&url.host, url.port)?;
     if url.is_tls() {
         let tls = connect_over(tcp, &url.host)?;
         let mut session = Session::new(BufReader::new(IoAdapter::Tls(Box::new(tls))));
@@ -121,8 +125,8 @@ fn un_dot_stuff(body: &[u8]) -> Vec<u8> {
 /// (small) or rustls (~1 KiB), and clippy flags the resulting variant-size
 /// mismatch against the bare `TcpStream` arm.
 enum IoAdapter {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(Box<dyn NetStream>),
+    Tls(Box<TlsStream<Box<dyn NetStream>>>),
 }
 
 impl Read for IoAdapter {

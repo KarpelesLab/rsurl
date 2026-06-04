@@ -39,7 +39,6 @@
 //!     do not proactively send our own on a schedule.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use compcol::deflate::Deflate;
@@ -212,14 +211,18 @@ fn deflate_message(payload: &[u8]) -> Result<Vec<u8>> {
 /// fragments and answering any interleaved ping/close control frames), send a
 /// close, and return that message's payload.
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &crate::net::NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
         "ws" => {
-            let mut sock = tcp_connect(url)?;
+            let mut sock = tcp_connect(url, cfg)?;
             let mut pmd = handshake(&mut sock, url)?;
             read_data_and_close(&mut sock, pmd.as_mut())
         }
         "wss" => {
-            let tcp = tcp_connect(url)?;
+            let tcp = tcp_connect(url, cfg)?;
             let mut tls = crate::tls::connect_over(tcp, &url.host)?;
             let mut pmd = handshake(&mut tls, url)?;
             read_data_and_close(&mut tls, pmd.as_mut())
@@ -228,14 +231,8 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
     }
 }
 
-fn tcp_connect(url: &Url) -> Result<TcpStream> {
-    let addr = format!("{}:{}", url.host, url.port);
-    let addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(&addr)?.collect();
-    let first = addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::InvalidUrl(url.host.clone()))?;
-    let stream = TcpStream::connect_timeout(&first, Duration::from_secs(30))?;
+fn tcp_connect(url: &Url, cfg: &crate::net::NetConfig) -> Result<Box<dyn crate::net::NetStream>> {
+    let stream = cfg.connect(&url.host, url.port)?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     Ok(stream)

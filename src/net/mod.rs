@@ -10,10 +10,13 @@
 //! [`connector_from_proxy_url`], or implement [`Connector`] yourself for a
 //! fully custom transport.
 
+mod client;
 mod connector;
 mod socks;
 mod stream;
 
+pub use client::Client;
+pub(crate) use client::NetConfig;
 pub use connector::{
     connector_from_proxy_url, Connector, DirectConnector, HttpProxyConnector, HttpProxyIntent,
     HttpsProxyConnector, Socks4Connector, Socks5Connector,

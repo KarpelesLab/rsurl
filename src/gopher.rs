@@ -15,7 +15,6 @@
 //! rejects control bytes, so the `?<words>` convention is the supported one.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -35,10 +34,13 @@ const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 /// Send the selector from `url.path` and read the server's response until
 /// the connection is closed (gopher has no length framing).
 pub fn fetch(url: &Url) -> Result<Vec<u8>> {
+    fetch_with(url, &crate::net::NetConfig::default())
+}
+
+pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let selector = selector_from_path(&url.path)?;
 
-    let addr = format!("{}:{}", url.host, url.port);
-    let tcp = TcpStream::connect(&addr)?;
+    let tcp = cfg.connect(&url.host, url.port)?;
     tcp.set_read_timeout(Some(IO_TIMEOUT))?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
 
