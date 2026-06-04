@@ -3037,6 +3037,12 @@ fn body_looks_binary(body: &[u8]) -> bool {
 /// expanding `%{var}` variables and `\n`/`\t`/`\r`/`\\` escapes. `time_total`
 /// is measured around the request. Variables we don't (yet) compute expand to
 /// an empty string, matching curl's treatment of unknown names.
+/// Format a phase duration as curl's fixed `%.6f` seconds; an unmeasured phase
+/// (`None`) renders as `0.000000`, matching curl.
+fn fmt_secs(d: Option<std::time::Duration>) -> String {
+    format!("{:.6}", d.map_or(0.0, |d| d.as_secs_f64()))
+}
+
 fn run_write_out(
     resp: &Response,
     url: &Url,
@@ -3074,6 +3080,13 @@ fn run_write_out(
             }
             "scheme" => url.scheme.to_uppercase(),
             "time_total" => format!("{:.6}", time_total.as_secs_f64()),
+            // Phase timers (HTTP/1.1 + HTTPS direct paths). An unmeasured phase
+            // — pooled reuse, HTTP/2, HTTP/3 — renders as 0.000000, as curl does.
+            "time_namelookup" => fmt_secs(None), // DNS isn't timed separately
+            "time_connect" => fmt_secs(resp.timing.connect),
+            "time_appconnect" => fmt_secs(resp.timing.appconnect),
+            "time_pretransfer" => fmt_secs(resp.timing.pretransfer),
+            "time_starttransfer" => fmt_secs(resp.timing.starttransfer),
             _ => String::new(),
         }
     };
@@ -3683,7 +3696,9 @@ Options:
       --max-filesize <n>   refuse a download larger than <n> bytes
   -w, --write-out <fmt>    after the transfer, print <fmt> with %{{vars}}
                            expanded (http_code, size_download, content_type,
-                           url_effective, time_total, …)
+                           url_effective, time_total, time_connect,
+                           time_appconnect, time_pretransfer, time_starttransfer;
+                           phase timers are HTTP/1.1-only, else 0.000000)
       --url <url>          add a URL (repeatable; same as a positional arg)
   -n, --netrc              read credentials from ~/.netrc (when no -u)
       --netrc-file <file>  read credentials from <file> (implies -n)

@@ -3261,6 +3261,7 @@ fn build_response_from_stream_labelled(
         version: "HTTP/2".to_string(),
         headers: clean_headers,
         body,
+        timing: crate::http::Timing::default(),
     })
 }
 

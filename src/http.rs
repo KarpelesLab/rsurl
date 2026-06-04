@@ -557,14 +557,24 @@ impl Request {
         req.url.set_idn(req.idn)?;
         let mut hops_left = req.max_redirs;
         loop {
+            let start = std::time::Instant::now();
+            let mut timing = Timing::default();
             let stream: Box<dyn Rw> = if req.url.scheme == "https" {
                 let tcp = tcp_connect(&req, trace)?;
+                timing.connect = Some(start.elapsed());
                 let opts = tls_opts_from(&req, &[])?;
                 let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+                let appconnect = start.elapsed();
+                timing.appconnect = Some(appconnect);
+                timing.pretransfer = Some(appconnect);
                 write_tls_info(&tls, trace);
                 Box::new(tls)
             } else {
-                Box::new(tcp_connect(&req, trace)?)
+                let tcp = tcp_connect(&req, trace)?;
+                let connect = start.elapsed();
+                timing.connect = Some(connect);
+                timing.pretransfer = Some(connect);
+                Box::new(tcp)
             };
             let mut bufrd = BufReader::new(stream);
 
@@ -586,6 +596,7 @@ impl Request {
                 trace,
             )?;
             let head = read_head(&mut bufrd, trace)?;
+            timing.starttransfer = Some(start.elapsed());
             if let Some(j) = jar.as_deref_mut() {
                 j.ingest_response(&req.url, &head.headers);
             }
@@ -688,6 +699,7 @@ impl Request {
                     version: head.version,
                     headers,
                     body: Vec::new(),
+                    timing,
                 });
             }
             let n = stream_body(&mut bufrd, sink, &head.headers, head.status, &req.method)?;
@@ -698,6 +710,7 @@ impl Request {
                 version: head.version,
                 headers: head.headers,
                 body: Vec::new(),
+                timing,
             });
         }
     }
@@ -889,6 +902,29 @@ pub struct Response {
     pub version: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Per-phase timings for `--write-out` `%{time_*}` variables. Populated on
+    /// the direct HTTP/1.1 + HTTPS paths; left empty on reused (pooled)
+    /// connections and the HTTP/2 / HTTP/3 backends (see [`Timing`]).
+    pub timing: Timing,
+}
+
+/// Per-phase wall-clock timings for `--write-out` (`%{time_connect}` etc.),
+/// each measured from the start of the (final) request attempt.
+///
+/// These are filled only on the direct HTTP/1.1 and HTTPS code paths. On a
+/// connection reused from the pool, and on the HTTP/2 and HTTP/3 backends, the
+/// fields are `None` — those transfers report only `%{time_total}`. A `None`
+/// field renders as `0.000000`, matching curl's output for an unmeasured phase.
+#[derive(Debug, Clone, Default)]
+pub struct Timing {
+    /// Time until the TCP connection to the origin was established.
+    pub connect: Option<Duration>,
+    /// Time until the TLS handshake completed (HTTPS only).
+    pub appconnect: Option<Duration>,
+    /// Time until just before the request bytes were written.
+    pub pretransfer: Option<Duration>,
+    /// Time until the full response head had been received (first-byte proxy).
+    pub starttransfer: Option<Duration>,
 }
 
 impl Response {
@@ -947,10 +983,14 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
 }
 
 fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
+    let start = std::time::Instant::now();
     let stream = tcp_connect(&req, trace)?;
+    let connect = start.elapsed();
     let mut bufrd = BufReader::new(stream);
     write_request(bufrd.get_mut(), &req, via_plain_http_proxy(&req), trace)?;
-    let resp = read_response(&mut bufrd, &req.method, trace)?;
+    let mut resp = read_response_timed(&mut bufrd, &req.method, Some(start), trace)?;
+    resp.timing.connect = Some(connect);
+    resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
     finalize_plain(bufrd, &req, &resp, may_pool, trace);
     Ok(resp)
 }
@@ -1379,7 +1419,9 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
 }
 
 fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
+    let start = std::time::Instant::now();
     let tcp = tcp_connect(&req, trace)?;
+    let connect = start.elapsed();
     // HTTPS via proxy means we have to ask the proxy to splice us through
     // to the origin before the TLS handshake — the proxy can't see the
     // encrypted bytes, so a CONNECT tunnel is the only way.
@@ -1392,13 +1434,17 @@ fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     }
     let opts = tls_opts_from(&req, &[])?;
     let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+    let appconnect = start.elapsed();
     write_tls_info(&tls, trace);
     let mut bufrd = BufReader::new(tls);
     // Always origin-form here: even with a proxy in play we've already
     // tunnelled past it via CONNECT, so the request the origin sees is
     // the normal direct one.
     write_request(bufrd.get_mut(), &req, false, trace)?;
-    let resp = read_response(&mut bufrd, &req.method, trace)?;
+    let mut resp = read_response_timed(&mut bufrd, &req.method, Some(start), trace)?;
+    resp.timing.connect = Some(connect);
+    resp.timing.appconnect = Some(appconnect);
+    resp.timing.pretransfer = Some(appconnect); // request goes out right after TLS
     finalize_tls(bufrd, &req, &resp, may_pool, trace);
     Ok(resp)
 }
@@ -1965,12 +2011,24 @@ fn read_response<R: Read>(
     method: &str,
     trace: &mut dyn Write,
 ) -> Result<Response> {
+    read_response_timed(r, method, None, trace)
+}
+
+/// As [`read_response`], but stamps `Response::timing.starttransfer` from
+/// `start` (the start of the request attempt) once the head has arrived.
+fn read_response_timed<R: Read>(
+    r: &mut BufReader<R>,
+    method: &str,
+    start: Option<std::time::Instant>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     let Head {
         version,
         status,
         reason,
         headers,
     } = read_head(r, trace)?;
+    let starttransfer = start.map(|s| s.elapsed());
 
     let body = read_body(r, &headers, &version, status, method)?;
     let wire_len = body.len();
@@ -1983,6 +2041,10 @@ fn read_response<R: Read>(
         version,
         headers,
         body,
+        timing: Timing {
+            starttransfer,
+            ..Default::default()
+        },
     })
 }
 

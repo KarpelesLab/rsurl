@@ -2146,6 +2146,7 @@ fn finalize_response(
         version: "HTTP/3".to_string(),
         headers: hdrs,
         body,
+        timing: crate::http::Timing::default(),
     })
 }
 

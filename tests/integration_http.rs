@@ -2448,3 +2448,36 @@ fn cli_compat_noop_flags_accepted() {
     );
     assert_eq!(out.stdout, b"ok");
 }
+
+/// `-w` phase timers are populated (non-zero, well-formed floats) on the
+/// direct HTTP/1.1 path.
+#[test]
+fn cli_write_out_phase_timers() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| SResp::ok("hello"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{time_connect} %{time_starttransfer} %{time_total}",
+            &server.url("/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    let line = String::from_utf8_lossy(&out.stdout);
+    let nums: Vec<f64> = line
+        .split_whitespace()
+        .map(|s| s.parse::<f64>().expect("write-out timer is a float"))
+        .collect();
+    assert_eq!(nums.len(), 3, "got: {line:?}");
+    // connect <= starttransfer <= total, and starttransfer was measured (> 0).
+    assert!(nums[1] > 0.0, "starttransfer should be measured: {line:?}");
+    assert!(
+        nums[0] <= nums[1] + 1e-6,
+        "connect<=starttransfer: {line:?}"
+    );
+    assert!(nums[1] <= nums[2] + 1e-6, "starttransfer<=total: {line:?}");
+}
