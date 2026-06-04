@@ -21,6 +21,9 @@ pub(crate) struct NetConfig {
     /// Try `EPSV` before `PASV` for FTP passive data connections. Cleared by
     /// curl's `--disable-epsv`; the FTP backend then goes straight to `PASV`.
     pub(crate) ftp_use_epsv: bool,
+    /// Create missing directory components of an FTP upload path with `MKD`
+    /// before `STOR`/`APPE` (curl `--ftp-create-dirs`).
+    pub(crate) ftp_create_dirs: bool,
 }
 
 impl Default for NetConfig {
@@ -30,6 +33,7 @@ impl Default for NetConfig {
             connect_timeout: Some(Duration::from_secs(30)),
             verify: true,
             ftp_use_epsv: true,
+            ftp_create_dirs: false,
         }
     }
 }
@@ -57,6 +61,7 @@ pub struct Client {
     idn: bool,
     no_proxy: Vec<String>,
     ftp_use_epsv: bool,
+    ftp_create_dirs: bool,
 }
 
 impl Default for Client {
@@ -68,6 +73,7 @@ impl Default for Client {
             idn: true,
             no_proxy: Vec::new(),
             ftp_use_epsv: true,
+            ftp_create_dirs: false,
         }
     }
 }
@@ -117,6 +123,13 @@ impl Client {
         self
     }
 
+    /// Create missing directories of an FTP upload path before storing (curl
+    /// `--ftp-create-dirs`). Default `false`.
+    pub fn ftp_create_dirs(mut self, on: bool) -> Self {
+        self.ftp_create_dirs = on;
+        self
+    }
+
     /// Replace the no-proxy host-suffix list (curl `NO_PROXY`).
     pub fn no_proxy<I, S>(mut self, entries: I) -> Self
     where
@@ -152,6 +165,7 @@ impl Client {
             connect_timeout: self.connect_timeout,
             verify: self.verify,
             ftp_use_epsv: self.ftp_use_epsv,
+            ftp_create_dirs: self.ftp_create_dirs,
         }
     }
 
@@ -192,6 +206,18 @@ impl Client {
     /// other schemes fetch then write, so the result is identical.
     pub fn transfer_url_to(&self, url: &Url, sink: &mut dyn std::io::Write) -> Result<u64> {
         crate::transfer::transfer_url_to_with(url, &self.net_config_for(&url.host), sink)
+    }
+
+    /// Upload `body` to an FTP/FTPS `url` via `STOR` (with optional `REST`
+    /// resume), honoring this client's proxy and `--ftp-create-dirs`.
+    pub fn ftp_store(&self, url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
+        crate::ftp::store_with(url, body, resume_at, &self.net_config_for(&url.host))
+    }
+
+    /// Upload `body` to an FTP/FTPS `url` via `APPE` (append), honoring this
+    /// client's proxy and `--ftp-create-dirs`.
+    pub fn ftp_append(&self, url: &Url, body: &[u8]) -> Result<()> {
+        crate::ftp::append_with(url, body, &self.net_config_for(&url.host))
     }
 
     /// Send a message over SMTP/SMTPS (curl `--mail-from`/`--mail-rcpt` + body).

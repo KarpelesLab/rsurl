@@ -55,7 +55,8 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   `--oauth2-bearer`, and **AWS SigV4** (`--aws-sigv4`, HMAC-SHA256 chain).
 - **M8**: `-Z/--parallel` + `--parallel-max` concurrent transfers.
 - **M10 (protocol depth, partial)**: FTP **`--disable-epsv`** (skip EPSV, use
-  PASV directly).
+  PASV directly) and **`--ftp-create-dirs`** (MKD missing upload dirs); FTP
+  upload now honors `-x` proxy via the `Client`.
 - **M11 (partial)**: centralized **curl-compatible exit codes** for transfer
   errors (1/3/6/7/8/28/47/52/79); a **`man/rsurl.1`** man page.
 

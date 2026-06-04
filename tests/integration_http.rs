@@ -1055,8 +1055,10 @@ fn cli_upload_file_rejects_unsupported_scheme() {
 }
 
 /// `-T` with an `ftp://` URL is now a supported upload, not a usage error.
-/// With an unresolvable host it fails at the connect step (exit 7), proving
-/// the FTP-upload path is reached rather than rejected as a usage error.
+/// Against an unresolvable host it fails at the resolve/connect step, proving
+/// the FTP-upload path is reached rather than rejected as a usage error. The
+/// exact transfer code (6 couldn't-resolve vs 7 connect) is resolver-dependent,
+/// so we only require a non-usage transfer failure.
 #[test]
 fn cli_upload_file_ftp_attempts_transfer() {
     use std::process::Command;
@@ -1069,16 +1071,15 @@ fn cli_upload_file_ftp_attempts_transfer() {
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
-    assert_eq!(
-        code,
-        Some(7),
-        "expected transfer error exit 7, got {code:?}"
+    assert!(
+        matches!(code, Some(6) | Some(7)),
+        "expected a transfer error (6/7), got {code:?}"
     );
 }
 
 /// `-a`/`--append` with an `ftp://` URL routes to the FTP upload path (APPE).
-/// With an unresolvable host it fails at the connect step (exit 7), proving the
-/// append branch is reached rather than rejected as a usage error.
+/// Against an unresolvable host it fails at the resolve/connect step, proving
+/// the append branch is reached rather than rejected as a usage error.
 #[test]
 fn cli_append_ftp_attempts_transfer() {
     use std::process::Command;
@@ -1092,16 +1093,15 @@ fn cli_append_ftp_attempts_transfer() {
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
-    assert_eq!(
-        code,
-        Some(7),
-        "expected transfer error exit 7, got {code:?}"
+    assert!(
+        matches!(code, Some(6) | Some(7)),
+        "expected a transfer error (6/7), got {code:?}"
     );
 }
 
 /// `-a` combined with `-C <offset>` for an FTP upload is accepted: APPE takes
 /// precedence over REST, so the offset is ignored rather than causing an error.
-/// Still reaches the FTP transfer path (exit 7 against an unresolvable host).
+/// Still reaches the FTP transfer path (resolve/connect failure, not usage).
 #[test]
 fn cli_append_with_continue_at_prefers_appe() {
     use std::process::Command;
@@ -1117,10 +1117,9 @@ fn cli_append_with_continue_at_prefers_appe() {
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
-    assert_eq!(
-        code,
-        Some(7),
-        "expected transfer error exit 7 (APPE ignores -C), got {code:?}"
+    assert!(
+        matches!(code, Some(6) | Some(7)),
+        "expected a transfer error (6/7, APPE ignores -C), got {code:?}"
     );
 }
 
@@ -2705,4 +2704,85 @@ fn cli_ftp_download_streams_to_file() {
     // -w works for FTP too: size_download is the streamed byte count (17).
     assert_eq!(String::from_utf8_lossy(&out.stdout), "17");
     let _ = std::fs::remove_file(&out_path);
+}
+
+/// `--ftp-create-dirs` issues MKD for each directory prefix before STOR, and
+/// the upload body is delivered. A mock FTP server records the MKD commands and
+/// the stored bytes.
+#[test]
+fn cli_ftp_create_dirs_upload() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    let ctrl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ctrl_port = ctrl.local_addr().unwrap().port();
+    let data = TcpListener::bind("127.0.0.1:0").unwrap();
+    let data_port = data.local_addr().unwrap().port();
+    let seen: Arc<Mutex<(Vec<String>, Vec<u8>)>> = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    let seen2 = Arc::clone(&seen);
+
+    let handle = std::thread::spawn(move || {
+        let (sock, _) = ctrl.accept().unwrap();
+        let mut w = sock.try_clone().unwrap();
+        let mut r = BufReader::new(sock);
+        w.write_all(b"220 mock\r\n").unwrap();
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let cmd = line.trim_end();
+            if cmd.starts_with("USER") {
+                w.write_all(b"331 pw\r\n").unwrap();
+            } else if cmd.starts_with("PASS") {
+                w.write_all(b"230 ok\r\n").unwrap();
+            } else if let Some(dir) = cmd.strip_prefix("MKD ") {
+                seen2.lock().unwrap().0.push(dir.to_string());
+                w.write_all(b"257 created\r\n").unwrap();
+            } else if cmd.starts_with("EPSV") {
+                w.write_all(
+                    format!("229 Entering Extended Passive Mode (|||{data_port}|)\r\n").as_bytes(),
+                )
+                .unwrap();
+            } else if cmd.starts_with("STOR") {
+                w.write_all(b"150 send it\r\n").unwrap();
+                let (mut d, _) = data.accept().unwrap();
+                let mut body = Vec::new();
+                d.read_to_end(&mut body).unwrap();
+                seen2.lock().unwrap().1 = body;
+                w.write_all(b"226 stored\r\n").unwrap();
+            } else if cmd.starts_with("QUIT") {
+                w.write_all(b"221 bye\r\n").unwrap();
+                break;
+            } else {
+                w.write_all(b"200 ok\r\n").unwrap();
+            }
+        }
+    });
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("rsurl-ftp-up-{}.bin", std::process::id()));
+    std::fs::write(&tmp, b"UPLOAD-PAYLOAD").unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--ftp-create-dirs",
+            "-T",
+            tmp.to_str().unwrap(),
+            &format!("ftp://127.0.0.1:{ctrl_port}/a/b/file.bin"),
+        ])
+        .status()
+        .expect("spawn rsurl");
+    let _ = handle.join();
+    assert!(status.success(), "ftp upload should succeed");
+    let g = seen.lock().unwrap();
+    assert_eq!(
+        g.0,
+        vec!["a".to_string(), "a/b".to_string()],
+        "MKD prefixes"
+    );
+    assert_eq!(g.1, b"UPLOAD-PAYLOAD");
+    let _ = std::fs::remove_file(&tmp);
 }

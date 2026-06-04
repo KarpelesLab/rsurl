@@ -161,6 +161,9 @@ struct Args {
     no_clobber: bool,
     /// `--disable-epsv`: for FTP, skip `EPSV` and use `PASV` directly.
     disable_epsv: bool,
+    /// `--ftp-create-dirs`: create missing remote directories before an FTP
+    /// upload.
+    ftp_create_dirs: bool,
     /// `--max-filesize <bytes>`: refuse a download larger than this.
     max_filesize: Option<u64>,
     /// `-w`/`--write-out <format>`: print a formatted summary after transfer.
@@ -2084,6 +2087,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--remove-on-error" => a.remove_on_error = true,
             "--no-clobber" => a.no_clobber = true,
             "--disable-epsv" => a.disable_epsv = true,
+            "--ftp-create-dirs" => a.ftp_create_dirs = true,
             // We always use passive mode (active/PORT is unimplemented), so
             // --ftp-pasv and re-enabling EPSV are accepted as confirmations.
             "--ftp-pasv" => {}
@@ -2562,11 +2566,21 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
             return 26;
         }
     };
+    // Build a client so the upload honors -x proxy and --ftp-create-dirs.
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: --proxy: {e}");
+            }
+            return 5;
+        }
+    };
 
     // APPE wins over REST: append always streams the whole file and lets the
     // server tack it onto whatever is already there, so -C is ignored here.
     let result = if args.append {
-        rsurl::ftp::append(url, &bytes)
+        client.ftp_append(url, &bytes)
     } else {
         // For REST resume, only the tail past `offset` is streamed; the server
         // already holds the first `offset` bytes.
@@ -2586,7 +2600,7 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
             }
             None => (&bytes[..], None),
         };
-        rsurl::ftp::store(url, body, resume_at)
+        client.ftp_store(url, body, resume_at)
     };
 
     match result {
@@ -2595,7 +2609,7 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
-            7
+            transfer_exit_code(&e)
         }
     }
 }
@@ -2858,7 +2872,8 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
     let mut c = rsurl::Client::new()
         .verify_tls(!args.insecure)
         .idn(!args.no_idn)
-        .ftp_use_epsv(!args.disable_epsv);
+        .ftp_use_epsv(!args.disable_epsv)
+        .ftp_create_dirs(args.ftp_create_dirs);
     if let Some(secs) = args.connect_timeout {
         c = c.connect_timeout(Some(Duration::from_secs(secs)));
     }
@@ -3986,6 +4001,7 @@ Options:
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
       --disable-epsv       FTP: skip EPSV, use PASV directly
+      --ftp-create-dirs    FTP: create missing remote dirs before upload (-T)
   -K, --config <file>      read options from a curl-style config file
       --next  (-:)         start a new request with its own options
   -#, --progress-bar       show progress on streamed file downloads (-o/-O)

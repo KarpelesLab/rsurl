@@ -291,6 +291,29 @@ fn rest_command(offset: u64) -> String {
     format!("REST {offset}")
 }
 
+/// `--ftp-create-dirs`: issue `MKD` for each directory prefix of the upload
+/// path (`a`, then `a/b` for `/a/b/file`), ignoring the reply code so an
+/// already-existing directory (a 5xx reply) is not treated as an error. Mirrors
+/// [`upload_command`]'s path handling: a single leading '/' is stripped.
+fn create_upload_dirs<R: Read + Write>(ctrl: &mut BufReader<R>, path: &str) -> Result<()> {
+    let rel = path.strip_prefix('/').unwrap_or(path);
+    let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    if comps.len() < 2 {
+        return Ok(()); // no directory component — just a filename
+    }
+    let mut prefix = String::new();
+    for dir in &comps[..comps.len() - 1] {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(dir);
+        // reject_ctl validated the whole path already; send() also guards CR/LF.
+        send(ctrl, &format!("MKD {prefix}"))?;
+        let _ = read_reply(ctrl)?; // 257 created or 5xx exists — ignore the code
+    }
+    Ok(())
+}
+
 /// Upload `body` to the file at `url.path` via `STOR`. If `resume_at` is
 /// `Some(n)`, send `REST n` first so the server appends starting at byte `n`
 /// (the caller is responsible for passing a `body` that begins at that offset).
@@ -306,6 +329,22 @@ pub fn store(url: &Url, body: &[u8], resume_at: Option<u64>) -> Result<()> {
         resume_at,
         &NetConfig::default(),
     )
+}
+
+/// As [`store`], but using the caller's [`NetConfig`] (proxy/connector,
+/// `--ftp-create-dirs`). Used by [`crate::Client`].
+pub(crate) fn store_with(
+    url: &Url,
+    body: &[u8],
+    resume_at: Option<u64>,
+    cfg: &NetConfig,
+) -> Result<()> {
+    upload(url, body, UploadMode::Stor, resume_at, cfg)
+}
+
+/// As [`append`], but using the caller's [`NetConfig`]. Used by [`crate::Client`].
+pub(crate) fn append_with(url: &Url, body: &[u8], cfg: &NetConfig) -> Result<()> {
+    upload(url, body, UploadMode::Appe, None, cfg)
 }
 
 /// Append `body` to the file at `url.path` via `APPE`, creating it if absent.
@@ -343,6 +382,12 @@ fn upload(
             url.path
         ))
     })?;
+
+    // --ftp-create-dirs: best-effort MKD of each directory prefix of the upload
+    // path before storing. Failures are ignored (the directory likely exists).
+    if cfg.ftp_create_dirs {
+        create_upload_dirs(&mut con.ctrl, &url.path)?;
+    }
 
     // REST before STOR for resume. Per RFC 3659 the server answers 350
     // ("restart marker accepted"); the next command (STOR) then proceeds from
