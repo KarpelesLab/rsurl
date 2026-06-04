@@ -134,6 +134,26 @@ struct Args {
     /// Note: curl's `-i` is `--include` here, so the SSH identity flag is the
     /// long form `--key` only (no `-i` alias, to avoid the collision).
     ssh_keys: Vec<String>,
+    /// `-f`/`--fail`: on HTTP >= 400, emit no body and exit 22.
+    fail: bool,
+    /// `-S`/`--show-error`: show errors even under `-s`.
+    show_error: bool,
+    /// `-G`/`--get`: move `-d` data into the URL query and use GET.
+    get: bool,
+    /// `-r`/`--range <range>`: byte range (`Range: bytes=<range>`).
+    range: Option<String>,
+    /// `--compressed`: advertise `Accept-Encoding` (we decode transparently).
+    compressed: bool,
+    /// `-D`/`--dump-header <file>`: write response headers to this file.
+    dump_header: Option<String>,
+    /// `-R`/`--remote-time`: set the output file's mtime from `Last-Modified`.
+    remote_time: bool,
+    /// `--create-dirs`: create missing parent directories of `-o`.
+    create_dirs: bool,
+    /// `--max-filesize <bytes>`: refuse a download larger than this.
+    max_filesize: Option<u64>,
+    /// `-w`/`--write-out <format>`: print a formatted summary after transfer.
+    write_out: Option<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -236,7 +256,7 @@ fn main() -> ExitCode {
     let mut jar: Option<CookieJar> = match build_initial_jar(&args) {
         Ok(j) => j,
         Err(e) => {
-            if !args.silent {
+            if show_errors(&args) {
                 eprintln!("rsurl: {e}");
             }
             return ExitCode::from(2);
@@ -258,7 +278,7 @@ fn main() -> ExitCode {
     // earlier non-zero exit code — curl behaves the same way.
     if let (Some(j), Some(path)) = (jar.as_ref(), args.cookie_jar.as_deref()) {
         if let Err(e) = j.save_netscape(path) {
-            if !args.silent {
+            if show_errors(&args) {
                 eprintln!("rsurl: writing cookie jar {path}: {e}");
             }
             if last_failure == 0 {
@@ -976,7 +996,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     let mut parsed_url = match Url::parse(url) {
         Ok(u) => u,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             return 3;
@@ -987,7 +1007,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // all see the same host the connection will use. (The HTTP path re-parses
     // the URL string in `Request::new`, so it also gets `req.idn(...)` below.)
     if let Err(e) = parsed_url.set_idn(!args.no_idn) {
-        if !args.silent {
+        if show_errors(args) {
             eprintln!("rsurl: {e}");
         }
         return 3;
@@ -1024,7 +1044,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
                 return run_ssh_upload(&parsed_url, path, args);
             }
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!(
                     "rsurl: -T is only supported for HTTP(S), FTP(S), TFTP, and SFTP/SCP URLs in this build"
                 );
@@ -1043,19 +1063,37 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // Assemble the body up front so we know whether to default the method
     // (PUT for `-T`, POST for `-d`/`-F`). Errors from file I/O or mutually
     // exclusive flag combos surface as exit code 2 ("usage").
-    let assembled = match assemble_request_body(args) {
+    let mut assembled = match assemble_request_body(args) {
         Ok(b) => b,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             return 2;
         }
     };
 
+    // `-G`/`--get`: fold urlencoded `-d` data into the URL query and send a
+    // bodyless GET (curl semantics; multipart/`-F` is left untouched).
+    let mut url_owned = url.to_string();
+    if args.get {
+        if let Some((bytes, ctype, _)) = &assembled {
+            if ctype.starts_with("application/x-www-form-urlencoded") {
+                let q = String::from_utf8_lossy(bytes);
+                if !q.is_empty() {
+                    url_owned.push(if url_owned.contains('?') { '&' } else { '?' });
+                    url_owned.push_str(&q);
+                }
+                assembled = None;
+            }
+        }
+    }
+
     let method = args.method.clone().unwrap_or_else(|| {
         if args.head {
             "HEAD".to_string()
+        } else if args.get {
+            "GET".to_string()
         } else if let Some((_, _, m)) = &assembled {
             (*m).to_string()
         } else {
@@ -1063,10 +1101,10 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         }
     });
 
-    let mut req = match Request::new(&method, url) {
+    let mut req = match Request::new(&method, &url_owned) {
         Ok(r) => r,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             return 3;
@@ -1081,6 +1119,27 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
     if let Some(rf) = &args.referer {
         req = req.header("Referer", rf);
+    }
+    let has_header = |name: &str| {
+        args.headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(name))
+    };
+    // `--compressed`: advertise codecs we transparently decode. (We always
+    // decode a compressed response; this just asks the server to send one.)
+    if args.compressed && !has_header("accept-encoding") {
+        req = req.header("Accept-Encoding", "gzip, deflate, br, zstd");
+    }
+    // `-r`/`--range`: a bare range becomes `bytes=<range>`.
+    if let Some(r) = &args.range {
+        if !has_header("range") {
+            let v = if r.contains('=') {
+                r.clone()
+            } else {
+                format!("bytes={r}")
+            };
+            req = req.header("Range", &v);
+        }
     }
     if let Some((body_bytes, ctype, _method)) = assembled {
         if !args
@@ -1131,7 +1190,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         req = match req.proxy(&spec) {
             Ok(r) => r,
             Err(e) => {
-                if !args.silent {
+                if show_errors(args) {
                     eprintln!("rsurl: --proxy: {e}");
                 }
                 return 5;
@@ -1141,7 +1200,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             req = match req.proxy_user(u, p) {
                 Ok(r) => r,
                 Err(e) => {
-                    if !args.silent {
+                    if show_errors(args) {
                         eprintln!("rsurl: --proxy-user: {e}");
                     }
                     return 5;
@@ -1162,6 +1221,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         }
     }
 
+    let started = std::time::Instant::now();
     let send_result = match (jar, args.verbose) {
         (Some(j), true) => {
             let mut err = io::stderr().lock();
@@ -1174,30 +1234,74 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         }
         (None, false) => req.send(),
     };
+    let time_total = started.elapsed();
     let resp = match send_result {
         Ok(r) => r,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             return 7;
         }
     };
 
-    let exit_for_status: u8 = if (200..400).contains(&resp.status) {
-        0
-    } else {
-        22
-    };
+    // --max-filesize: reject when the server declares (Content-Length) or
+    // delivers a body larger than the cap.
+    if let Some(max) = args.max_filesize {
+        let declared = resp
+            .header("content-length")
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > max) || resp.body.len() as u64 > max {
+            if show_errors(args) {
+                eprintln!("rsurl: Maximum file size exceeded");
+            }
+            return 63;
+        }
+    }
+
+    // -D/--dump-header: write the response headers out before the body.
+    if let Some(path) = &args.dump_header {
+        if let Err(e) = dump_headers(&resp, path) {
+            if show_errors(args) {
+                eprintln!("rsurl: dump-header {path}: {e}");
+            }
+            return 23;
+        }
+    }
+
+    // -f/--fail: on an HTTP error, emit no body and exit 22. (Without -f,
+    // curl — and now rsurl — exits 0 even on 4xx/5xx.)
+    if args.fail && resp.status >= 400 {
+        if show_errors(args) {
+            eprintln!(
+                "rsurl: The requested URL returned error: {} {}",
+                resp.status, resp.reason
+            );
+        }
+        run_write_out(&resp, &parsed_url, args, time_total);
+        return 22;
+    }
 
     if let Err(e) = write_output(&resp, &parsed_url, args) {
-        if !args.silent {
+        if show_errors(args) {
             eprintln!("rsurl: write error: {e}");
         }
         return 23;
     }
 
-    exit_for_status
+    // -R/--remote-time: stamp the saved file's mtime from Last-Modified.
+    if args.remote_time {
+        if let Some(path) = args.output.as_deref().filter(|p| *p != "-") {
+            set_remote_time(&resp, path);
+        } else if args.remote_name {
+            if let Ok(name) = remote_name_from_url(&parsed_url) {
+                set_remote_time(&resp, &name);
+            }
+        }
+    }
+
+    run_write_out(&resp, &parsed_url, args, time_total);
+    0
 }
 
 fn parse_args(raw: &[String]) -> Result<Args, String> {
@@ -1330,7 +1434,12 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "-b" | "--cookie" => a.cookie_in = Some(next_val(&mut it, arg)?),
             "-c" | "--cookie-jar" => a.cookie_jar = Some(next_val(&mut it, arg)?),
             "-x" | "--proxy" => a.proxy = Some(next_val(&mut it, arg)?),
-            "--proxy-user" => {
+            // curl shorthands that pin the proxy scheme.
+            "--socks4" => a.proxy = Some(format!("socks4://{}", next_val(&mut it, arg)?)),
+            "--socks4a" => a.proxy = Some(format!("socks4a://{}", next_val(&mut it, arg)?)),
+            "--socks5" => a.proxy = Some(format!("socks5://{}", next_val(&mut it, arg)?)),
+            "--socks5-hostname" => a.proxy = Some(format!("socks5h://{}", next_val(&mut it, arg)?)),
+            "-U" | "--proxy-user" => {
                 let v = next_val(&mut it, arg)?;
                 let (u, p) = match v.split_once(':') {
                     Some((u, p)) => (u.to_string(), p.to_string()),
@@ -1339,6 +1448,23 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 a.proxy_user = Some((u, p));
             }
             "--noproxy" => a.noproxy = Some(next_val(&mut it, arg)?),
+            "--url" => a.urls.push(next_val(&mut it, arg)?),
+            "-f" | "--fail" => a.fail = true,
+            "-S" | "--show-error" => a.show_error = true,
+            "-G" | "--get" => a.get = true,
+            "-r" | "--range" => a.range = Some(next_val(&mut it, arg)?),
+            "--compressed" => a.compressed = true,
+            "-D" | "--dump-header" => a.dump_header = Some(next_val(&mut it, arg)?),
+            "-R" | "--remote-time" => a.remote_time = true,
+            "--create-dirs" => a.create_dirs = true,
+            "--max-filesize" => {
+                a.max_filesize = Some(
+                    next_val(&mut it, arg)?
+                        .parse()
+                        .map_err(|_| "--max-filesize requires a byte count".to_string())?,
+                )
+            }
+            "-w" | "--write-out" => a.write_out = Some(next_val(&mut it, arg)?),
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => {
@@ -1347,6 +1473,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
         }
     }
     Ok(a)
+}
+
+/// Whether to print error messages: always, unless `-s` is set without `-S`.
+fn show_errors(args: &Args) -> bool {
+    !args.silent || args.show_error
 }
 
 fn next_val(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, String> {
@@ -1366,7 +1497,7 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: -T: can't read {path:?}: {e}");
             }
             return 26;
@@ -1384,7 +1515,7 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
             Some(off) => {
                 let off_usize = off as usize;
                 if off_usize > bytes.len() {
-                    if !args.silent {
+                    if show_errors(args) {
                         eprintln!(
                             "rsurl: -C {off}: offset is past the end of {path:?} ({} bytes)",
                             bytes.len()
@@ -1402,7 +1533,7 @@ fn run_ftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             7
@@ -1417,7 +1548,7 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: -T: can't read {path:?}: {e}");
             }
             return 26;
@@ -1427,7 +1558,7 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
     match rsurl::tftp::store(url, &bytes) {
         Ok(()) => 0,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             7
@@ -1472,7 +1603,7 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
     let (opts, user) = match build_ssh_options(url, args) {
         Ok(x) => x,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             return 2;
@@ -1491,14 +1622,14 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
                     Ok(name) => match File::create(&name) {
                         Ok(f) => Box::new(f),
                         Err(e) => {
-                            if !args.silent {
+                            if show_errors(args) {
                                 eprintln!("rsurl: open {name}: {e}");
                             }
                             return 23;
                         }
                     },
                     Err(e) => {
-                        if !args.silent {
+                        if show_errors(args) {
                             eprintln!("rsurl: {e}");
                         }
                         return 23;
@@ -1506,10 +1637,10 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
                 }
             } else {
                 match &args.output {
-                    Some(path) if path != "-" => match File::create(path) {
+                    Some(path) if path != "-" => match create_output_file(path, args) {
                         Ok(f) => Box::new(f),
                         Err(e) => {
-                            if !args.silent {
+                            if show_errors(args) {
                                 eprintln!("rsurl: open {path}: {e}");
                             }
                             return 23;
@@ -1519,7 +1650,7 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
                 }
             };
             if let Err(e) = out.write_all(&bytes) {
-                if !args.silent {
+                if show_errors(args) {
                     eprintln!("rsurl: write error: {e}");
                 }
                 return 23;
@@ -1527,7 +1658,7 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
             0
         }
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             7
@@ -1542,7 +1673,7 @@ fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: -T: can't read {path:?}: {e}");
             }
             return 26;
@@ -1551,7 +1682,7 @@ fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
     let (opts, user) = match build_ssh_options(url, args) {
         Ok(x) => x,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             return 2;
@@ -1566,7 +1697,7 @@ fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             7
@@ -1581,7 +1712,7 @@ fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
 /// error, 26 on local-read error, 2 on a usage/flag-combination error.
 fn run_mqtt_publish(url: &Url, args: &Args) -> u8 {
     if args.upload_file.is_some() && !args.data_parts.is_empty() {
-        if !args.silent {
+        if show_errors(args) {
             eprintln!("rsurl: -d/--data and -T/--upload-file are mutually exclusive");
         }
         return 2;
@@ -1591,7 +1722,7 @@ fn run_mqtt_publish(url: &Url, args: &Args) -> u8 {
         match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
-                if !args.silent {
+                if show_errors(args) {
                     eprintln!("rsurl: -T: can't read {path:?}: {e}");
                 }
                 return 26;
@@ -1602,7 +1733,7 @@ fn run_mqtt_publish(url: &Url, args: &Args) -> u8 {
             Ok(Some(b)) => b,
             Ok(None) => Vec::new(),
             Err(e) => {
-                if !args.silent {
+                if show_errors(args) {
                     eprintln!("rsurl: {e}");
                 }
                 return 2;
@@ -1615,7 +1746,7 @@ fn run_mqtt_publish(url: &Url, args: &Args) -> u8 {
     match rsurl::mqtt::publish(url, &payload, 0) {
         Ok(()) => 0,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             7
@@ -1634,10 +1765,10 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
     match rsurl::rtsp::run_method(url, method) {
         Ok(bytes) => {
             let mut out: Box<dyn Write> = match &args.output {
-                Some(path) if path != "-" => match File::create(path) {
+                Some(path) if path != "-" => match create_output_file(path, args) {
                     Ok(f) => Box::new(f),
                     Err(e) => {
-                        if !args.silent {
+                        if show_errors(args) {
                             eprintln!("rsurl: open {path}: {e}");
                         }
                         return 23;
@@ -1646,7 +1777,7 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
                 _ => Box::new(io::stdout().lock()),
             };
             if let Err(e) = out.write_all(&bytes) {
-                if !args.silent {
+                if show_errors(args) {
                     eprintln!("rsurl: write error: {e}");
                 }
                 return 23;
@@ -1654,7 +1785,7 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
             0
         }
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             7
@@ -1694,7 +1825,7 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
     let client = match transfer_client(url, args) {
         Ok(c) => c,
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: --proxy: {e}");
             }
             return 5;
@@ -1703,10 +1834,10 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
     match client.transfer_url(url) {
         Ok(bytes) => {
             let mut out: Box<dyn Write> = match &args.output {
-                Some(path) if path != "-" => match File::create(path) {
+                Some(path) if path != "-" => match create_output_file(path, args) {
                     Ok(f) => Box::new(f),
                     Err(e) => {
-                        if !args.silent {
+                        if show_errors(args) {
                             eprintln!("rsurl: open {path}: {e}");
                         }
                         return 23;
@@ -1715,7 +1846,7 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
                 _ => Box::new(io::stdout().lock()),
             };
             if let Err(e) = out.write_all(&bytes) {
-                if !args.silent {
+                if show_errors(args) {
                     eprintln!("rsurl: write error: {e}");
                 }
                 return 23;
@@ -1723,7 +1854,7 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
             0
         }
         Err(e) => {
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             7
@@ -1795,6 +1926,165 @@ fn body_looks_binary(body: &[u8]) -> bool {
     body.contains(&0)
 }
 
+/// `-w`/`--write-out`: render `args.write_out` to stdout after a transfer,
+/// expanding `%{var}` variables and `\n`/`\t`/`\r`/`\\` escapes. `time_total`
+/// is measured around the request. Variables we don't (yet) compute expand to
+/// an empty string, matching curl's treatment of unknown names.
+fn run_write_out(resp: &Response, url: &Url, args: &Args, time_total: std::time::Duration) {
+    let Some(fmt) = &args.write_out else { return };
+    let size_header: usize = resp
+        .headers
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 4)
+        .sum::<usize>()
+        + resp.version.len()
+        + resp.reason.len()
+        + 6;
+    let var = |name: &str| -> String {
+        match name {
+            "http_code" | "response_code" => resp.status.to_string(),
+            "http_version" => resp.version.clone(),
+            "size_download" => resp.body.len().to_string(),
+            "size_header" => size_header.to_string(),
+            "num_headers" => resp.headers.len().to_string(),
+            "content_type" => resp.header("content-type").unwrap_or("").to_string(),
+            "url_effective" => {
+                let default = matches!(
+                    (url.scheme.as_str(), url.port),
+                    ("http", 80) | ("https", 443)
+                );
+                if default {
+                    format!("{}://{}{}", url.scheme, url.host, url.path)
+                } else {
+                    format!("{}://{}:{}{}", url.scheme, url.host, url.port, url.path)
+                }
+            }
+            "scheme" => url.scheme.to_uppercase(),
+            "time_total" => format!("{:.6}", time_total.as_secs_f64()),
+            _ => String::new(),
+        }
+    };
+
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' => match chars.peek() {
+                Some('{') => {
+                    chars.next();
+                    let mut name = String::new();
+                    for nc in chars.by_ref() {
+                        if nc == '}' {
+                            break;
+                        }
+                        name.push(nc);
+                    }
+                    out.push_str(&var(&name));
+                }
+                Some('%') => {
+                    chars.next();
+                    out.push('%');
+                }
+                _ => out.push('%'),
+            },
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            other => out.push(other),
+        }
+    }
+    print!("{out}");
+    let _ = io::stdout().flush();
+}
+
+/// Parse an HTTP-date (RFC 1123, `Sun, 06 Nov 1994 08:49:37 GMT`) to a Unix
+/// epoch. Returns `None` for anything it can't parse. GMT is assumed.
+fn httpdate_to_epoch(s: &str) -> Option<u64> {
+    let rest = s
+        .trim()
+        .split_once(", ")
+        .map(|(_, r)| r)
+        .unwrap_or(s.trim());
+    let mut it = rest.split_whitespace();
+    let day: i64 = it.next()?.parse().ok()?;
+    let mon: i64 = match it.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = it.next()?.parse().ok()?;
+    let mut hms = it.next()?.split(':');
+    let hh: i64 = hms.next()?.parse().ok()?;
+    let mm: i64 = hms.next()?.parse().ok()?;
+    let ss: i64 = hms.next()?.parse().ok()?;
+    // Days from civil date (Howard Hinnant's algorithm).
+    let y = if mon <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if mon > 2 { mon - 3 } else { mon + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86400 + hh * 3600 + mm * 60 + ss;
+    u64::try_from(secs).ok()
+}
+
+/// Create `path` for writing, first creating parent directories when
+/// `--create-dirs` is set (curl semantics).
+fn create_output_file(path: &str, args: &Args) -> io::Result<File> {
+    if args.create_dirs {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+    }
+    File::create(path)
+}
+
+/// `-D`/`--dump-header`: write the status line and response headers to `path`,
+/// CRLF-terminated, exactly as curl does.
+fn dump_headers(resp: &Response, path: &str) -> io::Result<()> {
+    let mut f = File::create(path)?;
+    write!(f, "{} {} {}\r\n", resp.version, resp.status, resp.reason)?;
+    for (k, v) in &resp.headers {
+        write!(f, "{k}: {v}\r\n")?;
+    }
+    f.write_all(b"\r\n")
+}
+
+/// `-R`/`--remote-time`: stamp `path`'s mtime from the response `Last-Modified`
+/// header. Best-effort — failures (bad date, unsupported FS) are ignored.
+fn set_remote_time(resp: &Response, path: &str) {
+    let Some(lm) = resp.header("last-modified") else {
+        return;
+    };
+    let Some(epoch) = httpdate_to_epoch(lm) else {
+        return;
+    };
+    let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(epoch);
+    if let Ok(f) = File::options().write(true).open(path) {
+        let _ = f.set_modified(mtime);
+    }
+}
+
 fn write_output(resp: &Response, url: &Url, args: &Args) -> io::Result<()> {
     // Track whether we are writing to stdout (vs. a real file via -o/-O) and
     // whether the user explicitly asked for stdout with `-o -` / `--output -`.
@@ -1806,12 +2096,12 @@ fn write_output(resp: &Response, url: &Url, args: &Args) -> io::Result<()> {
     let mut out: Box<dyn Write> = if args.remote_name {
         let name = remote_name_from_url(url).map_err(|e| io::Error::other(e.to_string()))?;
         to_stdout = false;
-        Box::new(File::create(&name)?)
+        Box::new(create_output_file(&name, args)?)
     } else {
         match &args.output {
             Some(path) if path != "-" => {
                 to_stdout = false;
-                Box::new(File::create(path)?)
+                Box::new(create_output_file(path, args)?)
             }
             Some(_) => {
                 explicit_stdout = true; // `-o -` / `--output -`
@@ -1852,7 +2142,7 @@ fn write_output(resp: &Response, url: &Url, args: &Args) -> io::Result<()> {
             out.write_all(&resp.body)?;
         } else if body_looks_binary(&resp.body) {
             // Refuse to dump binary to the terminal (curl's behavior).
-            if !args.silent {
+            if show_errors(args) {
                 eprintln!(
                     "Warning: Binary output can mess up your terminal. Use \"--output -\" to tell"
                 );
@@ -1950,11 +2240,28 @@ Options:
   -b, --cookie <data>      cookies to send: \"k=v[; k2=v2]\" or path to a
                            Netscape cookies.txt file
   -c, --cookie-jar <file>  write all known cookies to <file> on exit
-  -x, --proxy <url>        route via HTTP proxy (e.g. http://host:8080).
-                           Also reads HTTPS_PROXY / http_proxy / ALL_PROXY.
-      --proxy-user <u:p>   credentials for the proxy (Basic)
+  -x, --proxy <url>        route via a proxy. Scheme picks the kind:
+                           http/https/socks4/socks4a/socks5/socks5h (bare
+                           host:port = http). SOCKS5 also tunnels HTTP/3 &
+                           TFTP (UDP). Reads HTTPS_PROXY/http_proxy/ALL_PROXY.
+      --socks4 <host:port> / --socks4a / --socks5 / --socks5-hostname
+                           shorthands for -x socks4://… etc.
+  -U, --proxy-user <u:p>   credentials for the proxy (Basic / SOCKS5 auth)
       --noproxy <hosts>    comma-separated host suffixes that bypass the
                            proxy; \"*\" bypasses everything
+  -f, --fail               on HTTP >= 400, emit no body and exit 22
+  -S, --show-error         show errors even with -s
+  -G, --get                put -d data in the URL query and use GET
+  -r, --range <range>      request a byte range (Range: bytes=<range>)
+      --compressed         ask for a compressed response (decoded anyway)
+  -D, --dump-header <file> write response headers to <file>
+  -R, --remote-time        set the saved file's mtime from Last-Modified
+      --create-dirs        create missing directories for -o
+      --max-filesize <n>   refuse a download larger than <n> bytes
+  -w, --write-out <fmt>    after the transfer, print <fmt> with %{{vars}}
+                           expanded (http_code, size_download, content_type,
+                           url_effective, time_total, …)
+      --url <url>          add a URL (repeatable; same as a positional arg)
   -h, --help               print this help
   -V, --version            print version
 "

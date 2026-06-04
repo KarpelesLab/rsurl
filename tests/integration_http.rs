@@ -1599,3 +1599,62 @@ fn client_custom_connector_drives_gopher() {
     assert!(body.starts_with(b"1Welcome"));
     handle.join().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Tier A CLI flags
+// ---------------------------------------------------------------------------
+
+/// `-f` makes an HTTP >= 400 exit 22 with no body; without it, exit is 0.
+#[test]
+fn cli_fail_flag_controls_exit_and_body() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| SResp::status(404).body("nope"));
+    let url = server.url("/missing");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-f", "-s", &url])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(out.status.code(), Some(22), "-f on 404 should exit 22");
+    assert!(out.stdout.is_empty(), "-f must suppress the body");
+
+    let out2 = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", &url])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(out2.status.code(), Some(0), "no -f on 404 should exit 0");
+    assert_eq!(out2.stdout, b"nope");
+}
+
+/// `-G` folds `-d` data into the URL query and switches to GET.
+#[test]
+fn cli_get_moves_data_to_query() {
+    use std::process::Command;
+    // Echo the request line so we can see method + path+query.
+    let server = TestServer::start(|req: SReq| SResp::ok(format!("{} {}", req.method, req.path)));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "-G", "-d", "a=1", "-d", "b=2", &server.url("/q")])
+        .output()
+        .expect("spawn rsurl");
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(body, "GET /q?a=1&b=2", "got: {body}");
+}
+
+/// `-w` expands `%{...}` variables to stdout after the body.
+#[test]
+fn cli_write_out_expands_vars() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| SResp::ok("hello"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code} %{size_download}",
+            &server.url("/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "200 5");
+}
