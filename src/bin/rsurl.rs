@@ -209,6 +209,8 @@ struct Args {
     post303: bool,
     /// `--connect-to <h1:p1:h2:p2>`: dial h2:p2 for requests to h1:p1.
     connect_to: Vec<(String, u16, String, u16)>,
+    /// `--unix-socket <path>`: route the connection through a Unix socket.
+    unix_socket: Option<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1637,6 +1639,22 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     for (fh, fp, th, tp) in &args.connect_to {
         req = req.connect_to(fh, *fp, th, *tp);
     }
+    if let Some(path) = &args.unix_socket {
+        #[cfg(unix)]
+        {
+            req = req.connector(std::sync::Arc::new(rsurl::net::UnixConnector {
+                path: path.into(),
+            }));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            if show_errors(args) {
+                eprintln!("rsurl: --unix-socket is not supported on this platform");
+            }
+            return 2;
+        }
+    }
     if let Some((u, p)) = &args.basic_auth {
         req = req.basic_auth(u, p);
     } else if args.netrc && parsed_url.userinfo.is_none() {
@@ -2038,6 +2056,9 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--retry-connrefused" => a.retry_connrefused = true,
             "--retry-all-errors" => a.retry_all_errors = true,
             "-g" | "--globoff" => a.globoff = true,
+            "--unix-socket" | "--abstract-unix-socket" => {
+                a.unix_socket = Some(next_val(&mut it, arg)?)
+            }
             "--location-trusted" => {
                 a.follow_redirects = true;
                 a.location_trusted = true;
@@ -2571,6 +2592,21 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
                 .map(String::from)
                 .collect::<Vec<_>>(),
         );
+    }
+    if let Some(path) = &args.unix_socket {
+        #[cfg(unix)]
+        {
+            c = c.connector(std::sync::Arc::new(rsurl::net::UnixConnector {
+                path: path.into(),
+            }));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            return Err(rsurl::Error::UnsupportedScheme(
+                "--unix-socket is not supported on this platform".into(),
+            ));
+        }
     }
     Ok(c)
 }
@@ -3159,6 +3195,7 @@ Options:
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1
                            (keeps the original Host:/SNI)
+      --unix-socket <path> connect through a Unix-domain socket (Unix only)
   -4, --ipv4               connect over IPv4 only
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)

@@ -18,6 +18,8 @@ pub(crate) mod udp;
 
 pub use client::Client;
 pub(crate) use client::NetConfig;
+#[cfg(unix)]
+pub use connector::UnixConnector;
 pub use connector::{
     connector_from_proxy_url, Connector, DirectConnector, HttpProxyConnector, HttpProxyIntent,
     HttpsProxyConnector, Socks4Connector, Socks5Connector,

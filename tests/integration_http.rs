@@ -1994,3 +1994,50 @@ fn cli_connect_to_redirects_dial_keeps_host() {
     );
     assert_eq!(out.stdout, b"origin.invalid");
 }
+
+/// `--unix-socket` routes the HTTP request through a Unix-domain socket.
+#[cfg(unix)]
+#[test]
+fn cli_unix_socket_transport() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+
+    let dir = std::env::temp_dir().join(format!("rsurl-uds-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("s.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            if s.read(&mut b).unwrap() == 0 {
+                break;
+            }
+            buf.push(b[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nUDS!")
+            .unwrap();
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--unix-socket",
+            sock.to_str().unwrap(),
+            "http://localhost/",
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"UDS!");
+    handle.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

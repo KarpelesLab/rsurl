@@ -376,6 +376,35 @@ fn clear_handshake_timeout(s: &TcpStream) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Unix-domain socket (curl --unix-socket)
+// ---------------------------------------------------------------------------
+
+/// Routes every connection through a Unix-domain socket, ignoring the target
+/// host/port (curl `--unix-socket`). Unix only.
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+pub struct UnixConnector {
+    pub path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Connector for UnixConnector {
+    fn connect(
+        &self,
+        _host: &str,
+        _port: u16,
+        timeout: Option<Duration>,
+    ) -> Result<Box<dyn NetStream>> {
+        let s = std::os::unix::net::UnixStream::connect(&self.path)?;
+        if let Some(t) = timeout {
+            s.set_read_timeout(Some(t))?;
+            s.set_write_timeout(Some(t))?;
+        }
+        Ok(Box::new(s))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Proxy-URL factory
 // ---------------------------------------------------------------------------
 

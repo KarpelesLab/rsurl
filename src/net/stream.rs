@@ -55,6 +55,35 @@ impl NetStream for TcpStream {
     }
 }
 
+#[cfg(unix)]
+impl NetStream for std::os::unix::net::UnixStream {
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        std::os::unix::net::UnixStream::set_read_timeout(self, dur)
+    }
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        std::os::unix::net::UnixStream::set_write_timeout(self, dur)
+    }
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        // Unix sockets have no IP peer address.
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "peer_addr unavailable on a Unix-domain socket",
+        ))
+    }
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "local_addr unavailable on a Unix-domain socket",
+        ))
+    }
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        std::os::unix::net::UnixStream::shutdown(self, how)
+    }
+    fn try_clone_box(&self) -> io::Result<Box<dyn NetStream>> {
+        Ok(Box::new(std::os::unix::net::UnixStream::try_clone(self)?))
+    }
+}
+
 // `Read`/`Write` for `Box<dyn NetStream>` come for free from the std blanket
 // impls `impl<T: Read + ?Sized> Read for Box<T>` (and the `Write` analogue),
 // since `dyn NetStream: Read + Write`. The `NetStream` methods are reachable
