@@ -27,7 +27,8 @@ Early, in active development.
 | Connection reuse | working | process-wide keep-alive pool for HTTP/1.1 (plain & TLS) and HTTP/2 (post-handshake conns keyed on scheme/host/port, reused across requests) |
 | Response compression | working | `gzip` / `deflate` / `x-gzip` / `zstd` / `br` / `compress` / `x-compress` (Unix `.Z` LZW) decoded transparently (always-on) |
 | Cookies (`-b` / `-c`) | working | RFC 6265 jar; Netscape `cookies.txt` I/O, curl-compatible |
-| HTTP proxy (`-x`) | working | absolute-form for plain HTTP, `CONNECT` tunnel for HTTPS, Basic auth, `--noproxy` / `*_PROXY` env vars |
+| Proxies (`-x`) | working | HTTP (absolute-form / `CONNECT`), HTTPS-to-proxy, and SOCKS4/4a/5/5h — including SOCKS5 UDP ASSOCIATE for HTTP/3 & TFTP. Basic/`Proxy-Authorization` + SOCKS5 user/pass auth, `--noproxy` / `*_PROXY` env vars. Honoured across every scheme, not just HTTP |
+| Custom transport | working | implement `rsurl::net::Connector` (or `UdpProxy`) and pass it via `Client::connector` / `Request::connector` to supply your own sockets, pool, or test double |
 | HTTPS via purecrypto | working | TLS 1.2/1.3, system roots, full cert verification |
 | HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; connection- and stream-level flow control (WINDOW_UPDATE, INITIAL_WINDOW_SIZE deltas); process-wide connection pool reuses a warm conn across requests, advancing stream ids 1/3/5 (sequential reuse). True concurrent multiplexing — many in-flight streams on one connection, interleaved frame I/O, non-blocking body sends with no head-of-line stall, queueing at `SETTINGS_MAX_CONCURRENT_STREAMS`, per-stream RST + GOAWAY demux — is available as the `rsurl::send_multiplexed` library API (see below); the CLI still issues one request at a time |
 | HTTP/3 over QUIC (RFC 9114) | working\*\* | reachable via `--http3` (try h3, fall back to HTTP/2/1.1 on a QUIC transport failure) and `--http3-only` (force h3, no fallback). QUIC + frame layer + QPACK static/dynamic tables and Huffman decoder; advertises a non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (blocked-streams 0), applies the peer's encoder-stream inserts and resolves dynamic / post-base field-line refs, acks sections on the decoder stream; the request encoder still emits literals only; honors `--cacert`/`-k` |
@@ -108,6 +109,44 @@ println!("{} {}", resp.status, resp.reason);
 println!("{}", String::from_utf8_lossy(&resp.body));
 ```
 
+### Proxies and custom transport
+
+A `Client` carries network config (proxy, timeouts, TLS/IDN) and applies it to
+every scheme:
+
+```rust
+use rsurl::Client;
+
+// Route everything — HTTP(S), FTP, IMAP, …, and HTTP/3 & TFTP over UDP — via SOCKS5.
+let client = Client::new().proxy("socks5h://user:pass@127.0.0.1:1080")?;
+let resp = client.get("https://example.com/")?;
+let bytes = client.transfer("ftp://ftp.example.com/pub/file")?;
+```
+
+To supply your own sockets (a pre-opened connection, an in-process pipe, a
+test double, an app-managed pool), implement `rsurl::net::Connector`:
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use rsurl::net::{Connector, NetStream};
+
+#[derive(Debug)]
+struct MyConnector;
+impl Connector for MyConnector {
+    fn connect(&self, host: &str, port: u16, _t: Option<Duration>)
+        -> rsurl::Result<Box<dyn NetStream>> {
+        Ok(Box::new(std::net::TcpStream::connect((host, port))?))
+    }
+}
+
+let client = Client::new().connector(Arc::new(MyConnector));
+// or per-request: rsurl::Request::get(url)?.connector(Arc::new(MyConnector)).send()?;
+```
+
+(Per-request HTTP also accepts a transport via `Request::connector` /
+`Request::proxy`.)
+
 ## CLI usage
 
 ```sh
@@ -123,6 +162,8 @@ rsurl -b cookies.txt -c cookies.txt http://api/...  # load + save jar
 rsurl -b "sid=abc" http://api/...       # send one inline cookie
 rsurl -x http://proxy:3128 http://x/    # plain HTTP via proxy (absolute-form)
 rsurl -x http://proxy:3128 https://x/   # HTTPS via proxy CONNECT tunnel
+rsurl -x socks5h://proxy:1080 https://x/   # SOCKS5 (proxy-side DNS)
+rsurl -x socks5h://u:p@proxy:1080 ftp://x/ # SOCKS5 also covers non-HTTP schemes
 rsurl --proxy-user u:p -x http://proxy:3128 https://x/   # Proxy-Authorization
 rsurl --noproxy localhost,.internal -x http://proxy https://x/  # bypass list
 rsurl -d a=1 -d b=2 http://api/         # urlencoded POST, multiple values

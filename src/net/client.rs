@@ -114,9 +114,28 @@ impl Client {
         self
     }
 
-    pub(crate) fn net_config(&self) -> NetConfig {
+    /// True if `host` matches the no-proxy list (suffix match, or `*`).
+    fn host_bypassed(&self, host: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.no_proxy.iter().any(|e| {
+            let e = e.trim().to_ascii_lowercase();
+            e == "*" || host == e || host.ends_with(&format!(".{e}"))
+        })
+    }
+
+    /// The connector to use for `host` — the configured one, or a direct dial
+    /// if the host is in the no-proxy list.
+    fn effective_connector(&self, host: &str) -> Arc<dyn Connector> {
+        if self.host_bypassed(host) {
+            Arc::new(DirectConnector)
+        } else {
+            self.connector.clone()
+        }
+    }
+
+    fn net_config_for(&self, host: &str) -> NetConfig {
         NetConfig {
-            connector: self.connector.clone(),
+            connector: self.effective_connector(host),
             connect_timeout: self.connect_timeout,
             verify: self.verify,
         }
@@ -126,10 +145,10 @@ impl Client {
     /// transport and defaults.
     pub fn request(&self, method: &str, url: &str) -> Result<crate::Request> {
         let mut r = crate::Request::new(method, url)?
-            .connector(self.connector.clone())
             .verify_tls(self.verify)
-            .idn(self.idn)
-            .no_proxy(self.no_proxy.clone());
+            .idn(self.idn);
+        let host = r.url().host.clone();
+        r = r.connector(self.effective_connector(&host));
         if let Some(t) = self.connect_timeout {
             r = r.connect_timeout(t);
         }
@@ -151,6 +170,6 @@ impl Client {
 
     /// Like [`Client::transfer`] but from an already-parsed URL.
     pub fn transfer_url(&self, url: &Url) -> Result<Vec<u8>> {
-        crate::transfer::transfer_url_with(url, &self.net_config())
+        crate::transfer::transfer_url_with(url, &self.net_config_for(&url.host))
     }
 }

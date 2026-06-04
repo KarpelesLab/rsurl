@@ -1662,10 +1662,45 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
     }
 }
 
+/// Build a [`rsurl::Client`] for the non-HTTP transfer path from the CLI args:
+/// proxy (`-x`, incl. socks/https), no-proxy, `-k`, `--no-idn`, connect timeout.
+fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
+    let mut c = rsurl::Client::new()
+        .verify_tls(!args.insecure)
+        .idn(!args.no_idn);
+    if let Some(secs) = args.connect_timeout {
+        c = c.connect_timeout(Some(Duration::from_secs(secs)));
+    }
+    if let Some(spec) = resolve_proxy_spec(url, args) {
+        c = c.proxy(&spec)?;
+    }
+    if let Some(list) = resolve_noproxy(args) {
+        c = c.no_proxy(
+            list.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(c)
+}
+
 fn run_transfer(url: &Url, args: &Args) -> u8 {
     // `url` is already IDN-normalised by `process_url`; dispatch the parsed URL
-    // directly so the host the caller chose (and `--no-idn`) is honoured.
-    match rsurl::transfer_url(url) {
+    // directly so the host the caller chose (and `--no-idn`) is honoured. The
+    // client carries any `-x` proxy / `--noproxy` so non-HTTP schemes honour
+    // them too.
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if !args.silent {
+                eprintln!("rsurl: --proxy: {e}");
+            }
+            return 5;
+        }
+    };
+    match client.transfer_url(url) {
         Ok(bytes) => {
             let mut out: Box<dyn Write> = match &args.output {
                 Some(path) if path != "-" => match File::create(path) {
