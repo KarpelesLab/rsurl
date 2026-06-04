@@ -462,6 +462,194 @@ impl Request {
         self.send_to(trace, Some(jar))
     }
 
+    /// Stream the response body straight to `sink` instead of buffering it,
+    /// so the CLI can apply progress / rate-limit / size-cap per chunk and not
+    /// hold large downloads in memory.
+    ///
+    /// Streaming applies only to a direct (no proxy / custom connector)
+    /// HTTP/1.1 connection whose final response has no `Content-Encoding`.
+    /// Every other case (HTTP/2 or /3, a proxy, a compressed or empty body)
+    /// falls back to the buffered path and writes the resulting body to `sink`.
+    /// The returned [`Response`] carries the final status/headers; its `body`
+    /// is empty because the bytes went to `sink`.
+    pub fn send_download(
+        self,
+        sink: &mut dyn Write,
+        jar: Option<&mut crate::cookie::CookieJar>,
+        trace: &mut dyn Write,
+    ) -> Result<Response> {
+        let streamable = self.connector.is_direct()
+            && self.proxy.is_none()
+            && (self.url.scheme == "http"
+                || matches!(self.http_version_pref, HttpVersionPref::Http11Only));
+        if !streamable {
+            let resp = self.send_to(trace, jar)?;
+            sink.write_all(&resp.body)?;
+            return Ok(Response {
+                body: Vec::new(),
+                ..resp
+            });
+        }
+        self.stream_h1(sink, jar, trace)
+    }
+
+    /// HTTP/1.1 streaming download with redirect following (the streamable
+    /// branch of [`Self::send_download`]).
+    fn stream_h1(
+        self,
+        sink: &mut dyn Write,
+        mut jar: Option<&mut crate::cookie::CookieJar>,
+        trace: &mut dyn Write,
+    ) -> Result<Response> {
+        let mut req = self;
+        req.url.set_idn(req.idn)?;
+        let mut hops_left = req.max_redirs;
+        loop {
+            let stream: Box<dyn Rw> = if req.url.scheme == "https" {
+                let tcp = tcp_connect(&req, trace)?;
+                let opts = tls_opts_from(&req, &[])?;
+                let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+                write_tls_info(&tls, trace);
+                Box::new(tls)
+            } else {
+                Box::new(tcp_connect(&req, trace)?)
+            };
+            let mut bufrd = BufReader::new(stream);
+
+            // Attach a jar-managed Cookie header to a snapshot of the request.
+            let mut snapshot = req.clone();
+            if let Some(j) = jar.as_deref_mut() {
+                j.purge_expired();
+                snapshot
+                    .headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+                if let Some(val) = j.cookie_header(&snapshot.url) {
+                    snapshot.headers.push(("Cookie".to_string(), val));
+                }
+            }
+            write_request(
+                bufrd.get_mut(),
+                &snapshot,
+                via_plain_http_proxy(&req),
+                trace,
+            )?;
+            let head = read_head(&mut bufrd, trace)?;
+            if let Some(j) = jar.as_deref_mut() {
+                j.ingest_response(&req.url, &head.headers);
+            }
+
+            // Follow a redirect (mirrors `send_to`'s logic, operating on the
+            // head; the small redirect body is drained first).
+            if req.follow_redirects && is_redirect_status(head.status) {
+                if let Some((_, loc)) = head
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                {
+                    let location = loc.clone();
+                    let _ = read_body(
+                        &mut bufrd,
+                        &head.headers,
+                        &head.version,
+                        head.status,
+                        &req.method,
+                    )?;
+                    if hops_left == 0 {
+                        return Err(Error::BadResponse(format!(
+                            "maximum ({}) redirects followed",
+                            req.max_redirs
+                        )));
+                    }
+                    let mut next_url = crate::url::resolve(&req.url, &location)?;
+                    next_url.set_idn(req.idn)?;
+                    let _ = writeln!(
+                        trace,
+                        "* Following redirect to {}",
+                        url_to_string(&next_url)
+                    );
+                    let host_changed = next_url.host != req.url.host
+                        || next_url.port != req.url.port
+                        || next_url.scheme != req.url.scheme;
+                    let prev_method = req.method.clone();
+                    let prev_url = url_to_string(&req.url);
+                    let prev_body = std::mem::take(&mut req.body);
+                    let status = head.status;
+                    let mut next = req;
+                    next.url = next_url;
+                    if next.auto_referer {
+                        next.headers
+                            .retain(|(k, _)| !k.eq_ignore_ascii_case("referer"));
+                        next.headers.push(("Referer".to_string(), prev_url));
+                    }
+                    if host_changed && !next.redirect_trusted {
+                        next.headers.retain(|(k, _)| {
+                            !k.eq_ignore_ascii_case("authorization")
+                                && !k.eq_ignore_ascii_case("cookie")
+                        });
+                        next.basic_auth = None;
+                    }
+                    let keep_post = if (301..=303).contains(&status) {
+                        next.keep_post[(status - 301) as usize]
+                    } else {
+                        false
+                    };
+                    if (301..=303).contains(&status)
+                        && !keep_post
+                        && !prev_method.eq_ignore_ascii_case("GET")
+                        && !prev_method.eq_ignore_ascii_case("HEAD")
+                    {
+                        next.method = "GET".to_string();
+                        next.headers.retain(|(k, _)| {
+                            !k.eq_ignore_ascii_case("content-type")
+                                && !k.eq_ignore_ascii_case("content-length")
+                                && !k.eq_ignore_ascii_case("transfer-encoding")
+                        });
+                    } else {
+                        next.body = prev_body;
+                    }
+                    hops_left -= 1;
+                    req = next;
+                    continue;
+                }
+                // 3xx without Location — treat as the final response.
+            }
+
+            // Final response. A `Content-Encoding` means we must decode, which
+            // needs the whole body — buffer that case; otherwise stream.
+            let encoded = head
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"));
+            if encoded {
+                let body = read_body(
+                    &mut bufrd,
+                    &head.headers,
+                    &head.version,
+                    head.status,
+                    &req.method,
+                )?;
+                let (headers, body) = maybe_decode_body(head.headers, body, trace)?;
+                sink.write_all(&body)?;
+                return Ok(Response {
+                    status: head.status,
+                    reason: head.reason,
+                    version: head.version,
+                    headers,
+                    body: Vec::new(),
+                });
+            }
+            let n = stream_body(&mut bufrd, sink, &head.headers, head.status, &req.method)?;
+            let _ = writeln!(trace, "* Streamed {n} body bytes");
+            return Ok(Response {
+                status: head.status,
+                reason: head.reason,
+                version: head.version,
+                headers: head.headers,
+                body: Vec::new(),
+            });
+        }
+    }
+
     /// Single-shot send with no redirect handling. Pure protocol dispatch.
     fn send_once(self, trace: &mut dyn Write) -> Result<Response> {
         if !self.verify_tls && self.url.scheme == "https" {
@@ -1643,11 +1831,17 @@ fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut String, max: usize) -> Resu
 /// the caller (rather than created inline) because connection-reuse hands
 /// the same `BufReader` to back-to-back requests, and the buffer's leftover
 /// bytes — even if empty in practice — must travel with the connection.
-fn read_response<R: Read>(
-    r: &mut BufReader<R>,
-    method: &str,
-    trace: &mut dyn Write,
-) -> Result<Response> {
+/// The status line + headers of a response (everything before the body).
+struct Head {
+    version: String,
+    status: u16,
+    reason: String,
+    headers: Vec<(String, String)>,
+}
+
+/// Read the status line and header block (up to the blank line). The reader is
+/// left positioned at the first body byte.
+fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Head> {
     let mut status_line = String::new();
     let n = read_line_capped(r, &mut status_line, MAX_HEADER_BYTES)?;
     if n == 0 {
@@ -1679,6 +1873,25 @@ fn read_response<R: Read>(
             .ok_or_else(|| Error::BadResponse(format!("malformed header line: {trimmed:?}")))?;
         headers.push((k.trim().to_string(), v.trim().to_string()));
     }
+    Ok(Head {
+        version,
+        status,
+        reason,
+        headers,
+    })
+}
+
+fn read_response<R: Read>(
+    r: &mut BufReader<R>,
+    method: &str,
+    trace: &mut dyn Write,
+) -> Result<Response> {
+    let Head {
+        version,
+        status,
+        reason,
+        headers,
+    } = read_head(r, trace)?;
 
     let body = read_body(r, &headers, &version, status, method)?;
     let wire_len = body.len();
@@ -1901,6 +2114,97 @@ fn read_chunked<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
         }
     }
     Ok(body)
+}
+
+/// Any bidirectional byte stream — lets the streaming download path hold a
+/// plain or TLS connection behind one boxed type.
+trait Rw: Read + Write {}
+impl<T: Read + Write + ?Sized> Rw for T {}
+
+/// Stream the response body to `sink` instead of buffering it, returning the
+/// number of bytes written. Mirrors [`read_body`]'s framing (no-body statuses,
+/// chunked, Content-Length, EOF) but does not decompress — callers use this
+/// only when there is no `Content-Encoding`.
+fn stream_body<R: BufRead, W: Write + ?Sized>(
+    r: &mut R,
+    sink: &mut W,
+    headers: &[(String, String)],
+    status: u16,
+    method: &str,
+) -> Result<u64> {
+    if method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304
+    {
+        return Ok(0);
+    }
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
+    });
+    if chunked {
+        return stream_chunked(r, sink);
+    }
+    match parse_content_length(headers)? {
+        Some(len) => {
+            if len > MAX_BODY_BYTES as u64 {
+                return Err(Error::BadResponse(format!("body too large: {len}")));
+            }
+            let n = io::copy(&mut r.by_ref().take(len), sink)?;
+            if n < len {
+                return Err(Error::UnexpectedEof);
+            }
+            Ok(n)
+        }
+        None => Ok(io::copy(&mut r.by_ref().take(MAX_BODY_BYTES as u64), sink)?),
+    }
+}
+
+/// Stream a chunked body to `sink` (mirrors [`read_chunked`]).
+fn stream_chunked<R: BufRead, W: Write + ?Sized>(r: &mut R, sink: &mut W) -> Result<u64> {
+    let mut total: u64 = 0;
+    loop {
+        let mut size_line = String::new();
+        let n = read_line_capped(r, &mut size_line, MAX_HEADER_BYTES)?;
+        if n == 0 {
+            return Err(Error::UnexpectedEof);
+        }
+        let size_str = size_line
+            .trim_end_matches(['\r', '\n'])
+            .split(';')
+            .next()
+            .unwrap_or("");
+        let s = size_str.trim();
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::BadResponse(format!("bad chunk size: {size_str:?}")));
+        }
+        let size = usize::from_str_radix(s, 16)
+            .map_err(|_| Error::BadResponse(format!("bad chunk size: {size_str:?}")))?;
+        if total.saturating_add(size as u64) > MAX_BODY_BYTES as u64 {
+            return Err(Error::BadResponse("body too large".into()));
+        }
+        if size == 0 {
+            loop {
+                let mut t = String::new();
+                let n = read_line_capped(r, &mut t, MAX_HEADER_BYTES)?;
+                if n == 0 || t.trim_end_matches(['\r', '\n']).is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        let copied = io::copy(&mut r.by_ref().take(size as u64), sink)?;
+        if copied < size as u64 {
+            return Err(Error::UnexpectedEof);
+        }
+        let mut crlf = [0u8; 2];
+        r.read_exact(&mut crlf)?;
+        if &crlf != b"\r\n" {
+            return Err(Error::BadResponse("missing CRLF after chunk".into()));
+        }
+        total += size as u64;
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

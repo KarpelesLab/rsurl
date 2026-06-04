@@ -411,12 +411,9 @@ fn warn_unsupported(ops: &[Args]) {
              are not supported in this build"
         );
     }
-    if ops.iter().any(|a| a.limit_rate.is_some()) {
-        eprintln!(
-            "rsurl: warning: --limit-rate is recognized but not enforced \
-             (no streaming downloads yet)"
-        );
-    }
+    // --limit-rate and -# are enforced on the streaming file-download path
+    // (-o FILE / -O); they are no-ops only when the body isn't streamed
+    // (stdout, -i, -f, ...). -y/-Y still need low-speed tracking.
     if ops
         .iter()
         .any(|a| a.speed_limit.is_some() || a.speed_time.is_some())
@@ -1745,6 +1742,21 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         }
     }
 
+    // Stream the body straight to a file when that's safe and useful: a file
+    // output (not a TTY, so no escape-guard needed), no header-inclusion, and
+    // no status-gated body suppression. This is the path that enforces
+    // --limit-rate, -# progress, and an early --max-filesize abort.
+    let output_is_file = args.remote_name || args.output.as_deref().is_some_and(|p| p != "-");
+    let stream_ok = output_is_file
+        && !args.include_headers
+        && !args.fail
+        && !args.fail_with_body
+        && !args.remote_header_name // -J needs the response head for the name
+        && args.dump_header.is_none();
+    if stream_ok {
+        return run_http_download(req, &parsed_url, args, jar);
+    }
+
     let started = std::time::Instant::now();
     let mut jar = jar;
     let mut attempt = 0u32;
@@ -1829,7 +1841,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             );
         }
         let _ = write_output(&resp, &parsed_url, args);
-        run_write_out(&resp, &parsed_url, args, time_total);
+        run_write_out(&resp, &parsed_url, args, time_total, resp.body.len() as u64);
         return 22;
     }
 
@@ -1842,7 +1854,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
                 resp.status, resp.reason
             );
         }
-        run_write_out(&resp, &parsed_url, args, time_total);
+        run_write_out(&resp, &parsed_url, args, time_total, resp.body.len() as u64);
         return 22;
     }
 
@@ -1864,7 +1876,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         }
     }
 
-    run_write_out(&resp, &parsed_url, args, time_total);
+    run_write_out(&resp, &parsed_url, args, time_total, resp.body.len() as u64);
     0
 }
 
@@ -2876,7 +2888,13 @@ fn body_looks_binary(body: &[u8]) -> bool {
 /// expanding `%{var}` variables and `\n`/`\t`/`\r`/`\\` escapes. `time_total`
 /// is measured around the request. Variables we don't (yet) compute expand to
 /// an empty string, matching curl's treatment of unknown names.
-fn run_write_out(resp: &Response, url: &Url, args: &Args, time_total: std::time::Duration) {
+fn run_write_out(
+    resp: &Response,
+    url: &Url,
+    args: &Args,
+    time_total: std::time::Duration,
+    size_download: u64,
+) {
     let Some(fmt) = &args.write_out else { return };
     let size_header: usize = resp
         .headers
@@ -2890,7 +2908,7 @@ fn run_write_out(resp: &Response, url: &Url, args: &Args, time_total: std::time:
         match name {
             "http_code" | "response_code" => resp.status.to_string(),
             "http_version" => resp.version.clone(),
-            "size_download" => resp.body.len().to_string(),
+            "size_download" => size_download.to_string(),
             "size_header" => size_header.to_string(),
             "num_headers" => resp.headers.len().to_string(),
             "content_type" => resp.header("content-type").unwrap_or("").to_string(),
@@ -3093,6 +3111,147 @@ fn proto_allowed(scheme: &str, spec: &str) -> bool {
         }
     }
     set.contains(&scheme.to_ascii_lowercase())
+}
+
+/// Parse a curl `--limit-rate` value (`1000`, `2k`, `3M`, `1G`) to bytes/sec.
+fn parse_rate(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, mult): (&str, u64) = match s.chars().last() {
+        Some('k') | Some('K') => (&s[..s.len() - 1], 1024),
+        Some('m') | Some('M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('g') | Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(mult))
+}
+
+/// Sentinel in the io::Error message used to signal an exceeded `--max-filesize`
+/// across the `send_download` boundary.
+const MAX_FILESIZE_SENTINEL: &str = "rsurl-max-filesize-exceeded";
+
+/// A write sink for streamed downloads: enforces `--max-filesize` (early
+/// abort), `--limit-rate` (paced writes), and `-#` progress, and counts bytes
+/// for `-w %{size_download}`.
+struct DownloadSink<'a> {
+    inner: Box<dyn Write + 'a>,
+    written: u64,
+    max: Option<u64>,
+    rate: Option<u64>,
+    started: std::time::Instant,
+    progress: bool,
+    silent: bool,
+    last_tick: std::time::Instant,
+}
+
+impl Write for DownloadSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(max) = self.max {
+            if self.written + buf.len() as u64 > max {
+                return Err(io::Error::other(MAX_FILESIZE_SENTINEL));
+            }
+        }
+        if let Some(rate) = self.rate.filter(|r| *r > 0) {
+            let target = std::time::Duration::from_secs_f64(
+                (self.written + buf.len() as u64) as f64 / rate as f64,
+            );
+            let elapsed = self.started.elapsed();
+            if target > elapsed {
+                std::thread::sleep(target - elapsed);
+            }
+        }
+        self.inner.write_all(buf)?;
+        self.written += buf.len() as u64;
+        if self.progress
+            && !self.silent
+            && self.last_tick.elapsed() >= std::time::Duration::from_millis(100)
+        {
+            eprint!("\rrsurl: {} bytes received", self.written);
+            let _ = io::stderr().flush();
+            self.last_tick = std::time::Instant::now();
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Streaming HTTP download to a file: enforces `--limit-rate`/`-#`/
+/// `--max-filesize` and avoids buffering the whole body in memory.
+fn run_http_download(
+    req: rsurl::Request,
+    url: &Url,
+    args: &Args,
+    jar: Option<&mut CookieJar>,
+) -> u8 {
+    let name = if args.remote_name {
+        match remote_name_from_url(url) {
+            Ok(n) => n,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                return 23;
+            }
+        }
+    } else {
+        args.output.clone().unwrap_or_default()
+    };
+    let file = match create_output_file(&name, args) {
+        Ok(f) => f,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: open {name}: {e}");
+            }
+            return 23;
+        }
+    };
+    let now = std::time::Instant::now();
+    let mut sink = DownloadSink {
+        inner: Box::new(file),
+        written: 0,
+        max: args.max_filesize,
+        rate: args.limit_rate.as_deref().and_then(parse_rate),
+        started: now,
+        progress: args.progress_bar,
+        silent: args.silent,
+        last_tick: now,
+    };
+    let result = if args.verbose {
+        let mut err = io::stderr().lock();
+        req.send_download(&mut sink, jar, &mut err)
+    } else {
+        req.send_download(&mut sink, jar, &mut io::sink())
+    };
+    let time_total = now.elapsed();
+    let written = sink.written;
+    if args.progress_bar && !args.silent {
+        eprintln!();
+    }
+    match result {
+        Ok(resp) => {
+            if args.remote_time {
+                set_remote_time(&resp, &name);
+            }
+            run_write_out(&resp, url, args, time_total, written);
+            0
+        }
+        Err(e) => {
+            if e.to_string().contains(MAX_FILESIZE_SENTINEL) {
+                if show_errors(args) {
+                    eprintln!("rsurl: Maximum file size exceeded");
+                }
+                return 63;
+            }
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
 }
 
 /// Create `path` for writing, first creating parent directories when
@@ -3357,9 +3516,9 @@ Options:
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
   -K, --config <file>      read options from a curl-style config file
       --next  (-:)         start a new request with its own options
-  -#, --progress-bar       accepted (no-op: bodies are buffered, not streamed)
+  -#, --progress-bar       show progress on streamed file downloads (-o/-O)
   -E, --cert <c[:pass]>    accepted; TLS client certs not supported yet
-      --limit-rate <speed> accepted; not enforced yet (needs streaming)
+      --limit-rate <speed> cap download rate (e.g. 200k, 1M) on -o/-O downloads
   -y, --speed-time <s> / -Y, --speed-limit <bps>
                            accepted; not enforced yet (needs streaming)
   -h, --help               print this help

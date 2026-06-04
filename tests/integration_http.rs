@@ -2180,3 +2180,63 @@ fn cli_telnet_strips_iac_and_refuses() {
         "should refuse with IAC DONT 1"
     );
 }
+
+/// A download to a file is streamed (chunked) to disk and the bytes match.
+#[test]
+fn cli_streamed_download_to_file() {
+    use std::process::Command;
+    // 100 KiB across several chunks.
+    let chunk = vec![b'z'; 16 * 1024];
+    let chunks: Vec<Vec<u8>> = (0..7).map(|_| chunk.clone()).collect();
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let server = TestServer::start(move |_r: SReq| {
+        SResp::ok(Vec::new()).mode(BodyMode::Chunked {
+            chunks: chunks.clone(),
+            trailers: vec![],
+        })
+    });
+    let dir = std::env::temp_dir().join(format!("rsurl-dl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_path = dir.join("big.bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "-o", out_path.to_str().unwrap(), &server.url("/big")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read(&out_path).unwrap();
+    assert_eq!(saved.len(), total);
+    assert!(saved.iter().all(|&b| b == b'z'));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--max-filesize` aborts a streamed download that exceeds the cap (exit 63).
+#[test]
+fn cli_max_filesize_aborts_stream() {
+    use std::process::Command;
+    let server = TestServer::start(|_r: SReq| SResp::ok(vec![b'x'; 50_000]));
+    let dir = std::env::temp_dir().join(format!("rsurl-mfs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_path = dir.join("capped.bin");
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--max-filesize",
+            "1000",
+            "-o",
+            out_path.to_str().unwrap(),
+            &server.url("/big"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(
+        out.status.code(),
+        Some(63),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
