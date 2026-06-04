@@ -221,6 +221,10 @@ struct Args {
     digest: bool,
     /// `--oauth2-bearer <token>`: send `Authorization: Bearer <token>`.
     bearer: Option<String>,
+    /// `-Z`/`--parallel`: run this invocation's transfers concurrently.
+    parallel: bool,
+    /// `--parallel-max <n>`: cap on concurrent transfers (default 50).
+    parallel_max: Option<usize>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -334,6 +338,17 @@ fn main() -> ExitCode {
     }
 
     warn_unsupported(&ops);
+
+    // -Z/--parallel: run the transfers concurrently. We only parallelize when
+    // no cookie engine is in play (a shared jar would need locking and -c
+    // writes can't run from multiple threads); otherwise we fall through to the
+    // sequential path.
+    let uses_cookies = ops
+        .iter()
+        .any(|a| a.cookie_in.is_some() || a.cookie_jar.is_some());
+    if ops.iter().any(|a| a.parallel) && !uses_cookies {
+        return ExitCode::from(run_parallel(&ops));
+    }
 
     // One cookie jar shared across all operations (curl carries it over
     // --next). Build it from the first operation that configures cookies.
@@ -643,6 +658,85 @@ fn apply_glob_output(template: &str, caps: &[String]) -> String {
         out.push(c);
     }
     out
+}
+
+/// Run all operations' (glob-expanded) URLs concurrently (-Z/--parallel),
+/// bounded by --parallel-max (default 50). No shared cookie jar (the caller
+/// only routes here when cookies aren't in use). Returns the last non-zero
+/// exit code, or 0.
+fn run_parallel(ops: &[Args]) -> u8 {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    struct Item<'a> {
+        op: &'a Args,
+        url: String,
+        caps: Vec<String>,
+    }
+    let mut items: Vec<Item> = Vec::new();
+    for op in ops {
+        for url in &op.urls {
+            let expansions = if op.globoff {
+                vec![(url.clone(), Vec::new())]
+            } else {
+                match glob_expand(url) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if show_errors(op) {
+                            eprintln!("rsurl: {e}");
+                        }
+                        continue;
+                    }
+                }
+            };
+            for (eurl, caps) in expansions {
+                items.push(Item {
+                    op,
+                    url: eurl,
+                    caps,
+                });
+            }
+        }
+    }
+    if items.is_empty() {
+        return 0;
+    }
+    let max = ops
+        .iter()
+        .filter_map(|a| a.parallel_max)
+        .max()
+        .unwrap_or(50)
+        .max(1);
+    let n_threads = max.min(items.len());
+    let idx = AtomicUsize::new(0);
+    let worst = AtomicU8::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..n_threads {
+            s.spawn(|| loop {
+                let i = idx.fetch_add(1, Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                let item = &items[i];
+                let code = if !item.caps.is_empty()
+                    && item.op.output.as_ref().is_some_and(|o| o.contains('#'))
+                {
+                    let mut op2 = item.op.clone();
+                    op2.output = item
+                        .op
+                        .output
+                        .as_ref()
+                        .map(|o| apply_glob_output(o, &item.caps));
+                    process_url(&item.url, &op2, None)
+                } else {
+                    process_url(&item.url, item.op, None)
+                };
+                if code != 0 {
+                    worst.store(code, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    worst.load(Ordering::Relaxed)
 }
 
 /// Split a token stream into independent operations at `--next` / `-:`.
@@ -2032,6 +2126,14 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--mail-from" => a.mail_from = Some(next_val(&mut it, arg)?),
             "--mail-rcpt" => a.mail_rcpt.push(next_val(&mut it, arg)?),
             "--digest" => a.digest = true,
+            "-Z" | "--parallel" => a.parallel = true,
+            "--parallel-max" => {
+                a.parallel_max = Some(
+                    next_val(&mut it, arg)?
+                        .parse()
+                        .map_err(|_| "--parallel-max requires a number".to_string())?,
+                )
+            }
             "--tls-max" => {
                 let v = next_val(&mut it, arg)?;
                 a.tls_max = Some(match v.as_str() {
@@ -3527,6 +3629,8 @@ Options:
       --proto <spec>       restrict allowed schemes (e.g. =https,http)
       --proto-default <s>  scheme for URLs given without one
   -g, --globoff            disable URL globbing ({{}} and [] taken literally)
+  -Z, --parallel           run this invocation's transfers concurrently
+      --parallel-max <n>   cap on concurrent transfers (default 50)
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1

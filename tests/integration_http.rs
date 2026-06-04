@@ -2313,3 +2313,28 @@ fn cli_oauth2_bearer() {
     assert!(out.status.success());
     assert_eq!(cap.lock().unwrap().as_deref(), Some("Bearer tok123"));
 }
+
+/// `-Z/--parallel` runs globbed transfers concurrently; each writes its file.
+#[test]
+fn cli_parallel_glob_downloads() {
+    use std::process::Command;
+    let server = TestServer::start_keepalive(|req: SReq| SResp::ok(req.path.clone()));
+    let dir = std::env::temp_dir().join(format!("rsurl-par-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("{}[1-4]", server.url("/p"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .current_dir(&dir)
+        .args(["-s", "-Z", "-o", "#1.out", &url])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for n in 1..=4 {
+        let got = std::fs::read(dir.join(format!("{n}.out"))).expect("file present");
+        assert_eq!(got, format!("/p{n}").into_bytes());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
