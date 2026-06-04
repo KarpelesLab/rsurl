@@ -9,6 +9,7 @@
 
 mod compress;
 mod cookie;
+mod digest;
 mod error;
 mod http;
 mod idn;

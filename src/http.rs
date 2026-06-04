@@ -106,6 +106,9 @@ pub struct Request {
     /// TLS version floor/ceiling (curl `--tlsv1.x` / `--tls-max`).
     pub(crate) tls_min: Option<crate::tls::ProtocolVersion>,
     pub(crate) tls_max: Option<crate::tls::ProtocolVersion>,
+    /// Use HTTP Digest auth with `basic_auth`'s credentials (curl `--digest`):
+    /// send unauthenticated, then answer a `401 Digest` challenge.
+    pub(crate) auth_digest: bool,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -192,7 +195,16 @@ impl Request {
             connect_to: Vec::new(),
             tls_min: None,
             tls_max: None,
+            auth_digest: false,
         })
+    }
+
+    /// Authenticate with HTTP Digest using the `-u` credentials (curl
+    /// `--digest`): the request is sent unauthenticated, then retried with a
+    /// `Digest` response to the server's `401` challenge.
+    pub fn digest_auth(mut self, on: bool) -> Self {
+        self.auth_digest = on;
+        self
     }
 
     /// Minimum acceptable TLS version (curl `--tlsv1.x`).
@@ -680,6 +692,14 @@ impl Request {
         // the `Host:` header, TLS SNI, and cookie matching all see the same
         // ASCII host. Redirect targets are normalised the same way below.
         req.url.set_idn(req.idn)?;
+        // For Digest auth, withhold the Basic credentials so the first request
+        // goes out unauthenticated; we answer the 401 challenge below.
+        let digest_creds = if req.auth_digest {
+            req.basic_auth.take()
+        } else {
+            None
+        };
+        let mut digest_tried = false;
         let deadline = req.max_time.map(|d| std::time::Instant::now() + d);
         let mut hops_left = req.max_redirs;
         loop {
@@ -707,6 +727,25 @@ impl Request {
             let resp = snapshot.send_once(trace)?;
             if let Some(j) = jar.as_deref_mut() {
                 j.ingest_response(&req.url, &resp.headers);
+            }
+            // Digest auth: answer a 401 Digest challenge once, then resend.
+            if resp.status == 401 && !digest_tried {
+                if let (Some((u, p)), Some(chal)) =
+                    (digest_creds.as_ref(), resp.header("www-authenticate"))
+                {
+                    let scheme = chal.trim_start();
+                    if scheme.len() >= 6 && scheme[..6].eq_ignore_ascii_case("digest") {
+                        if let Some(h) =
+                            crate::digest::authorization(u, p, &req.method, &req.url.path, chal)
+                        {
+                            req.headers
+                                .retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                            req.headers.push(("Authorization".to_string(), h));
+                            digest_tried = true;
+                            continue;
+                        }
+                    }
+                }
             }
             if !req.follow_redirects || !is_redirect_status(resp.status) {
                 return Ok(resp);

@@ -217,6 +217,8 @@ struct Args {
     /// `--mail-from <addr>` / `--mail-rcpt <addr>`: SMTP envelope.
     mail_from: Option<String>,
     mail_rcpt: Vec<String>,
+    /// `--digest`: use HTTP Digest auth with the `-u` credentials.
+    digest: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1682,6 +1684,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(v) = args.tls_max {
         req = req.tls_max_version(v);
     }
+    if args.digest {
+        req = req.digest_auth(true);
+    }
     if args.no_idn {
         req = req.idn(false);
     }
@@ -1752,6 +1757,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         && !args.fail
         && !args.fail_with_body
         && !args.remote_header_name // -J needs the response head for the name
+        && !args.digest // Digest needs the buffered 401-retry path
         && args.dump_header.is_none();
     if stream_ok {
         return run_http_download(req, &parsed_url, args, jar);
@@ -2013,6 +2019,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--tlsv1.3" => a.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_3),
             "--mail-from" => a.mail_from = Some(next_val(&mut it, arg)?),
             "--mail-rcpt" => a.mail_rcpt.push(next_val(&mut it, arg)?),
+            "--digest" => a.digest = true,
             "--tls-max" => {
                 let v = next_val(&mut it, arg)?;
                 a.tls_max = Some(match v.as_str() {
@@ -3452,6 +3459,7 @@ Options:
   -L, --location           follow 3xx redirects
       --max-redirs <n>     cap on redirect hops (default 50)
   -u, --user <user:pass>   HTTP Basic auth credentials
+      --digest             use HTTP Digest auth with -u credentials
   -k, --insecure           don't verify the TLS certificate chain
       --cacert <file>      PEM bundle to use instead of system trust
       --tlsv1.2/1.3        require at least this TLS version (floor)

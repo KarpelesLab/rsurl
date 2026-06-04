@@ -2240,3 +2240,53 @@ fn cli_max_filesize_aborts_stream() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--digest`: first request is unauthenticated, gets a 401 Digest challenge,
+/// then resends with a computed Digest Authorization and succeeds.
+#[test]
+fn cli_digest_auth() {
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    let auth_seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let a2 = Arc::clone(&auth_seen);
+    let server = TestServer::start(move |req: SReq| {
+        let auth = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.clone());
+        match auth {
+            Some(a) if a.starts_with("Digest") => {
+                *a2.lock().unwrap() = Some(a);
+                SResp::ok("authed")
+            }
+            _ => {
+                let mut r = SResp::status(401);
+                r.headers.push((
+                    "WWW-Authenticate".into(),
+                    "Digest realm=\"test\", nonce=\"abc123\", qop=\"auth\"".into(),
+                ));
+                r
+            }
+        }
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "--digest", "-u", "alice:secret", &server.url("/")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"authed");
+    let a = auth_seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("digest header sent");
+    assert!(a.contains("username=\"alice\""), "got: {a}");
+    assert!(a.contains("realm=\"test\""), "got: {a}");
+    assert!(a.contains("qop=auth"), "got: {a}");
+    assert!(a.contains("response=\""), "got: {a}");
+}
