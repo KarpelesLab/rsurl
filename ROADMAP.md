@@ -60,24 +60,33 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   `--oauth2-bearer`, and **AWS SigV4** (`--aws-sigv4`, HMAC-SHA256 chain).
 - **M8**: `-Z/--parallel` + `--parallel-max` concurrent transfers.
 - **M10 (protocol depth, partial)**: FTP **`--disable-epsv`** (skip EPSV, use
-  PASV directly) and **`--ftp-create-dirs`** (MKD missing upload dirs); FTP
+  PASV directly), **`--ftp-create-dirs`** (MKD missing upload dirs), and
+  **active mode `-P`/`--ftp-port`** (`EPRT` with IPv4 `PORT` fallback;
+  direct-only; verifies the data callback comes from the control peer); FTP
   upload now honors `-x` proxy via the `Client`.
 - **M11 (partial)**: centralized **curl-compatible exit codes** for transfer
   errors (1/3/6/7/8/28/47/52/79); a **`man/rsurl.1`** man page.
 
-**Remaining (large / multi-session):** the rest of M1 (stream HTTP/2-3 bodies
-and the remaining file-transfer protocols; streaming decompression); M9
-SMB/RTMP; M10 protocol depth (FTP active mode, RTSP RTP, LDAP writes); M11
-polish (broader libcurl-shaped C API surface).
+**Remaining (large / multi-session):** stream HTTP/2-3 response bodies (the
+backends currently reassemble the full body — a frame-loop refactor); RTSP
+interleaved RTP/RTCP reception after `PLAY`; a broader libcurl-shaped C API
+surface (M11).
 
 **Out of scope under the no-C invariant or current architecture** (documented,
-not "remaining"): **NTLM** — its handshake binds auth to a single TCP
-connection, which rsurl's stateless send/retry model does not expose; a
-pool-reuse hack would be unreliable. **Negotiate/Kerberos (GSSAPI)** and
-**c-ares DNS** — require C libraries. These are intentionally not pursued.
+not "remaining" — verified against what curl itself requires):
+- **RTMP** — curl only supports `rtmp://` when built against **librtmp**, a C
+  library. There is no pure-Rust path the no-C invariant permits.
+- **SMB/SMBS** — curl's built-in SMB authenticates with **NTLM**; see NTLM below.
+- **NTLM** — its handshake binds auth to a single TCP connection, which rsurl's
+  stateless send/retry model does not expose; a pool-reuse hack would be
+  unreliable.
+- **Negotiate/Kerberos (GSSAPI)** and **c-ares DNS** — require C libraries.
+- **LDAP writes** — not a curl feature (curl's LDAP is search/read only), so
+  out of scope for *parity*.
+These are intentionally not pursued.
 
-**Next highest-leverage steps:** stream the file-transfer protocols and HTTP/2-3
-bodies (rest of M1), then M10 protocol depth and M11 polish (man page).
+**Next highest-leverage step:** stream HTTP/2-3 response bodies (the last
+buffered transfer path), then RTSP interleaved RTP and C-API polish.
 
 ## Where we are today
 

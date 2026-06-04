@@ -24,6 +24,9 @@ pub(crate) struct NetConfig {
     /// Create missing directory components of an FTP upload path with `MKD`
     /// before `STOR`/`APPE` (curl `--ftp-create-dirs`).
     pub(crate) ftp_create_dirs: bool,
+    /// Use active-mode FTP data connections (`EPRT`/`PORT`; the server dials
+    /// back) instead of passive (curl `-P`/`--ftp-port`). Direct-only.
+    pub(crate) ftp_active: bool,
 }
 
 impl Default for NetConfig {
@@ -34,6 +37,7 @@ impl Default for NetConfig {
             verify: true,
             ftp_use_epsv: true,
             ftp_create_dirs: false,
+            ftp_active: false,
         }
     }
 }
@@ -62,6 +66,7 @@ pub struct Client {
     no_proxy: Vec<String>,
     ftp_use_epsv: bool,
     ftp_create_dirs: bool,
+    ftp_active: bool,
 }
 
 impl Default for Client {
@@ -74,6 +79,7 @@ impl Default for Client {
             no_proxy: Vec::new(),
             ftp_use_epsv: true,
             ftp_create_dirs: false,
+            ftp_active: false,
         }
     }
 }
@@ -130,6 +136,14 @@ impl Client {
         self
     }
 
+    /// Use active-mode FTP data connections (curl `-P`/`--ftp-port`): the
+    /// server dials back to us instead of us dialing it. Direct-only (a proxy
+    /// can't accept the callback). Default `false` (passive).
+    pub fn ftp_active(mut self, on: bool) -> Self {
+        self.ftp_active = on;
+        self
+    }
+
     /// Replace the no-proxy host-suffix list (curl `NO_PROXY`).
     pub fn no_proxy<I, S>(mut self, entries: I) -> Self
     where
@@ -166,6 +180,7 @@ impl Client {
             verify: self.verify,
             ftp_use_epsv: self.ftp_use_epsv,
             ftp_create_dirs: self.ftp_create_dirs,
+            ftp_active: self.ftp_active,
         }
     }
 

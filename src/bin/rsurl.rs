@@ -164,6 +164,10 @@ struct Args {
     /// `--ftp-create-dirs`: create missing remote directories before an FTP
     /// upload.
     ftp_create_dirs: bool,
+    /// `-P`/`--ftp-port <addr>`: use active-mode FTP. The address argument is
+    /// accepted for curl compatibility; rsurl uses the control connection's
+    /// local IP as the callback address regardless.
+    ftp_port: Option<String>,
     /// `--max-filesize <bytes>`: refuse a download larger than this.
     max_filesize: Option<u64>,
     /// `-w`/`--write-out <format>`: print a formatted summary after transfer.
@@ -500,6 +504,7 @@ fn short_flag_takes_value(c: char) -> bool {
             | 'Y'
             | 'U'
             | 'K'
+            | 'P'
     )
 }
 
@@ -2088,6 +2093,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--no-clobber" => a.no_clobber = true,
             "--disable-epsv" => a.disable_epsv = true,
             "--ftp-create-dirs" => a.ftp_create_dirs = true,
+            "-P" | "--ftp-port" => a.ftp_port = Some(next_val(&mut it, arg)?),
             // We always use passive mode (active/PORT is unimplemented), so
             // --ftp-pasv and re-enabling EPSV are accepted as confirmations.
             "--ftp-pasv" => {}
@@ -2873,7 +2879,8 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
         .verify_tls(!args.insecure)
         .idn(!args.no_idn)
         .ftp_use_epsv(!args.disable_epsv)
-        .ftp_create_dirs(args.ftp_create_dirs);
+        .ftp_create_dirs(args.ftp_create_dirs)
+        .ftp_active(args.ftp_port.is_some());
     if let Some(secs) = args.connect_timeout {
         c = c.connect_timeout(Some(Duration::from_secs(secs)));
     }
@@ -4003,6 +4010,8 @@ Options:
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
       --disable-epsv       FTP: skip EPSV, use PASV directly
+  -P, --ftp-port <addr>    FTP: active mode (server connects back); <addr> is
+                           accepted but the control-connection local IP is used
       --ftp-create-dirs    FTP: create missing remote dirs before upload (-T)
   -K, --config <file>      read options from a curl-style config file
       --next  (-:)         start a new request with its own options

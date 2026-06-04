@@ -7,13 +7,17 @@
 //!   * Plain FTP (`ftp://`) and implicit FTPS (`ftps://`, TLS-from-connect).
 //!   * Anonymous or `user:pass@` login.
 //!   * Binary mode (`TYPE I`).
-//!   * Passive data transfer: `EPSV`, with `PASV` fallback.
+//!   * Passive data transfer: `EPSV`, with `PASV` fallback (or `PASV` directly
+//!     under `--disable-epsv`). Active mode (`EPRT`, with a `PORT` fallback for
+//!     IPv4) is available via curl's `-P`/`--ftp-port`; it is direct-only and
+//!     verifies the data callback comes from the control peer.
 //!   * `RETR` for files, `LIST` for paths ending in `/`.
 //!
 //! Uploads use `STOR` (see [`store`]), with optional `REST <offset>` resume
 //! when the caller supplies a byte offset, or `APPE` (see [`append`]) to
-//! append to an existing remote file. Explicit `AUTH TLS` upgrade and active
-//! mode (`PORT`/`EPRT`) are intentionally not implemented yet.
+//! append to an existing remote file; `--ftp-create-dirs` issues `MKD` for the
+//! upload path's directories first. Explicit `AUTH TLS` upgrade is intentionally
+//! not implemented yet.
 //!
 //! For TLS we use [`crate::tls::connect_over`] on both the control channel
 //! (on connect, for implicit FTPS) and the data channel (using the host
@@ -64,6 +68,9 @@ impl Write for Stream {
 struct Control {
     ctrl: BufReader<Stream>,
     ctrl_peer_ip: std::net::IpAddr,
+    /// Our local IP on the control connection — advertised to the server in
+    /// `EPRT`/`PORT` for active-mode data connections.
+    ctrl_local_ip: std::net::IpAddr,
 }
 
 /// Connect, read the banner, log in (anonymous or `user[:pass]@`), and switch
@@ -89,6 +96,12 @@ fn connect_login(url: &Url, cfg: &NetConfig) -> Result<Control> {
     } else {
         std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
     };
+    // Capture our local IP before TLS-wrapping the socket; active mode needs it
+    // for EPRT/PORT. Falls back to unspecified (active mode is direct-only).
+    let ctrl_local_ip = tcp
+        .local_addr()
+        .map(|a| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     let control = if url.scheme == "ftps" {
         Stream::Tls(Box::new(crate::tls::connect_over(tcp, &url.host)?))
     } else {
@@ -136,21 +149,91 @@ fn connect_login(url: &Url, cfg: &NetConfig) -> Result<Control> {
         return Err(Error::BadResponse(format!("ftp TYPE I: {c} {m}")));
     }
 
-    Ok(Control { ctrl, ctrl_peer_ip })
+    Ok(Control {
+        ctrl,
+        ctrl_peer_ip,
+        ctrl_local_ip,
+    })
 }
 
-/// Open a passive data connection, dialing the control peer (per the PASV
-/// bounce fix) and wrapping in TLS for `ftps`. Shared by RETR and STOR.
-///
-/// Generic over the control reader so unit tests can drive the passive
-/// handshake over a scripted mock while a real loopback socket stands in for
-/// the data connection.
+/// A data connection that's either already dialed (passive) or waiting for the
+/// server to connect back (active). In active mode the `accept()` must happen
+/// *after* the transfer command (`RETR`/`STOR`) is sent, so the caller holds
+/// this between issuing the command and reading the data.
+enum DataConn {
+    /// Passive: we dialed the server's advertised port; ready to transfer.
+    Ready(Stream),
+    /// Active: we sent `EPRT`/`PORT` and are listening; the server will connect.
+    Active {
+        listener: std::net::TcpListener,
+        /// The control peer; the inbound data connection must come from it.
+        peer_ip: std::net::IpAddr,
+        /// `Some(host)` wraps the accepted socket in TLS (ftps), using `host`
+        /// as the SNI; `None` for plain ftp.
+        tls_host: Option<String>,
+    },
+}
+
+impl DataConn {
+    /// Resolve to a usable [`Stream`]. Passive returns the dialed socket;
+    /// active blocks on `accept()`, verifies the peer is the control server
+    /// (anti-hijack), then TLS-wraps for ftps.
+    fn into_stream(self) -> Result<Stream> {
+        match self {
+            DataConn::Ready(s) => Ok(s),
+            DataConn::Active {
+                listener,
+                peer_ip,
+                tls_host,
+            } => {
+                let (sock, addr) = listener.accept()?;
+                // Only the control server may open the data connection; reject
+                // any other source (a port-scanner or off-path attacker).
+                if addr.ip() != peer_ip {
+                    return Err(Error::BadResponse(format!(
+                        "ftp active: data connection from unexpected peer {}",
+                        addr.ip()
+                    )));
+                }
+                let boxed: Box<dyn NetStream> = Box::new(sock);
+                Ok(match tls_host {
+                    Some(host) => Stream::Tls(Box::new(crate::tls::connect_over(boxed, &host)?)),
+                    None => Stream::Plain(boxed),
+                })
+            }
+        }
+    }
+}
+
+/// Set up the data connection: active (`EPRT`/`PORT`) when `cfg.ftp_active`,
+/// otherwise passive (`EPSV`→`PASV`). Active mode requires a direct connection
+/// (no proxy can route a server-initiated callback) and uses the control
+/// connection's local IP as the callback address.
 fn open_data<R: Read + Write>(
     ctrl: &mut BufReader<R>,
     url: &Url,
     ctrl_peer_ip: std::net::IpAddr,
+    ctrl_local_ip: std::net::IpAddr,
     cfg: &NetConfig,
-) -> Result<Stream> {
+) -> Result<DataConn> {
+    if cfg.ftp_active {
+        if !cfg.connector.is_direct() {
+            return Err(Error::BadResponse(
+                "ftp active mode (-P) requires a direct connection; a proxy cannot \
+                 accept the server's data callback"
+                    .into(),
+            ));
+        }
+        let listener = std::net::TcpListener::bind((ctrl_local_ip, 0))?;
+        let port = listener.local_addr()?.port();
+        announce_active(ctrl, ctrl_local_ip, port)?;
+        let tls_host = (url.scheme == "ftps").then(|| url.host.clone());
+        return Ok(DataConn::Active {
+            listener,
+            peer_ip: ctrl_peer_ip,
+            tls_host,
+        });
+    }
     let (data_host, data_port) = open_passive(
         ctrl,
         &url.host,
@@ -159,13 +242,47 @@ fn open_data<R: Read + Write>(
         cfg.ftp_use_epsv,
     )?;
     let data_tcp = cfg.connect(&data_host, data_port)?;
-    Ok(if url.scheme == "ftps" {
+    Ok(DataConn::Ready(if url.scheme == "ftps" {
         // Per RFC 4217 §10.2: SNI must be the original hostname, not the
         // address we got from PASV/EPSV (which is often an IP literal).
         Stream::Tls(Box::new(crate::tls::connect_over(data_tcp, &url.host)?))
     } else {
         Stream::Plain(data_tcp)
-    })
+    }))
+}
+
+/// Advertise our active-mode listening address to the server: `EPRT` first
+/// (RFC 2428, both address families), with a `PORT` fallback for IPv4 if the
+/// server rejects `EPRT`.
+fn announce_active<R: Read + Write>(
+    ctrl: &mut BufReader<R>,
+    ip: std::net::IpAddr,
+    port: u16,
+) -> Result<()> {
+    let af = match ip {
+        std::net::IpAddr::V4(_) => 1,
+        std::net::IpAddr::V6(_) => 2,
+    };
+    send(ctrl, &format!("EPRT |{af}|{ip}|{port}|"))?;
+    let (c, m) = read_reply(ctrl)?;
+    if is_positive(c) {
+        return Ok(());
+    }
+    // EPRT refused: fall back to the legacy PORT command for IPv4.
+    if let std::net::IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        let (p1, p2) = (port >> 8, port & 0xff);
+        send(
+            ctrl,
+            &format!("PORT {},{},{},{},{p1},{p2}", o[0], o[1], o[2], o[3]),
+        )?;
+        let (cp, mp) = read_reply(ctrl)?;
+        if is_positive(cp) {
+            return Ok(());
+        }
+        return Err(Error::BadResponse(format!("ftp PORT: {cp} {mp}")));
+    }
+    Err(Error::BadResponse(format!("ftp EPRT: {c} {m}")))
 }
 
 /// Default operation: download the file at `url.path`, or list the directory
@@ -188,10 +305,10 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
 pub(crate) fn fetch_to_with(url: &Url, cfg: &NetConfig, sink: &mut dyn Write) -> Result<u64> {
     let mut con = connect_login(url, cfg)?;
 
-    // 5+6) Open the passive data connection (EPSV→PASV, dialing the control
-    //       peer; TLS-wrapped for ftps). The server may answer 125/150 before
-    //       opening its side, which is fine — we already have ours dialed.
-    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, cfg)?;
+    // 5+6) Set up the data connection: passive (EPSV→PASV, we dial) or active
+    //       (EPRT/PORT, the server dials back). Active mode's accept() happens
+    //       after the transfer command below.
+    let dataconn = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, con.ctrl_local_ip, cfg)?;
     let ctrl = &mut con.ctrl;
 
     // 7) RETR for files, LIST for directories. We treat a trailing '/' or
@@ -217,7 +334,9 @@ pub(crate) fn fetch_to_with(url: &Url, cfg: &NetConfig, sink: &mut dyn Write) ->
         }
     }
 
-    // 9) Copy the data channel to the sink, to EOF / TLS close_notify.
+    // 9) Resolve the data connection (active: accept the callback now) and copy
+    //    it to the sink, to EOF / TLS close_notify.
+    let mut data = dataconn.into_stream()?;
     let n = std::io::copy(&mut data, sink)?;
     // Dropping `data` closes both the TLS layer and the TCP socket.
     drop(data);
@@ -402,9 +521,9 @@ fn upload(
         }
     }
 
-    // Open the passive data connection (same logic as RETR: dial the control
-    // peer, TLS-wrap for ftps).
-    let mut data = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, cfg)?;
+    // Set up the data connection (passive dial, or active EPRT/PORT callback;
+    // same logic as RETR). Active mode's accept() happens after STOR/APPE.
+    let dataconn = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, con.ctrl_local_ip, cfg)?;
     let ctrl = &mut con.ctrl;
 
     // Issue STOR/APPE, then expect the 1xx preliminary reply before streaming.
@@ -416,9 +535,10 @@ fn upload(
         return Err(Error::BadResponse(format!("ftp {cmd}: {c} {m}")));
     }
 
-    // Stream the upload bytes over the data channel, then close it to signal
-    // EOF to the server (dropping closes the TLS layer's close_notify and the
-    // TCP socket).
+    // Resolve the data connection (active: accept the server's callback now),
+    // stream the upload bytes, then close it to signal EOF (dropping closes the
+    // TLS layer's close_notify and the TCP socket).
+    let mut data = dataconn.into_stream()?;
     data.write_all(body)?;
     data.flush()?;
     drop(data);
@@ -1096,12 +1216,14 @@ mod tests {
                     }
                 }
             }
-            let mut data = open_data(&mut ctrl, &parsed, ctrl_peer, &NetConfig::default())?;
+            let unspec = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+            let dataconn = open_data(&mut ctrl, &parsed, ctrl_peer, unspec, &NetConfig::default())?;
             send(&mut ctrl, &cmd)?;
             let (c, m) = read_reply(&mut ctrl)?;
             if !(c == 125 || c == 150) {
                 return Err(Error::BadResponse(format!("{cmd}: {c} {m}")));
             }
+            let mut data = dataconn.into_stream()?;
             data.write_all(body)?;
             data.flush()?;
             drop(data);

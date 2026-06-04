@@ -2870,3 +2870,70 @@ fn cli_streaming_gzip_decode_to_file() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "21");
     let _ = std::fs::remove_file(&out_path);
 }
+
+/// End-to-end active-mode FTP download (`-P`): the client sends EPRT and
+/// listens; the mock server parses the advertised port, dials back, and streams
+/// the file over that data connection.
+#[test]
+fn cli_ftp_active_mode_download() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::process::Command;
+
+    let ctrl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ctrl_port = ctrl.local_addr().unwrap().port();
+
+    let handle = std::thread::spawn(move || {
+        let (sock, _) = ctrl.accept().unwrap();
+        let mut w = sock.try_clone().unwrap();
+        let mut r = BufReader::new(sock);
+        w.write_all(b"220 mock\r\n").unwrap();
+        let mut data_port: u16 = 0;
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let cmd = line.trim_end();
+            if cmd.starts_with("USER") {
+                w.write_all(b"331 pw\r\n").unwrap();
+            } else if cmd.starts_with("PASS") {
+                w.write_all(b"230 ok\r\n").unwrap();
+            } else if let Some(rest) = cmd.strip_prefix("EPRT ") {
+                // EPRT |1|127.0.0.1|PORT|
+                let parts: Vec<&str> = rest.trim_matches('|').split('|').collect();
+                data_port = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+                w.write_all(b"200 EPRT ok\r\n").unwrap();
+            } else if cmd.starts_with("RETR") {
+                w.write_all(b"150 opening\r\n").unwrap();
+                // Active mode: WE dial back to the client's advertised port.
+                let mut d = TcpStream::connect(("127.0.0.1", data_port)).unwrap();
+                d.write_all(b"ACTIVE-MODE-BODY").unwrap();
+                drop(d);
+                w.write_all(b"226 done\r\n").unwrap();
+            } else if cmd.starts_with("QUIT") {
+                w.write_all(b"221 bye\r\n").unwrap();
+                break;
+            } else {
+                w.write_all(b"200 ok\r\n").unwrap();
+            }
+        }
+    });
+
+    let out_path = tmp_out_path("ftp-active");
+    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-P",
+            "-",
+            "-o",
+            out_path.to_str().unwrap(),
+            &format!("ftp://127.0.0.1:{ctrl_port}/file.txt"),
+        ])
+        .status()
+        .expect("spawn rsurl");
+    let _ = handle.join();
+    assert!(status.success(), "active-mode ftp download should succeed");
+    assert_eq!(std::fs::read(&out_path).unwrap(), b"ACTIVE-MODE-BODY");
+    let _ = std::fs::remove_file(&out_path);
+}
