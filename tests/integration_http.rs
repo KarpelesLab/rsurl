@@ -2448,6 +2448,9 @@ fn cli_compat_noop_flags_accepted() {
             "-N",
             "--styled-output",
             "--no-styled-output",
+            "--basic",
+            "--ftp-skip-pasv-ip",
+            "--ftp-pasv",
             "-s",
             &server.url("/"),
         ])

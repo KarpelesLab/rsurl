@@ -2080,6 +2080,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             // --ftp-pasv and re-enabling EPSV are accepted as confirmations.
             "--ftp-pasv" => {}
             "--epsv" => a.disable_epsv = false,
+            // Confirmations of behavior rsurl already implements (honest no-ops,
+            // not stubs): Basic is the default auth when -u is given, and for a
+            // direct FTP dial we always ignore the PASV-advertised IP (SSRF
+            // guard) — exactly what --ftp-skip-pasv-ip requests.
+            "--basic" | "--ftp-skip-pasv-ip" => {}
             "--json" => a.json_parts.push(next_val(&mut it, arg)?),
             "--oauth2-bearer" => a.bearer = Some(next_val(&mut it, arg)?),
             "--aws-sigv4" => a.aws_sigv4 = Some(next_val(&mut it, arg)?),
