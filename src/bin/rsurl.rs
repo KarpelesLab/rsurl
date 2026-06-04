@@ -1658,6 +1658,14 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
             return run_ssh(&parsed_url, args);
         }
+        // FTP/FTPS download to a file streams the data channel straight to disk
+        // (enforcing --limit-rate / -# / --max-filesize / -y / -Y /
+        // --remove-on-error) instead of buffering the whole body in memory.
+        let ftp_to_file = matches!(parsed_url.scheme.as_str(), "ftp" | "ftps")
+            && (args.remote_name || args.output.as_deref().is_some_and(|p| p != "-"));
+        if ftp_to_file {
+            return run_ftp_download(&parsed_url, args);
+        }
         return run_transfer(&parsed_url, args);
     }
 
@@ -3041,6 +3049,104 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
             0
         }
         Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            transfer_exit_code(&e)
+        }
+    }
+}
+
+/// Streaming FTP/FTPS download to a file: copies the data channel straight to
+/// disk through a [`DownloadSink`], so `--limit-rate`, `-#`, `--max-filesize`,
+/// `-y`/`-Y`, `--no-clobber`, and `--remove-on-error` all apply without holding
+/// the whole file in memory.
+fn run_ftp_download(url: &Url, args: &Args) -> u8 {
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: --proxy: {e}");
+            }
+            return 5;
+        }
+    };
+    let name = if args.remote_name {
+        match remote_name_from_url(url) {
+            Ok(n) => n,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                return 23;
+            }
+        }
+    } else {
+        args.output.clone().unwrap_or_default()
+    };
+    let (file, out_path) = match create_output_file_tracked(&name, args) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: open {name}: {e}");
+            }
+            return 23;
+        }
+    };
+    let (speed_limit, speed_time) = {
+        let lim = args
+            .speed_limit
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok());
+        let tim = args
+            .speed_time
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok());
+        match (lim, tim) {
+            (None, None) => (None, 30),
+            (l, t) => (Some(l.unwrap_or(1)), t.unwrap_or(30)),
+        }
+    };
+    let now = std::time::Instant::now();
+    let mut sink = DownloadSink {
+        inner: Box::new(file),
+        written: 0,
+        max: args.max_filesize,
+        rate: args.limit_rate.as_deref().and_then(parse_rate),
+        speed_limit,
+        speed_time,
+        started: now,
+        progress: args.progress_bar,
+        silent: args.silent,
+        last_tick: now,
+    };
+    let result = client.transfer_url_to(url, &mut sink);
+    if args.progress_bar && !args.silent {
+        eprintln!();
+    }
+    match result {
+        Ok(_) => 0,
+        Err(e) => {
+            if args.remove_on_error {
+                drop(sink);
+                let _ = std::fs::remove_file(&out_path);
+            }
+            if e.to_string().contains(MAX_FILESIZE_SENTINEL) {
+                if show_errors(args) {
+                    eprintln!("rsurl: Maximum file size exceeded");
+                }
+                return 63;
+            }
+            if e.to_string().contains(LOW_SPEED_SENTINEL) {
+                if show_errors(args) {
+                    eprintln!(
+                        "rsurl: Operation too slow. Less than {} bytes/sec transferred \
+                         the last {speed_time} seconds",
+                        speed_limit.unwrap_or(1)
+                    );
+                }
+                return 28;
+            }
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }

@@ -175,6 +175,17 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fetch_to_with(url, cfg, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Stream a RETR (file) or LIST (directory) to `sink`, returning the number of
+/// bytes written. This is the streaming core of [`fetch_with`]; it copies the
+/// data channel straight to the sink instead of buffering the whole body, so a
+/// CLI download can enforce `--limit-rate`/`-#`/`--max-filesize`/`-y`/`-Y` and
+/// avoid holding a large file in memory.
+pub(crate) fn fetch_to_with(url: &Url, cfg: &NetConfig, sink: &mut dyn Write) -> Result<u64> {
     let mut con = connect_login(url, cfg)?;
 
     // 5+6) Open the passive data connection (EPSV→PASV, dialing the control
@@ -206,9 +217,8 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
         }
     }
 
-    // 9) Drain the data channel to EOF / TLS close_notify.
-    let mut bytes = Vec::new();
-    data.read_to_end(&mut bytes)?;
+    // 9) Copy the data channel to the sink, to EOF / TLS close_notify.
+    let n = std::io::copy(&mut data, sink)?;
     // Dropping `data` closes both the TLS layer and the TCP socket.
     drop(data);
 
@@ -227,7 +237,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
     let _ = send(ctrl, "QUIT");
     let _ = read_reply(ctrl);
 
-    Ok(bytes)
+    Ok(n)
 }
 
 /// Which upload verb to issue: `STOR` (overwrite/create, optionally after a

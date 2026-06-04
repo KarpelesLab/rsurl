@@ -187,6 +187,13 @@ impl Client {
         crate::transfer::transfer_url_with(url, &self.net_config_for(&url.host))
     }
 
+    /// Stream the payload for `url` to `sink`, returning the byte count.
+    /// FTP/FTPS copy the data channel straight through (no full-body buffer);
+    /// other schemes fetch then write, so the result is identical.
+    pub fn transfer_url_to(&self, url: &Url, sink: &mut dyn std::io::Write) -> Result<u64> {
+        crate::transfer::transfer_url_to_with(url, &self.net_config_for(&url.host), sink)
+    }
+
     /// Send a message over SMTP/SMTPS (curl `--mail-from`/`--mail-rcpt` + body).
     pub fn smtp_send(
         &self,

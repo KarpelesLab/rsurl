@@ -41,7 +41,10 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 
 - **M1 streaming I/O (keystone, partial)**: `Request::send_download` streams the
   HTTP/1.1 body to a sink (redirect-following, cookies); HTTP/2/3, proxied,
-  compressed, and empty bodies fall back to buffered.
+  compressed, and empty bodies fall back to buffered. **FTP/FTPS downloads to a
+  file** stream the data channel straight to disk (`ftp::fetch_to_with` /
+  `Client::transfer_url_to`), enforcing `--limit-rate`/`-#`/`--max-filesize`/
+  `-y`/`-Y`/`--remove-on-error`.
 - **M5 (partial, on streaming)**: enforced `--max-filesize` (early abort),
   `--limit-rate`, `-#` progress, and **`-y`/`-Y` low-speed abort** (exit 28) for
   file downloads; **`--remove-on-error`**, **`--no-clobber`**; `-w
@@ -56,10 +59,10 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 - **M11 (partial)**: centralized **curl-compatible exit codes** for transfer
   errors (1/3/6/7/8/28/47/52/79); a **`man/rsurl.1`** man page.
 
-**Remaining (large / multi-session):** the rest of M1 (stream HTTP/2-3 and the
-file-transfer protocols; streaming decompression); M9 SMB/RTMP; M10 protocol
-depth (FTP active mode, RTSP RTP, LDAP writes); M11 polish (broader
-libcurl-shaped C API surface).
+**Remaining (large / multi-session):** the rest of M1 (stream HTTP/2-3 bodies
+and the remaining file-transfer protocols; streaming decompression); M9
+SMB/RTMP; M10 protocol depth (FTP active mode, RTSP RTP, LDAP writes); M11
+polish (broader libcurl-shaped C API surface).
 
 **Out of scope under the no-C invariant or current architecture** (documented,
 not "remaining"): **NTLM** — its handshake binds auth to a single TCP

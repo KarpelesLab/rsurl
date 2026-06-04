@@ -80,3 +80,22 @@ pub(crate) fn transfer_url_with(url: &Url, cfg: &crate::net::NetConfig) -> Resul
         other => Err(Error::UnsupportedScheme(other.to_string())),
     }
 }
+
+/// Like [`transfer_url_with`], but stream the payload to `sink` and return the
+/// byte count. Schemes with a streaming backend (currently FTP/FTPS) copy the
+/// data channel straight through; every other scheme falls back to fetching
+/// the whole body and writing it once, so behavior is identical either way.
+pub(crate) fn transfer_url_to_with(
+    url: &Url,
+    cfg: &crate::net::NetConfig,
+    sink: &mut dyn std::io::Write,
+) -> Result<u64> {
+    match url.scheme.as_str() {
+        "ftp" | "ftps" => crate::ftp::fetch_to_with(url, cfg, sink),
+        _ => {
+            let bytes = transfer_url_with(url, cfg)?;
+            sink.write_all(&bytes)?;
+            Ok(bytes.len() as u64)
+        }
+    }
+}

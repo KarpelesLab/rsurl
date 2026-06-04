@@ -2636,3 +2636,69 @@ fn cli_remove_on_error_deletes_partial() {
     );
     let _ = std::fs::remove_file(&out_path);
 }
+
+/// End-to-end FTP download streams the data channel to a file. A minimal mock
+/// FTP server scripts the control dialogue (banner, USER/PASS, TYPE I, EPSV,
+/// RETR) and serves the file body on the passive data connection.
+#[test]
+fn cli_ftp_download_streams_to_file() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+
+    let ctrl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ctrl_port = ctrl.local_addr().unwrap().port();
+    let data = TcpListener::bind("127.0.0.1:0").unwrap();
+    let data_port = data.local_addr().unwrap().port();
+
+    let handle = std::thread::spawn(move || {
+        let (sock, _) = ctrl.accept().unwrap();
+        let mut w = sock.try_clone().unwrap();
+        let mut r = BufReader::new(sock);
+        w.write_all(b"220 mock ready\r\n").unwrap();
+        loop {
+            let mut line = String::new();
+            if r.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            let cmd = line.trim_end();
+            if cmd.starts_with("USER") {
+                w.write_all(b"331 need password\r\n").unwrap();
+            } else if cmd.starts_with("PASS") {
+                w.write_all(b"230 logged in\r\n").unwrap();
+            } else if cmd.starts_with("EPSV") {
+                w.write_all(
+                    format!("229 Entering Extended Passive Mode (|||{data_port}|)\r\n").as_bytes(),
+                )
+                .unwrap();
+            } else if cmd.starts_with("RETR") {
+                w.write_all(b"150 opening data connection\r\n").unwrap();
+                let (mut d, _) = data.accept().unwrap();
+                d.write_all(b"FTP-STREAMED-BODY").unwrap();
+                drop(d); // EOF closes the data channel
+                w.write_all(b"226 transfer complete\r\n").unwrap();
+            } else if cmd.starts_with("QUIT") {
+                w.write_all(b"221 bye\r\n").unwrap();
+                break;
+            } else {
+                // TYPE I and anything else.
+                w.write_all(b"200 ok\r\n").unwrap();
+            }
+        }
+    });
+
+    let out_path = tmp_out_path("ftp-dl");
+    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-o",
+            out_path.to_str().unwrap(),
+            &format!("ftp://127.0.0.1:{ctrl_port}/file.txt"),
+        ])
+        .status()
+        .expect("spawn rsurl");
+    let _ = handle.join();
+    assert!(status.success(), "ftp download should succeed");
+    assert_eq!(std::fs::read(&out_path).unwrap(), b"FTP-STREAMED-BODY");
+    let _ = std::fs::remove_file(&out_path);
+}
