@@ -178,6 +178,19 @@ struct Args {
     limit_rate: Option<String>,
     speed_limit: Option<String>,
     speed_time: Option<String>,
+    /// `-z`/`--time-cond <date|file>`: conditional GET. A leading `-` flips to
+    /// If-Unmodified-Since; a value naming an existing file uses its mtime.
+    time_cond: Option<String>,
+    /// `--output-dir <dir>`: directory prepended to `-o`/`-O` output names.
+    output_dir: Option<String>,
+    /// `--fail-with-body`: like `-f` (exit 22 on >=400) but still write the body.
+    fail_with_body: bool,
+    /// `--proto <spec>`: restrict which schemes the initial URL may use.
+    proto: Option<String>,
+    /// `--proto-default <scheme>`: scheme for URLs given without one.
+    proto_default: Option<String>,
+    /// `-e`/`--referer` `;auto`: send Referer from the previous URL on redirect.
+    auto_referer: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1198,6 +1211,16 @@ fn assemble_form_body(parts: &[DataPart]) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
+    // A URL given without a scheme defaults to --proto-default (or http),
+    // matching curl's "curl example.com" behaviour.
+    let scheme_defaulted;
+    let url: &str = if url.contains("://") {
+        url
+    } else {
+        let scheme = args.proto_default.as_deref().unwrap_or("http");
+        scheme_defaulted = format!("{scheme}://{url}");
+        &scheme_defaulted
+    };
     let mut parsed_url = match Url::parse(url) {
         Ok(u) => u,
         Err(e) => {
@@ -1216,6 +1239,18 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             eprintln!("rsurl: {e}");
         }
         return 3;
+    }
+    // --proto: restrict which schemes the initial URL may use.
+    if let Some(spec) = &args.proto {
+        if !proto_allowed(&parsed_url.scheme, spec) {
+            if show_errors(args) {
+                eprintln!(
+                    "rsurl: protocol \"{}\" not permitted by --proto",
+                    parsed_url.scheme
+                );
+            }
+            return 1;
+        }
     }
 
     // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
@@ -1324,6 +1359,18 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
     if let Some(rf) = &args.referer {
         req = req.header("Referer", rf);
+    }
+    if args.auto_referer {
+        req = req.auto_referer(true);
+    }
+    // -z/--time-cond: If-Modified-Since (or If-Unmodified-Since for a leading
+    // '-'); a value naming an existing file uses its mtime.
+    if let Some(tc) = &args.time_cond {
+        if let Some((hdr, date)) = time_cond_header(tc) {
+            req = req.header(hdr, &date);
+        } else if show_errors(args) {
+            eprintln!("rsurl: warning: could not parse --time-cond {tc:?}");
+        }
     }
     let has_header = |name: &str| {
         args.headers
@@ -1513,6 +1560,19 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         }
     }
 
+    // --fail-with-body: exit 22 on an HTTP error but still write the body.
+    if args.fail_with_body && resp.status >= 400 {
+        if show_errors(args) {
+            eprintln!(
+                "rsurl: The requested URL returned error: {} {}",
+                resp.status, resp.reason
+            );
+        }
+        let _ = write_output(&resp, &parsed_url, args);
+        run_write_out(&resp, &parsed_url, args, time_total);
+        return 22;
+    }
+
     // -f/--fail: on an HTTP error, emit no body and exit 22. (Without -f,
     // curl — and now rsurl — exits 0 even on 4xx/5xx.)
     if args.fail && resp.status >= 400 {
@@ -1633,7 +1693,24 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "-a" | "--append" => a.append = true,
             "--key" => a.ssh_keys.push(next_val(&mut it, arg)?),
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
-            "-e" | "--referer" => a.referer = Some(next_val(&mut it, arg)?),
+            "-e" | "--referer" => {
+                let v = next_val(&mut it, arg)?;
+                // curl: a trailing ";auto" enables auto-referer on redirect;
+                // the part before it (if any) is the initial Referer.
+                let (head, auto) = match v.strip_suffix(";auto") {
+                    Some(h) => (h, true),
+                    None => (v.as_str(), false),
+                };
+                a.auto_referer = a.auto_referer || auto;
+                if !head.is_empty() {
+                    a.referer = Some(head.to_string());
+                }
+            }
+            "-z" | "--time-cond" => a.time_cond = Some(next_val(&mut it, arg)?),
+            "--output-dir" => a.output_dir = Some(next_val(&mut it, arg)?),
+            "--fail-with-body" => a.fail_with_body = true,
+            "--proto" => a.proto = Some(next_val(&mut it, arg)?),
+            "--proto-default" => a.proto_default = Some(next_val(&mut it, arg)?),
             "--http2" => a.http_version = Some(HttpVersionPref::Http2Only),
             // curl also accepts `--http1` as a shorthand for `--http1.1`.
             "--http1.1" | "--http1" => a.http_version = Some(HttpVersionPref::Http11Only),
@@ -2428,17 +2505,129 @@ fn httpdate_to_epoch(s: &str) -> Option<u64> {
     u64::try_from(secs).ok()
 }
 
+/// Format a Unix epoch as an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`).
+fn epoch_to_httpdate(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = (secs % 86400) as i64;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let wd = (days % 7 + 4).rem_euclid(7); // 1970-01-01 was Thursday (4)
+                                           // Civil date from days since epoch (Howard Hinnant).
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        WD[wd as usize],
+        d,
+        MON[(m - 1) as usize],
+        year,
+        hh,
+        mm,
+        ss
+    )
+}
+
+/// Build the conditional-request header for `-z`/`--time-cond`. A leading `-`
+/// selects `If-Unmodified-Since`; a value naming an existing file uses its
+/// mtime, otherwise it is treated as a literal HTTP-date.
+fn time_cond_header(spec: &str) -> Option<(&'static str, String)> {
+    let (unmod, body) = match spec.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, spec.strip_prefix('+').unwrap_or(spec)),
+    };
+    let date = match std::fs::metadata(body).and_then(|m| m.modified()) {
+        Ok(mtime) => {
+            let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            epoch_to_httpdate(secs)
+        }
+        Err(_) => body.trim().to_string(),
+    };
+    if date.is_empty() {
+        return None;
+    }
+    Some((
+        if unmod {
+            "If-Unmodified-Since"
+        } else {
+            "If-Modified-Since"
+        },
+        date,
+    ))
+}
+
+/// Evaluate curl's `--proto` spec against a scheme. Tokens are comma-separated
+/// with optional `+`/`-`/`=` prefixes (`=` resets the set); `all` is a keyword.
+fn proto_allowed(scheme: &str, spec: &str) -> bool {
+    const ALL: &[&str] = &[
+        "http", "https", "ftp", "ftps", "sftp", "scp", "imap", "imaps", "pop3", "pop3s", "smtp",
+        "smtps", "mqtt", "mqtts", "rtsp", "tftp", "ldap", "ldaps", "gopher", "gophers", "dict",
+        "file", "ws", "wss", "telnet",
+    ];
+    let mut set: std::collections::HashSet<String> = ALL.iter().map(|s| s.to_string()).collect();
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let (op, name) = match tok.as_bytes()[0] {
+            b'=' => ('=', &tok[1..]),
+            b'+' => ('+', &tok[1..]),
+            b'-' => ('-', &tok[1..]),
+            _ => ('+', tok),
+        };
+        let names: Vec<String> = if name == "all" {
+            ALL.iter().map(|s| s.to_string()).collect()
+        } else {
+            vec![name.to_ascii_lowercase()]
+        };
+        match op {
+            '=' => {
+                set.clear();
+                set.extend(names);
+            }
+            '+' => set.extend(names),
+            '-' => {
+                for n in names {
+                    set.remove(&n);
+                }
+            }
+            _ => {}
+        }
+    }
+    set.contains(&scheme.to_ascii_lowercase())
+}
+
 /// Create `path` for writing, first creating parent directories when
 /// `--create-dirs` is set (curl semantics).
 fn create_output_file(path: &str, args: &Args) -> io::Result<File> {
+    // --output-dir is prepended to -o/-O names (absolute paths are left alone,
+    // matching std::path::Path::join semantics).
+    let full = match &args.output_dir {
+        Some(dir) => std::path::Path::new(dir).join(path),
+        None => std::path::PathBuf::from(path),
+    };
     if args.create_dirs {
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Some(parent) = full.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
+    } else if let Some(dir) = &args.output_dir {
+        // curl creates the --output-dir itself even without --create-dirs.
+        std::fs::create_dir_all(dir)?;
     }
-    File::create(path)
+    File::create(full)
 }
 
 /// `-D`/`--dump-header`: write the status line and response headers to `path`,
@@ -2656,6 +2845,12 @@ Options:
       --netrc-file <file>  read credentials from <file> (implies -n)
   -J, --remote-header-name with -O, name the file from Content-Disposition
       --retry <n>          retry transient failures up to <n> times
+  -z, --time-cond <t>      If-Modified-Since (or If-Unmodified-Since for
+                           a leading '-'); a filename uses its mtime
+      --output-dir <dir>   directory to prepend to -o/-O output names
+      --fail-with-body     exit 22 on HTTP >= 400 but still write the body
+      --proto <spec>       restrict allowed schemes (e.g. =https,http)
+      --proto-default <s>  scheme for URLs given without one
   -4, --ipv4               connect over IPv4 only
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)

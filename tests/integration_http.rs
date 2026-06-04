@@ -1819,3 +1819,82 @@ fn cli_bundled_short_flags() {
     assert_eq!(std::fs::read(&outfile).unwrap(), b"bundled");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--fail-with-body` exits 22 on an HTTP error but still writes the body.
+#[test]
+fn cli_fail_with_body() {
+    use std::process::Command;
+    let server = TestServer::start(|_r: SReq| SResp::status(404).body("err-body"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "--fail-with-body", &server.url("/x")])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(out.status.code(), Some(22));
+    assert_eq!(out.stdout, b"err-body");
+}
+
+/// `--proto =https` rejects an http:// URL (exit 1) before connecting.
+#[test]
+fn cli_proto_restricts_scheme() {
+    use std::process::Command;
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "--proto", "=https", "http://example.invalid/"])
+        .output()
+        .expect("spawn rsurl");
+    assert_eq!(out.status.code(), Some(1));
+}
+
+/// A scheme-less URL defaults to http; combined with --resolve it reaches the
+/// local server.
+#[test]
+fn cli_schemeless_url_defaults_to_http() {
+    use std::process::Command;
+    let server = TestServer::start(|_r: SReq| SResp::ok("defaulted"));
+    let port = server.addr.port();
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--resolve",
+            &format!("h.invalid:{port}:127.0.0.1"),
+            &format!("h.invalid:{port}/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"defaulted");
+}
+
+/// `-z` sends an If-Modified-Since header carrying the given date.
+#[test]
+fn cli_time_cond_sends_if_modified_since() {
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    let cap: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let c2 = Arc::clone(&cap);
+    let server = TestServer::start(move |req: SReq| {
+        *c2.lock().unwrap() = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("if-modified-since"))
+            .map(|(_, v)| v.clone());
+        SResp::ok("ok")
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-z",
+            "Sun, 06 Nov 1994 08:49:37 GMT",
+            &server.url("/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    assert_eq!(
+        cap.lock().unwrap().as_deref(),
+        Some("Sun, 06 Nov 1994 08:49:37 GMT")
+    );
+}

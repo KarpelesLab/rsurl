@@ -90,6 +90,9 @@ pub struct Request {
     pub(crate) ip_family: Option<IpFamily>,
     /// Static DNS overrides (curl `--resolve`): `(host, port) -> IP`.
     pub(crate) resolve: Vec<(String, u16, std::net::IpAddr)>,
+    /// Send `Referer:` set to the previous URL on each redirect hop
+    /// (curl `-e ';auto'`).
+    pub(crate) auto_referer: bool,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -170,7 +173,14 @@ impl Request {
             connector: Arc::new(DirectConnector),
             ip_family: None,
             resolve: Vec::new(),
+            auto_referer: false,
         })
+    }
+
+    /// Send `Referer:` from the previous URL on each redirect (curl `-e ;auto`).
+    pub fn auto_referer(mut self, on: bool) -> Self {
+        self.auto_referer = on;
+        self
     }
 
     /// Force IPv4 for the connection (curl `-4`).
@@ -475,9 +485,16 @@ impl Request {
                 || next_url.scheme != req.url.scheme;
 
             let prev_method = req.method.clone();
+            let prev_url = url_to_string(&req.url);
             let prev_body = std::mem::take(&mut req.body);
             let mut next = req;
             next.url = next_url;
+            // -e ';auto': set Referer to the URL we are coming from.
+            if next.auto_referer {
+                next.headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("referer"));
+                next.headers.push(("Referer".to_string(), prev_url));
+            }
             if host_changed {
                 next.headers.retain(|(k, _)| {
                     !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie")
