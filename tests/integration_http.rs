@@ -1930,3 +1930,36 @@ fn cli_globoff_keeps_brackets() {
     assert!(out.status.success());
     assert_eq!(out.stdout, b"/p[1-3]");
 }
+
+/// `--post302` keeps the POST method across a 302 (curl downgrades to GET
+/// without it).
+#[test]
+fn cli_post302_preserves_method() {
+    use std::process::Command;
+    let server = TestServer::start(|req: SReq| {
+        if req.path == "/a" {
+            let mut r = SResp::status(302);
+            r.headers.push(("Location".into(), "/b".into()));
+            r
+        } else {
+            SResp::ok(req.method.clone())
+        }
+    });
+    // With --post302: method preserved → /b sees POST.
+    let kept = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "-L", "--post302", "-d", "x=1", &server.url("/a")])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        kept.stdout,
+        b"POST",
+        "stderr: {}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    // Without it: curl-default downgrade → /b sees GET.
+    let downgraded = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "-L", "-d", "x=1", &server.url("/a")])
+        .output()
+        .expect("spawn");
+    assert_eq!(downgraded.stdout, b"GET");
+}

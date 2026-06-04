@@ -201,6 +201,12 @@ struct Args {
     retry_all_errors: bool,
     /// `-g`/`--globoff`: disable URL globbing (`{}`/`[]` taken literally).
     globoff: bool,
+    /// `--location-trusted`: keep credentials across cross-host redirects.
+    location_trusted: bool,
+    /// `--post301`/`--post302`/`--post303`: keep POST on that redirect status.
+    post301: bool,
+    post302: bool,
+    post303: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1614,6 +1620,18 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(n) = args.max_redirs {
         req = req.max_redirs(n);
     }
+    if args.location_trusted {
+        req = req.redirect_trusted(true);
+    }
+    if args.post301 {
+        req = req.keep_post_on(301);
+    }
+    if args.post302 {
+        req = req.keep_post_on(302);
+    }
+    if args.post303 {
+        req = req.keep_post_on(303);
+    }
     if let Some((u, p)) = &args.basic_auth {
         req = req.basic_auth(u, p);
     } else if args.netrc && parsed_url.userinfo.is_none() {
@@ -2015,6 +2033,13 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--retry-connrefused" => a.retry_connrefused = true,
             "--retry-all-errors" => a.retry_all_errors = true,
             "-g" | "--globoff" => a.globoff = true,
+            "--location-trusted" => {
+                a.follow_redirects = true;
+                a.location_trusted = true;
+            }
+            "--post301" => a.post301 = true,
+            "--post302" => a.post302 = true,
+            "--post303" => a.post303 = true,
             "-4" | "--ipv4" => a.ipv4 = true,
             "-6" | "--ipv6" => a.ipv6 = true,
             "-#" | "--progress-bar" => a.progress_bar = true,
@@ -3102,6 +3127,8 @@ Options:
       --proto <spec>       restrict allowed schemes (e.g. =https,http)
       --proto-default <s>  scheme for URLs given without one
   -g, --globoff            disable URL globbing ({{}} and [] taken literally)
+      --location-trusted   keep credentials across cross-host redirects
+      --post301/302/303    keep POST (don't downgrade to GET) on that redirect
   -4, --ipv4               connect over IPv4 only
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)

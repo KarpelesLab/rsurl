@@ -93,6 +93,12 @@ pub struct Request {
     /// Send `Referer:` set to the previous URL on each redirect hop
     /// (curl `-e ';auto'`).
     pub(crate) auto_referer: bool,
+    /// Keep `Authorization`/`Cookie` across cross-host redirects
+    /// (curl `--location-trusted`). Off by default.
+    pub(crate) redirect_trusted: bool,
+    /// Preserve the request method (don't rewrite POST→GET) on 301/302/303
+    /// respectively (curl `--post301`/`--post302`/`--post303`).
+    pub(crate) keep_post: [bool; 3],
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -174,7 +180,25 @@ impl Request {
             ip_family: None,
             resolve: Vec::new(),
             auto_referer: false,
+            redirect_trusted: false,
+            keep_post: [false; 3],
         })
+    }
+
+    /// Keep `Authorization`/`Cookie` on cross-host redirects (curl
+    /// `--location-trusted`).
+    pub fn redirect_trusted(mut self, on: bool) -> Self {
+        self.redirect_trusted = on;
+        self
+    }
+
+    /// Preserve the method (don't downgrade POST→GET) on the given 3xx status
+    /// (301/302/303) — curl `--post301`/`--post302`/`--post303`.
+    pub fn keep_post_on(mut self, status: u16) -> Self {
+        if (301..=303).contains(&status) {
+            self.keep_post[(status - 301) as usize] = true;
+        }
+        self
     }
 
     /// Send `Referer:` from the previous URL on each redirect (curl `-e ;auto`).
@@ -495,7 +519,8 @@ impl Request {
                     .retain(|(k, _)| !k.eq_ignore_ascii_case("referer"));
                 next.headers.push(("Referer".to_string(), prev_url));
             }
-            if host_changed {
+            // --location-trusted keeps credentials across hosts.
+            if host_changed && !next.redirect_trusted {
                 next.headers.retain(|(k, _)| {
                     !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie")
                 });
@@ -505,7 +530,14 @@ impl Request {
             // Method/body rewriting per RFC 9110 §15.4 plus curl's default
             // backward-compat behaviour: 301/302/303 rewrite POST/PUT/etc
             // to GET and drop the body; 307/308 preserve method + body.
+            // --post301/302/303 opt out of the downgrade for that status.
+            let keep_post = if (301..=303).contains(&resp.status) {
+                next.keep_post[(resp.status - 301) as usize]
+            } else {
+                false
+            };
             if (301..=303).contains(&resp.status)
+                && !keep_post
                 && !prev_method.eq_ignore_ascii_case("GET")
                 && !prev_method.eq_ignore_ascii_case("HEAD")
             {
