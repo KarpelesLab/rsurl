@@ -168,6 +168,16 @@ struct Args {
     ipv6: bool,
     /// `--resolve <host:port:addr>`: static DNS overrides.
     resolve: Vec<(String, u16, std::net::IpAddr)>,
+    /// `-#`/`--progress-bar`: accepted; rsurl buffers the body, so there is no
+    /// live progress to render — this is a no-op.
+    progress_bar: bool,
+    /// Recognized-but-not-yet-enforced flags, kept so curl scripts/config files
+    /// don't hard-fail. `-E`/`--cert` needs TLS client-auth plumbing;
+    /// `--limit-rate`/`-y`/`-Y` need streaming downloads. We warn when used.
+    cert: Option<String>,
+    limit_rate: Option<String>,
+    speed_limit: Option<String>,
+    speed_time: Option<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -277,6 +287,8 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    warn_unsupported(&ops);
+
     // One cookie jar shared across all operations (curl carries it over
     // --next). Build it from the first operation that configures cookies.
     let jar_op = ops
@@ -317,6 +329,33 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::from(last_failure)
+}
+
+/// Warn (once) about recognized flags that aren't yet enforced, so users
+/// aren't misled into thinking a limit/cert is active. Silenced by `-s`
+/// (without `-S`), like other diagnostics.
+fn warn_unsupported(ops: &[Args]) {
+    if !ops.iter().any(show_errors) {
+        return;
+    }
+    if ops.iter().any(|a| a.cert.is_some()) {
+        eprintln!(
+            "rsurl: warning: -E/--cert is recognized but TLS client certificates \
+             are not supported in this build"
+        );
+    }
+    if ops.iter().any(|a| a.limit_rate.is_some()) {
+        eprintln!(
+            "rsurl: warning: --limit-rate is recognized but not enforced \
+             (no streaming downloads yet)"
+        );
+    }
+    if ops
+        .iter()
+        .any(|a| a.speed_limit.is_some() || a.speed_time.is_some())
+    {
+        eprintln!("rsurl: warning: -y/-Y speed limits are recognized but not enforced");
+    }
 }
 
 /// Split a token stream into independent operations at `--next` / `-:`.
@@ -1623,6 +1662,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             }
             "-4" | "--ipv4" => a.ipv4 = true,
             "-6" | "--ipv6" => a.ipv6 = true,
+            "-#" | "--progress-bar" => a.progress_bar = true,
+            "-E" | "--cert" => a.cert = Some(next_val(&mut it, arg)?),
+            "--limit-rate" => a.limit_rate = Some(next_val(&mut it, arg)?),
+            "-Y" | "--speed-limit" => a.speed_limit = Some(next_val(&mut it, arg)?),
+            "-y" | "--speed-time" => a.speed_time = Some(next_val(&mut it, arg)?),
             "--resolve" => {
                 let spec = next_val(&mut it, arg)?;
                 let mut parts = spec.splitn(3, ':');
@@ -2557,6 +2601,11 @@ Options:
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
   -K, --config <file>      read options from a curl-style config file
       --next  (-:)         start a new request with its own options
+  -#, --progress-bar       accepted (no-op: bodies are buffered, not streamed)
+  -E, --cert <c[:pass]>    accepted; TLS client certs not supported yet
+      --limit-rate <speed> accepted; not enforced yet (needs streaming)
+  -y, --speed-time <s> / -Y, --speed-limit <bps>
+                           accepted; not enforced yet (needs streaming)
   -h, --help               print this help
   -V, --version            print version
 "
