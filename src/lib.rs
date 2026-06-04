@@ -16,6 +16,7 @@ mod pool;
 mod transfer;
 mod url;
 
+pub mod net;
 pub mod tls;
 
 // Protocol backends — each one owns a single URL scheme family.
