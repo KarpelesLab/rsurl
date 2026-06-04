@@ -1402,8 +1402,8 @@ fn cli_http3_only_unresolvable_fails_cleanly() {
     let code = out.status.code();
     assert_eq!(
         code,
-        Some(7),
-        "expected transfer error exit 7, got {code:?}"
+        Some(6),
+        "unresolvable host should exit 6 (CURLE_COULDNT_RESOLVE_HOST), got {code:?}"
     );
     // It must not have crashed (a panic yields no exit code on unix, or a
     // SIGABRT/SIGSEGV-derived code), and the error must be a clean message.
@@ -1431,7 +1431,7 @@ fn cli_http3_only_rejects_plaintext_http() {
 
 /// `--http3` (with fallback) against an unresolvable host fails cleanly too:
 /// the QUIC attempt can't resolve, falls through to the Auto h2/1.1 path, and
-/// that also can't resolve — so the whole thing exits 7 without panicking.
+/// that also can't resolve — so the whole thing exits 6 without panicking.
 #[test]
 fn cli_http3_with_fallback_unresolvable_fails_cleanly() {
     use std::process::Command;
@@ -1442,8 +1442,8 @@ fn cli_http3_with_fallback_unresolvable_fails_cleanly() {
     let code = out.status.code();
     assert_eq!(
         code,
-        Some(7),
-        "expected transfer error exit 7, got {code:?}"
+        Some(6),
+        "unresolvable host should exit 6 (CURLE_COULDNT_RESOLVE_HOST), got {code:?}"
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("panicked"), "must not panic; stderr: {err}");
@@ -2501,4 +2501,23 @@ fn cli_write_out_header_var() {
         .expect("spawn rsurl");
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[abc123|0]");
+}
+
+/// A connection refused on an HTTP URL exits 7 (CURLE_COULDNT_CONNECT), and a
+/// malformed URL exits 3 (CURLE_URL_MALFORMAT) — the centralized exit-code map.
+#[test]
+fn cli_exit_codes_connect_and_url() {
+    use std::process::Command;
+    // Port 1 is privileged and almost certainly not listening → connect fails.
+    let refused = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "http://127.0.0.1:1/"])
+        .status()
+        .expect("spawn rsurl");
+    assert_eq!(refused.code(), Some(7), "connection refused should exit 7");
+
+    let bad = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "http://"])
+        .status()
+        .expect("spawn rsurl");
+    assert_eq!(bad.code(), Some(3), "malformed URL should exit 3");
 }

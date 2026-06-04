@@ -1928,7 +1928,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
                 if show_errors(args) {
                     eprintln!("rsurl: {e}");
                 }
-                return 7;
+                return transfer_exit_code(&e);
             }
         }
     };
@@ -2344,6 +2344,40 @@ fn next_retry_delay(attempt: u32, args: &Args) -> std::time::Duration {
     match args.retry_delay {
         Some(s) => std::time::Duration::from_secs(s),
         None => retry_delay(attempt),
+    }
+}
+
+/// Map a transfer error to curl's documented exit code. Covers the cases curl
+/// distinguishes for network transfers; unclassifiable failures fall back to 7
+/// ("failed to connect"), curl's own catch-all for transport trouble.
+fn transfer_exit_code(e: &rsurl::Error) -> u8 {
+    use std::io::ErrorKind;
+    match e {
+        rsurl::Error::InvalidUrl(_) => 3,        // CURLE_URL_MALFORMAT
+        rsurl::Error::UnsupportedScheme(_) => 1, // CURLE_UNSUPPORTED_PROTOCOL
+        rsurl::Error::UnexpectedEof => 52,       // CURLE_GOT_NOTHING
+        rsurl::Error::Ssh(_) => 79,              // CURLE_SSH
+        rsurl::Error::H2NotNegotiated => 7,
+        rsurl::Error::BadResponse(m) => {
+            let m = m.to_ascii_lowercase();
+            if m.contains("timed out") {
+                28 // CURLE_OPERATION_TIMEDOUT
+            } else if m.contains("redirect") {
+                47 // CURLE_TOO_MANY_REDIRECTS
+            } else {
+                8 // CURLE_WEIRD_SERVER_REPLY
+            }
+        }
+        rsurl::Error::Io(io) => match io.kind() {
+            ErrorKind::TimedOut => 28,
+            ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted => 7,
+            // std has no stable "name resolution failed" kind; the OS resolver
+            // surfaces it in the message ("failed to lookup address ...").
+            _ if io.to_string().contains("failed to lookup") => 6, // CURLE_COULDNT_RESOLVE_HOST
+            _ => 7,                                                // CURLE_COULDNT_CONNECT
+        },
     }
 }
 
@@ -2964,7 +2998,7 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
-            7
+            transfer_exit_code(&e)
         }
     }
 }
@@ -3471,7 +3505,7 @@ fn run_http_download(
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
-            7
+            transfer_exit_code(&e)
         }
     }
 }
@@ -3766,6 +3800,48 @@ Options:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_exit_code_maps_curl_codes() {
+        use std::io::{Error as IoError, ErrorKind};
+        assert_eq!(transfer_exit_code(&rsurl::Error::InvalidUrl("x".into())), 3);
+        assert_eq!(
+            transfer_exit_code(&rsurl::Error::UnsupportedScheme("gopher+ssh".into())),
+            1
+        );
+        assert_eq!(transfer_exit_code(&rsurl::Error::UnexpectedEof), 52);
+        assert_eq!(transfer_exit_code(&rsurl::Error::Ssh("auth".into())), 79);
+        assert_eq!(
+            transfer_exit_code(&rsurl::Error::BadResponse("operation timed out".into())),
+            28
+        );
+        assert_eq!(
+            transfer_exit_code(&rsurl::Error::BadResponse(
+                "maximum (50) redirects followed".into()
+            )),
+            47
+        );
+        assert_eq!(
+            transfer_exit_code(&rsurl::Error::BadResponse("garbage status line".into())),
+            8
+        );
+        assert_eq!(
+            transfer_exit_code(&rsurl::Error::Io(IoError::from(
+                ErrorKind::ConnectionRefused
+            ))),
+            7
+        );
+        assert_eq!(
+            transfer_exit_code(&rsurl::Error::Io(IoError::from(ErrorKind::TimedOut))),
+            28
+        );
+        assert_eq!(
+            transfer_exit_code(&rsurl::Error::Io(IoError::other(
+                "failed to lookup address information: Name or service not known"
+            ))),
+            6
+        );
+    }
 
     #[test]
     fn proto_allowed_evaluates_specs() {
