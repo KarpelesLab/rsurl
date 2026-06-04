@@ -1,0 +1,260 @@
+.\" Manpage for rsurl.
+.\" This page summarizes the most-used options; `rsurl --help` always lists the
+.\" complete, authoritative set for the installed build.
+.TH RSURL 1 "2026-06-04" "rsurl 0.0.4" "User Commands"
+.SH NAME
+rsurl \- transfer a URL (a pure\-Rust curl)
+.SH SYNOPSIS
+.B rsurl
+[\fIoptions\fR]
+\fIurl\fR...
+.SH DESCRIPTION
+.B rsurl
+transfers data to or from a server using one of many supported protocols. It
+is a pure\-Rust reimplementation of much of
+.BR curl (1):
+no C toolchain and no
+.I *-sys
+crates are used, so there is no OpenSSL, GSSAPI/Kerberos, or c\-ares
+dependency. The command line, semantics, and exit codes follow curl unless
+noted otherwise.
+.PP
+Supported URL schemes:
+.BR http ", " https ", " ftp ", " ftps ", " sftp ", " scp ", "
+.BR imap ", " imaps ", " pop3 ", " pop3s ", " smtp ", " smtps ", "
+.BR mqtt ", " mqtts ", " rtsp ", " tftp ", " ldap ", " ldaps ", "
+.BR telnet ", " gopher ", " gophers ", " dict ", " file ", " ws ", and " wss .
+HTTP runs over HTTP/1.1, HTTP/2, or HTTP/3 (QUIC).
+.SH OPTIONS
+.SS General
+.TP
+.BR \-h ", " \-\-help
+Print the full option list and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.TP
+.BR \-v ", " \-\-verbose
+Write a protocol trace to standard error.
+.TP
+.BR \-s ", " \-\-silent
+Silent mode: suppress progress and error messages.
+.TP
+.BR \-S ", " \-\-show\-error
+Show errors even when \fB\-s\fR is set.
+.TP
+.BR \-\-next ", " \-:
+Begin a new request with its own independent options.
+.TP
+.BI \-K " file" "\fR, \fB\-\-config " file
+Read further options from a curl\-style config file.
+.SS HTTP request
+.TP
+.BI \-X " method" "\fR, \fB\-\-request " method
+Set the request method.
+.TP
+.BI \-H " header" "\fR, \fB\-\-header " header
+Add a request header (repeatable).
+.TP
+.BI \-A " ua" "\fR, \fB\-\-user\-agent " ua
+Set the \fIUser\-Agent\fR header.
+.TP
+.BI \-e " url" "\fR, \fB\-\-referer " url
+Set the \fIReferer\fR header; \fB\-e ';auto'\fR sends it on each redirect.
+.TP
+.BI \-d " data" "\fR, \fB\-\-data " data
+Send \fIdata\fR as a urlencoded POST body; \fB@\fIfile\fR reads from disk.
+See also \fB\-\-data\-raw\fR, \fB\-\-data\-binary\fR, \fB\-\-data\-urlencode\fR.
+.TP
+.BI \-\-json " data"
+POST \fIdata\fR as \fIapplication/json\fR and request a JSON response.
+.TP
+.BI \-F " name=value" "\fR, \fB\-\-form " name=value
+Add a multipart/form\-data part (\fB@\fIfile\fR uploads, \fB<\fIfile\fR inlines).
+.TP
+.BI \-G ", " \-\-get
+Move \fB\-d\fR data into the URL query and use GET.
+.TP
+.BR \-I ", " \-\-head
+Fetch headers only (HEAD).
+.TP
+.BR \-L ", " \-\-location
+Follow 3xx redirects. \fB\-\-location\-trusted\fR keeps credentials across hosts.
+.TP
+.BI \-b " data" "\fR, \fB\-\-cookie " data
+Send cookies (a \fIname=value\fR string or a file to read).
+.TP
+.BI \-c " file" "\fR, \fB\-\-cookie\-jar " file
+Write the cookie jar to \fIfile\fR after the transfer.
+.TP
+.BR \-\-compressed
+Request and transparently decode a compressed response.
+.SS Authentication
+.TP
+.BI \-u " user:password" "\fR, \fB\-\-user " user:password
+Server credentials (Basic by default).
+.TP
+.BR \-\-digest
+Use HTTP Digest authentication.
+.TP
+.BI \-\-oauth2\-bearer " token"
+Send an OAuth 2 bearer token.
+.TP
+.BI \-\-aws\-sigv4 " provider"
+Sign the request with AWS Signature V4 (use \fB\-u \fIkey:secret\fR).
+.TP
+.BI \-n ", " \-\-netrc
+Read credentials from \fI~/.netrc\fR (or \fB\-\-netrc\-file\fR).
+.SS TLS
+.TP
+.BR \-k ", " \-\-insecure
+Do not verify the server certificate.
+.TP
+.BI \-\-cacert " file"
+Use \fIfile\fR as the CA certificate bundle.
+.TP
+.BR \-\-tlsv1.2 ", " \-\-tlsv1.3 ", " \-\-tls\-max " <ver>"
+Pin the minimum / maximum TLS version.
+.SS Transfer and output
+.TP
+.BI \-o " file" "\fR, \fB\-\-output " file
+Write output to \fIfile\fR instead of standard output.
+.TP
+.BR \-O ", " \-\-remote\-name
+Save to a file named like the remote resource.
+.TP
+.BR \-\-create\-dirs
+Create missing directories for \fB\-o\fR.
+.TP
+.BR \-\-output\-dir " <dir>"
+Prepend \fIdir\fR to \fB\-o\fR/\fB\-O\fR names.
+.TP
+.BR \-\-remove\-on\-error
+Delete a partial \fB\-o\fR/\fB\-O\fR file if the transfer fails.
+.TP
+.BR \-\-no\-clobber
+Never overwrite an existing \fB\-o\fR/\fB\-O\fR file; pick \fI.1\fR, \fI.2\fR, ...
+.TP
+.BI \-r " range" "\fR, \fB\-\-range " range
+Request a byte range.
+.TP
+.BI \-\-limit\-rate " speed"
+Cap the download rate (e.g. \fI200k\fR, \fI1M\fR) on file downloads.
+.TP
+.BI \-Y " bps" "\fR, \fB\-\-speed\-limit " bps "\fR / \fB\-y " s "\fR, \fB\-\-speed\-time " s
+Abort a file download averaging below \fIbps\fR bytes/sec over \fIs\fR seconds
+(exit 28).
+.TP
+.BI \-\-max\-filesize " bytes"
+Refuse a download larger than \fIbytes\fR.
+.TP
+.BR \-# ", " \-\-progress\-bar
+Show progress on streamed file downloads.
+.TP
+.BR \-R ", " \-\-remote\-time
+Set the saved file's mtime from the response.
+.TP
+.BI \-w " format" "\fR, \fB\-\-write\-out " format
+After the transfer, print \fIformat\fR with \fB%{\fIvar\fB}\fR expanded:
+\fIhttp_code\fR, \fIsize_download\fR, \fIcontent_type\fR, \fIurl_effective\fR,
+\fItime_total\fR, \fItime_connect\fR, \fItime_appconnect\fR,
+\fItime_pretransfer\fR, \fItime_starttransfer\fR, \fIssl_verify_result\fR, and
+\fB%header{\fIName\fB}\fR. Phase timers are reported on HTTP/1.1 transfers.
+.SS Connection and protocol
+.TP
+.BR \-4 ", " \-\-ipv4 ", " \-6 ", " \-\-ipv6
+Force IPv4 or IPv6.
+.TP
+.BI \-x " proxy" "\fR, \fB\-\-proxy " proxy
+Route through a proxy. Schemes: \fIhttp\fR, \fIhttps\fR, \fIsocks4\fR,
+\fIsocks4a\fR, \fIsocks5\fR, \fIsocks5h\fR.
+.TP
+.BI \-\-resolve " host:port:addr"
+Provide a static address for \fIhost:port\fR.
+.TP
+.BI \-\-connect\-to " spec"
+Dial a different host:port while keeping the original \fIHost:\fR/SNI.
+.TP
+.BR \-\-unix\-socket " <path>"
+Connect through a Unix\-domain socket (Unix only).
+.TP
+.BR \-\-disable\-epsv
+For FTP, skip EPSV and use PASV directly.
+.TP
+.BR \-\-http2 ", " \-\-http1.1 ", " \-\-http3 ", " \-\-http3\-only
+Select the HTTP version.
+.TP
+.BI \-\-retry " n"
+Retry a failed transfer up to \fIn\fR times (with \fB\-\-retry\-delay\fR,
+\fB\-\-retry\-max\-time\fR, \fB\-\-retry\-connrefused\fR,
+\fB\-\-retry\-all\-errors\fR).
+.TP
+.BR \-Z ", " \-\-parallel
+Run this invocation's transfers concurrently (\fB\-\-parallel\-max\fR caps them).
+.SH EXIT STATUS
+rsurl uses curl's exit codes. The common ones:
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Unsupported protocol.
+.TP
+.B 2
+Failed to initialize / option error.
+.TP
+.B 3
+URL malformed.
+.TP
+.B 6
+Could not resolve host.
+.TP
+.B 7
+Failed to connect.
+.TP
+.B 8
+Weird server reply.
+.TP
+.B 22
+HTTP page not retrieved (\fB\-f\fR with a >= 400 status).
+.TP
+.B 23
+Write error.
+.TP
+.B 28
+Operation timed out (includes \fB\-y\fR/\fB\-Y\fR low\-speed abort).
+.TP
+.B 47
+Too many redirects.
+.TP
+.B 63
+Maximum file size exceeded.
+.SH EXAMPLES
+Fetch a page:
+.PP
+.RS
+.nf
+rsurl https://example.com/
+.fi
+.RE
+.PP
+POST JSON and print the status and timing:
+.PP
+.RS
+.nf
+rsurl --json '{"a":1}' -w '%{http_code} %{time_total}\\n' https://api.example.com/
+.fi
+.RE
+.PP
+Download through a SOCKS5 proxy, resumable name, deleting partials on failure:
+.PP
+.RS
+.nf
+rsurl -x socks5h://127.0.0.1:1080 --remove-on-error -O https://example.com/file.bin
+.fi
+.RE
+.SH "SEE ALSO"
+.BR curl (1).
+Run
+.B rsurl --help
+for the complete, build\-specific option list.

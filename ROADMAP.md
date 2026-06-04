@@ -51,12 +51,14 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 - **M3 (partial)**: **HTTP Digest** auth (`--digest`, MD5/SHA-256 + qop=auth),
   `--oauth2-bearer`, and **AWS SigV4** (`--aws-sigv4`, HMAC-SHA256 chain).
 - **M8**: `-Z/--parallel` + `--parallel-max` concurrent transfers.
+- **M10 (protocol depth, partial)**: FTP **`--disable-epsv`** (skip EPSV, use
+  PASV directly).
 - **M11 (partial)**: centralized **curl-compatible exit codes** for transfer
-  errors (1/3/6/7/8/28/47/52/79).
+  errors (1/3/6/7/8/28/47/52/79); a **`man/rsurl.1`** man page.
 
 **Remaining (large / multi-session):** the rest of M1 (stream HTTP/2-3 and the
 file-transfer protocols; streaming decompression); M9 SMB/RTMP; M10 protocol
-depth (FTP active mode, RTSP RTP, LDAP writes); M11 polish (man page,
+depth (FTP active mode, RTSP RTP, LDAP writes); M11 polish (broader
 libcurl-shaped C API surface).
 
 **Out of scope under the no-C invariant or current architecture** (documented,

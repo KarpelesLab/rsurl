@@ -180,7 +180,15 @@ rsurl -u user sftp://host/path/file               # SFTP download (password auth
 rsurl --key ~/.ssh/id_ed25519 sftp://host/f       # SFTP download (public-key auth)
 rsurl -T local.bin sftp://host/remote.bin         # SFTP upload (-T)
 rsurl -u user scp://host/etc/motd                 # SCP download
+rsurl --json '{"a":1}' https://api/               # POST JSON (+ JSON Accept)
+rsurl --aws-sigv4 aws:amz:us-east-1:s3 -u K:S https://bucket.s3.amazonaws.com/o
+rsurl -O --remove-on-error --no-clobber https://x/f.bin  # safe resumable-ish save
+rsurl -Z -O https://x/[1-50].jpg                  # parallel globbed download
 ```
+
+A man page is provided at `man/rsurl.1` (install to your `man1` directory); it
+summarizes the most-used options. `rsurl --help` always lists the complete,
+build-specific set.
 
 SSH (`sftp://` / `scp://`) takes the user from the URL userinfo, else
 `-u`, else `$USER`. Public-key auth uses `--key <file>` (curl's `--key`;
