@@ -2375,3 +2375,76 @@ fn cli_aws_sigv4_signs() {
     assert!(get("x-amz-date").is_some());
     assert!(get("x-amz-content-sha256").is_some());
 }
+
+/// `-Y <limit> -y 1` aborts a download whose average rate stays below the
+/// limit for the window, exiting 28 (curl's CURLE_OPERATION_TIMEDOUT). A raw
+/// listener trickles a few bytes across >1s so the low-speed check arms.
+#[test]
+fn cli_low_speed_abort_exits_28() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        // Drain the request head.
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf);
+        // Promise 100 bytes, then trickle 10 across >1s and stall.
+        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+        let _ = sock.flush();
+        let _ = sock.write_all(b"01234");
+        let _ = sock.flush();
+        std::thread::sleep(Duration::from_millis(1300));
+        let _ = sock.write_all(b"56789");
+        let _ = sock.flush();
+        std::thread::sleep(Duration::from_millis(1300));
+        // Let the client decide; drop the socket.
+    });
+
+    let mut out_path = std::env::temp_dir();
+    out_path.push(format!("rsurl-lowspeed-{}.bin", std::process::id()));
+    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "-Y",
+            "1000000", // 1 MB/s minimum
+            "-y",
+            "1", // measured over a 1s window
+            "-o",
+            out_path.to_str().unwrap(),
+            &format!("http://{addr}/slow"),
+        ])
+        .status()
+        .expect("spawn rsurl");
+    assert_eq!(status.code(), Some(28), "expected low-speed exit code 28");
+    let _ = handle.join();
+    let _ = std::fs::remove_file(&out_path);
+}
+
+/// curl-compat no-op flags (`-q`, `--no-progress-meter`, `-N`,
+/// `--styled-output`) are accepted without error.
+#[test]
+fn cli_compat_noop_flags_accepted() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| SResp::ok("ok"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-q",
+            "--no-progress-meter",
+            "-N",
+            "--styled-output",
+            "--no-styled-output",
+            "-s",
+            &server.url("/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ok");
+}

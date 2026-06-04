@@ -422,6 +422,21 @@ fn main() -> ExitCode {
 /// Warn (once) about recognized flags that aren't yet enforced, so users
 /// aren't misled into thinking a limit/cert is active. Silenced by `-s`
 /// (without `-S`), like other diagnostics.
+/// True when the HTTP body will be streamed straight to a file: a file output
+/// (not a TTY, so no escape-guard needed), no header-inclusion, and no
+/// status-gated body suppression. This is the path that enforces
+/// `--limit-rate`, `-y/-Y`, `-#`, and an early `--max-filesize` abort.
+fn streams_to_file(args: &Args) -> bool {
+    let output_is_file = args.remote_name || args.output.as_deref().is_some_and(|p| p != "-");
+    output_is_file
+        && !args.include_headers
+        && !args.fail
+        && !args.fail_with_body
+        && !args.remote_header_name // -J needs the response head for the name
+        && !args.digest // Digest needs the buffered 401-retry path
+        && args.dump_header.is_none()
+}
+
 fn warn_unsupported(ops: &[Args]) {
     if !ops.iter().any(show_errors) {
         return;
@@ -432,14 +447,17 @@ fn warn_unsupported(ops: &[Args]) {
              are not supported in this build"
         );
     }
-    // --limit-rate and -# are enforced on the streaming file-download path
-    // (-o FILE / -O); they are no-ops only when the body isn't streamed
-    // (stdout, -i, -f, ...). -y/-Y still need low-speed tracking.
+    // --limit-rate, -#, and -y/-Y are enforced on the streaming file-download
+    // path (-o FILE / -O); they are no-ops only when the body isn't streamed
+    // (stdout, -i, -f, ...). Warn only for ops that won't take that path.
     if ops
         .iter()
-        .any(|a| a.speed_limit.is_some() || a.speed_time.is_some())
+        .any(|a| (a.speed_limit.is_some() || a.speed_time.is_some()) && !streams_to_file(a))
     {
-        eprintln!("rsurl: warning: -y/-Y speed limits are recognized but not enforced");
+        eprintln!(
+            "rsurl: warning: -y/-Y speed limits are enforced only for file downloads \
+             (-o FILE / -O)"
+        );
     }
 }
 
@@ -1861,15 +1879,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // output (not a TTY, so no escape-guard needed), no header-inclusion, and
     // no status-gated body suppression. This is the path that enforces
     // --limit-rate, -# progress, and an early --max-filesize abort.
-    let output_is_file = args.remote_name || args.output.as_deref().is_some_and(|p| p != "-");
-    let stream_ok = output_is_file
-        && !args.include_headers
-        && !args.fail
-        && !args.fail_with_body
-        && !args.remote_header_name // -J needs the response head for the name
-        && !args.digest // Digest needs the buffered 401-retry path
-        && args.dump_header.is_none();
-    if stream_ok {
+    if streams_to_file(args) {
         return run_http_download(req, &parsed_url, args, jar);
     }
 
@@ -2288,6 +2298,18 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                     .map_err(|_| format!("--resolve: bad IP {addr_s:?}"))?;
                 a.resolve.push((host.to_string(), port, ip));
             }
+            // Accepted for curl compatibility — genuine no-ops for rsurl, so
+            // accepting them silently is honest (not a misleading stub):
+            //   -q             : we never read a curlrc, so "no config" is the default.
+            //   --no-progress-meter / --styled-output[/--no-]: we render neither by default.
+            //   -N/--no-buffer : output is already streamed/flushed, not buffered.
+            "-q"
+            | "--disable"
+            | "-N"
+            | "--no-buffer"
+            | "--no-progress-meter"
+            | "--styled-output"
+            | "--no-styled-output" => {}
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => {
@@ -3259,14 +3281,22 @@ fn parse_rate(s: &str) -> Option<u64> {
 /// across the `send_download` boundary.
 const MAX_FILESIZE_SENTINEL: &str = "rsurl-max-filesize-exceeded";
 
+/// Sentinel in the io::Error message used to signal a `-y/-Y` low-speed abort
+/// across the `send_download` boundary (maps to curl exit 28).
+const LOW_SPEED_SENTINEL: &str = "rsurl-low-speed-abort";
+
 /// A write sink for streamed downloads: enforces `--max-filesize` (early
-/// abort), `--limit-rate` (paced writes), and `-#` progress, and counts bytes
-/// for `-w %{size_download}`.
+/// abort), `--limit-rate` (paced writes), `-y/-Y` (low-speed abort), and `-#`
+/// progress, and counts bytes for `-w %{size_download}`.
 struct DownloadSink<'a> {
     inner: Box<dyn Write + 'a>,
     written: u64,
     max: Option<u64>,
     rate: Option<u64>,
+    /// `-Y` minimum average bytes/sec, enforced once `speed_time` has elapsed.
+    speed_limit: Option<u64>,
+    /// `-y` window in seconds before the low-speed check arms.
+    speed_time: u64,
     started: std::time::Instant,
     progress: bool,
     silent: bool,
@@ -3291,6 +3321,12 @@ impl Write for DownloadSink<'_> {
         }
         self.inner.write_all(buf)?;
         self.written += buf.len() as u64;
+        if let Some(limit) = self.speed_limit {
+            let secs = self.started.elapsed().as_secs();
+            if secs >= self.speed_time && self.written / secs.max(1) < limit {
+                return Err(io::Error::other(LOW_SPEED_SENTINEL));
+            }
+        }
         if self.progress
             && !self.silent
             && self.last_tick.elapsed() >= std::time::Duration::from_millis(100)
@@ -3336,12 +3372,30 @@ fn run_http_download(
             return 23;
         }
     };
+    // -Y bytes/sec minimum; -y window seconds. curl: -y alone implies -Y 1,
+    // -Y alone implies -y 30. Neither → no low-speed check.
+    let (speed_limit, speed_time) = {
+        let lim = args
+            .speed_limit
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok());
+        let tim = args
+            .speed_time
+            .as_deref()
+            .and_then(|s| s.parse::<u64>().ok());
+        match (lim, tim) {
+            (None, None) => (None, 30),
+            (l, t) => (Some(l.unwrap_or(1)), t.unwrap_or(30)),
+        }
+    };
     let now = std::time::Instant::now();
     let mut sink = DownloadSink {
         inner: Box::new(file),
         written: 0,
         max: args.max_filesize,
         rate: args.limit_rate.as_deref().and_then(parse_rate),
+        speed_limit,
+        speed_time,
         started: now,
         progress: args.progress_bar,
         silent: args.silent,
@@ -3372,6 +3426,16 @@ fn run_http_download(
                     eprintln!("rsurl: Maximum file size exceeded");
                 }
                 return 63;
+            }
+            if e.to_string().contains(LOW_SPEED_SENTINEL) {
+                if show_errors(args) {
+                    eprintln!(
+                        "rsurl: Operation too slow. Less than {} bytes/sec transferred \
+                         the last {speed_time} seconds",
+                        speed_limit.unwrap_or(1)
+                    );
+                }
+                return 28;
             }
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
@@ -3652,7 +3716,13 @@ Options:
   -E, --cert <c[:pass]>    accepted; TLS client certs not supported yet
       --limit-rate <speed> cap download rate (e.g. 200k, 1M) on -o/-O downloads
   -y, --speed-time <s> / -Y, --speed-limit <bps>
-                           accepted; not enforced yet (needs streaming)
+                           abort an -o/-O download averaging below <bps>
+                           bytes/sec over <s> seconds (exit 28)
+  -q, --disable            no-op (rsurl reads no config unless -K is given)
+  -N, --no-buffer          no-op (output is already streamed)
+      --no-progress-meter  no-op (no meter is shown by default)
+      --styled-output, --no-styled-output
+                           no-op (headers are never styled)
   -h, --help               print this help
   -V, --version            print version
 "
