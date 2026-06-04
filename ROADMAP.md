@@ -65,7 +65,11 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   direct-only; verifies the data callback comes from the control peer); FTP
   upload now honors `-x` proxy via the `Client`.
 - **M11 (partial)**: centralized **curl-compatible exit codes** for transfer
-  errors (1/3/6/7/8/28/47/52/79); a **`man/rsurl.1`** man page.
+  errors (1/3/6/7/8/28/47/52/79); a **`man/rsurl.1`** man page; an expanded
+  **libcurl-shaped C ABI** (`rsurl_easy_*` with `RSURLOPT_` for URL, method,
+  headers, body, timeouts, IDN, **followlocation, maxredirs, userpwd,
+  ssl_verifypeer, proxy, referer, range, cookie, xoauth2_bearer,
+  accept_encoding**).
 
 **Remaining (large / multi-session):** stream HTTP/2-3 response bodies (the
 backends currently reassemble the full body — a frame-loop refactor); RTSP

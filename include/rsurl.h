@@ -36,8 +36,18 @@ typedef enum {
     RSURLOPT_CONNECTTIMEOUT   = 5,  /* long seconds */
     RSURLOPT_TIMEOUT          = 6,  /* long seconds */
     RSURLOPT_USERAGENT        = 7,  /* const char* */
-    RSURLOPT_IDN              = 8   /* long: 1 (default) convert IDN hosts to
+    RSURLOPT_IDN              = 8,  /* long: 1 (default) convert IDN hosts to
                                        punycode, 0 = off (curl --no-idn) */
+    RSURLOPT_FOLLOWLOCATION   = 9,  /* long: follow 3xx redirects (off default) */
+    RSURLOPT_MAXREDIRS        = 10, /* long: max redirects (<0 = none) */
+    RSURLOPT_USERPWD          = 11, /* const char* "user:password" (Basic auth) */
+    RSURLOPT_SSL_VERIFYPEER   = 12, /* long: verify TLS peer (default 1; 0 = -k) */
+    RSURLOPT_PROXY            = 13, /* const char* proxy URL (http/socks5h/...) */
+    RSURLOPT_REFERER          = 14, /* const char* Referer header */
+    RSURLOPT_RANGE            = 15, /* const char* byte range, e.g. "0-1023" */
+    RSURLOPT_COOKIE           = 16, /* const char* Cookie request header */
+    RSURLOPT_XOAUTH2_BEARER   = 17, /* const char* OAuth2 bearer token */
+    RSURLOPT_ACCEPT_ENCODING  = 18  /* const char*; "" = all codecs (--compressed) */
 } rsurl_option_t;
 
 /* Status codes returned by API functions. */

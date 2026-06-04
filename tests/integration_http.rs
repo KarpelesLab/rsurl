@@ -2937,3 +2937,59 @@ fn cli_ftp_active_mode_download() {
     assert_eq!(std::fs::read(&out_path).unwrap(), b"ACTIVE-MODE-BODY");
     let _ = std::fs::remove_file(&out_path);
 }
+
+/// The C ABI honors the newer options: RSURLOPT_USERPWD (Basic auth),
+/// RSURLOPT_FOLLOWLOCATION, and RSURLOPT_REFERER. Driven through the real
+/// extern "C" entry points against a loopback server.
+#[test]
+fn ffi_easy_extended_options() {
+    use rsurl::ffi::{
+        rsurl_easy_cleanup, rsurl_easy_init, rsurl_easy_perform, rsurl_easy_response_body,
+        rsurl_easy_response_status, rsurl_easy_setopt_long, rsurl_easy_setopt_str,
+    };
+    use std::ffi::CString;
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = Arc::clone(&seen);
+    let server = TestServer::start(move |req: SReq| {
+        *s2.lock().unwrap() = req.headers.clone();
+        SResp::ok("ffi-ok")
+    });
+    let url = CString::new(server.url("/")).unwrap();
+    let userpwd = CString::new("alice:s3cret").unwrap();
+    let referer = CString::new("https://ref.example/").unwrap();
+
+    unsafe {
+        let h = rsurl_easy_init();
+        assert!(!h.is_null());
+        // 1=URL, 11=USERPWD, 14=REFERER, 9=FOLLOWLOCATION, 12=SSL_VERIFYPEER.
+        assert_eq!(rsurl_easy_setopt_str(h, 1, url.as_ptr()) as i32, 0);
+        assert_eq!(rsurl_easy_setopt_str(h, 11, userpwd.as_ptr()) as i32, 0);
+        assert_eq!(rsurl_easy_setopt_str(h, 14, referer.as_ptr()) as i32, 0);
+        assert_eq!(rsurl_easy_setopt_long(h, 9, 1) as i32, 0);
+        assert_eq!(rsurl_easy_setopt_long(h, 12, 1) as i32, 0);
+        assert_eq!(rsurl_easy_perform(h) as i32, 0);
+        assert_eq!(rsurl_easy_response_status(h), 200);
+
+        let mut ptr: *const u8 = std::ptr::null();
+        let mut len: usize = 0;
+        assert_eq!(rsurl_easy_response_body(h, &mut ptr, &mut len) as i32, 0);
+        let body = std::slice::from_raw_parts(ptr, len);
+        assert_eq!(body, b"ffi-ok");
+        rsurl_easy_cleanup(h);
+    }
+
+    let h = seen.lock().unwrap();
+    let get = |n: &str| {
+        h.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.clone())
+    };
+    // USERPWD → Basic base64("alice:s3cret"); REFERER → Referer header.
+    assert_eq!(
+        get("authorization").as_deref(),
+        Some("Basic YWxpY2U6czNjcmV0")
+    );
+    assert_eq!(get("referer").as_deref(), Some("https://ref.example/"));
+}

@@ -69,6 +69,28 @@ pub enum RsurlOpt {
     /// long — convert international (IDN) hostnames to punycode. Non-zero
     /// (default) on, 0 off (curl `--no-idn`). No-op without the `idn` feature.
     Idn = 8,
+    /// long — follow 3xx redirects (curl `CURLOPT_FOLLOWLOCATION`). Off default.
+    FollowLocation = 9,
+    /// long — maximum redirects to follow when FollowLocation is on. <0 = none.
+    MaxRedirs = 10,
+    /// const char* — `"user:password"` for HTTP Basic auth (`CURLOPT_USERPWD`).
+    UserPwd = 11,
+    /// long — verify the TLS peer certificate (default on). 0 = curl `-k`
+    /// (`CURLOPT_SSL_VERIFYPEER`).
+    SslVerifyPeer = 12,
+    /// const char* — proxy URL (`CURLOPT_PROXY`): http/https/socks4/4a/5/5h.
+    Proxy = 13,
+    /// const char* — `Referer` header value (`CURLOPT_REFERER`).
+    Referer = 14,
+    /// const char* — byte range, e.g. `"0-1023"` (`CURLOPT_RANGE`).
+    Range = 15,
+    /// const char* — `Cookie` request header (`CURLOPT_COOKIE`).
+    Cookie = 16,
+    /// const char* — OAuth2 bearer token (`CURLOPT_XOAUTH2_BEARER`).
+    Bearer = 17,
+    /// const char* — `Accept-Encoding` value; empty string requests every codec
+    /// rsurl can decode, like curl `--compressed` (`CURLOPT_ACCEPT_ENCODING`).
+    AcceptEncoding = 18,
 }
 
 /// Status codes returned by the API.
@@ -98,6 +120,16 @@ struct Handle {
     timeout_secs: Option<u64>,
     /// Convert international (IDN) hostnames to punycode. On by default.
     idn: bool,
+    follow_location: bool,
+    max_redirs: Option<u32>,
+    basic_auth: Option<(String, String)>,
+    verify_peer: bool,
+    proxy: Option<String>,
+    referer: Option<String>,
+    range: Option<String>,
+    cookie: Option<String>,
+    bearer: Option<String>,
+    accept_encoding: Option<String>,
     last_response: Option<Response>,
     /// Stable storage so C callers can read header values as NUL-terminated
     /// strings without us having to allocate per-call.
@@ -115,6 +147,16 @@ impl Handle {
             connect_timeout_secs: None,
             timeout_secs: None,
             idn: true,
+            follow_location: false,
+            max_redirs: None,
+            basic_auth: None,
+            verify_peer: true,
+            proxy: None,
+            referer: None,
+            range: None,
+            cookie: None,
+            bearer: None,
+            accept_encoding: None,
             last_response: None,
             header_buf: Vec::new(),
         }
@@ -228,9 +270,24 @@ pub unsafe extern "C" fn rsurl_easy_setopt_str(
                 None => h.headers.clear(),
             },
             RsurlOpt::PostFieldsString => h.body = s.map(|s| s.into_bytes()),
-            RsurlOpt::ConnectTimeout | RsurlOpt::Timeout | RsurlOpt::Idn => {
-                return RsurlCode::InvalidArg
+            RsurlOpt::UserPwd => {
+                h.basic_auth = s.map(|v| match v.split_once(':') {
+                    Some((u, p)) => (u.to_string(), p.to_string()),
+                    None => (v, String::new()),
+                });
             }
+            RsurlOpt::Proxy => h.proxy = s,
+            RsurlOpt::Referer => h.referer = s,
+            RsurlOpt::Range => h.range = s,
+            RsurlOpt::Cookie => h.cookie = s,
+            RsurlOpt::Bearer => h.bearer = s,
+            RsurlOpt::AcceptEncoding => h.accept_encoding = s,
+            RsurlOpt::ConnectTimeout
+            | RsurlOpt::Timeout
+            | RsurlOpt::Idn
+            | RsurlOpt::FollowLocation
+            | RsurlOpt::MaxRedirs
+            | RsurlOpt::SslVerifyPeer => return RsurlCode::InvalidArg,
         }
         RsurlCode::Ok
     })
@@ -255,6 +312,15 @@ pub extern "C" fn rsurl_easy_setopt_long(
             RsurlOpt::ConnectTimeout => h.connect_timeout_secs = secs,
             RsurlOpt::Timeout => h.timeout_secs = secs,
             RsurlOpt::Idn => h.idn = value != 0,
+            RsurlOpt::FollowLocation => h.follow_location = value != 0,
+            RsurlOpt::MaxRedirs => {
+                h.max_redirs = if value < 0 {
+                    Some(0)
+                } else {
+                    Some(value as u32)
+                }
+            }
+            RsurlOpt::SslVerifyPeer => h.verify_peer = value != 0,
             _ => return RsurlCode::InvalidArg,
         }
         RsurlCode::Ok
@@ -271,6 +337,16 @@ fn opt_from_int(v: c_int) -> Option<RsurlOpt> {
         6 => RsurlOpt::Timeout,
         7 => RsurlOpt::UserAgent,
         8 => RsurlOpt::Idn,
+        9 => RsurlOpt::FollowLocation,
+        10 => RsurlOpt::MaxRedirs,
+        11 => RsurlOpt::UserPwd,
+        12 => RsurlOpt::SslVerifyPeer,
+        13 => RsurlOpt::Proxy,
+        14 => RsurlOpt::Referer,
+        15 => RsurlOpt::Range,
+        16 => RsurlOpt::Cookie,
+        17 => RsurlOpt::Bearer,
+        18 => RsurlOpt::AcceptEncoding,
         _ => return None,
     })
 }
@@ -299,12 +375,53 @@ pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
             Err(crate::Error::UnsupportedScheme(_)) => return RsurlCode::Unsupported,
             Err(_) => return RsurlCode::InvalidArg,
         };
-        req = req.idn(h.idn);
+        req = req.idn(h.idn).verify_tls(h.verify_peer);
+        if h.follow_location {
+            req = req.follow_redirects(true);
+            if let Some(n) = h.max_redirs {
+                req = req.max_redirs(n);
+            }
+        }
+        if let Some(spec) = &h.proxy {
+            req = match req.proxy(spec) {
+                Ok(r) => r,
+                Err(_) => return RsurlCode::InvalidArg,
+            };
+        }
+        if let Some((u, p)) = &h.basic_auth {
+            req = req.basic_auth(u, p);
+        }
         for (k, v) in &h.headers {
             req = req.header(k, v);
         }
         if let Some(ua) = &h.user_agent {
             req = req.header("User-Agent", ua);
+        }
+        if let Some(referer) = &h.referer {
+            req = req.header("Referer", referer);
+        }
+        if let Some(cookie) = &h.cookie {
+            req = req.header("Cookie", cookie);
+        }
+        if let Some(token) = &h.bearer {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        if let Some(range) = &h.range {
+            let v = if range.contains('=') {
+                range.clone()
+            } else {
+                format!("bytes={range}")
+            };
+            req = req.header("Range", &v);
+        }
+        if let Some(enc) = &h.accept_encoding {
+            // curl: an empty string means "every codec I can decode".
+            let v = if enc.is_empty() {
+                "gzip, deflate, br, zstd"
+            } else {
+                enc.as_str()
+            };
+            req = req.header("Accept-Encoding", v);
         }
         if let Some(body) = h.body.clone() {
             req = req.body(body);
