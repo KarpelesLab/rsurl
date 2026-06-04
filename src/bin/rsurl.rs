@@ -60,7 +60,7 @@ use rsurl::{CookieJar, HttpVersionPref, Request, Response, Url};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Args {
     urls: Vec<String>,
     output: Option<String>,
@@ -199,6 +199,8 @@ struct Args {
     retry_connrefused: bool,
     /// `--retry-all-errors`: retry on any error.
     retry_all_errors: bool,
+    /// `-g`/`--globoff`: disable URL globbing (`{}`/`[]` taken literally).
+    globoff: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -330,12 +332,37 @@ fn main() -> ExitCode {
     };
 
     // Run each operation's URLs; remember the last non-zero exit code.
+    // URL globbing ({a,b} / [1-100]) expands one URL into many transfers,
+    // unless -g/--globoff is set; `#N` in -o names picks the N-th glob value.
     let mut last_failure: u8 = 0;
     for op in &ops {
         for url in &op.urls {
-            let code = process_url(url, op, jar.as_mut());
-            if code != 0 {
-                last_failure = code;
+            let expansions = if op.globoff {
+                vec![(url.clone(), Vec::new())]
+            } else {
+                match glob_expand(url) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if show_errors(op) {
+                            eprintln!("rsurl: {e}");
+                        }
+                        last_failure = 3;
+                        continue;
+                    }
+                }
+            };
+            for (eurl, caps) in expansions {
+                let code =
+                    if !caps.is_empty() && op.output.as_ref().is_some_and(|o| o.contains('#')) {
+                        let mut op2 = op.clone();
+                        op2.output = op.output.as_ref().map(|o| apply_glob_output(o, &caps));
+                        process_url(&eurl, &op2, jar.as_mut())
+                    } else {
+                        process_url(&eurl, op, jar.as_mut())
+                    };
+                if code != 0 {
+                    last_failure = code;
+                }
             }
         }
     }
@@ -435,6 +462,168 @@ fn expand_short_bundles(tokens: &[String]) -> Vec<String> {
             }
             i += 1;
         }
+    }
+    out
+}
+
+/// A URL glob is a sequence of literal runs and brace/bracket sets.
+enum GlobSeg {
+    Lit(String),
+    Set(Vec<String>),
+}
+
+/// Parse curl-style URL globs: `{a,b,c}` alternation and `[1-100]` / `[a-z]`
+/// ranges with an optional `:step`. `\{`/`\[` escape a literal. Returns the
+/// segment list, or an error for a malformed glob.
+fn parse_glob(url: &str) -> Result<Vec<GlobSeg>, String> {
+    let mut segs = Vec::new();
+    let mut lit = String::new();
+    let chars: Vec<char> = url.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() => {
+                lit.push(chars[i + 1]);
+                i += 2;
+            }
+            '{' => {
+                let close = find_close(&chars, i, '{', '}')
+                    .ok_or_else(|| format!("unmatched '{{' in URL glob: {url:?}"))?;
+                let inner: String = chars[i + 1..close].iter().collect();
+                let items: Vec<String> = inner.split(',').map(|s| s.to_string()).collect();
+                if !lit.is_empty() {
+                    segs.push(GlobSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(GlobSeg::Set(items));
+                i = close + 1;
+            }
+            '[' => {
+                let close = find_close(&chars, i, '[', ']')
+                    .ok_or_else(|| format!("unmatched '[' in URL glob: {url:?}"))?;
+                let inner: String = chars[i + 1..close].iter().collect();
+                let items = expand_range(&inner)
+                    .ok_or_else(|| format!("bad range '[{inner}]' in URL glob"))?;
+                if !lit.is_empty() {
+                    segs.push(GlobSeg::Lit(std::mem::take(&mut lit)));
+                }
+                segs.push(GlobSeg::Set(items));
+                i = close + 1;
+            }
+            c => {
+                lit.push(c);
+                i += 1;
+            }
+        }
+    }
+    if !lit.is_empty() {
+        segs.push(GlobSeg::Lit(lit));
+    }
+    Ok(segs)
+}
+
+fn find_close(chars: &[char], open_at: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0;
+    for (k, &c) in chars.iter().enumerate().skip(open_at) {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Expand a `[...]` range body: `1-100`, `001-100`, `a-z`, each with optional
+/// `:step`.
+fn expand_range(body: &str) -> Option<Vec<String>> {
+    let (range, step) = match body.split_once(':') {
+        Some((r, s)) => (r, s.parse::<usize>().ok().filter(|&s| s > 0)?),
+        None => (body, 1),
+    };
+    let (start, end) = range.split_once('-')?;
+    // Numeric range (with optional zero-padding to the start's width).
+    if let (Ok(a), Ok(b)) = (start.parse::<u64>(), end.parse::<u64>()) {
+        let width = if start.starts_with('0') && start.len() > 1 {
+            start.len()
+        } else {
+            0
+        };
+        let mut out = Vec::new();
+        let mut v = a;
+        while v <= b {
+            out.push(format!("{v:0width$}"));
+            v += step as u64;
+        }
+        return Some(out);
+    }
+    // Single-char alpha range.
+    let (sc, ec) = (start.chars().next()?, end.chars().next()?);
+    if start.chars().count() == 1 && end.chars().count() == 1 && sc <= ec {
+        let mut out = Vec::new();
+        let mut c = sc as u32;
+        while c <= ec as u32 {
+            if let Some(ch) = char::from_u32(c) {
+                out.push(ch.to_string());
+            }
+            c += step as u32;
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Expand a URL's globs into concrete `(url, captures)` pairs. `captures[k]` is
+/// the chosen value of the k-th set, for `#N` output-name substitution.
+fn glob_expand(url: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let segs = parse_glob(url)?;
+    let mut results = vec![(String::new(), Vec::new())];
+    for seg in &segs {
+        match seg {
+            GlobSeg::Lit(s) => {
+                for (u, _) in results.iter_mut() {
+                    u.push_str(s);
+                }
+            }
+            GlobSeg::Set(items) => {
+                let mut next = Vec::with_capacity(results.len() * items.len());
+                for (u, caps) in &results {
+                    for item in items {
+                        let mut nu = u.clone();
+                        nu.push_str(item);
+                        let mut nc = caps.clone();
+                        nc.push(item.clone());
+                        next.push((nu, nc));
+                    }
+                }
+                results = next;
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Substitute `#1`..`#9` in an output-name template with glob captures.
+fn apply_glob_output(template: &str, caps: &[String]) -> String {
+    if caps.is_empty() || !template.contains('#') {
+        return template.to_string();
+    }
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '#' {
+            if let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
+                chars.next();
+                let idx = d as usize;
+                if idx >= 1 && idx <= caps.len() {
+                    out.push_str(&caps[idx - 1]);
+                    continue;
+                }
+            }
+        }
+        out.push(c);
     }
     out
 }
@@ -1825,6 +2014,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             }
             "--retry-connrefused" => a.retry_connrefused = true,
             "--retry-all-errors" => a.retry_all_errors = true,
+            "-g" | "--globoff" => a.globoff = true,
             "-4" | "--ipv4" => a.ipv4 = true,
             "-6" | "--ipv6" => a.ipv6 = true,
             "-#" | "--progress-bar" => a.progress_bar = true,
@@ -2911,6 +3101,7 @@ Options:
       --fail-with-body     exit 22 on HTTP >= 400 but still write the body
       --proto <spec>       restrict allowed schemes (e.g. =https,http)
       --proto-default <s>  scheme for URLs given without one
+  -g, --globoff            disable URL globbing ({{}} and [] taken literally)
   -4, --ipv4               connect over IPv4 only
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
@@ -2953,6 +3144,39 @@ mod tests {
             Some(784111777)
         );
         assert_eq!(epoch_to_httpdate(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn glob_brace_and_range_expand() {
+        let urls: Vec<String> = glob_expand("http://h/{a,b}/[1-3]")
+            .unwrap()
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "http://h/a/1",
+                "http://h/a/2",
+                "http://h/a/3",
+                "http://h/b/1",
+                "http://h/b/2",
+                "http://h/b/3",
+            ]
+        );
+    }
+
+    #[test]
+    fn glob_zero_padded_and_step_and_alpha() {
+        assert_eq!(expand_range("08-11").unwrap(), vec!["08", "09", "10", "11"]);
+        assert_eq!(expand_range("1-10:3").unwrap(), vec!["1", "4", "7", "10"]);
+        assert_eq!(expand_range("a-e:2").unwrap(), vec!["a", "c", "e"]);
+    }
+
+    #[test]
+    fn glob_output_substitution() {
+        let (_, caps) = &glob_expand("img[1-2].jpg").unwrap()[0];
+        assert_eq!(apply_glob_output("out-#1.bin", caps), "out-1.bin");
     }
 
     #[test]

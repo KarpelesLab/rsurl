@@ -1898,3 +1898,35 @@ fn cli_time_cond_sends_if_modified_since() {
         Some("Sun, 06 Nov 1994 08:49:37 GMT")
     );
 }
+
+/// URL globbing: `[1-3]` expands into three transfers.
+#[test]
+fn cli_url_globbing_expands_range() {
+    use std::process::Command;
+    let server = TestServer::start(|req: SReq| SResp::ok(req.path.clone()));
+    let url = format!("{}[1-3]", server.url("/p"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", &url])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"/p1/p2/p3");
+}
+
+/// `-g/--globoff` disables globbing — the brackets reach the server literally.
+#[test]
+fn cli_globoff_keeps_brackets() {
+    use std::process::Command;
+    let server = TestServer::start(|req: SReq| SResp::ok(req.path.clone()));
+    let url = format!("{}[1-3]", server.url("/p"));
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "-g", &url])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"/p[1-3]");
+}
