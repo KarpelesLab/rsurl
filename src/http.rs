@@ -207,6 +207,46 @@ impl Request {
         self
     }
 
+    /// Sign the request with AWS Signature V4 (curl `--aws-sigv4`). `spec` is
+    /// curl-style `provider1[:provider2[:region[:service]]]`; `region`/`service`
+    /// default to the URL host's 2nd/1st labels (else `us-east-1`/`s3`). Adds
+    /// `Authorization` + `X-Amz-Date` + `X-Amz-Content-Sha256` headers.
+    pub fn aws_sigv4(mut self, spec: &str, access: &str, secret: &str) -> Self {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let labels: Vec<&str> = self.url.host.split('.').collect();
+        let region = parts
+            .get(2)
+            .filter(|s| !s.is_empty())
+            .copied()
+            .or_else(|| labels.get(1).copied())
+            .unwrap_or("us-east-1");
+        let service = parts
+            .get(3)
+            .filter(|s| !s.is_empty())
+            .copied()
+            .or_else(|| labels.first().copied())
+            .unwrap_or("s3");
+        let (path, query) = match self.url.path.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (self.url.path.clone(), String::new()),
+        };
+        let amz = crate::sigv4::amz_date_now();
+        let cfg = crate::sigv4::SigV4 {
+            access_key: access,
+            secret_key: secret,
+            region,
+            service,
+        };
+        let host = self.url.host.clone();
+        let method = self.method.clone();
+        let body = self.body.clone();
+        for (k, v) in crate::sigv4::sign(&cfg, &method, &host, &path, &query, &body, &amz) {
+            self.headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(&k));
+            self.headers.push((k, v));
+        }
+        self
+    }
+
     /// Minimum acceptable TLS version (curl `--tlsv1.x`).
     pub fn tls_min_version(mut self, v: crate::tls::ProtocolVersion) -> Self {
         self.tls_min = Some(v);

@@ -221,6 +221,8 @@ struct Args {
     digest: bool,
     /// `--oauth2-bearer <token>`: send `Authorization: Bearer <token>`.
     bearer: Option<String>,
+    /// `--aws-sigv4 <provider...>`: sign the request with AWS Signature V4.
+    aws_sigv4: Option<String>,
     /// `-Z`/`--parallel`: run this invocation's transfers concurrently.
     parallel: bool,
     /// `--parallel-max <n>`: cap on concurrent transfers (default 50).
@@ -1792,6 +1794,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             req = req.header("Authorization", &format!("Bearer {token}"));
         }
     }
+    if let (Some(spec), Some((ak, sk))) = (&args.aws_sigv4, &args.basic_auth) {
+        req = req.aws_sigv4(spec, ak, sk);
+    }
     if args.no_idn {
         req = req.idn(false);
     }
@@ -2027,6 +2032,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 at_file_ok: true,
             }),
             "--oauth2-bearer" => a.bearer = Some(next_val(&mut it, arg)?),
+            "--aws-sigv4" => a.aws_sigv4 = Some(next_val(&mut it, arg)?),
             "--data-raw" => a.data_parts.push(DataPart::Plain {
                 value: next_val(&mut it, arg)?,
                 at_file_ok: false,
@@ -3575,6 +3581,7 @@ Options:
   -u, --user <user:pass>   HTTP Basic auth credentials
       --digest             use HTTP Digest auth with -u credentials
       --oauth2-bearer <t>  send Authorization: Bearer <token>
+      --aws-sigv4 <spec>   sign with AWS SigV4 (e.g. aws:amz:us-east-1:s3, -u key:secret)
   -k, --insecure           don't verify the TLS certificate chain
       --cacert <file>      PEM bundle to use instead of system trust
       --tlsv1.2/1.3        require at least this TLS version (floor)

@@ -2338,3 +2338,40 @@ fn cli_parallel_glob_downloads() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--aws-sigv4` adds an AWS4-HMAC-SHA256 Authorization plus x-amz-* headers.
+#[test]
+fn cli_aws_sigv4_signs() {
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    let hdrs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let h2 = Arc::clone(&hdrs);
+    let server = TestServer::start(move |req: SReq| {
+        *h2.lock().unwrap() = req.headers.clone();
+        SResp::ok("ok")
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--aws-sigv4",
+            "aws:amz:us-east-1:s3",
+            "-u",
+            "AKID:SECRET",
+            &server.url("/bucket/key"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    let h = hdrs.lock().unwrap();
+    let get = |n: &str| {
+        h.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.clone())
+    };
+    let auth = get("authorization").expect("authorization header");
+    assert!(auth.starts_with("AWS4-HMAC-SHA256 "), "got: {auth}");
+    assert!(auth.contains("Credential=AKID/"));
+    assert!(auth.contains("/us-east-1/s3/aws4_request"));
+    assert!(get("x-amz-date").is_some());
+    assert!(get("x-amz-content-sha256").is_some());
+}

@@ -14,6 +14,7 @@ mod error;
 mod http;
 mod idn;
 mod pool;
+mod sigv4;
 mod smtp;
 mod telnet;
 mod transfer;
