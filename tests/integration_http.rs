@@ -2521,3 +2521,36 @@ fn cli_exit_codes_connect_and_url() {
         .expect("spawn rsurl");
     assert_eq!(bad.code(), Some(3), "malformed URL should exit 3");
 }
+
+/// `--json` sends the body as application/json, sets Accept: application/json,
+/// and defaults the method to POST.
+#[test]
+fn cli_json_flag_sets_content_type_and_accept() {
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    // (method, headers, body) — aliased so clippy::type_complexity is happy.
+    type Cap = Arc<Mutex<Option<(String, Vec<(String, String)>, Vec<u8>)>>>;
+    let cap: Cap = Arc::new(Mutex::new(None));
+    let c2 = Arc::clone(&cap);
+    let server = TestServer::start(move |req: SReq| {
+        *c2.lock().unwrap() = Some((req.method.clone(), req.headers.clone(), req.body.clone()));
+        SResp::ok("ok")
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "--json", r#"{"a":1}"#, &server.url("/")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    let g = cap.lock().unwrap();
+    let (method, headers, body) = g.as_ref().expect("request captured");
+    assert_eq!(method, "POST");
+    assert_eq!(body, br#"{"a":1}"#);
+    let hv = |n: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(n))
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(hv("content-type"), Some("application/json"));
+    assert_eq!(hv("accept"), Some("application/json"));
+}

@@ -75,6 +75,10 @@ struct Args {
     /// each part's encoded bytes joined with `b"&"`. See [`DataPart`] and
     /// [`assemble_form_body`].
     data_parts: Vec<DataPart>,
+    /// One entry per `--json` flag, in order. The body is the verbatim
+    /// concatenation of every part (each may be `@file`); it also sets
+    /// `Content-Type` and `Accept` to `application/json`.
+    json_parts: Vec<String>,
     user_agent: Option<String>,
     referer: Option<String>,
     /// Most recent HTTP version flag (--http2, --http1.1, --http3,
@@ -1481,12 +1485,28 @@ fn build_multipart_body(parts: &[FormPart], escape: bool) -> Result<AssembledBod
 fn assemble_request_body(args: &Args) -> Result<Option<AssembledBody>, String> {
     let n = (!args.data_parts.is_empty()) as u8
         + (!args.form_parts.is_empty()) as u8
-        + args.upload_file.is_some() as u8;
+        + args.upload_file.is_some() as u8
+        + (!args.json_parts.is_empty()) as u8;
     if n > 1 {
-        return Err("-d/--data, -F/--form, and -T/--upload-file are mutually exclusive".into());
+        return Err(
+            "-d/--data, -F/--form, -T/--upload-file, and --json are mutually exclusive".into(),
+        );
     }
     if let Some(path) = &args.upload_file {
         return build_upload_body(path).map(Some);
+    }
+    // --json: verbatim concatenation of every part (each may be @file), sent as
+    // application/json. The matching Accept header is added by the caller.
+    if !args.json_parts.is_empty() {
+        let mut out: Vec<u8> = Vec::new();
+        for v in &args.json_parts {
+            if let Some(path) = v.strip_prefix('@') {
+                out.extend_from_slice(&read_at_file(path)?);
+            } else {
+                out.extend_from_slice(v.as_bytes());
+            }
+        }
+        return Ok(Some((out, "application/json".into(), "POST")));
     }
     if !args.form_parts.is_empty() {
         return build_multipart_body(&args.form_parts, args.form_escape).map(Some);
@@ -1715,6 +1735,11 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // decode a compressed response; this just asks the server to send one.)
     if args.compressed && !has_header("accept-encoding") {
         req = req.header("Accept-Encoding", "gzip, deflate, br, zstd");
+    }
+    // `--json`: also request a JSON response (curl sets Accept too). The
+    // Content-Type is applied via the assembled body's content type below.
+    if !args.json_parts.is_empty() && !has_header("accept") {
+        req = req.header("Accept", "application/json");
     }
     // `-r`/`--range`: a bare range becomes `bytes=<range>`.
     if let Some(r) = &args.range {
@@ -2041,6 +2066,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 value: next_val(&mut it, arg)?,
                 at_file_ok: true,
             }),
+            "--json" => a.json_parts.push(next_val(&mut it, arg)?),
             "--oauth2-bearer" => a.bearer = Some(next_val(&mut it, arg)?),
             "--aws-sigv4" => a.aws_sigv4 = Some(next_val(&mut it, arg)?),
             "--data-raw" => a.data_parts.push(DataPart::Plain {
@@ -3687,6 +3713,8 @@ Options:
       --data-binary <body> like -d but @file is read verbatim (no strip)
       --data-urlencode <s> percent-encode <s> before sending. Forms:
                              text  =text  name=text  @file  name@file
+      --json <data>        POST <data> as application/json and set Accept to
+                           application/json; @file reads verbatim. Repeatable.
   -F, --form <name=value>  add a multipart/form-data part. Value forms:
                              text  @file (upload)  <file (field from file)
                            Modifiers: ;type=  ;filename=  ;headers=@hdrfile
