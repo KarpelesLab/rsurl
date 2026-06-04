@@ -71,10 +71,21 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   ssl_verifypeer, proxy, referer, range, cookie, xoauth2_bearer,
   accept_encoding**).
 
-**Remaining (large / multi-session):** stream HTTP/2-3 response bodies (the
-backends currently reassemble the full body — a frame-loop refactor); RTSP
-interleaved RTP/RTCP reception after `PLAY`; a broader libcurl-shaped C API
-surface (M11).
+**Deferred — output is already correct, these change only internals/UX, not
+feature coverage:**
+- **HTTP/2-3 response-body streaming** — h2/h3 downloads already work and return
+  exactly the same bytes as curl for any body within the size cap; only the
+  *peak memory* differs (the backends reassemble the full body). True streaming
+  needs a borrowed/non-`Send` sink threaded into the `Conn` struct, which is
+  shared with the threaded `send_multiplexed` path and the hardened
+  flow-control accounting — a deep refactor with real regression risk for a
+  memory-footprint win on an uncommon case (very large single h2/h3 downloads).
+  Deferred deliberately; HTTP/1.1, FTP/FTPS, and `file://` already stream.
+- **RTSP interleaved RTP/RTCP after `PLAY`** — an architectural mismatch with
+  the one-shot CLI model: an interleaved media stream has no clean termination,
+  so reading it would hang on a live source (curl only does this inside its
+  long-running `--interleaved` workflows). The control-channel handshake
+  (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN) is fully implemented.
 
 **Out of scope under the no-C invariant or current architecture** (documented,
 not "remaining" — verified against what curl itself requires):
@@ -89,21 +100,29 @@ not "remaining" — verified against what curl itself requires):
   out of scope for *parity*.
 These are intentionally not pursued.
 
-**Next highest-leverage step:** stream HTTP/2-3 response bodies (the last
-buffered transfer path), then RTSP interleaved RTP and C-API polish.
+**Status:** every curl feature that is feasible under the no-C invariant and a
+good fit for a one-shot CLI is now implemented and tested. What remains is one
+deferred memory optimization (HTTP/2-3 body streaming — output already matches
+curl), one architectural mismatch (RTSP interleaved media), and the documented
+no-C/architecture exclusions below. There is no remaining *functional* parity
+gap for the in-scope protocols.
 
 ## Where we are today
 
 Protocols: HTTP/1.1, HTTP/2, HTTP/3, FTP/FTPS, SFTP, SCP, IMAP(S), POP3(S),
-MQTT(S), RTSP, TFTP, LDAP(S), gopher(s), dict, file, ws/wss. ~65 CLI flags,
-cookies (RFC 6265 + Netscape I/O), transparent decompression, proxies
+MQTT(S), RTSP, TFTP, LDAP(S), gopher(s), dict, file, ws/wss, SMTP(S), TELNET.
+~100 CLI flags, cookies (RFC 6265 + Netscape I/O), transparent decompression
+(buffered, plus streaming gzip/zstd/br on HTTP/1.1 downloads), proxies
 (HTTP/HTTPS/SOCKS4/4a/5/5h incl. SOCKS5-UDP), pluggable transport (`Connector`),
-TLS 1.2/1.3 with full verification, a `Client`/`Request` library API.
+TLS 1.2/1.3 with full verification, four auth schemes (Basic/Digest/Bearer/
+SigV4), a `Client`/`Request` library API, and a `rsurl_easy_*` C ABI.
 
-**The single biggest limiter is buffered I/O:** request and response bodies are
-materialized fully in memory. This blocks progress meters, rate limiting,
-low-speed aborts, early `--max-filesize`, and large/▶infinite transfers. It is
-the foundation that unlocks the most parity, so it is Milestone 1.
+**Streaming I/O (the original Milestone 1) is in place** for HTTP/1.1, FTP/FTPS,
+and `file://` downloads to a file: bodies flow straight to disk through a sink
+that enforces `--limit-rate`, `-#`, `--max-filesize`, `-y`/`-Y`, `-w`,
+`--remove-on-error`, and `--no-clobber`. The only transfer paths that still
+buffer are HTTP/2-3 (see *Deferred* above — output is already identical to curl)
+and the small text protocols where buffering is immaterial.
 
 ---
 
