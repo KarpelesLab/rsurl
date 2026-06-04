@@ -3121,11 +3121,29 @@ fn run_ftp_download(url: &Url, args: &Args) -> u8 {
         last_tick: now,
     };
     let result = client.transfer_url_to(url, &mut sink);
+    let time_total = now.elapsed();
+    let written = sink.written;
     if args.progress_bar && !args.silent {
         eprintln!();
     }
     match result {
-        Ok(_) => 0,
+        Ok(_) => {
+            // FTP has no HTTP response, but curl still honors -w: report
+            // %{size_download}, %{time_total}, %{url_effective}, etc. against a
+            // synthetic empty response (http_code renders 0, as curl does).
+            if args.write_out.is_some() {
+                let resp = rsurl::Response {
+                    status: 0,
+                    reason: String::new(),
+                    version: String::new(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    timing: rsurl::Timing::default(),
+                };
+                run_write_out(&resp, url, args, time_total, written);
+            }
+            0
+        }
         Err(e) => {
             if args.remove_on_error {
                 drop(sink);

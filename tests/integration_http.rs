@@ -2688,17 +2688,21 @@ fn cli_ftp_download_streams_to_file() {
     });
 
     let out_path = tmp_out_path("ftp-dl");
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
         .args([
             "-s",
             "-o",
             out_path.to_str().unwrap(),
+            "-w",
+            "%{size_download}",
             &format!("ftp://127.0.0.1:{ctrl_port}/file.txt"),
         ])
-        .status()
+        .output()
         .expect("spawn rsurl");
     let _ = handle.join();
-    assert!(status.success(), "ftp download should succeed");
+    assert!(out.status.success(), "ftp download should succeed");
     assert_eq!(std::fs::read(&out_path).unwrap(), b"FTP-STREAMED-BODY");
+    // -w works for FTP too: size_download is the streamed byte count (17).
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "17");
     let _ = std::fs::remove_file(&out_path);
 }
