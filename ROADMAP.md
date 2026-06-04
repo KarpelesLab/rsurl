@@ -28,7 +28,7 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   **bundled short flags** (`-sS`, `-ofile`).
 - **M4 (HTTP breadth, partial)**: `-z/--time-cond`, `-e ;auto`, `--output-dir`,
   `--fail-with-body`, `--proto`/`--proto-default`, `--location-trusted`,
-  `--post301/302/303`, `--connect-to`.
+  `--post301/302/303`, `--connect-to`, **`--json`** (POST JSON + Accept).
 - **M7 URL globbing**: `{a,b}`, `[1-100]`/`[a-z]` (`:step`, zero-pad), `-g`, `#N`.
 - **M6 (connection control, partial)**: `--connect-to`, `--unix-socket`.
 - **M2 (TLS, partial)**: `--tlsv1.x` / `--tls-max` version pinning (both backends).
@@ -44,20 +44,29 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   compressed, and empty bodies fall back to buffered.
 - **M5 (partial, on streaming)**: enforced `--max-filesize` (early abort),
   `--limit-rate`, `-#` progress, and **`-y`/`-Y` low-speed abort** (exit 28) for
-  file downloads; `-w %{size_download}` and **`-w` phase timers**
-  (`%{time_connect,appconnect,pretransfer,starttransfer}`, HTTP/1.1 paths).
+  file downloads; **`--remove-on-error`**, **`--no-clobber`**; `-w
+  %{size_download}`, **`-w` phase timers** (`%{time_connect,appconnect,
+  pretransfer,starttransfer}`, HTTP/1.1 paths), **`%header{Name}`**,
+  **`%{ssl_verify_result}`**.
 - **M3 (partial)**: **HTTP Digest** auth (`--digest`, MD5/SHA-256 + qop=auth),
   `--oauth2-bearer`, and **AWS SigV4** (`--aws-sigv4`, HMAC-SHA256 chain).
 - **M8**: `-Z/--parallel` + `--parallel-max` concurrent transfers.
+- **M11 (partial)**: centralized **curl-compatible exit codes** for transfer
+  errors (1/3/6/7/8/28/47/52/79).
 
 **Remaining (large / multi-session):** the rest of M1 (stream HTTP/2-3 and the
-file-transfer protocols; streaming decompression); M3 NTLM / Negotiate (needs
-pure-Rust Kerberos, out of scope); M9 SMB/RTMP; M10 protocol depth (FTP active
-mode, RTSP RTP, LDAP writes); M11 polish (exit-code sweep, man page,
-libcurl-shaped C API).
+file-transfer protocols; streaming decompression); M9 SMB/RTMP; M10 protocol
+depth (FTP active mode, RTSP RTP, LDAP writes); M11 polish (man page,
+libcurl-shaped C API surface).
+
+**Out of scope under the no-C invariant or current architecture** (documented,
+not "remaining"): **NTLM** — its handshake binds auth to a single TCP
+connection, which rsurl's stateless send/retry model does not expose; a
+pool-reuse hack would be unreliable. **Negotiate/Kerberos (GSSAPI)** and
+**c-ares DNS** — require C libraries. These are intentionally not pursued.
 
 **Next highest-leverage steps:** stream the file-transfer protocols and HTTP/2-3
-bodies (rest of M1), then M3 NTLM, M10 protocol depth, and M11 polish.
+bodies (rest of M1), then M10 protocol depth and M11 polish (man page).
 
 ## Where we are today
 
