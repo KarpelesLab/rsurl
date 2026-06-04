@@ -99,6 +99,10 @@ pub struct Request {
     /// Preserve the request method (don't rewrite POST→GET) on 301/302/303
     /// respectively (curl `--post301`/`--post302`/`--post303`).
     pub(crate) keep_post: [bool; 3],
+    /// Connect-target overrides (curl `--connect-to`):
+    /// `(from_host, from_port, to_host, to_port)`. An empty from-host or a
+    /// from-port of 0 is a wildcard. The `Host:`/SNI stay the request's.
+    pub(crate) connect_to: Vec<(String, u16, String, u16)>,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -182,7 +186,27 @@ impl Request {
             auto_referer: false,
             redirect_trusted: false,
             keep_post: [false; 3],
+            connect_to: Vec::new(),
         })
+    }
+
+    /// Add a connect-target override (curl `--connect-to`): requests to
+    /// `from_host:from_port` instead connect to `to_host:to_port`, keeping the
+    /// original `Host:`/SNI. Empty `from_host` / zero `from_port` are wildcards.
+    pub fn connect_to(
+        mut self,
+        from_host: &str,
+        from_port: u16,
+        to_host: &str,
+        to_port: u16,
+    ) -> Self {
+        self.connect_to.push((
+            from_host.to_string(),
+            from_port,
+            to_host.to_string(),
+            to_port,
+        ));
+        self
     }
 
     /// Keep `Authorization`/`Cookie` on cross-host redirects (curl
@@ -1138,6 +1162,22 @@ fn finalize_tls(
 /// [`connect_tunnel`] on the returned socket before any TLS handshake.
 /// This function intentionally stops at "TCP connected" so that the
 /// HTTP/1.1 and HTTP/2 paths can share the same tunnel logic.
+/// Apply `--connect-to` remapping to a dial target. An empty from-host or a
+/// zero from-port matches any. An empty to-host / zero to-port keeps the
+/// original. First match wins.
+fn apply_connect_to(rules: &[(String, u16, String, u16)], host: &str, port: u16) -> (String, u16) {
+    for (fh, fp, th, tp) in rules {
+        let host_ok = fh.is_empty() || fh.eq_ignore_ascii_case(host);
+        let port_ok = *fp == 0 || *fp == port;
+        if host_ok && port_ok {
+            let new_host = if th.is_empty() { host } else { th.as_str() };
+            let new_port = if *tp == 0 { port } else { *tp };
+            return (new_host.to_string(), new_port);
+        }
+    }
+    (host.to_string(), port)
+}
+
 /// Resolve `host:port` to a single socket address, honoring `--resolve`
 /// overrides and the `-4`/`-6` address-family preference.
 fn resolve_target(host: &str, port: u16, req: &Request) -> Result<std::net::SocketAddr> {
@@ -1170,7 +1210,14 @@ pub(crate) fn tcp_connect(req: &Request, trace: &mut dyn Write) -> Result<TcpStr
         Some(p) => (p.host.as_str(), p.port, true),
         None => (req.url.host.as_str(), req.url.port, false),
     };
-    let first = resolve_target(target_host, target_port, req)?;
+    // --connect-to remaps the dial target (not the Host/SNI). Only for the
+    // direct (non-proxy) path.
+    let (target_host, target_port) = if via_proxy_label {
+        (target_host.to_string(), target_port)
+    } else {
+        apply_connect_to(&req.connect_to, target_host, target_port)
+    };
+    let first = resolve_target(&target_host, target_port, req)?;
     let _ = writeln!(trace, "*   Trying {first}...");
     let stream = match req.connect_timeout {
         Some(t) => TcpStream::connect_timeout(&first, t)?,

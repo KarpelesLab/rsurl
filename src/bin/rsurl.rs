@@ -207,6 +207,8 @@ struct Args {
     post301: bool,
     post302: bool,
     post303: bool,
+    /// `--connect-to <h1:p1:h2:p2>`: dial h2:p2 for requests to h1:p1.
+    connect_to: Vec<(String, u16, String, u16)>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1632,6 +1634,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if args.post303 {
         req = req.keep_post_on(303);
     }
+    for (fh, fp, th, tp) in &args.connect_to {
+        req = req.connect_to(fh, *fp, th, *tp);
+    }
     if let Some((u, p)) = &args.basic_auth {
         req = req.basic_auth(u, p);
     } else if args.netrc && parsed_url.userinfo.is_none() {
@@ -2040,6 +2045,29 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--post301" => a.post301 = true,
             "--post302" => a.post302 = true,
             "--post303" => a.post303 = true,
+            "--connect-to" => {
+                let spec = next_val(&mut it, arg)?;
+                let p: Vec<&str> = spec.split(':').collect();
+                if p.len() != 4 {
+                    return Err(format!(
+                        "--connect-to expects HOST1:PORT1:HOST2:PORT2: {spec:?}"
+                    ));
+                }
+                let port = |s: &str, what: &str| -> Result<u16, String> {
+                    if s.is_empty() {
+                        Ok(0)
+                    } else {
+                        s.parse()
+                            .map_err(|_| format!("--connect-to: bad {what} in {spec:?}"))
+                    }
+                };
+                a.connect_to.push((
+                    p[0].to_string(),
+                    port(p[1], "PORT1")?,
+                    p[2].to_string(),
+                    port(p[3], "PORT2")?,
+                ));
+            }
             "-4" | "--ipv4" => a.ipv4 = true,
             "-6" | "--ipv6" => a.ipv6 = true,
             "-#" | "--progress-bar" => a.progress_bar = true,
@@ -3129,6 +3157,8 @@ Options:
   -g, --globoff            disable URL globbing ({{}} and [] taken literally)
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
+      --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1
+                           (keeps the original Host:/SNI)
   -4, --ipv4               connect over IPv4 only
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)

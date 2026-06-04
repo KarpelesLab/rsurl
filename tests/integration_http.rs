@@ -1963,3 +1963,34 @@ fn cli_post302_preserves_method() {
         .expect("spawn");
     assert_eq!(downgraded.stdout, b"GET");
 }
+
+/// `--connect-to` dials a different address while keeping the original Host:.
+#[test]
+fn cli_connect_to_redirects_dial_keeps_host() {
+    use std::process::Command;
+    let server = TestServer::start(|req: SReq| {
+        let host = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        SResp::ok(host)
+    });
+    let port = server.addr.port();
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--connect-to",
+            &format!("origin.invalid:80:127.0.0.1:{port}"),
+            "http://origin.invalid/",
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"origin.invalid");
+}
