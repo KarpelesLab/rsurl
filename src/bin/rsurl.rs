@@ -219,6 +219,8 @@ struct Args {
     mail_rcpt: Vec<String>,
     /// `--digest`: use HTTP Digest auth with the `-u` credentials.
     digest: bool,
+    /// `--oauth2-bearer <token>`: send `Authorization: Bearer <token>`.
+    bearer: Option<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1687,6 +1689,15 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if args.digest {
         req = req.digest_auth(true);
     }
+    if let Some(token) = &args.bearer {
+        if !args
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+        {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+    }
     if args.no_idn {
         req = req.idn(false);
     }
@@ -1917,10 +1928,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                     .ok_or_else(|| format!("malformed header: {h:?}"))?;
                 a.headers.push((k.trim().to_string(), v.trim().to_string()));
             }
-            "-d" | "--data" => a.data_parts.push(DataPart::Plain {
+            "-d" | "--data" | "--data-ascii" => a.data_parts.push(DataPart::Plain {
                 value: next_val(&mut it, arg)?,
                 at_file_ok: true,
             }),
+            "--oauth2-bearer" => a.bearer = Some(next_val(&mut it, arg)?),
             "--data-raw" => a.data_parts.push(DataPart::Plain {
                 value: next_val(&mut it, arg)?,
                 at_file_ok: false,
@@ -3460,6 +3472,7 @@ Options:
       --max-redirs <n>     cap on redirect hops (default 50)
   -u, --user <user:pass>   HTTP Basic auth credentials
       --digest             use HTTP Digest auth with -u credentials
+      --oauth2-bearer <t>  send Authorization: Bearer <token>
   -k, --insecure           don't verify the TLS certificate chain
       --cacert <file>      PEM bundle to use instead of system trust
       --tlsv1.2/1.3        require at least this TLS version (floor)

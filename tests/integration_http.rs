@@ -2290,3 +2290,26 @@ fn cli_digest_auth() {
     assert!(a.contains("qop=auth"), "got: {a}");
     assert!(a.contains("response=\""), "got: {a}");
 }
+
+/// `--oauth2-bearer` sends `Authorization: Bearer <token>`.
+#[test]
+fn cli_oauth2_bearer() {
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    let cap: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let c2 = Arc::clone(&cap);
+    let server = TestServer::start(move |req: SReq| {
+        *c2.lock().unwrap() = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.clone());
+        SResp::ok("ok")
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", "--oauth2-bearer", "tok123", &server.url("/")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(out.status.success());
+    assert_eq!(cap.lock().unwrap().as_deref(), Some("Bearer tok123"));
+}
