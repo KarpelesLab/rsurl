@@ -33,6 +33,10 @@ pub struct TlsOpts {
     /// Roots to trust. When `None`, [`connect_over_tls`] loads the system
     /// bundle. When `Some`, that store is used as-is.
     pub roots: Option<RootCertStore>,
+    /// Minimum / maximum acceptable TLS version (curl `--tlsv1.x`/`--tls-max`).
+    /// `None` leaves the backend default (TLS 1.2–1.3).
+    pub min_version: Option<ProtocolVersion>,
+    pub max_version: Option<ProtocolVersion>,
 }
 
 impl TlsOpts {
@@ -43,7 +47,18 @@ impl TlsOpts {
             alpn: Vec::new(),
             verify: true,
             roots: None,
+            min_version: None,
+            max_version: None,
         }
+    }
+}
+
+/// Map the backend-neutral version to purecrypto's, clamping to the 1.2–1.3
+/// range the stack supports.
+fn to_pc_version(v: ProtocolVersion) -> purecrypto::tls::ProtocolVersion {
+    match v {
+        ProtocolVersion::TLSv1_3 => purecrypto::tls::ProtocolVersion::TLSv1_3,
+        _ => purecrypto::tls::ProtocolVersion::TLSv1_2,
     }
 }
 
@@ -114,6 +129,12 @@ pub fn connect_over_tls<S: Read + Write>(
         .verify_certificates(opts.verify);
     if !opts.alpn.is_empty() {
         builder = builder.alpn(opts.alpn);
+    }
+    if let Some(v) = opts.min_version {
+        builder = builder.min_version(to_pc_version(v));
+    }
+    if let Some(v) = opts.max_version {
+        builder = builder.max_version(to_pc_version(v));
     }
     let cfg = builder.build();
     let conn = Connection::client(&cfg).map_err(tls_err)?;

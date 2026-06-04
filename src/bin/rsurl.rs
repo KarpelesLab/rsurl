@@ -211,6 +211,9 @@ struct Args {
     connect_to: Vec<(String, u16, String, u16)>,
     /// `--unix-socket <path>`: route the connection through a Unix socket.
     unix_socket: Option<String>,
+    /// `--tlsv1.x` / `--tls-max`: TLS version floor / ceiling.
+    tls_min: Option<rsurl::tls::ProtocolVersion>,
+    tls_max: Option<rsurl::tls::ProtocolVersion>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1667,6 +1670,12 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if args.insecure {
         req = req.verify_tls(false);
     }
+    if let Some(v) = args.tls_min {
+        req = req.tls_min_version(v);
+    }
+    if let Some(v) = args.tls_max {
+        req = req.tls_max_version(v);
+    }
     if args.no_idn {
         req = req.idn(false);
     }
@@ -1977,6 +1986,18 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 a.basic_auth = Some((u, p));
             }
             "-k" | "--insecure" => a.insecure = true,
+            "--tlsv1" | "--tlsv1.0" | "--tlsv1.1" | "--tlsv1.2" => {
+                a.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_2)
+            }
+            "--tlsv1.3" => a.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_3),
+            "--tls-max" => {
+                let v = next_val(&mut it, arg)?;
+                a.tls_max = Some(match v.as_str() {
+                    "1.3" => rsurl::tls::ProtocolVersion::TLSv1_3,
+                    "1.0" | "1.1" | "1.2" => rsurl::tls::ProtocolVersion::TLSv1_2,
+                    other => return Err(format!("--tls-max: unsupported version {other:?}")),
+                });
+            }
             "--no-idn" => a.no_idn = true,
             "--cacert" => a.cacert = Some(next_val(&mut it, arg)?),
             "--max-time" => {
@@ -3143,6 +3164,8 @@ Options:
   -u, --user <user:pass>   HTTP Basic auth credentials
   -k, --insecure           don't verify the TLS certificate chain
       --cacert <file>      PEM bundle to use instead of system trust
+      --tlsv1.2/1.3        require at least this TLS version (floor)
+      --tls-max <ver>      cap the TLS version (1.2 or 1.3)
       --no-idn             don't convert international (IDN) hostnames to punycode
       --max-time <secs>    cap on the whole operation's wall time
       --connect-timeout <secs>

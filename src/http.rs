@@ -103,6 +103,9 @@ pub struct Request {
     /// `(from_host, from_port, to_host, to_port)`. An empty from-host or a
     /// from-port of 0 is a wildcard. The `Host:`/SNI stay the request's.
     pub(crate) connect_to: Vec<(String, u16, String, u16)>,
+    /// TLS version floor/ceiling (curl `--tlsv1.x` / `--tls-max`).
+    pub(crate) tls_min: Option<crate::tls::ProtocolVersion>,
+    pub(crate) tls_max: Option<crate::tls::ProtocolVersion>,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -187,7 +190,21 @@ impl Request {
             redirect_trusted: false,
             keep_post: [false; 3],
             connect_to: Vec::new(),
+            tls_min: None,
+            tls_max: None,
         })
+    }
+
+    /// Minimum acceptable TLS version (curl `--tlsv1.x`).
+    pub fn tls_min_version(mut self, v: crate::tls::ProtocolVersion) -> Self {
+        self.tls_min = Some(v);
+        self
+    }
+
+    /// Maximum acceptable TLS version (curl `--tls-max`).
+    pub fn tls_max_version(mut self, v: crate::tls::ProtocolVersion) -> Self {
+        self.tls_max = Some(v);
+        self
     }
 
     /// Add a connect-target override (curl `--connect-to`): requests to
@@ -926,6 +943,8 @@ pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls:
     let mut opts = crate::tls::TlsOpts::verifying();
     opts.alpn = alpn.iter().map(|p| p.to_vec()).collect();
     opts.verify = req.verify_tls;
+    opts.min_version = req.tls_min;
+    opts.max_version = req.tls_max;
     if let Some(path) = &req.ca_bundle {
         opts.roots = Some(crate::tls::load_roots_from_file(path)?);
     }

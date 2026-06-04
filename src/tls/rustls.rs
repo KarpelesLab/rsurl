@@ -42,6 +42,9 @@ pub struct TlsOpts {
     pub alpn: Vec<Vec<u8>>,
     pub verify: bool,
     pub roots: Option<RootCertStore>,
+    /// Minimum / maximum acceptable TLS version (curl `--tlsv1.x`/`--tls-max`).
+    pub min_version: Option<ProtocolVersion>,
+    pub max_version: Option<ProtocolVersion>,
 }
 
 impl TlsOpts {
@@ -50,6 +53,8 @@ impl TlsOpts {
             alpn: Vec::new(),
             verify: true,
             roots: None,
+            min_version: None,
+            max_version: None,
         }
     }
 }
@@ -151,12 +156,33 @@ pub fn connect_over_tls<S: Read + Write>(
     // handshake still validates the cryptographic binding between the
     // presented cert and the server's signed handshake — only chain trust
     // is skipped. This is what curl's -k does.
+    // Restrict the offered TLS versions if --tlsv1.x/--tls-max were given.
+    let rank = |v: ProtocolVersion| match v {
+        ProtocolVersion::TLSv1_3 => 3u8,
+        _ => 2u8,
+    };
+    let min = opts.min_version.map(rank).unwrap_or(0);
+    let max = opts.max_version.map(rank).unwrap_or(u8::MAX);
+    let versions: Vec<&'static rustls::SupportedProtocolVersion> =
+        if opts.min_version.is_none() && opts.max_version.is_none() {
+            rustls::ALL_VERSIONS.to_vec()
+        } else {
+            [&rustls::version::TLS12, &rustls::version::TLS13]
+                .into_iter()
+                .filter(|v| {
+                    let r = match v.version {
+                        rustls::ProtocolVersion::TLSv1_3 => 3u8,
+                        _ => 2u8,
+                    };
+                    r >= min && r <= max
+                })
+                .collect()
+        };
+    let builder = ClientConfig::builder_with_protocol_versions(&versions);
     let mut config = if opts.verify {
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        builder.with_root_certificates(roots).with_no_client_auth()
     } else {
-        ClientConfig::builder()
+        builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify::new()))
             .with_no_client_auth()
