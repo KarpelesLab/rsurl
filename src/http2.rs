@@ -1515,7 +1515,12 @@ struct Stream {
     /// been seen. `None` until then.
     response_headers: Option<Vec<(String, String)>>,
     /// Accumulator for response body bytes (DATA payloads, post-padding).
+    /// Stays empty when the body is streamed straight to a caller-supplied sink
+    /// (see [`Connection::process_data`]); `streamed_len` then holds the count.
     body: Vec<u8>,
+    /// Bytes written directly to the streaming sink (when streaming, `body` is
+    /// empty). Used only for the `* Received N body bytes` trace.
+    streamed_len: u64,
     /// True once the peer's END_STREAM has been observed.
     end_stream_recv: bool,
     /// Outbound request body not yet written, with a cursor into it. Used by
@@ -1547,6 +1552,7 @@ impl Stream {
             headers_buf: Vec::new(),
             response_headers: None,
             body: Vec::new(),
+            streamed_len: 0,
             end_stream_recv: false,
             pending_body: None,
         }
@@ -1872,7 +1878,7 @@ impl<S: Read + Write> Connection<S> {
                     if budget > 0 {
                         break;
                     }
-                    match self.read_and_dispatch()? {
+                    match self.read_and_dispatch(None)? {
                         DispatchOutcome::Continue => {}
                         DispatchOutcome::Done(done_id) if done_id == stream_id => {
                             // The peer ended our stream before we finished
@@ -1919,6 +1925,18 @@ impl<S: Read + Write> Connection<S> {
     /// Drive the connection's read side until `stream_id` reaches a terminal
     /// state, then remove that stream from the map and return it.
     fn drive_until_stream_done(&mut self, stream_id: u32) -> Result<Stream> {
+        self.drive_until_stream_done_to(stream_id, None)
+    }
+
+    /// As [`drive_until_stream_done`], but DATA payloads for `stream_id` are
+    /// written to `sink` instead of buffered (when the response permits — see
+    /// [`Connection::process_data`]). The reborrow keeps the `&mut` usable
+    /// across loop iterations.
+    fn drive_until_stream_done_to(
+        &mut self,
+        stream_id: u32,
+        mut sink: Option<&mut dyn Write>,
+    ) -> Result<Stream> {
         loop {
             // Has the stream already completed in an earlier dispatch?
             if let Some(s) = self.streams.get(&stream_id) {
@@ -1934,7 +1952,11 @@ impl<S: Read + Write> Connection<S> {
                 )));
             }
 
-            match self.read_and_dispatch()? {
+            let reborrow: Option<&mut dyn Write> = match &mut sink {
+                Some(w) => Some(&mut **w),
+                None => None,
+            };
+            match self.read_and_dispatch(reborrow)? {
                 DispatchOutcome::Continue => {}
                 DispatchOutcome::Done(done_id) if done_id == stream_id => {
                     return Ok(self.streams.remove(&stream_id).unwrap());
@@ -2169,7 +2191,7 @@ impl<S: Read + Write> Connection<S> {
             }
 
             // Read and dispatch one inbound frame.
-            let outcome = match self.read_and_dispatch() {
+            let outcome = match self.read_and_dispatch(None) {
                 Ok(o) => o,
                 Err(e) => {
                     // Distinguish a per-stream RST (carried as BadResponse from
@@ -2366,7 +2388,7 @@ impl<S: Read + Write> Connection<S> {
     /// connection-scoped frames (SETTINGS / PING / GOAWAY / WINDOW_UPDATE on
     /// stream 0) are handled here directly; stream-scoped frames are looked
     /// up in `self.streams` and dispatched.
-    fn read_and_dispatch(&mut self) -> Result<DispatchOutcome> {
+    fn read_and_dispatch(&mut self, sink: Option<&mut dyn Write>) -> Result<DispatchOutcome> {
         let frame = match read_frame(&mut self.tls) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -2374,12 +2396,16 @@ impl<S: Read + Write> Connection<S> {
             }
             Err(e) => return Err(Error::Io(e)),
         };
-        self.process_frame(frame)
+        self.process_frame(frame, sink)
     }
 
     /// Apply one already-read frame. Split out from `read_and_dispatch` so
     /// tests can drive the dispatch ladder with synthetic frames.
-    fn process_frame(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+    fn process_frame(
+        &mut self,
+        frame: Frame,
+        sink: Option<&mut dyn Write>,
+    ) -> Result<DispatchOutcome> {
         // RFC 9113 §6.10: between HEADERS-without-END_HEADERS and the
         // matching final CONTINUATION on the same stream, NO other frame
         // type — and no HEADERS/CONTINUATION on any other stream — may
@@ -2412,7 +2438,7 @@ impl<S: Read + Write> Connection<S> {
         let outcome = if frame.stream_id == 0 {
             self.process_conn_frame(frame)
         } else {
-            self.process_stream_frame(frame)
+            self.process_stream_frame(frame, sink)
         }?;
         let progress = self.made_progress || matches!(outcome, DispatchOutcome::Done(_));
         self.budget.record_progress(progress)?;
@@ -2517,11 +2543,15 @@ impl<S: Read + Write> Connection<S> {
 
     /// Stream-scoped frames (stream_id != 0). Validates the per-stream state
     /// machine and applies the frame.
-    fn process_stream_frame(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+    fn process_stream_frame(
+        &mut self,
+        frame: Frame,
+        sink: Option<&mut dyn Write>,
+    ) -> Result<DispatchOutcome> {
         match frame.typ {
             F_HEADERS => self.process_headers(frame),
             F_CONTINUATION => self.process_continuation(frame),
-            F_DATA => self.process_data(frame),
+            F_DATA => self.process_data(frame, sink),
             F_RST_STREAM => self.process_rst(frame),
             F_WINDOW_UPDATE => {
                 let inc = parse_window_update(&frame.payload)?;
@@ -2700,7 +2730,11 @@ impl<S: Read + Write> Connection<S> {
         })
     }
 
-    fn process_data(&mut self, frame: Frame) -> Result<DispatchOutcome> {
+    fn process_data(
+        &mut self,
+        frame: Frame,
+        sink: Option<&mut dyn Write>,
+    ) -> Result<DispatchOutcome> {
         let stream_id = frame.stream_id;
         let frame_bytes = frame.payload.len();
         // Connection window is billed regardless of whether the stream is
@@ -2763,11 +2797,21 @@ impl<S: Read + Write> Connection<S> {
             }
             payload = &payload[..payload.len() - pad_len];
         }
-        // Cumulative body cap. HTTP/2 flow control auto-replenishes (see the
-        // `replenish()` calls below), so it never stops a server that streams
-        // DATA forever — only an absolute ceiling does. Mirrors HTTP/3's
-        // `MAX_RESPONSE_BYTES`.
-        if s.body.len().saturating_add(payload.len()) > MAX_RESPONSE_BYTES {
+        // Stream the body straight to the caller's sink when possible: a sink
+        // is present, nothing has been buffered yet (so byte order is kept),
+        // and the response is not content-encoded (encoded bodies need the
+        // buffered decode path). Otherwise accumulate into `body`.
+        let encoded = s.response_headers.as_ref().is_some_and(|h| {
+            h.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+        });
+        let to_sink = sink.is_some() && !encoded && s.body.is_empty();
+        // Cumulative body cap for the *buffered* path. HTTP/2 flow control
+        // auto-replenishes (see the `replenish()` calls below), so it never
+        // stops a server that streams DATA forever — only an absolute ceiling
+        // does. Streamed-to-disk bytes aren't held in memory, so they are
+        // bounded by the sink (e.g. `--max-filesize`), like curl `-o`.
+        if !to_sink && s.body.len().saturating_add(payload.len()) > MAX_RESPONSE_BYTES {
             return Err(Error::BadResponse(
                 "response body exceeds size limit".into(),
             ));
@@ -2778,7 +2822,14 @@ impl<S: Read + Write> Connection<S> {
         // the empty-DATA spin we are guarding against. (Recorded after the
         // `s` borrow ends, below.)
         let appended_body = !payload.is_empty();
-        s.body.extend_from_slice(payload);
+        if to_sink {
+            if let Some(w) = sink {
+                w.write_all(payload)?;
+            }
+            s.streamed_len += payload.len() as u64;
+        } else {
+            s.body.extend_from_slice(payload);
+        }
         if end_stream {
             s.end_stream_recv = true;
         }
@@ -3263,6 +3314,93 @@ fn build_response_from_stream_labelled(
         body,
         timing: crate::http::Timing::default(),
     })
+}
+
+/// Like [`build_response_from_stream`] but for the streaming path: the body has
+/// already been written to `sink` by [`Connection::process_data`] (so
+/// `stream.body` is empty), unless it was a content-encoded response, which the
+/// streaming path deliberately buffers — in that case decode it now and write
+/// the plaintext to `sink`. The returned `Response` always carries an empty
+/// `body` (the bytes are in the sink).
+fn build_response_from_stream_streaming(
+    stream: Stream,
+    sink: &mut dyn Write,
+    trace: &mut dyn Write,
+) -> Result<Response> {
+    let headers = stream
+        .response_headers
+        .ok_or_else(|| Error::BadResponse("response ended before any HEADERS frame".into()))?;
+
+    let mut status: Option<u16> = None;
+    let mut clean_headers: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    for (k, v) in headers {
+        if k == ":status" {
+            status = Some(
+                v.parse::<u16>()
+                    .map_err(|_| Error::BadResponse(format!("bad :status {v:?}")))?,
+            );
+        } else if !k.starts_with(':') {
+            clean_headers.push((k, v));
+        }
+    }
+    let status = status.ok_or_else(|| Error::BadResponse("response missing :status".into()))?;
+
+    let _ = writeln!(trace, "< HTTP/2 {status}");
+    for (k, v) in &clean_headers {
+        let _ = writeln!(trace, "< {k}: {v}");
+    }
+    let _ = writeln!(trace, "< ");
+    let total = stream.body.len() as u64 + stream.streamed_len;
+    let _ = writeln!(trace, "* Received {total} body bytes (streamed)");
+
+    // `stream.body` is non-empty only on the buffered fallback (content-encoded
+    // response): decode it and write the plaintext through to the sink.
+    let (clean_headers, body) = crate::http::maybe_decode_body(clean_headers, stream.body, trace)?;
+    if !body.is_empty() {
+        sink.write_all(&body)?;
+    }
+
+    Ok(Response {
+        status,
+        reason: String::new(),
+        version: "HTTP/2".to_string(),
+        headers: clean_headers,
+        body: Vec::new(),
+        timing: crate::http::Timing::default(),
+    })
+}
+
+/// Streaming counterpart of [`run_one_request`]: response DATA is written to
+/// `sink` as it arrives rather than buffered (see
+/// [`Connection::drive_until_stream_done_to`]).
+fn run_one_request_to<S: Read + Write>(
+    conn: &mut Connection<S>,
+    req: &Request,
+    sink: &mut dyn Write,
+    trace: &mut dyn Write,
+) -> Result<Response> {
+    let stream_id = conn.open_stream()?;
+    trace_request(req, trace);
+    conn.send_request_on(stream_id, req)?;
+    let stream = conn.drive_until_stream_done_to(stream_id, Some(sink))?;
+    conn.prune_completed_streams();
+    build_response_from_stream_streaming(stream, sink, trace)
+}
+
+/// Stream an HTTP/2 response body straight to `sink` instead of buffering it.
+/// Always cold-dials (the streaming path does not pool) and closes the
+/// connection afterward; the returned [`Response`] carries an empty `body`.
+pub fn send_to(req: Request, sink: &mut dyn Write, trace: &mut dyn Write) -> Result<Response> {
+    if req.url.scheme != "https" {
+        return Err(Error::UnsupportedScheme(format!(
+            "http/2 over {} not supported",
+            req.url.scheme
+        )));
+    }
+    let mut fresh = dial_h2(&req, trace)?;
+    let resp = run_one_request_to(&mut fresh, &req, sink, trace)?;
+    let _ = writeln!(trace, "* Connection closed");
+    Ok(resp)
 }
 
 /// Build the HPACK-encoded header block for the request: pseudo-headers in the
@@ -4701,7 +4839,7 @@ mod tests {
             payload,
         };
         let mut conn = fake_conn();
-        let outcome = conn.process_frame(frame).unwrap();
+        let outcome = conn.process_frame(frame, None).unwrap();
         assert_eq!(outcome, DispatchOutcome::Continue);
         assert_eq!(conn.peer.max_frame_size, 32_768);
         assert_eq!(conn.peer.initial_window_size, 131_072);
@@ -4723,14 +4861,16 @@ mod tests {
         // a WINDOW_UPDATE on stream 0 grows the conn window.
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
-        conn.process_frame(window_update_frame(id, 10_000)).unwrap();
+        conn.process_frame(window_update_frame(id, 10_000), None)
+            .unwrap();
         assert_eq!(
             conn.streams.get(&id).unwrap().send_window.available,
             65_535 + 10_000
         );
         assert_eq!(conn.conn_send_window.available, 65_535);
 
-        conn.process_frame(window_update_frame(0, 5_000)).unwrap();
+        conn.process_frame(window_update_frame(0, 5_000), None)
+            .unwrap();
         assert_eq!(conn.conn_send_window.available, 65_535 + 5_000);
     }
 
@@ -4840,15 +4980,18 @@ mod tests {
         conn.streams.get_mut(&id_a).unwrap().state = StreamState::Open;
         conn.streams.get_mut(&id_b).unwrap().state = StreamState::Open;
 
-        conn.process_frame(synth_status_200_headers(id_a, false))
+        conn.process_frame(synth_status_200_headers(id_a, false), None)
             .unwrap();
-        conn.process_frame(synth_status_200_headers(id_b, false))
+        conn.process_frame(synth_status_200_headers(id_b, false), None)
             .unwrap();
-        conn.process_frame(synth_data(id_a, b"aaa", false)).unwrap();
-        conn.process_frame(synth_data(id_b, b"bbbb", false))
+        conn.process_frame(synth_data(id_a, b"aaa", false), None)
             .unwrap();
-        conn.process_frame(synth_data(id_a, b"AAA", true)).unwrap();
-        conn.process_frame(synth_data(id_b, b"BBBB", true)).unwrap();
+        conn.process_frame(synth_data(id_b, b"bbbb", false), None)
+            .unwrap();
+        conn.process_frame(synth_data(id_a, b"AAA", true), None)
+            .unwrap();
+        conn.process_frame(synth_data(id_b, b"BBBB", true), None)
+            .unwrap();
 
         assert_eq!(conn.streams.get(&id_a).unwrap().body, b"aaaAAA");
         assert_eq!(conn.streams.get(&id_b).unwrap().body, b"bbbbBBBB");
@@ -4860,7 +5003,7 @@ mod tests {
         // ignore. No error surfaces and nothing is accumulated.
         let mut conn = fake_conn();
         let outcome = conn
-            .process_frame(synth_data(7, b"orphaned", false))
+            .process_frame(synth_data(7, b"orphaned", false), None)
             .unwrap();
         assert_eq!(outcome, DispatchOutcome::Continue);
         // No stream was registered, so no body anywhere.
@@ -4877,13 +5020,13 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
-        conn.process_frame(synth_status_200_headers(id, false))
+        conn.process_frame(synth_status_200_headers(id, false), None)
             .unwrap();
 
         // OUR_INITIAL_WINDOW + 1 bytes overruns the 65_535 conn window.
         let overrun = vec![0u8; OUR_INITIAL_WINDOW as usize + 1];
         let err = conn
-            .process_frame(synth_data(id, &overrun, false))
+            .process_frame(synth_data(id, &overrun, false), None)
             .unwrap_err();
         match err {
             Error::BadResponse(m) => assert!(
@@ -4902,7 +5045,7 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
-        conn.process_frame(synth_status_200_headers(id, false))
+        conn.process_frame(synth_status_200_headers(id, false), None)
             .unwrap();
 
         // Give the conn window plenty of room so it stays >= 0.
@@ -4910,7 +5053,7 @@ mod tests {
 
         let overrun = vec![0u8; OUR_INITIAL_WINDOW as usize + 1];
         let err = conn
-            .process_frame(synth_data(id, &overrun, false))
+            .process_frame(synth_data(id, &overrun, false), None)
             .unwrap_err();
         match err {
             Error::BadResponse(m) => assert!(
@@ -4930,12 +5073,13 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
-        conn.process_frame(synth_status_200_headers(id, false))
+        conn.process_frame(synth_status_200_headers(id, false), None)
             .unwrap();
 
         let exact = vec![0u8; OUR_INITIAL_WINDOW as usize];
         // Must succeed; both windows reach exactly 0 before replenish runs.
-        conn.process_frame(synth_data(id, &exact, false)).unwrap();
+        conn.process_frame(synth_data(id, &exact, false), None)
+            .unwrap();
         assert_eq!(conn.streams.get(&id).unwrap().body.len(), exact.len());
     }
 
@@ -4958,7 +5102,7 @@ mod tests {
             stream_id: id1,
             payload: vec![0x88], // partial — but the gate triggers before HPACK
         };
-        conn.process_frame(frame).unwrap();
+        conn.process_frame(frame, None).unwrap();
         assert_eq!(conn.expecting_continuation, Some(id1));
 
         // CONTINUATION on stream 3 must error.
@@ -4968,7 +5112,7 @@ mod tests {
             stream_id: id3,
             payload: vec![],
         };
-        let err = conn.process_frame(bad).unwrap_err();
+        let err = conn.process_frame(bad, None).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
     }
 
@@ -4983,7 +5127,7 @@ mod tests {
         // that tips it over.
         conn.streams.get_mut(&id).unwrap().body = vec![0u8; MAX_RESPONSE_BYTES - 2];
         let err = conn
-            .process_frame(synth_data(id, b"abc", false))
+            .process_frame(synth_data(id, b"abc", false), None)
             .unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
         // The over-limit payload must not have been appended.
@@ -5003,13 +5147,13 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
-        conn.process_frame(synth_status_200_headers(id, false))
+        conn.process_frame(synth_status_200_headers(id, false), None)
             .unwrap();
         // The HEADERS above completed a block → progress, so the streak starts
         // fresh. Feed empty DATA frames until the guard fires.
         let mut err = None;
         for _ in 0..(MAX_NO_PROGRESS_FRAMES as usize + 10) {
-            match conn.process_frame(synth_data(id, b"", false)) {
+            match conn.process_frame(synth_data(id, b"", false), None) {
                 Ok(_) => {}
                 Err(e) => {
                     err = Some(e);
@@ -5031,6 +5175,26 @@ mod tests {
     }
 
     #[test]
+    fn process_data_streams_body_to_sink() {
+        // With a sink and an un-encoded 200 response, DATA payloads are written
+        // straight to the sink and never buffered in `body`.
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        conn.process_frame(synth_status_200_headers(id, false), None)
+            .unwrap();
+        let mut sink: Vec<u8> = Vec::new();
+        conn.process_frame(synth_data(id, b"hello ", false), Some(&mut sink))
+            .unwrap();
+        conn.process_frame(synth_data(id, b"world", true), Some(&mut sink))
+            .unwrap();
+        assert_eq!(sink, b"hello world");
+        let s = conn.streams.get(&id).unwrap();
+        assert_eq!(s.body.len(), 0, "streamed body must not be buffered");
+        assert_eq!(s.streamed_len, 11);
+    }
+
+    #[test]
     fn body_byte_resets_no_progress_counter() {
         // A single real DATA byte must reset the no-progress streak so a server
         // that legitimately interleaves small bodies with other frames is never
@@ -5039,15 +5203,17 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
-        conn.process_frame(synth_status_200_headers(id, false))
+        conn.process_frame(synth_status_200_headers(id, false), None)
             .unwrap();
 
         for _ in 0..(MAX_NO_PROGRESS_FRAMES - 1) {
-            conn.process_frame(synth_data(id, b"", false)).unwrap();
+            conn.process_frame(synth_data(id, b"", false), None)
+                .unwrap();
         }
         assert_eq!(conn.budget.no_progress, MAX_NO_PROGRESS_FRAMES - 1);
         // One real byte resets the streak.
-        conn.process_frame(synth_data(id, b"x", false)).unwrap();
+        conn.process_frame(synth_data(id, b"x", false), None)
+            .unwrap();
         assert_eq!(conn.budget.no_progress, 0);
         assert_eq!(conn.streams.get(&id).unwrap().body, b"x");
     }
@@ -5066,7 +5232,7 @@ mod tests {
                 stream_id: 0,
                 payload: Vec::new(),
             };
-            if let Err(e) = conn.process_frame(f) {
+            if let Err(e) = conn.process_frame(f, None) {
                 err = Some(e);
                 break;
             }
@@ -5091,7 +5257,7 @@ mod tests {
                 stream_id: 0,
                 payload: vec![0u8; 8],
             };
-            if let Err(e) = conn.process_frame(f) {
+            if let Err(e) = conn.process_frame(f, None) {
                 err = Some(e);
                 break;
             }
@@ -5114,7 +5280,7 @@ mod tests {
             // Unknown odd stream id (never opened) → process_rst returns
             // Continue; only the flood budget can stop the loop.
             let f = synth_rst((2 * i as u32) + 1001, 0);
-            if let Err(e) = conn.process_frame(f) {
+            if let Err(e) = conn.process_frame(f, None) {
                 err = Some(e);
                 break;
             }
@@ -5136,24 +5302,30 @@ mod tests {
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
         // HEADERS, no END_HEADERS — opens the continuation window. Payload is
         // raw HPACK bytes that we never decode (we error before END_HEADERS).
-        conn.process_frame(Frame {
-            typ: F_HEADERS,
-            flags: 0,
-            stream_id: id,
-            payload: vec![0u8; 8 * 1024],
-        })
+        conn.process_frame(
+            Frame {
+                typ: F_HEADERS,
+                flags: 0,
+                stream_id: id,
+                payload: vec![0u8; 8 * 1024],
+            },
+            None,
+        )
         .unwrap();
         // Keep feeding CONTINUATION fragments with no END_HEADERS; eventually
         // the aggregate buffer cap fires.
         let chunk = vec![0u8; 16 * 1024];
         let mut hit_cap = false;
         for _ in 0..(MAX_HEADERS_BUF / chunk.len() + 4) {
-            let r = conn.process_frame(Frame {
-                typ: F_CONTINUATION,
-                flags: 0,
-                stream_id: id,
-                payload: chunk.clone(),
-            });
+            let r = conn.process_frame(
+                Frame {
+                    typ: F_CONTINUATION,
+                    flags: 0,
+                    stream_id: id,
+                    payload: chunk.clone(),
+                },
+                None,
+            );
             if let Err(Error::BadResponse(_)) = r {
                 hit_cap = true;
                 break;
@@ -5465,7 +5637,7 @@ mod tests {
         assert!(conn.is_usable(), "no GOAWAY seen yet — still reusable");
 
         // Consume the GOAWAY that's sitting in the inbound buffer.
-        let outcome = conn.read_and_dispatch().unwrap();
+        let outcome = conn.read_and_dispatch(None).unwrap();
         assert_eq!(outcome, DispatchOutcome::Continue);
         assert_eq!(conn.goaway_received, Some(1));
         assert!(
@@ -5517,7 +5689,7 @@ mod tests {
             stream_id: 0,
             payload,
         };
-        conn.process_frame(frame).unwrap();
+        conn.process_frame(frame, None).unwrap();
 
         let expect = 65_535 + (131_072 - 65_535);
         assert_eq!(
@@ -5658,7 +5830,8 @@ mod tests {
         // A single 40_000-byte DATA frame drops both windows from 65_535 to
         // 25_535 — below the 32_767 half-threshold — so both replenish.
         let big = vec![0xa5u8; 40_000];
-        conn.process_frame(synth_data(id, &big, false)).unwrap();
+        conn.process_frame(synth_data(id, &big, false), None)
+            .unwrap();
 
         let out = drain_wire_out(&conn);
         let updates: Vec<&Frame> = out.iter().filter(|f| f.typ == F_WINDOW_UPDATE).collect();
@@ -5689,7 +5862,8 @@ mod tests {
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
 
-        conn.process_frame(synth_data(id, b"hello", false)).unwrap();
+        conn.process_frame(synth_data(id, b"hello", false), None)
+            .unwrap();
         let out = drain_wire_out(&conn);
         assert!(
             out.iter().all(|f| f.typ != F_WINDOW_UPDATE),
@@ -5708,7 +5882,7 @@ mod tests {
         // error. Driving it through the full dispatch ladder must surface it.
         let mut conn = fake_conn();
         let frame = window_update_frame(0, 0);
-        let err = conn.process_frame(frame).unwrap_err();
+        let err = conn.process_frame(frame, None).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
     }
 
@@ -5719,7 +5893,7 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         let frame = window_update_frame(id, 0);
-        let err = conn.process_frame(frame).unwrap_err();
+        let err = conn.process_frame(frame, None).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
     }
 
@@ -5730,7 +5904,9 @@ mod tests {
         // drive an oversized grant through dispatch.
         let mut conn = fake_conn();
         conn.conn_send_window.available = WINDOW_MAX - 1;
-        let err = conn.process_frame(window_update_frame(0, 5)).unwrap_err();
+        let err = conn
+            .process_frame(window_update_frame(0, 5), None)
+            .unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
     }
 
@@ -5740,7 +5916,9 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().send_window.available = WINDOW_MAX - 1;
-        let err = conn.process_frame(window_update_frame(id, 5)).unwrap_err();
+        let err = conn
+            .process_frame(window_update_frame(id, 5), None)
+            .unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)));
     }
 

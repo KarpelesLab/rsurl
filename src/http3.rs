@@ -1447,6 +1447,20 @@ impl Http3State {
 }
 
 pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
+    send_inner(req, None, trace)
+}
+
+/// Stream an HTTP/3 response body straight to `sink` instead of buffering it.
+/// The returned [`Response`] carries an empty `body`.
+pub fn send_to(req: Request, sink: &mut dyn Write, trace: &mut dyn Write) -> Result<Response> {
+    send_inner(req, Some(sink), trace)
+}
+
+fn send_inner(
+    req: Request,
+    sink: Option<&mut dyn Write>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     if req.url.scheme != "https" {
         // HTTP/3 only runs over QUIC, which only runs encrypted.
         return Err(Error::UnsupportedScheme(format!(
@@ -1508,6 +1522,7 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
         request_stream,
         &req,
         &mut state,
+        sink,
         trace,
     )
 }
@@ -1925,6 +1940,7 @@ fn pump(
 
 /// Block on the request stream until FIN, decoding frames and accumulating
 /// HEADERS + DATA into a `Response`.
+#[allow(clippy::too_many_arguments)]
 fn read_response(
     conn: &mut QuicConnection,
     sock: &dyn UdpTransport,
@@ -1932,8 +1948,10 @@ fn read_response(
     sid: StreamId,
     req: &Request,
     state: &mut Http3State,
+    mut sink: Option<&mut dyn Write>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
+    let mut streamed_len: u64 = 0;
     let total_deadline = req
         .read_timeout
         .unwrap_or(MAX_TOTAL_DEADLINE)
@@ -1975,12 +1993,33 @@ fn read_response(
 
         // Try to peel frames off the buffer.
         loop {
-            let (consumed, ack_owed) =
-                match try_consume_frame(&stream_buf, &mut headers, &mut body, &state.dyn_table) {
-                    FrameOutcome::Consumed(n, ack) => (n, ack),
-                    FrameOutcome::NeedMore => break,
-                    FrameOutcome::Err(e) => return Err(e),
-                };
+            // Stream DATA to the sink only when the response is not
+            // content-encoded (encoded bodies must be buffered to decode).
+            // Recomputed each frame because HEADERS may have just arrived.
+            let encoded = headers.as_ref().is_some_and(|f| {
+                f.iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+            });
+            let frame_sink: Option<&mut dyn Write> = if encoded {
+                None
+            } else {
+                match &mut sink {
+                    Some(w) => Some(&mut **w),
+                    None => None,
+                }
+            };
+            let (consumed, ack_owed) = match try_consume_frame(
+                &stream_buf,
+                &mut headers,
+                &mut body,
+                &state.dyn_table,
+                frame_sink,
+                &mut streamed_len,
+            ) {
+                FrameOutcome::Consumed(n, ack) => (n, ack),
+                FrameOutcome::NeedMore => break,
+                FrameOutcome::Err(e) => return Err(e),
+            };
             if ack_owed {
                 // RFC 9204 §4.4.1: acknowledge a section that referenced the
                 // dynamic table. Best-effort; the result doesn't depend on it.
@@ -2006,7 +2045,7 @@ fn read_response(
     }
 
     let fields = headers.ok_or_else(|| Error::BadResponse("http3: no HEADERS frame".into()))?;
-    finalize_response(fields, body, trace)
+    finalize_response(fields, body, streamed_len, sink, trace)
 }
 
 enum FrameOutcome {
@@ -2024,11 +2063,14 @@ enum FrameOutcome {
 /// `dyn_table`; the returned flag reports whether the block referenced the
 /// dynamic table (Required Insert Count > 0), so the caller can send a
 /// Section Acknowledgement.
+#[allow(clippy::too_many_arguments)]
 fn try_consume_frame(
     buf: &[u8],
     headers: &mut Option<qpack::Fields>,
     body: &mut Vec<u8>,
     dyn_table: &qpack::DynamicTable,
+    sink: Option<&mut dyn Write>,
+    streamed_len: &mut u64,
 ) -> FrameOutcome {
     let (frame, hdr_len) = match Frame::decode_header(buf) {
         Ok(x) => x,
@@ -2084,6 +2126,18 @@ fn try_consume_frame(
             Err(e) => FrameOutcome::Err(e),
         },
         frame_type::DATA => {
+            // Stream straight to the caller's sink when one is supplied and
+            // nothing has been buffered yet (the caller passes `None` for a
+            // content-encoded response, which must be buffered to decode).
+            if let Some(w) = sink {
+                if body.is_empty() {
+                    if let Err(e) = w.write_all(payload) {
+                        return FrameOutcome::Err(Error::Io(e));
+                    }
+                    *streamed_len += payload.len() as u64;
+                    return FrameOutcome::Consumed(total, false);
+                }
+            }
             body.extend_from_slice(payload);
             FrameOutcome::Consumed(total, false)
         }
@@ -2106,6 +2160,8 @@ fn send_section_ack(conn: &mut QuicConnection, request_sid: StreamId, state: &Ht
 fn finalize_response(
     fields: qpack::Fields,
     body: Vec<u8>,
+    streamed_len: u64,
+    sink: Option<&mut dyn Write>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let mut status: Option<u16> = None;
@@ -2134,11 +2190,30 @@ fn finalize_response(
         let _ = writeln!(trace, "< {k}: {v}");
     }
     let _ = writeln!(trace, "< ");
-    let _ = writeln!(trace, "* Received {} body bytes", body.len());
+    let _ = writeln!(
+        trace,
+        "* Received {} body bytes",
+        body.len() as u64 + streamed_len
+    );
 
     // Shared with HTTP/1.1 and HTTP/2: strip any Content-Encoding layer we
     // recognise (gzip / deflate / x-gzip / identity).
     let (hdrs, body) = crate::http::maybe_decode_body(hdrs, body, trace)?;
+    // Streaming path: the un-encoded body already went to the sink; only the
+    // buffered (content-encoded) fallback still has bytes here to flush.
+    if let Some(w) = sink {
+        if !body.is_empty() {
+            w.write_all(&body)?;
+        }
+        return Ok(Response {
+            status,
+            reason: String::new(),
+            version: "HTTP/3".to_string(),
+            headers: hdrs,
+            body: Vec::new(),
+            timing: crate::http::Timing::default(),
+        });
+    }
     Ok(Response {
         status,
         // HTTP/3 has no reason phrase on the wire.
@@ -2515,7 +2590,7 @@ mod tests {
         let mut body = Vec::new();
         let table = qpack::DynamicTable::new();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body, &table),
+            try_consume_frame(&buf, &mut headers, &mut body, &table, None, &mut 0),
             FrameOutcome::Err(Error::BadResponse(_))
         ));
     }
@@ -2530,9 +2605,39 @@ mod tests {
         let mut body = Vec::new();
         let table = qpack::DynamicTable::new();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body, &table),
+            try_consume_frame(&buf, &mut headers, &mut body, &table, None, &mut 0),
             FrameOutcome::Err(Error::BadResponse(_))
         ));
+    }
+
+    #[test]
+    fn data_frame_streams_to_sink_when_present() {
+        // With a sink and an empty buffer so far, a DATA frame's payload is
+        // written straight to the sink instead of `body`.
+        let payload = b"h3-streamed-body";
+        let mut buf = Vec::new();
+        Frame::encode_header(frame_type::DATA, payload.len() as u64, &mut buf);
+        buf.extend_from_slice(payload);
+        let mut headers = None;
+        let mut body = Vec::new();
+        let table = qpack::DynamicTable::new();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut streamed: u64 = 0;
+        let outcome = try_consume_frame(
+            &buf,
+            &mut headers,
+            &mut body,
+            &table,
+            Some(&mut sink),
+            &mut streamed,
+        );
+        assert!(
+            matches!(outcome, FrameOutcome::Consumed(_, _)),
+            "expected the DATA frame to be consumed"
+        );
+        assert_eq!(sink, payload);
+        assert!(body.is_empty(), "streamed body must not be buffered");
+        assert_eq!(streamed, payload.len() as u64);
     }
 
     #[test]
@@ -2556,7 +2661,7 @@ mod tests {
             let mut body = Vec::new();
             let table = qpack::DynamicTable::new();
             assert!(matches!(
-                try_consume_frame(&buf, &mut headers, &mut body, &table),
+                try_consume_frame(&buf, &mut headers, &mut body, &table, None, &mut 0),
                 FrameOutcome::Err(Error::BadResponse(_))
             ));
         }
@@ -2576,7 +2681,7 @@ mod tests {
         let mut body = Vec::new();
         let table = qpack::DynamicTable::new();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body, &table),
+            try_consume_frame(&buf, &mut headers, &mut body, &table, None, &mut 0),
             FrameOutcome::NeedMore
         ));
     }

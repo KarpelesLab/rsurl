@@ -527,22 +527,127 @@ impl Request {
     pub fn send_download(
         self,
         sink: &mut dyn Write,
+        mut jar: Option<&mut crate::cookie::CookieJar>,
+        trace: &mut dyn Write,
+    ) -> Result<Response> {
+        let direct = self.connector.is_direct() && self.proxy.is_none();
+        // HTTP/1.1 streaming (plaintext, or `--http1.1`) — follows redirects and
+        // manages cookies itself.
+        let h1_streamable = direct
+            && (self.url.scheme == "http"
+                || matches!(self.http_version_pref, HttpVersionPref::Http11Only));
+        if h1_streamable {
+            return self.stream_h1(sink, jar, trace);
+        }
+        // HTTP/2 streaming for a direct https GET when h2 is allowed and we are
+        // not following redirects (the buffered path handles cross-protocol
+        // redirect chains). A custom/proxy connector or `--http1.1` skips this.
+        let h2_streamable = direct
+            && self.url.scheme == "https"
+            && !self.follow_redirects
+            && matches!(
+                self.http_version_pref,
+                HttpVersionPref::Auto | HttpVersionPref::Http2Only
+            );
+        if h2_streamable {
+            let mut req = self;
+            req.url.set_idn(req.idn)?;
+            // Attach jar cookies to the request, then ingest Set-Cookie below.
+            if let Some(j) = jar.as_deref_mut() {
+                j.purge_expired();
+                req.headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+                if let Some(val) = j.cookie_header(&req.url) {
+                    req.headers.push(("Cookie".to_string(), val));
+                }
+            }
+            let url = req.url.clone();
+            let force_h2 = matches!(req.http_version_pref, HttpVersionPref::Http2Only);
+            // Keep a copy to retry over HTTP/1.1 if the server doesn't pick h2.
+            let fallback = (!force_h2).then(|| {
+                let mut fb = req.clone();
+                fb.http_version_pref = HttpVersionPref::Http11Only;
+                fb
+            });
+            match crate::http2::send_to(req, sink, trace) {
+                Ok(resp) => {
+                    if let Some(j) = jar {
+                        j.ingest_response(&url, &resp.headers);
+                    }
+                    return Ok(resp);
+                }
+                // Auto: server didn't select h2 — retry the same request forced
+                // to HTTP/1.1, which streams via `stream_h1` (it's now https +
+                // Http11Only). The jar is re-applied there.
+                Err(Error::H2NotNegotiated) => {
+                    if let Some(fb) = fallback {
+                        return fb.send_download(sink, jar, trace);
+                    }
+                    return Err(Error::H2NotNegotiated);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // HTTP/3 streaming for a direct https GET under `--http3`/`--http3-only`
+        // when not following redirects. On a QUIC transport failure with
+        // `--http3` (not `--http3-only`), retry the request over the Auto path.
+        let h3_streamable = direct
+            && self.url.scheme == "https"
+            && !self.follow_redirects
+            && matches!(
+                self.http_version_pref,
+                HttpVersionPref::Http3 | HttpVersionPref::Http3Only
+            );
+        if h3_streamable {
+            let mut req = self;
+            req.url.set_idn(req.idn)?;
+            if let Some(j) = jar.as_deref_mut() {
+                j.purge_expired();
+                req.headers
+                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+                if let Some(val) = j.cookie_header(&req.url) {
+                    req.headers.push(("Cookie".to_string(), val));
+                }
+            }
+            let url = req.url.clone();
+            let force_h3 = matches!(req.http_version_pref, HttpVersionPref::Http3Only);
+            let fallback = (!force_h3).then(|| {
+                let mut fb = req.clone();
+                fb.http_version_pref = HttpVersionPref::Auto;
+                fb
+            });
+            match crate::http3::send_to(req, sink, trace) {
+                Ok(resp) => {
+                    if let Some(j) = jar {
+                        j.ingest_response(&url, &resp.headers);
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if fallback.is_some() && h3_should_fall_back(&e) => {
+                    let _ = writeln!(trace, "* HTTP/3 failed ({e}); falling back");
+                    return fallback.unwrap().send_download(sink, jar, trace);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.send_download_buffered(sink, jar, trace)
+    }
+
+    /// Buffered download fallback: perform the request normally (following
+    /// redirects, h2/h3 negotiation, proxy, decode) and copy the materialized
+    /// body to `sink`. Used when streaming isn't applicable.
+    fn send_download_buffered(
+        self,
+        sink: &mut dyn Write,
         jar: Option<&mut crate::cookie::CookieJar>,
         trace: &mut dyn Write,
     ) -> Result<Response> {
-        let streamable = self.connector.is_direct()
-            && self.proxy.is_none()
-            && (self.url.scheme == "http"
-                || matches!(self.http_version_pref, HttpVersionPref::Http11Only));
-        if !streamable {
-            let resp = self.send_to(trace, jar)?;
-            sink.write_all(&resp.body)?;
-            return Ok(Response {
-                body: Vec::new(),
-                ..resp
-            });
-        }
-        self.stream_h1(sink, jar, trace)
+        let resp = self.send_to(trace, jar)?;
+        sink.write_all(&resp.body)?;
+        Ok(Response {
+            body: Vec::new(),
+            ..resp
+        })
     }
 
     /// HTTP/1.1 streaming download with redirect following (the streamable

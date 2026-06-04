@@ -41,8 +41,13 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 
 - **M1 streaming I/O (keystone, partial)**: `Request::send_download` streams the
   HTTP/1.1 body to a sink (redirect-following, cookies); HTTP/2/3, proxied,
-  compressed, and empty bodies fall back to buffered. **Every non-HTTP download
-  to a file** now goes through the streaming sink (`Client::transfer_url_to`):
+  compressed, and empty bodies fall back to buffered. **HTTP/2 and HTTP/3
+  response bodies also stream** straight to the sink (`http2::send_to` /
+  `http3::send_to`): DATA-frame payloads are written as they arrive instead of
+  reassembled in memory (content-encoded responses still buffer to decode; the
+  download path uses this for direct https GETs that aren't following
+  redirects). **Every non-HTTP download to a file** now goes through the
+  streaming sink (`Client::transfer_url_to`):
   FTP/FTPS and `file://` stream the source directly (no full-body buffer), the
   rest fetch-then-write through the same sink — all gaining `--limit-rate`/`-#`/
   `--max-filesize`/`-y`/`-Y`/`--remove-on-error`/`--no-clobber` and `-w`.
@@ -71,16 +76,7 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   ssl_verifypeer, proxy, referer, range, cookie, xoauth2_bearer,
   accept_encoding**).
 
-**Deferred — output is already correct, these change only internals/UX, not
-feature coverage:**
-- **HTTP/2-3 response-body streaming** — h2/h3 downloads already work and return
-  exactly the same bytes as curl for any body within the size cap; only the
-  *peak memory* differs (the backends reassemble the full body). True streaming
-  needs a borrowed/non-`Send` sink threaded into the `Conn` struct, which is
-  shared with the threaded `send_multiplexed` path and the hardened
-  flow-control accounting — a deep refactor with real regression risk for a
-  memory-footprint win on an uncommon case (very large single h2/h3 downloads).
-  Deferred deliberately; HTTP/1.1, FTP/FTPS, and `file://` already stream.
+**Remaining:**
 - **RTSP interleaved RTP/RTCP after `PLAY`** — an architectural mismatch with
   the one-shot CLI model: an interleaved media stream has no clean termination,
   so reading it would hang on a live source (curl only does this inside its
@@ -101,11 +97,11 @@ not "remaining" — verified against what curl itself requires):
 These are intentionally not pursued.
 
 **Status:** every curl feature that is feasible under the no-C invariant and a
-good fit for a one-shot CLI is now implemented and tested. What remains is one
-deferred memory optimization (HTTP/2-3 body streaming — output already matches
-curl), one architectural mismatch (RTSP interleaved media), and the documented
-no-C/architecture exclusions below. There is no remaining *functional* parity
-gap for the in-scope protocols.
+good fit for a one-shot CLI is now implemented and tested — including streaming
+response bodies for HTTP/1.1, HTTP/2, HTTP/3, FTP/FTPS, and `file://`. The only
+remaining roadmap item is RTSP interleaved-media reception, which is an
+architectural mismatch with the one-shot model (it would hang on a live
+stream); plus the documented no-C/architecture exclusions below.
 
 ## Where we are today
 
@@ -117,12 +113,12 @@ MQTT(S), RTSP, TFTP, LDAP(S), gopher(s), dict, file, ws/wss, SMTP(S), TELNET.
 TLS 1.2/1.3 with full verification, four auth schemes (Basic/Digest/Bearer/
 SigV4), a `Client`/`Request` library API, and a `rsurl_easy_*` C ABI.
 
-**Streaming I/O (the original Milestone 1) is in place** for HTTP/1.1, FTP/FTPS,
-and `file://` downloads to a file: bodies flow straight to disk through a sink
-that enforces `--limit-rate`, `-#`, `--max-filesize`, `-y`/`-Y`, `-w`,
-`--remove-on-error`, and `--no-clobber`. The only transfer paths that still
-buffer are HTTP/2-3 (see *Deferred* above — output is already identical to curl)
-and the small text protocols where buffering is immaterial.
+**Streaming I/O (the original Milestone 1) is in place** for HTTP/1.1, HTTP/2,
+HTTP/3, FTP/FTPS, and `file://` downloads to a file: bodies flow straight to
+disk through a sink that enforces `--limit-rate`, `-#`, `--max-filesize`,
+`-y`/`-Y`, `-w`, `--remove-on-error`, and `--no-clobber`. Content-encoded
+responses still buffer to decode (single gzip/zstd/br layers stream-decode on
+HTTP/1.1), and the small text protocols buffer where it's immaterial.
 
 ---
 
