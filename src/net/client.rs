@@ -191,4 +191,9 @@ impl Client {
         };
         crate::smtp::send(url, body, &opts, &self.net_config_for(&url.host))
     }
+
+    /// TELNET: send `input`, return the received data (curl `telnet://`).
+    pub fn telnet(&self, url: &Url, input: &[u8]) -> Result<Vec<u8>> {
+        crate::telnet::run(url, input, &self.net_config_for(&url.host))
+    }
 }

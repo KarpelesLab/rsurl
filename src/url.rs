@@ -268,6 +268,7 @@ fn default_port(scheme: &str) -> Option<u16> {
         "pop3s" => 995,
         "smtp" => 25,
         "smtps" => 465,
+        "telnet" => 23,
         "rtsp" => 554,
         "tftp" => 69,
         "sftp" | "scp" => 22,

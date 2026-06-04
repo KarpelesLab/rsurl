@@ -1477,6 +1477,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         if matches!(parsed_url.scheme.as_str(), "smtp" | "smtps") {
             return run_smtp(&parsed_url, args);
         }
+        if parsed_url.scheme == "telnet" {
+            return run_telnet(&parsed_url, args);
+        }
         // MQTT: a request body (`-d`/`--data*` or `-T`) switches from the
         // default subscribe (`run_transfer`) to publish, matching curl. With
         // no body we fall through to the subscribe transfer below.
@@ -2701,6 +2704,56 @@ fn run_smtp(url: &Url, args: &Args) -> u8 {
         pass.as_deref(),
     ) {
         Ok(()) => 0,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            7
+        }
+    }
+}
+
+/// TELNET: connect, send any `-d`/`-T` input, write received data to output.
+fn run_telnet(url: &Url, args: &Args) -> u8 {
+    let input: Vec<u8> = if let Some(path) = &args.upload_file {
+        std::fs::read(path).unwrap_or_default()
+    } else if !args.data_parts.is_empty() {
+        assemble_request_body(args)
+            .ok()
+            .flatten()
+            .map(|(b, _, _)| b)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            return 5;
+        }
+    };
+    match client.telnet(url, &input) {
+        Ok(bytes) => {
+            let mut out: Box<dyn Write> = match &args.output {
+                Some(path) if path != "-" => match create_output_file(path, args) {
+                    Ok(f) => Box::new(f),
+                    Err(e) => {
+                        if show_errors(args) {
+                            eprintln!("rsurl: open {path}: {e}");
+                        }
+                        return 23;
+                    }
+                },
+                _ => Box::new(io::stdout().lock()),
+            };
+            if out.write_all(&bytes).is_err() {
+                return 23;
+            }
+            0
+        }
         Err(e) => {
             if show_errors(args) {
                 eprintln!("rsurl: {e}");

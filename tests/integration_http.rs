@@ -2134,3 +2134,49 @@ fn cli_smtp_send() {
         "got: {c:?}"
     );
 }
+
+/// TELNET: server negotiates an option and sends a banner; rsurl strips the
+/// IAC bytes from output and refuses the option.
+#[test]
+fn cli_telnet_strips_iac_and_refuses() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let got = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let g2 = Arc::clone(&got);
+    let handle = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // IAC WILL ECHO(1), then "banner\r\n".
+        s.write_all(&[255, 251, 1]).unwrap();
+        s.write_all(b"banner\r\n").unwrap();
+        s.flush().unwrap();
+        // Read the client's refusal (IAC DONT 1) then close.
+        let mut buf = [0u8; 16];
+        if let Ok(n) = s.read(&mut buf) {
+            g2.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-s", &format!("telnet://127.0.0.1:{}", addr.port())])
+        .output()
+        .expect("spawn rsurl");
+    handle.join().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, b"banner\r\n",
+        "IAC should be stripped from output"
+    );
+    assert_eq!(
+        &*got.lock().unwrap(),
+        &[255, 254, 1],
+        "should refuse with IAC DONT 1"
+    );
+}

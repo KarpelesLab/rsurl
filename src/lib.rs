@@ -14,6 +14,7 @@ mod http;
 mod idn;
 mod pool;
 mod smtp;
+mod telnet;
 mod transfer;
 mod url;
 
