@@ -35,28 +35,29 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 - **M9 (new protocols, partial)**: **SMTP/SMTPS** (EHLO/STARTTLS/AUTH/MAIL/RCPT/
   DATA via `--mail-from`/`--mail-rcpt`) and **TELNET** (IAC-stripping). New
   schemes: `smtp`(25)/`smtps`(465)/`telnet`(23).
-- Recognized-but-not-yet-enforced (need foundations): `-E/--cert`,
-  `--limit-rate`, `-y`/`-Y`, `-#` — warn transparently.
+- Recognized-but-not-yet-enforced (need foundations): `-E/--cert` — warn
+  transparently. Genuine no-ops accepted for compat: `-q/--disable`,
+  `-N/--no-buffer`, `--no-progress-meter`, `--styled-output`/`--no-styled-output`.
 
 - **M1 streaming I/O (keystone, partial)**: `Request::send_download` streams the
   HTTP/1.1 body to a sink (redirect-following, cookies); HTTP/2/3, proxied,
   compressed, and empty bodies fall back to buffered.
 - **M5 (partial, on streaming)**: enforced `--max-filesize` (early abort),
-  `--limit-rate`, and `-#` progress for file downloads; `-w %{size_download}`.
-- **M3 (partial)**: **HTTP Digest** auth (`--digest`, MD5/SHA-256 + qop=auth)
-  and `--oauth2-bearer`.
+  `--limit-rate`, `-#` progress, and **`-y`/`-Y` low-speed abort** (exit 28) for
+  file downloads; `-w %{size_download}` and **`-w` phase timers**
+  (`%{time_connect,appconnect,pretransfer,starttransfer}`, HTTP/1.1 paths).
+- **M3 (partial)**: **HTTP Digest** auth (`--digest`, MD5/SHA-256 + qop=auth),
+  `--oauth2-bearer`, and **AWS SigV4** (`--aws-sigv4`, HMAC-SHA256 chain).
 - **M8**: `-Z/--parallel` + `--parallel-max` concurrent transfers.
 
 **Remaining (large / multi-session):** the rest of M1 (stream HTTP/2-3 and the
 file-transfer protocols; streaming decompression); M3 NTLM / Negotiate (needs
-pure-Rust Kerberos) / AWS-SigV4; M5 `-y`/`-Y` low-speed abort and write-out
-phase timers (need timing instrumentation threaded through `Response`); M9
-SMB/RTMP; M10 protocol depth (FTP active mode, RTSP RTP, LDAP writes); M11
-polish (exit-code sweep, man page, libcurl-shaped C API).
+pure-Rust Kerberos, out of scope); M9 SMB/RTMP; M10 protocol depth (FTP active
+mode, RTSP RTP, LDAP writes); M11 polish (exit-code sweep, man page,
+libcurl-shaped C API).
 
-**Next highest-leverage step: M1 streaming I/O** — it unblocks live progress,
-real `--limit-rate`/`-y`/`-Y`, early `--max-filesize`, write-out phase timers,
-and large/infinite transfers. Then M3 auth, M9 SMTP, M8 parallel.
+**Next highest-leverage steps:** stream the file-transfer protocols and HTTP/2-3
+bodies (rest of M1), then M3 NTLM, M10 protocol depth, and M11 polish.
 
 ## Where we are today
 
