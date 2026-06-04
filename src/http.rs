@@ -86,6 +86,17 @@ pub struct Request {
     /// caller-supplied implementation) routes the request through it and, in
     /// this milestone, forces HTTP/1.1 with pooling disabled.
     pub(crate) connector: Arc<dyn Connector>,
+    /// Force an address family (curl `-4`/`-6`). `None` = either.
+    pub(crate) ip_family: Option<IpFamily>,
+    /// Static DNS overrides (curl `--resolve`): `(host, port) -> IP`.
+    pub(crate) resolve: Vec<(String, u16, std::net::IpAddr)>,
+}
+
+/// Address-family preference for connecting (curl `-4`/`-6`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpFamily {
+    V4,
+    V6,
 }
 
 /// Where to route HTTP(S) traffic through. Parsed from a curl-style proxy
@@ -157,7 +168,28 @@ impl Request {
             no_proxy: Vec::new(),
             idn: true,
             connector: Arc::new(DirectConnector),
+            ip_family: None,
+            resolve: Vec::new(),
         })
+    }
+
+    /// Force IPv4 for the connection (curl `-4`).
+    pub fn ipv4(mut self) -> Self {
+        self.ip_family = Some(IpFamily::V4);
+        self
+    }
+
+    /// Force IPv6 for the connection (curl `-6`).
+    pub fn ipv6(mut self) -> Self {
+        self.ip_family = Some(IpFamily::V6);
+        self
+    }
+
+    /// Add a static DNS override (curl `--resolve`): connections to
+    /// `host:port` use `ip` instead of resolving.
+    pub fn resolve_addr(mut self, host: &str, port: u16, ip: std::net::IpAddr) -> Self {
+        self.resolve.push((host.to_string(), port, ip));
+        self
     }
 
     pub fn get(url: &str) -> Result<Self> {
@@ -1057,16 +1089,39 @@ fn finalize_tls(
 /// [`connect_tunnel`] on the returned socket before any TLS handshake.
 /// This function intentionally stops at "TCP connected" so that the
 /// HTTP/1.1 and HTTP/2 paths can share the same tunnel logic.
+/// Resolve `host:port` to a single socket address, honoring `--resolve`
+/// overrides and the `-4`/`-6` address-family preference.
+fn resolve_target(host: &str, port: u16, req: &Request) -> Result<std::net::SocketAddr> {
+    // --resolve: a fixed address for this host:port wins.
+    if let Some((_, _, ip)) = req
+        .resolve
+        .iter()
+        .find(|(h, p, _)| *p == port && h.eq_ignore_ascii_case(host))
+    {
+        return Ok(std::net::SocketAddr::new(*ip, port));
+    }
+    let addr = format!("{host}:{port}");
+    let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr)?;
+    match req.ip_family {
+        Some(IpFamily::V4) => addrs
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| Error::InvalidUrl(format!("{host}: no IPv4 address"))),
+        Some(IpFamily::V6) => addrs
+            .find(|a| a.is_ipv6())
+            .ok_or_else(|| Error::InvalidUrl(format!("{host}: no IPv6 address"))),
+        None => addrs
+            .next()
+            .ok_or_else(|| Error::InvalidUrl(host.to_string())),
+    }
+}
+
 pub(crate) fn tcp_connect(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
     let proxy = req.proxy.as_ref().filter(|_| !proxy_bypassed(req));
     let (target_host, target_port, via_proxy_label) = match proxy {
         Some(p) => (p.host.as_str(), p.port, true),
         None => (req.url.host.as_str(), req.url.port, false),
     };
-    let addr = format!("{target_host}:{target_port}");
-    let first = std::net::ToSocketAddrs::to_socket_addrs(&addr)?
-        .next()
-        .ok_or_else(|| Error::InvalidUrl(target_host.to_string()))?;
+    let first = resolve_target(target_host, target_port, req)?;
     let _ = writeln!(trace, "*   Trying {first}...");
     let stream = match req.connect_timeout {
         Some(t) => TcpStream::connect_timeout(&first, t)?,

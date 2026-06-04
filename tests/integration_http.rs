@@ -1658,3 +1658,100 @@ fn cli_write_out_expands_vars() {
         .expect("spawn rsurl");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "200 5");
 }
+
+/// `-n`/`--netrc-file` supplies Basic credentials for the host when `-u` and
+/// URL userinfo are absent.
+#[test]
+fn cli_netrc_supplies_basic_auth() {
+    use std::io::Write;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cap2 = Arc::clone(&captured);
+    let server = TestServer::start(move |req: SReq| {
+        *cap2.lock().unwrap() = req
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v.clone());
+        SResp::ok("ok")
+    });
+
+    let mut netrc = std::env::temp_dir();
+    netrc.push(format!("rsurl-netrc-{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&netrc).unwrap();
+        writeln!(f, "machine 127.0.0.1 login alice password s3cret").unwrap();
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--netrc-file",
+            netrc.to_str().unwrap(),
+            &server.url("/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    let _ = std::fs::remove_file(&netrc);
+    assert!(out.status.success());
+    // base64("alice:s3cret") = "YWxpY2U6czNjcmV0"
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some("Basic YWxpY2U6czNjcmV0")
+    );
+}
+
+/// `-O -J` names the saved file from a sanitized Content-Disposition filename.
+#[test]
+fn cli_remote_header_name_uses_content_disposition() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| {
+        let mut r = SResp::ok("payload");
+        r.headers.push((
+            "Content-Disposition".into(),
+            // include a path component to prove it's stripped to a basename
+            "attachment; filename=\"/etc/cd-name.txt\"".into(),
+        ));
+        r
+    });
+    let dir = std::env::temp_dir().join(format!("rsurl-cd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .current_dir(&dir)
+        .args(["-s", "-O", "-J", &server.url("/file")])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let saved = std::fs::read(dir.join("cd-name.txt")).expect("file named from CD basename");
+    assert_eq!(saved, b"payload");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--resolve host:port:127.0.0.1` makes an otherwise-unresolvable host reach
+/// the local test server.
+#[test]
+fn cli_resolve_overrides_dns() {
+    use std::process::Command;
+    let server = TestServer::start(|_req: SReq| SResp::ok("resolved"));
+    let port = server.addr.port();
+    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args([
+            "-s",
+            "--resolve",
+            &format!("origin.invalid:{port}:127.0.0.1"),
+            &format!("http://origin.invalid:{port}/"),
+        ])
+        .output()
+        .expect("spawn rsurl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"resolved");
+}

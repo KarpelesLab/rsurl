@@ -154,6 +154,20 @@ struct Args {
     max_filesize: Option<u64>,
     /// `-w`/`--write-out <format>`: print a formatted summary after transfer.
     write_out: Option<String>,
+    /// `-n`/`--netrc` (or `--netrc-file <path>`): read credentials from a
+    /// netrc file when no `-u` is given.
+    netrc: bool,
+    netrc_file: Option<String>,
+    /// `-J`/`--remote-header-name`: with `-O`, name the saved file from the
+    /// response `Content-Disposition` header.
+    remote_header_name: bool,
+    /// `--retry <n>`: retry a failed transfer up to `n` times.
+    retry: u32,
+    /// `-4`/`-6`: force the connection's address family.
+    ipv4: bool,
+    ipv6: bool,
+    /// `--resolve <host:port:addr>`: static DNS overrides.
+    resolve: Vec<(String, u16, std::net::IpAddr)>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1167,6 +1181,12 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
     if let Some((u, p)) = &args.basic_auth {
         req = req.basic_auth(u, p);
+    } else if args.netrc && parsed_url.userinfo.is_none() {
+        // -n/--netrc: pull credentials for this host from the netrc file when
+        // neither -u nor URL userinfo supplied them.
+        if let Some((u, p)) = netrc_credentials(args, &parsed_url.host) {
+            req = req.basic_auth(&u, &p);
+        }
     }
     if args.insecure {
         req = req.verify_tls(false);
@@ -1182,6 +1202,16 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
     if let Some(secs) = args.connect_timeout {
         req = req.connect_timeout(Duration::from_secs(secs));
+    }
+    // -6 wins if both -4 and -6 are given (last-wins is curl's rule, but both
+    // set is degenerate; prefer v6 to match curl's IPRESOLVE precedence).
+    if args.ipv6 {
+        req = req.ipv6();
+    } else if args.ipv4 {
+        req = req.ipv4();
+    }
+    for (h, p, ip) in &args.resolve {
+        req = req.resolve_addr(h, *p, *ip);
     }
 
     // Proxy: explicit `-x` wins over env vars; `-x ""` disables both.
@@ -1222,28 +1252,51 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
 
     let started = std::time::Instant::now();
-    let send_result = match (jar, args.verbose) {
-        (Some(j), true) => {
-            let mut err = io::stderr().lock();
-            req.send_traced_with_jar(j, &mut err)
+    let mut jar = jar;
+    let mut attempt = 0u32;
+    let resp = loop {
+        let attempt_req = req.clone();
+        let result = match (jar.as_deref_mut(), args.verbose) {
+            (Some(j), true) => {
+                let mut err = io::stderr().lock();
+                attempt_req.send_traced_with_jar(j, &mut err)
+            }
+            (Some(j), false) => attempt_req.send_with_jar(j),
+            (None, true) => {
+                let mut err = io::stderr().lock();
+                attempt_req.send_traced(&mut err)
+            }
+            (None, false) => attempt_req.send(),
+        };
+        match result {
+            // A transient HTTP status is retried up to `--retry` times.
+            Ok(r) if is_retryable_status(r.status) && attempt < args.retry => {
+                attempt += 1;
+                if show_errors(args) {
+                    eprintln!(
+                        "rsurl: transient HTTP {} — retry {}/{}",
+                        r.status, attempt, args.retry
+                    );
+                }
+                std::thread::sleep(retry_delay(attempt));
+            }
+            Ok(r) => break r,
+            Err(e) if attempt < args.retry => {
+                attempt += 1;
+                if show_errors(args) {
+                    eprintln!("rsurl: {e} — retry {}/{}", attempt, args.retry);
+                }
+                std::thread::sleep(retry_delay(attempt));
+            }
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                return 7;
+            }
         }
-        (Some(j), false) => req.send_with_jar(j),
-        (None, true) => {
-            let mut err = io::stderr().lock();
-            req.send_traced(&mut err)
-        }
-        (None, false) => req.send(),
     };
     let time_total = started.elapsed();
-    let resp = match send_result {
-        Ok(r) => r,
-        Err(e) => {
-            if show_errors(args) {
-                eprintln!("rsurl: {e}");
-            }
-            return 7;
-        }
-    };
 
     // --max-filesize: reject when the server declares (Content-Length) or
     // delivers a body larger than the cap.
@@ -1465,6 +1518,40 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 )
             }
             "-w" | "--write-out" => a.write_out = Some(next_val(&mut it, arg)?),
+            "-n" | "--netrc" => a.netrc = true,
+            "--netrc-file" => {
+                a.netrc_file = Some(next_val(&mut it, arg)?);
+                a.netrc = true;
+            }
+            "-J" | "--remote-header-name" => a.remote_header_name = true,
+            "--retry" => {
+                a.retry = next_val(&mut it, arg)?
+                    .parse()
+                    .map_err(|_| "--retry requires a count".to_string())?
+            }
+            "-4" | "--ipv4" => a.ipv4 = true,
+            "-6" | "--ipv6" => a.ipv6 = true,
+            "--resolve" => {
+                let spec = next_val(&mut it, arg)?;
+                let mut parts = spec.splitn(3, ':');
+                let host = parts
+                    .next()
+                    .filter(|h| !h.is_empty())
+                    .ok_or_else(|| format!("--resolve: missing host in {spec:?}"))?
+                    .trim_start_matches(['+', '-']);
+                let port: u16 = parts
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .ok_or_else(|| format!("--resolve: bad port in {spec:?}"))?;
+                let addr_s = parts
+                    .next()
+                    .ok_or_else(|| format!("--resolve: missing address in {spec:?}"))?;
+                let addr_s = addr_s.trim().trim_start_matches('[').trim_end_matches(']');
+                let ip: std::net::IpAddr = addr_s
+                    .parse()
+                    .map_err(|_| format!("--resolve: bad IP {addr_s:?}"))?;
+                a.resolve.push((host.to_string(), port, ip));
+            }
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => {
@@ -1478,6 +1565,105 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
 /// Whether to print error messages: always, unless `-s` is set without `-S`.
 fn show_errors(args: &Args) -> bool {
     !args.silent || args.show_error
+}
+
+/// HTTP statuses curl's `--retry` treats as transient.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Exponential backoff (base 1s, capped at 60s), like curl's default.
+fn retry_delay(attempt: u32) -> std::time::Duration {
+    let secs = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(60)
+        .min(60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Resolve credentials for `host` from the netrc file (`--netrc-file` or
+/// `~/.netrc`). Returns `None` if no file or no matching entry.
+fn netrc_credentials(args: &Args, host: &str) -> Option<(String, String)> {
+    let path: std::path::PathBuf = match &args.netrc_file {
+        Some(p) => p.into(),
+        None => {
+            let home = std::env::var_os("HOME")?;
+            let mut p = std::path::PathBuf::from(home);
+            p.push(".netrc");
+            p
+        }
+    };
+    let text = std::fs::read_to_string(&path).ok()?;
+    netrc_lookup(&text, host)
+}
+
+/// Parse netrc text and return `(login, password)` for `host`, falling back to
+/// a `default` entry. Handles `machine`/`login`/`password`/`default`, skips
+/// `account`/`macdef` argument tokens.
+fn netrc_lookup(text: &str, host: &str) -> Option<(String, String)> {
+    let mut toks = text.split_whitespace();
+    // (machine-name, login, password); "\0default" marks the default entry.
+    let mut entries: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    while let Some(t) = toks.next() {
+        match t {
+            "machine" => {
+                if let Some(n) = toks.next() {
+                    entries.push((n.to_string(), None, None));
+                }
+            }
+            "default" => entries.push(("\0default".to_string(), None, None)),
+            "login" => {
+                if let (Some(v), Some(e)) = (toks.next(), entries.last_mut()) {
+                    e.1 = Some(v.to_string());
+                }
+            }
+            "password" => {
+                if let (Some(v), Some(e)) = (toks.next(), entries.last_mut()) {
+                    e.2 = Some(v.to_string());
+                }
+            }
+            "account" | "macdef" => {
+                let _ = toks.next();
+            }
+            _ => {}
+        }
+    }
+    let pick = |e: &(String, Option<String>, Option<String>)| {
+        (
+            e.1.clone().unwrap_or_default(),
+            e.2.clone().unwrap_or_default(),
+        )
+    };
+    entries
+        .iter()
+        .find(|e| e.0.eq_ignore_ascii_case(host))
+        .or_else(|| entries.iter().find(|e| e.0 == "\0default"))
+        .map(pick)
+}
+
+/// `-J`/`--remote-header-name`: extract a safe basename from the response
+/// `Content-Disposition: ...; filename=...` (or `filename*=`). Path components,
+/// `.`/`..`, and empty names are rejected so a server can't pick the directory.
+fn content_disposition_filename(resp: &Response) -> Option<String> {
+    let cd = resp.header("content-disposition")?;
+    for part in cd.split(';') {
+        let p = part.trim();
+        let Some(val) = p
+            .strip_prefix("filename*=")
+            .or_else(|| p.strip_prefix("filename="))
+        else {
+            continue;
+        };
+        let val = val.trim().trim_matches('"');
+        // RFC 5987 `filename*=UTF-8''name` — drop the charset'lang' prefix.
+        let val = val.rsplit("''").next().unwrap_or(val);
+        let name = std::path::Path::new(val).file_name()?.to_str()?.to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            return None;
+        }
+        return Some(name);
+    }
+    None
 }
 
 fn next_val(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, String> {
@@ -2094,7 +2280,15 @@ fn write_output(resp: &Response, url: &Url, args: &Args) -> io::Result<()> {
     let mut to_stdout = true;
     let mut explicit_stdout = false;
     let mut out: Box<dyn Write> = if args.remote_name {
-        let name = remote_name_from_url(url).map_err(|e| io::Error::other(e.to_string()))?;
+        // -J: prefer a sanitized Content-Disposition filename; else the URL's
+        // last path segment.
+        let name = args
+            .remote_header_name
+            .then(|| content_disposition_filename(resp))
+            .flatten()
+            .map(Ok)
+            .unwrap_or_else(|| remote_name_from_url(url))
+            .map_err(|e| io::Error::other(e.to_string()))?;
         to_stdout = false;
         Box::new(create_output_file(&name, args)?)
     } else {
@@ -2262,6 +2456,13 @@ Options:
                            expanded (http_code, size_download, content_type,
                            url_effective, time_total, …)
       --url <url>          add a URL (repeatable; same as a positional arg)
+  -n, --netrc              read credentials from ~/.netrc (when no -u)
+      --netrc-file <file>  read credentials from <file> (implies -n)
+  -J, --remote-header-name with -O, name the file from Content-Disposition
+      --retry <n>          retry transient failures up to <n> times
+  -4, --ipv4               connect over IPv4 only
+  -6, --ipv6               connect over IPv6 only
+      --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
   -h, --help               print this help
   -V, --version            print version
 "
