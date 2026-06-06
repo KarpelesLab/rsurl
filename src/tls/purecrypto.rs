@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use purecrypto::tls::{Config, Connection, HandshakeStatus};
 
 use super::common::ProtocolVersion;
-use super::pc_roots;
+use super::{client_auth, pc_roots};
 use crate::error::{Error, Result};
 
 pub use purecrypto::tls::RootCertStore;
@@ -37,6 +37,21 @@ pub struct TlsOpts {
     /// `None` leaves the backend default (TLS 1.2–1.3).
     pub min_version: Option<ProtocolVersion>,
     pub max_version: Option<ProtocolVersion>,
+    /// Raw bytes of the client certificate file (curl `-E`/`--cert`). PEM
+    /// (one or more `CERTIFICATE` blocks, leaf first) unless [`Self::cert_is_der`].
+    pub client_cert: Option<Vec<u8>>,
+    /// Raw bytes of the client private-key file (curl `--key`). When `None`
+    /// and `client_cert` is set, the key is looked for inside the cert file.
+    pub client_key: Option<Vec<u8>>,
+    /// Passphrase for an encrypted client key (curl `--pass` / `-E cert:pass`).
+    pub client_key_pass: Option<String>,
+    /// The client cert file is DER, not PEM (curl `--cert-type DER`).
+    pub cert_is_der: bool,
+    /// The client key file is DER, not PEM (curl `--key-type DER`).
+    pub key_is_der: bool,
+    /// SHA-256 pins of the server leaf SPKI (curl `--pinnedpubkey`). Empty
+    /// means no pinning; non-empty requires the leaf to match at least one.
+    pub pinned_spki_sha256: Vec<[u8; 32]>,
 }
 
 impl TlsOpts {
@@ -49,6 +64,12 @@ impl TlsOpts {
             roots: None,
             min_version: None,
             max_version: None,
+            client_cert: None,
+            client_key: None,
+            client_key_pass: None,
+            cert_is_der: false,
+            key_is_der: false,
+            pinned_spki_sha256: Vec::new(),
         }
     }
 }
@@ -74,6 +95,20 @@ pub fn load_system_roots() -> Result<RootCertStore> {
 /// flag in curl). Thin wrapper around [`super::pc_roots::load_from_file`].
 pub fn load_roots_from_file(path: &str) -> Result<RootCertStore> {
     pc_roots::load_from_file(path)
+}
+
+/// Add every CA in `dir` to a base root store and return it (curl `--capath`,
+/// which *adds* to the trust set). When `base` is `None` the system bundle is
+/// loaded first, so `--capath` alone augments the default roots; when `base`
+/// is `Some` (e.g. a `--cacert` bundle) the directory's CAs are added on top
+/// of that.
+pub fn load_roots_from_dir(base: Option<RootCertStore>, dir: &str) -> Result<RootCertStore> {
+    let mut roots = match base {
+        Some(r) => r,
+        None => load_system_roots()?,
+    };
+    pc_roots::add_from_dir(&mut roots, dir)?;
+    Ok(roots)
 }
 
 /// A blocking TLS adapter around a transport `S: Read + Write` plus a
@@ -136,6 +171,17 @@ pub fn connect_over_tls<S: Read + Write>(
     if let Some(v) = opts.max_version {
         builder = builder.max_version(to_pc_version(v));
     }
+    // Client certificate / mTLS (curl `-E`/`--cert` + `--key`/`--pass`).
+    if let Some(cert_bytes) = &opts.client_cert {
+        let (chain, key) = build_identity(
+            cert_bytes,
+            opts.client_key.as_deref(),
+            opts.client_key_pass.as_deref(),
+            opts.cert_is_der,
+            opts.key_is_der,
+        )?;
+        builder = builder.identity(chain, key);
+    }
     let cfg = builder.build();
     let conn = Connection::client(&cfg).map_err(tls_err)?;
     let mut s = TlsStream {
@@ -146,7 +192,61 @@ pub fn connect_over_tls<S: Read + Write>(
         seen_eof: false,
     };
     s.run_handshake()?;
+    // Public-key pinning (curl `--pinnedpubkey`): after the handshake, hash the
+    // leaf cert's SPKI and require a match against at least one pin.
+    if !opts.pinned_spki_sha256.is_empty() {
+        let leaf = s.peer_certificates().first().map(Vec::as_slice);
+        match leaf {
+            Some(der) if client_auth::spki_pin_matches(der, &opts.pinned_spki_sha256) => {}
+            _ => {
+                return Err(Error::BadResponse(
+                    "pinned public key does not match server certificate".into(),
+                ))
+            }
+        }
+    }
     Ok(s)
+}
+
+/// Parse the client cert chain + signing key from raw file bytes, honouring the
+/// PEM/DER cert/key type flags and an optional key passphrase.
+fn build_identity(
+    cert_bytes: &[u8],
+    key_bytes: Option<&[u8]>,
+    pass: Option<&str>,
+    cert_is_der: bool,
+    key_is_der: bool,
+) -> Result<(Vec<Vec<u8>>, purecrypto::tls::SigningKey)> {
+    let chain = if cert_is_der {
+        client_auth::load_cert_chain_der(cert_bytes)?
+    } else {
+        let pem = std::str::from_utf8(cert_bytes)
+            .map_err(|_| Error::BadResponse("client cert: PEM file is not valid UTF-8".into()))?;
+        client_auth::load_cert_chain(pem)?
+    };
+    // The key may be in its own file (`--key`) or embedded in the cert PEM.
+    let key = match key_bytes {
+        Some(kb) if key_is_der => client_auth::parse_signing_key_der(kb, pass)?,
+        Some(kb) => {
+            let pem = std::str::from_utf8(kb).map_err(|_| {
+                Error::BadResponse("client key: PEM file is not valid UTF-8".into())
+            })?;
+            client_auth::parse_signing_key(pem, pass)?
+        }
+        None if cert_is_der => {
+            return Err(Error::BadResponse(
+                "client cert: a DER cert has no embedded key; pass --key".into(),
+            ))
+        }
+        None => {
+            // No separate key file: the key must live in the cert PEM.
+            let pem = std::str::from_utf8(cert_bytes).map_err(|_| {
+                Error::BadResponse("client cert: PEM file is not valid UTF-8".into())
+            })?;
+            client_auth::parse_signing_key(pem, pass)?
+        }
+    };
+    Ok((chain, key))
 }
 
 impl<S: Read + Write> TlsStream<S> {

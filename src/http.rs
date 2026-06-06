@@ -109,6 +109,23 @@ pub struct Request {
     /// Use HTTP Digest auth with `basic_auth`'s credentials (curl `--digest`):
     /// send unauthenticated, then answer a `401 Digest` challenge.
     pub(crate) auth_digest: bool,
+    /// Path to the client certificate file for mTLS (curl `-E`/`--cert`).
+    pub(crate) client_cert: Option<String>,
+    /// Path to the client private-key file (curl `--key`). When `None` and
+    /// `client_cert` is set, the key is read from the cert file itself.
+    pub(crate) client_key: Option<String>,
+    /// Passphrase for an encrypted client key (curl `--pass`).
+    pub(crate) client_key_pass: Option<String>,
+    /// `true` if the client cert file is DER (curl `--cert-type DER`).
+    pub(crate) cert_is_der: bool,
+    /// `true` if the client key file is DER (curl `--key-type DER`).
+    pub(crate) key_is_der: bool,
+    /// `--pinnedpubkey` spec (`sha256//BASE64[;...]`). Parsed in
+    /// [`tls_opts_from`] into SHA-256 SPKI pins.
+    pub(crate) pinned_pubkey: Option<String>,
+    /// Directory of additional CA certificates to trust (curl `--capath`),
+    /// added on top of the system roots / `--cacert` bundle.
+    pub(crate) ca_path: Option<String>,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -196,6 +213,13 @@ impl Request {
             tls_min: None,
             tls_max: None,
             auth_digest: false,
+            client_cert: None,
+            client_key: None,
+            client_key_pass: None,
+            cert_is_der: false,
+            key_is_der: false,
+            pinned_pubkey: None,
+            ca_path: None,
         })
     }
 
@@ -412,6 +436,58 @@ impl Request {
     /// Use a custom CA bundle (PEM) instead of the system trust store.
     pub fn ca_bundle(mut self, path: &str) -> Self {
         self.ca_bundle = Some(path.to_string());
+        self
+    }
+
+    /// Trust additional CA certificates from every file in `dir`, on top of
+    /// the system roots (or a `--cacert` bundle). Curl's `--capath`.
+    pub fn ca_path(mut self, dir: &str) -> Self {
+        self.ca_path = Some(dir.to_string());
+        self
+    }
+
+    /// Present a client certificate for mutual TLS (curl `-E`/`--cert`).
+    /// `path` is the cert file; if no separate [`Self::client_key`] is set the
+    /// key is read from the same file. Default type is PEM
+    /// (see [`Self::cert_type_der`]).
+    pub fn client_cert(mut self, path: &str) -> Self {
+        self.client_cert = Some(path.to_string());
+        self
+    }
+
+    /// Path to the client private key (curl `--key`). Optional when the key is
+    /// embedded in the cert file.
+    pub fn client_key(mut self, path: &str) -> Self {
+        self.client_key = Some(path.to_string());
+        self
+    }
+
+    /// Passphrase for an encrypted client key (curl `--pass`, or the `:pass`
+    /// suffix of `-E cert:pass`).
+    pub fn client_key_pass(mut self, pass: &str) -> Self {
+        self.client_key_pass = Some(pass.to_string());
+        self
+    }
+
+    /// Treat the client certificate file as DER (curl `--cert-type DER`).
+    /// Default is PEM.
+    pub fn cert_type_der(mut self, der: bool) -> Self {
+        self.cert_is_der = der;
+        self
+    }
+
+    /// Treat the client key file as DER (curl `--key-type DER`). Default is PEM.
+    pub fn key_type_der(mut self, der: bool) -> Self {
+        self.key_is_der = der;
+        self
+    }
+
+    /// Pin the server's public key (curl `--pinnedpubkey`). `spec` is
+    /// `sha256//BASE64[;sha256//BASE64...]`; the leaf cert's SPKI SHA-256 must
+    /// match one of the pins or the connection fails. The spec is parsed into
+    /// SHA-256 SPKI pins when the TLS options are built for the request.
+    pub fn pinned_pubkey(mut self, spec: &str) -> Self {
+        self.pinned_pubkey = Some(spec.to_string());
         self
     }
 
@@ -1273,12 +1349,18 @@ fn pool_checkout_plain(u: &Url) -> Option<BufReader<TcpStream>> {
 }
 
 /// True iff this request's TLS posture matches what a pooled socket can be
-/// safely shared with. A connection made with verification off (`-k`) or
-/// against a custom CA bundle (`--cacert`) must NEVER be handed to a later
-/// verifying request to the same host:port — that would silently downgrade
-/// the second request's trust decision (MITM). Mirrors `http2::pool_eligible`.
+/// safely shared with. A connection made with verification off (`-k`), against
+/// a custom CA bundle (`--cacert`)/directory (`--capath`), with a client
+/// certificate (`-E`), or with public-key pinning (`--pinnedpubkey`) must NEVER
+/// be handed to a later differently-configured request to the same host:port —
+/// that would silently downgrade the second request's trust decision (MITM) or
+/// reuse the wrong client identity. Mirrors `http2::pool_eligible`.
 pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
-    req.verify_tls && req.ca_bundle.is_none()
+    req.verify_tls
+        && req.ca_bundle.is_none()
+        && req.ca_path.is_none()
+        && req.client_cert.is_none()
+        && req.pinned_pubkey.is_none()
 }
 
 fn pool_checkout_tls(req: &Request) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
@@ -1395,8 +1477,29 @@ pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls:
     opts.verify = req.verify_tls;
     opts.min_version = req.tls_min;
     opts.max_version = req.tls_max;
+    // Base trust store: `--cacert` replaces the system roots; otherwise leave
+    // `None` so the backend loads the system bundle. `--capath` *adds* a
+    // directory of CAs on top of whichever base is in effect (curl semantics).
     if let Some(path) = &req.ca_bundle {
         opts.roots = Some(crate::tls::load_roots_from_file(path)?);
+    }
+    if let Some(dir) = &req.ca_path {
+        opts.roots = Some(crate::tls::load_roots_from_dir(opts.roots.take(), dir)?);
+    }
+    // Client certificate / key for mTLS. Files are read here so a missing /
+    // unreadable file surfaces as an `Error` before the connection is dialed.
+    if let Some(cert_path) = &req.client_cert {
+        opts.client_cert = Some(std::fs::read(cert_path).map_err(Error::Io)?);
+        opts.cert_is_der = req.cert_is_der;
+        opts.key_is_der = req.key_is_der;
+        opts.client_key_pass = req.client_key_pass.clone();
+        if let Some(key_path) = &req.client_key {
+            opts.client_key = Some(std::fs::read(key_path).map_err(Error::Io)?);
+        }
+    }
+    // Public-key pinning.
+    if let Some(spec) = &req.pinned_pubkey {
+        opts.pinned_spki_sha256 = crate::tls::parse_pinned_pubkey(spec)?;
     }
     Ok(opts)
 }
@@ -2624,6 +2727,58 @@ mod tests {
         req.verify_tls = true;
         req.ca_bundle = Some("/tmp/ca.pem".into());
         assert!(!tls_pool_eligible(&req)); // --cacert
+        req.ca_bundle = None;
+        req.ca_path = Some("/tmp/cadir".into());
+        assert!(!tls_pool_eligible(&req)); // --capath
+        req.ca_path = None;
+        req.client_cert = Some("/tmp/client.pem".into());
+        assert!(!tls_pool_eligible(&req)); // -E (client identity)
+        req.client_cert = None;
+        req.pinned_pubkey = Some("sha256//AAAA".into());
+        assert!(!tls_pool_eligible(&req)); // --pinnedpubkey
+    }
+
+    #[test]
+    fn tls_opts_from_wires_client_cert_and_pins() {
+        use std::io::Write;
+        // Generate a self-signed Ed25519 cert + key, write them to temp files,
+        // and confirm tls_opts_from reads them and parses the --pinnedpubkey.
+        let (leaf_der, key_pem) = crate::tls::client_auth::tests_support_ed25519_leaf();
+        let cert_pem = purecrypto::x509::Certificate::from_der(leaf_der.clone())
+            .unwrap()
+            .to_pem();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join(format!("rsurl_test_cert_{}.pem", std::process::id()));
+        let key_path = dir.join(format!("rsurl_test_key_{}.pem", std::process::id()));
+        std::fs::File::create(&cert_path)
+            .unwrap()
+            .write_all(cert_pem.as_bytes())
+            .unwrap();
+        std::fs::File::create(&key_path)
+            .unwrap()
+            .write_all(key_pem.as_bytes())
+            .unwrap();
+
+        let pin = crate::tls::client_auth::leaf_spki_sha256(&leaf_der).unwrap();
+        let b64 = pin_to_sha256_spec(&pin);
+
+        let req = Request::get("https://example.com/")
+            .unwrap()
+            .client_cert(cert_path.to_str().unwrap())
+            .client_key(key_path.to_str().unwrap())
+            .pinned_pubkey(&b64);
+        let opts = tls_opts_from(&req, &[]).expect("build TlsOpts");
+        assert!(opts.client_cert.is_some());
+        assert!(opts.client_key.is_some());
+        assert_eq!(opts.pinned_spki_sha256, vec![pin]);
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// Base64-encode a 32-byte hash into curl's `sha256//BASE64` pin form.
+    fn pin_to_sha256_spec(hash: &[u8; 32]) -> String {
+        format!("sha256//{}", crate::websocket::base64_encode(hash))
     }
 
     #[test]

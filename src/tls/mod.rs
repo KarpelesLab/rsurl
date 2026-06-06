@@ -30,6 +30,12 @@ pub use common::ProtocolVersion;
 // rustls backend has its own.
 pub(crate) mod pc_roots;
 
+// Backend-neutral client-auth (`-E`/`--key`/`--pass`) and public-key pinning
+// (`--pinnedpubkey`) helpers. The SPKI/pin logic uses purecrypto's x509
+// parser, which is always linked regardless of the active TLS backend.
+pub(crate) mod client_auth;
+pub(crate) use client_auth::parse_pinned_pubkey;
+
 #[cfg(feature = "rustls-tls")]
 mod rustls;
 #[cfg(feature = "rustls-tls")]
@@ -50,6 +56,6 @@ compile_error!(
 // compile_error! above, not a confusing follow-on "unresolved import".
 #[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
 pub use backend::{
-    connect_over, connect_over_tls, connect_over_with_alpn, load_roots_from_file,
-    load_system_roots, RootCertStore, TlsOpts, TlsStream,
+    connect_over, connect_over_tls, connect_over_with_alpn, load_roots_from_dir,
+    load_roots_from_file, load_system_roots, RootCertStore, TlsOpts, TlsStream,
 };

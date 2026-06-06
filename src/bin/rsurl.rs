@@ -189,10 +189,25 @@ struct Args {
     /// `-#`/`--progress-bar`: accepted; rsurl buffers the body, so there is no
     /// live progress to render — this is a no-op.
     progress_bar: bool,
-    /// Recognized-but-not-yet-enforced flags, kept so curl scripts/config files
-    /// don't hard-fail. `-E`/`--cert` needs TLS client-auth plumbing;
-    /// `--limit-rate`/`-y`/`-Y` need streaming downloads. We warn when used.
+    /// `-E`/`--cert <file[:password]>`: client certificate for mutual TLS. An
+    /// inline `:password` (after the path) is the key passphrase, same as
+    /// `--pass`. The key may be in this file or in a separate `--key` file.
     cert: Option<String>,
+    /// `--key <file>`: the client private key, when not embedded in `--cert`.
+    key_file: Option<String>,
+    /// `--pass <phrase>`: passphrase for an encrypted `--key`/`--cert` key.
+    key_pass: Option<String>,
+    /// `--cert-type <PEM|DER>` / `--key-type <PEM|DER>`: encoding of the cert /
+    /// key files. Default PEM. `true` means DER.
+    cert_type_der: bool,
+    key_type_der: bool,
+    /// `--pinnedpubkey <sha256//BASE64[;...]>`: pin the server's public key.
+    pinned_pubkey: Option<String>,
+    /// `--capath <dir>`: trust additional CA certs from every file in `dir`.
+    capath: Option<String>,
+    /// Recognized-but-not-yet-enforced flags, kept so curl scripts/config files
+    /// don't hard-fail. `--limit-rate`/`-y`/`-Y` need streaming downloads
+    /// (enforced on the file-download path). We warn when they are no-ops.
     limit_rate: Option<String>,
     speed_limit: Option<String>,
     speed_time: Option<String>,
@@ -459,12 +474,6 @@ fn warn_unsupported(ops: &[Args]) {
     if !ops.iter().any(show_errors) {
         return;
     }
-    if ops.iter().any(|a| a.cert.is_some()) {
-        eprintln!(
-            "rsurl: warning: -E/--cert is recognized but TLS client certificates \
-             are not supported in this build"
-        );
-    }
     // --limit-rate, -#, and -y/-Y are enforced on the streaming file-download
     // path (-o FILE / -O); they are no-ops only when the body isn't streamed
     // (stdout, -i, -f, ...). Warn only for ops that won't take that path.
@@ -476,6 +485,44 @@ fn warn_unsupported(ops: &[Args]) {
             "rsurl: warning: -y/-Y speed limits are enforced only for file downloads \
              (-o FILE / -O)"
         );
+    }
+}
+
+/// Split a `-E cert[:password]` value into the cert path and optional inline
+/// passphrase, matching curl: the password starts after the first `:`, except
+/// a `:` immediately following a single leading letter is treated as a Windows
+/// drive-letter separator (`C:\path`) and not a delimiter. Returns
+/// `(cert_path, password)`.
+fn split_cert_pass(s: &str) -> (&str, Option<&str>) {
+    let bytes = s.as_bytes();
+    // Find the first ':' that isn't the drive-letter colon at index 1.
+    let mut idx = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' {
+            let is_drive = i == 1 && bytes[0].is_ascii_alphabetic();
+            if !is_drive {
+                idx = Some(i);
+                break;
+            }
+        }
+    }
+    match idx {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    }
+}
+
+/// Parse a curl `--cert-type`/`--key-type` value. Returns `true` for `DER`,
+/// `false` for `PEM` (the default). curl also accepts `ENG`/`P12`, which we do
+/// not support (no engine, no PKCS#12) — reject them with a clear message
+/// rather than silently treating them as PEM.
+fn parse_cert_type(v: &str, flag: &str) -> Result<bool, String> {
+    match v.to_ascii_uppercase().as_str() {
+        "PEM" => Ok(false),
+        "DER" => Ok(true),
+        other => Err(format!(
+            "{flag}: unsupported type {other:?}; only PEM and DER are supported"
+        )),
     }
 }
 
@@ -1869,6 +1916,31 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(path) = &args.cacert {
         req = req.ca_bundle(path);
     }
+    if let Some(dir) = &args.capath {
+        req = req.ca_path(dir);
+    }
+    if let Some(spec) = &args.pinned_pubkey {
+        req = req.pinned_pubkey(spec);
+    }
+    if let Some(cert) = &args.cert {
+        // curl allows an inline `-E cert:password`. Split on the first ':'
+        // that isn't part of a Windows drive letter; on Unix a bare first ':'
+        // separates the password. An explicit --pass overrides the inline one.
+        let (cert_path, inline_pass) = split_cert_pass(cert);
+        req = req.client_cert(cert_path);
+        if let Some(key) = &args.key_file {
+            req = req.client_key(key);
+        }
+        if let Some(pass) = args.key_pass.as_deref().or(inline_pass) {
+            req = req.client_key_pass(pass);
+        }
+        if args.cert_type_der {
+            req = req.cert_type_der(true);
+        }
+        if args.key_type_der {
+            req = req.key_type_der(true);
+        }
+    }
     if let Some(secs) = args.max_time {
         req = req.max_time(Duration::from_secs(secs));
     }
@@ -2154,7 +2226,15 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 );
             }
             "-a" | "--append" => a.append = true,
-            "--key" => a.ssh_keys.push(next_val(&mut it, arg)?),
+            "--key" => {
+                // curl's `--key` is the "private key file", used both for SSH
+                // public-key auth (sftp://, scp://) and as the TLS client key
+                // (with `-E`). Record it for both; the request path picks the
+                // one relevant to its scheme.
+                let path = next_val(&mut it, arg)?;
+                a.key_file = Some(path.clone());
+                a.ssh_keys.push(path);
+            }
             "-A" | "--user-agent" => a.user_agent = Some(next_val(&mut it, arg)?),
             "-e" | "--referer" => {
                 let v = next_val(&mut it, arg)?;
@@ -2337,6 +2417,11 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "-6" | "--ipv6" => a.ipv6 = true,
             "-#" | "--progress-bar" => a.progress_bar = true,
             "-E" | "--cert" => a.cert = Some(next_val(&mut it, arg)?),
+            "--pass" => a.key_pass = Some(next_val(&mut it, arg)?),
+            "--cert-type" => a.cert_type_der = parse_cert_type(&next_val(&mut it, arg)?, arg)?,
+            "--key-type" => a.key_type_der = parse_cert_type(&next_val(&mut it, arg)?, arg)?,
+            "--pinnedpubkey" => a.pinned_pubkey = Some(next_val(&mut it, arg)?),
+            "--capath" => a.capath = Some(next_val(&mut it, arg)?),
             "--limit-rate" => a.limit_rate = Some(next_val(&mut it, arg)?),
             "-Y" | "--speed-limit" => a.speed_limit = Some(next_val(&mut it, arg)?),
             "-y" | "--speed-time" => a.speed_time = Some(next_val(&mut it, arg)?),
@@ -2373,6 +2458,32 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             | "--no-progress-meter"
             | "--styled-output"
             | "--no-styled-output" => {}
+            // TLS knobs neither backend can honour. Fail loudly rather than
+            // silently ignore, so a user is never misled into thinking a
+            // cipher restriction / revocation check is in effect.
+            //   --ciphers / --tls13-ciphers : no per-cipher selection API in
+            //     purecrypto or rustls (both pick a safe suite set internally).
+            //   --cert-status (OCSP must-staple) and --crlfile : no OCSP/CRL
+            //     enforcement hook in either stack.
+            "--ciphers" | "--tls13-ciphers" => {
+                let _ = next_val(&mut it, arg)?;
+                return Err(format!(
+                    "{arg}: per-cipher selection is not supported (no backend exposes it)"
+                ));
+            }
+            "--crlfile" => {
+                let _ = next_val(&mut it, arg)?;
+                return Err(
+                    "--crlfile: CRL-based revocation is not supported by either TLS backend"
+                        .to_string(),
+                );
+            }
+            "--cert-status" => {
+                return Err(
+                    "--cert-status: OCSP stapling validation is not supported by either TLS backend"
+                        .to_string(),
+                );
+            }
             s if s.starts_with("--") => return Err(format!("unknown option: {s}")),
             s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option: {s}")),
             _ => {
@@ -4016,7 +4127,17 @@ Options:
   -K, --config <file>      read options from a curl-style config file
       --next  (-:)         start a new request with its own options
   -#, --progress-bar       show progress on streamed file downloads (-o/-O)
-  -E, --cert <c[:pass]>    accepted; TLS client certs not supported yet
+  -E, --cert <c[:pass]>    client certificate for mutual TLS (PEM, or DER with
+                           --cert-type). Optional inline ':password' for the key
+      --key <file>         client TLS private key (also the SSH identity file);
+                           omit when the key is embedded in --cert
+      --pass <phrase>      passphrase for an encrypted --key/--cert key
+      --cert-type <type>   --cert encoding: PEM (default) or DER
+      --key-type <type>    --key encoding: PEM (default) or DER
+      --pinnedpubkey <h>   pin the server pubkey: sha256//BASE64[;sha256//...]
+                           (SHA-256 of the leaf cert's SPKI); fail on mismatch
+      --capath <dir>       trust extra CA certs from every file in <dir>
+                           (in addition to system roots / --cacert)
       --limit-rate <speed> cap download rate (e.g. 200k, 1M) on -o/-O downloads
   -y, --speed-time <s> / -Y, --speed-limit <bps>
                            abort an -o/-O download averaging below <bps>

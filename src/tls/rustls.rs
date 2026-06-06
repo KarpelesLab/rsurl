@@ -20,6 +20,7 @@ use rustls::crypto::{ring as crypto, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
 
+use super::client_auth;
 use super::common::ProtocolVersion;
 use crate::error::{Error, Result};
 
@@ -45,6 +46,21 @@ pub struct TlsOpts {
     /// Minimum / maximum acceptable TLS version (curl `--tlsv1.x`/`--tls-max`).
     pub min_version: Option<ProtocolVersion>,
     pub max_version: Option<ProtocolVersion>,
+    /// Raw bytes of the client certificate file (curl `-E`/`--cert`).
+    pub client_cert: Option<Vec<u8>>,
+    /// Raw bytes of the client private-key file (curl `--key`). When `None`
+    /// and `client_cert` is set, the key is looked for inside the cert file.
+    pub client_key: Option<Vec<u8>>,
+    /// Passphrase for an encrypted client key (curl `--pass`). rustls-pemfile
+    /// cannot decrypt keys; a set passphrase with an encrypted key is an error.
+    pub client_key_pass: Option<String>,
+    /// The client cert file is DER, not PEM (curl `--cert-type DER`).
+    pub cert_is_der: bool,
+    /// The client key file is DER, not PEM (curl `--key-type DER`).
+    pub key_is_der: bool,
+    /// SHA-256 pins of the server leaf SPKI (curl `--pinnedpubkey`). Empty
+    /// means no pinning; non-empty requires the leaf to match at least one.
+    pub pinned_spki_sha256: Vec<[u8; 32]>,
 }
 
 impl TlsOpts {
@@ -55,6 +71,12 @@ impl TlsOpts {
             roots: None,
             min_version: None,
             max_version: None,
+            client_cert: None,
+            client_key: None,
+            client_key_pass: None,
+            cert_is_der: false,
+            key_is_der: false,
+            pinned_spki_sha256: Vec::new(),
         }
     }
 }
@@ -81,6 +103,43 @@ pub fn load_system_roots() -> Result<RootCertStore> {
 pub fn load_roots_from_file(path: &str) -> Result<RootCertStore> {
     let file = File::open(path).map_err(Error::Io)?;
     parse_roots(BufReader::new(file), path)
+}
+
+/// Add every CA in `dir` to a base root store and return it (curl `--capath`,
+/// which *adds* to the trust set). When `base` is `None` the system bundle is
+/// loaded first, so `--capath` alone augments the default roots; when `base`
+/// is `Some` (e.g. a `--cacert` bundle) the directory's CAs are added on top.
+/// Files that don't parse as PEM certs are skipped, matching curl/OpenSSL.
+pub fn load_roots_from_dir(base: Option<RootCertStore>, dir: &str) -> Result<RootCertStore> {
+    let mut roots = match base {
+        Some(r) => r,
+        None => load_system_roots()?,
+    };
+    let mut added = 0usize;
+    for entry in std::fs::read_dir(dir).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        let Ok(certs) =
+            rustls_pemfile::certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>()
+        else {
+            continue; // unreadable / non-PEM file in the dir — skip it
+        };
+        let (n, _ignored) = roots.add_parsable_certificates(certs);
+        added += n;
+    }
+    if added == 0 {
+        return Err(Error::BadResponse(format!(
+            "--capath {dir}: no usable CA certificates found"
+        )));
+    }
+    Ok(roots)
 }
 
 fn parse_roots<R: io::BufRead>(mut reader: R, path: &str) -> Result<RootCertStore> {
@@ -179,13 +238,32 @@ pub fn connect_over_tls<S: Read + Write>(
                 .collect()
         };
     let builder = ClientConfig::builder_with_protocol_versions(&versions);
-    let mut config = if opts.verify {
-        builder.with_root_certificates(roots).with_no_client_auth()
+    // Parse the client identity (curl `-E`/`--key`/`--pass`), if any, before
+    // choosing the verifier branch so both branches share it.
+    let identity = if let Some(cert_bytes) = &opts.client_cert {
+        Some(build_identity(
+            cert_bytes,
+            opts.client_key.as_deref(),
+            opts.client_key_pass.as_deref(),
+            opts.cert_is_der,
+            opts.key_is_der,
+        )?)
     } else {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify::new()))
-            .with_no_client_auth()
+        None
+    };
+    let verified = builder.with_root_certificates(roots);
+    let dangerous = ClientConfig::builder_with_protocol_versions(&versions)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify::new()));
+    let mut config = match (opts.verify, identity) {
+        (true, Some((chain, key))) => verified
+            .with_client_auth_cert(chain, key)
+            .map_err(rustls_err)?,
+        (true, None) => verified.with_no_client_auth(),
+        (false, Some((chain, key))) => dangerous
+            .with_client_auth_cert(chain, key)
+            .map_err(rustls_err)?,
+        (false, None) => dangerous.with_no_client_auth(),
     };
     config.alpn_protocols = opts.alpn;
 
@@ -202,7 +280,93 @@ pub fn connect_over_tls<S: Read + Write>(
     };
     s.run_handshake()?;
     s.snapshot_post_handshake();
+    // Public-key pinning (curl `--pinnedpubkey`): hash the leaf cert SPKI and
+    // require a match against at least one pin. SPKI extraction uses
+    // purecrypto's x509 parser (always linked), shared with the other backend.
+    if !opts.pinned_spki_sha256.is_empty() {
+        let leaf = s.peer_certificates().first().map(Vec::as_slice);
+        match leaf {
+            Some(der) if client_auth::spki_pin_matches(der, &opts.pinned_spki_sha256) => {}
+            _ => {
+                return Err(Error::BadResponse(
+                    "pinned public key does not match server certificate".into(),
+                ))
+            }
+        }
+    }
     Ok(s)
+}
+
+/// Parse the client cert chain + private key from raw file bytes into the
+/// rustls owned-DER types, honouring the PEM/DER cert/key type flags.
+///
+/// rustls-pemfile cannot decrypt encrypted keys, so a `--pass` is only usable
+/// to confirm the key is *not* encrypted; an actually-encrypted key is reported
+/// as unsupported on this backend.
+fn build_identity(
+    cert_bytes: &[u8],
+    key_bytes: Option<&[u8]>,
+    pass: Option<&str>,
+    cert_is_der: bool,
+    key_is_der: bool,
+) -> Result<(
+    Vec<CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    use rustls::pki_types::PrivateKeyDer;
+
+    // Certificate chain.
+    let chain: Vec<CertificateDer<'static>> = if cert_is_der {
+        vec![CertificateDer::from(cert_bytes.to_vec())]
+    } else {
+        let mut reader = BufReader::new(cert_bytes);
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::BadResponse(format!("client cert: PEM parse error: {e}")))?;
+        if certs.is_empty() {
+            return Err(Error::BadResponse(
+                "client cert: file contains no CERTIFICATE blocks".into(),
+            ));
+        }
+        certs
+    };
+
+    // Private key: from `--key` file, or embedded in the cert PEM.
+    let key: PrivateKeyDer<'static> = if key_is_der {
+        let kb = key_bytes.ok_or_else(|| {
+            Error::BadResponse("client cert: a DER key needs --key (no embedded key)".into())
+        })?;
+        PrivateKeyDer::try_from(kb.to_vec())
+            .map_err(|e| Error::BadResponse(format!("client key (DER): {e}")))?
+    } else {
+        // Look in the key file if given, else fall back to the cert file.
+        let src = key_bytes.unwrap_or(cert_bytes);
+        let mut reader = BufReader::new(src);
+        match rustls_pemfile::private_key(&mut reader) {
+            Ok(Some(k)) => k,
+            Ok(None) => {
+                return Err(Error::BadResponse(
+                    "client key: no private key found in the PEM \
+                     (encrypted keys are not supported by the rustls backend)"
+                        .into(),
+                ))
+            }
+            Err(e) => {
+                return Err(Error::BadResponse(format!(
+                    "client key: PEM parse error: {e}"
+                )))
+            }
+        }
+    };
+
+    // An explicit passphrase can't be applied (rustls-pemfile won't decrypt).
+    // If the key parsed anyway it was unencrypted; warn-by-error only when we
+    // failed above. Nothing to do here on success, but reject a `--pass` that
+    // the user clearly expected to matter for a key we *couldn't* decrypt is
+    // already handled by the parse failure above.
+    let _ = pass;
+
+    Ok((chain, key))
 }
 
 impl<S: Read + Write> TlsStream<S> {

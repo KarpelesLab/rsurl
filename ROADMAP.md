@@ -31,7 +31,11 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
   `--post301/302/303`, `--connect-to`, **`--json`** (POST JSON + Accept).
 - **M7 URL globbing**: `{a,b}`, `[1-100]`/`[a-z]` (`:step`, zero-pad), `-g`, `#N`.
 - **M6 (connection control, partial)**: `--connect-to`, `--unix-socket`.
-- **M2 (TLS, partial)**: `--tlsv1.x` / `--tls-max` version pinning (both backends).
+- **M2 (TLS)**: `--tlsv1.x` / `--tls-max` version pinning, **client certs /
+  mTLS** (`-E/--cert`, `--key`, `--pass`, `--cert-type`/`--key-type`),
+  **public-key pinning** (`--pinnedpubkey sha256//…`), and **`--capath`** — all
+  on both backends. `--ciphers`/`--tls13-ciphers`, `--cert-status`/OCSP, and
+  `--crlfile` are documented-unsupported (backend limits; accept-and-error).
 - **M9 (new protocols, partial)**: **SMTP/SMTPS** (EHLO/STARTTLS/AUTH/MAIL/RCPT/
   DATA via `--mail-from`/`--mail-rcpt`) and **TELNET** (IAC-stripping). New
   schemes: `smtp`(25)/`smtps`(465)/`telnet`(23).
@@ -139,19 +143,30 @@ abort, `-C -` auto-resume, streamed `-T` uploads. **Effort: XL.**
 
 ## Milestone 2 — TLS completeness
 
-Depends on small additions to `tls/*` (both purecrypto + rustls backends).
+Implemented across **both** TLS backends (`purecrypto-tls` default + `rustls-tls`).
 
-- **Client certificates** `-E/--cert`, `--cert-type`, `--key`, `--key-type`,
-  `--pass` (purecrypto exposes `Identity`/`SigningKey`; needs PEM/DER key
-  parsing across RSA/ECDSA/Ed25519 and plumbing through `TlsOpts`).
-- **Version/cipher control** `--tlsv1.0/1.1/1.2/1.3`, `--tls-max`,
-  `--ciphers`/`--tls13-ciphers`.
-- **Pinning & revocation** `--pinnedpubkey`, `--cert-status` (OCSP staple),
-  `--crlfile`, `--capath`.
-- **Names/ALPN** `--connect-to`, explicit SNI override, `--false-start`,
-  `--no-alpn`.
+- **Client certificates / mTLS** ✅ `-E/--cert <file[:password]>`, `--key`,
+  `--pass`, `--cert-type <PEM|DER>`, `--key-type <PEM|DER>`. The cert may embed
+  the key (one file) or carry it separately via `--key`; `-E cert:secret` or
+  `--pass` supply the key passphrase. Key parsing covers Ed25519 (PKCS#8),
+  ECDSA (SEC1), and RSA (PKCS#1/PKCS#8), plus encrypted PKCS#8 for Ed25519/RSA
+  on the purecrypto backend. (rustls backend: `rustls-pemfile` cannot decrypt
+  keys, so an encrypted key errors clearly; encrypted ECDSA is unsupported on
+  both backends — purecrypto has no encrypted-ECDSA loader.)
+- **Public-key pinning** ✅ `--pinnedpubkey sha256//BASE64[;sha256//...]`:
+  after the handshake, SHA-256 of the leaf cert's DER SPKI must match a pin or
+  the connection fails (`Error::BadResponse` "pinned public key …"). The bare
+  `<file>` pin form and non-`sha256//` algorithms are rejected, not ignored.
+- **Trust store** ✅ `--cacert <file>` (replaces system roots) and `--capath
+  <dir>` (adds every CA in the directory on top of the chosen base roots).
+- **Version control** ✅ `--tlsv1.0/1.1/1.2/1.3`, `--tls-max` (both backends).
 
-**Delivers:** mutual TLS, enterprise TLS knobs. **Effort: L.**
+**Documented-unsupported (backend limitations — accept-and-error / warn, never
+silently ignore):** `--ciphers`/`--tls13-ciphers` (neither backend exposes
+per-cipher selection), `--cert-status`/OCSP-must-staple client validation, and
+`--crlfile` (no CRL/OCSP enforcement hook in either stack).
+
+**Delivers:** mutual TLS + public-key pinning + extra trust anchors. **Done.**
 
 ## Milestone 3 — Authentication completeness
 

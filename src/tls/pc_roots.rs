@@ -58,6 +58,42 @@ pub(crate) fn load_from_file(path: &str) -> Result<RootCertStore> {
     parse_into_store(&pem, path)
 }
 
+/// Add every CA certificate found in the files under `dir` to `roots` (curl's
+/// `--capath <dir>`). Each regular file in the directory is read as PEM and any
+/// `CERTIFICATE` blocks it contains are added; non-PEM / unreadable files are
+/// skipped. An empty directory (no usable certs found anywhere) is an error so
+/// the user knows the flag had no effect.
+///
+/// Only the purecrypto TLS backend wires this in (the rustls backend has its
+/// own dir loader); kept always-compiled (HTTP/3 is bound to purecrypto) and
+/// `allow(dead_code)` so the rustls-only build doesn't warn.
+#[allow(dead_code)]
+pub(crate) fn add_from_dir(roots: &mut RootCertStore, dir: &str) -> Result<()> {
+    let entries = std::fs::read_dir(dir).map_err(Error::Io)?;
+    let mut loaded = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(Error::Io)?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(pem) = std::fs::read_to_string(&path) else {
+            continue; // binary/unreadable file in the dir — skip like curl/OpenSSL
+        };
+        for block in pem_blocks(&pem) {
+            if roots.add_pem(&block).is_ok() {
+                loaded += 1;
+            }
+        }
+    }
+    if loaded == 0 {
+        return Err(Error::BadResponse(format!(
+            "--capath {dir}: no usable CA certificates found"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_into_store(pem: &str, path: &str) -> Result<RootCertStore> {
     let mut roots = RootCertStore::new();
     let mut loaded = 0usize;
