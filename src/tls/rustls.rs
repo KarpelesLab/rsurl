@@ -61,6 +61,10 @@ pub struct TlsOpts {
     /// SHA-256 pins of the server leaf SPKI (curl `--pinnedpubkey`). Empty
     /// means no pinning; non-empty requires the leaf to match at least one.
     pub pinned_spki_sha256: Vec<[u8; 32]>,
+    /// Raw bytes of a CRL file (curl `--crlfile`). The rustls backend does not
+    /// wire CRL checking; a non-`None` value is reported as unsupported (use
+    /// the default purecrypto-tls backend, which honors it).
+    pub crl_pem: Option<Vec<u8>>,
 }
 
 impl TlsOpts {
@@ -77,6 +81,7 @@ impl TlsOpts {
             cert_is_der: false,
             key_is_der: false,
             pinned_spki_sha256: Vec::new(),
+            crl_pem: None,
         }
     }
 }
@@ -204,6 +209,15 @@ pub fn connect_over_tls<S: Read + Write>(
     sni: &str,
     opts: TlsOpts,
 ) -> Result<TlsStream<S>> {
+    // CRL checking (curl `--crlfile`) is only wired on the purecrypto-tls
+    // backend; refuse it here rather than silently skip revocation.
+    if opts.crl_pem.is_some() {
+        return Err(Error::BadResponse(
+            "--crlfile is not supported by the rustls-tls backend; \
+             build with the default purecrypto-tls backend for CRL checking"
+                .into(),
+        ));
+    }
     let roots = match opts.roots {
         Some(r) => r,
         None => load_system_roots()?,

@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-use purecrypto::tls::{Config, Connection, HandshakeStatus};
+use purecrypto::tls::{Config, Connection, CrlStore, HandshakeStatus};
 
 use super::common::ProtocolVersion;
 use super::{client_auth, pc_roots};
@@ -52,6 +52,9 @@ pub struct TlsOpts {
     /// SHA-256 pins of the server leaf SPKI (curl `--pinnedpubkey`). Empty
     /// means no pinning; non-empty requires the leaf to match at least one.
     pub pinned_spki_sha256: Vec<[u8; 32]>,
+    /// Raw bytes of a CRL file (curl `--crlfile`) to check the server chain
+    /// against. `None` disables CRL checking. PEM (`X509 CRL`) or DER.
+    pub crl_pem: Option<Vec<u8>>,
 }
 
 impl TlsOpts {
@@ -70,6 +73,7 @@ impl TlsOpts {
             cert_is_der: false,
             key_is_der: false,
             pinned_spki_sha256: Vec::new(),
+            crl_pem: None,
         }
     }
 }
@@ -181,6 +185,23 @@ pub fn connect_over_tls<S: Read + Write>(
             opts.key_is_der,
         )?;
         builder = builder.identity(chain, key);
+    }
+    // CRL-based revocation (curl `--crlfile`): the chain is rejected at
+    // handshake time if the leaf/intermediates appear on a supplied CRL.
+    if let Some(crl_bytes) = &opts.crl_pem {
+        let mut store = CrlStore::new();
+        // Try PEM (`X509 CRL`) first, then raw DER. A single file with one CRL
+        // is the common case; `add_pem` consumes the first `X509 CRL` block.
+        let pem_ok = std::str::from_utf8(crl_bytes)
+            .ok()
+            .map(|s| store.add_pem(s).is_ok())
+            .unwrap_or(false);
+        if !pem_ok {
+            store
+                .add_der(crl_bytes.clone())
+                .map_err(|_| Error::BadResponse("--crlfile: not a valid PEM or DER CRL".into()))?;
+        }
+        builder = builder.crls(store);
     }
     let cfg = builder.build();
     let conn = Connection::client(&cfg).map_err(tls_err)?;

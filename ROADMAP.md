@@ -33,9 +33,12 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 - **M6 (connection control, partial)**: `--connect-to`, `--unix-socket`.
 - **M2 (TLS)**: `--tlsv1.x` / `--tls-max` version pinning, **client certs /
   mTLS** (`-E/--cert`, `--key`, `--pass`, `--cert-type`/`--key-type`),
-  **public-key pinning** (`--pinnedpubkey sha256//…`), and **`--capath`** — all
-  on both backends. `--ciphers`/`--tls13-ciphers`, `--cert-status`/OCSP, and
-  `--crlfile` are documented-unsupported (backend limits; accept-and-error).
+  **public-key pinning** (`--pinnedpubkey sha256//…`), and **`--capath`** on
+  both backends; **`--crlfile`** (CRL revocation) on the default purecrypto-tls
+  backend (the rustls-tls backend errors clearly — its `WebPkiServerVerifier`
+  CRL path isn't wired). `--ciphers`/`--tls13-ciphers` (no per-cipher selection
+  API in either backend) and `--cert-status` (rsurl requests no OCSP staple)
+  are documented-unsupported — accept-and-error, never silently ignored.
 - **M9 (new protocols, partial)**: **SMTP/SMTPS** (EHLO/STARTTLS/AUTH/MAIL/RCPT/
   DATA via `--mail-from`/`--mail-rcpt`) and **TELNET** (IAC-stripping). New
   schemes: `smtp`(25)/`smtps`(465)/`telnet`(23).
@@ -161,10 +164,14 @@ Implemented across **both** TLS backends (`purecrypto-tls` default + `rustls-tls
   <dir>` (adds every CA in the directory on top of the chosen base roots).
 - **Version control** ✅ `--tlsv1.0/1.1/1.2/1.3`, `--tls-max` (both backends).
 
-**Documented-unsupported (backend limitations — accept-and-error / warn, never
-silently ignore):** `--ciphers`/`--tls13-ciphers` (neither backend exposes
-per-cipher selection), `--cert-status`/OCSP-must-staple client validation, and
-`--crlfile` (no CRL/OCSP enforcement hook in either stack).
+**`--crlfile`** (CRL revocation) is honored on the default purecrypto-tls
+backend (`ConfigBuilder::crls`); the rustls-tls backend returns a clear error
+rather than skip revocation (its `WebPkiServerVerifier` CRL path is not wired).
+
+**Documented-unsupported (accept-and-error / warn, never silently ignore):**
+`--ciphers`/`--tls13-ciphers` — neither backend exposes per-cipher selection;
+`--cert-status` (OCSP must-staple) — rsurl neither requests nor requires a
+stapled response.
 
 **Delivers:** mutual TLS + public-key pinning + extra trust anchors. **Done.**
 

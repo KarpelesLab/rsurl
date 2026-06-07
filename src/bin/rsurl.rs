@@ -205,6 +205,9 @@ struct Args {
     pinned_pubkey: Option<String>,
     /// `--capath <dir>`: trust additional CA certs from every file in `dir`.
     capath: Option<String>,
+    /// `--crlfile <file>`: CRL to check the server chain against (honored on
+    /// the default purecrypto-tls backend; the rustls backend errors).
+    crl_file: Option<String>,
     /// Recognized-but-not-yet-enforced flags, kept so curl scripts/config files
     /// don't hard-fail. `--limit-rate`/`-y`/`-Y` need streaming downloads
     /// (enforced on the file-download path). We warn when they are no-ops.
@@ -1922,6 +1925,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(spec) = &args.pinned_pubkey {
         req = req.pinned_pubkey(spec);
     }
+    if let Some(path) = &args.crl_file {
+        req = req.crl_file(path);
+    }
     if let Some(cert) = &args.cert {
         // curl allows an inline `-E cert:password`. Split on the first ':'
         // that isn't part of a Windows drive letter; on Unix a bare first ':'
@@ -2422,6 +2428,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--key-type" => a.key_type_der = parse_cert_type(&next_val(&mut it, arg)?, arg)?,
             "--pinnedpubkey" => a.pinned_pubkey = Some(next_val(&mut it, arg)?),
             "--capath" => a.capath = Some(next_val(&mut it, arg)?),
+            "--crlfile" => a.crl_file = Some(next_val(&mut it, arg)?),
             "--limit-rate" => a.limit_rate = Some(next_val(&mut it, arg)?),
             "-Y" | "--speed-limit" => a.speed_limit = Some(next_val(&mut it, arg)?),
             "-y" | "--speed-time" => a.speed_time = Some(next_val(&mut it, arg)?),
@@ -2463,24 +2470,18 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             // cipher restriction / revocation check is in effect.
             //   --ciphers / --tls13-ciphers : no per-cipher selection API in
             //     purecrypto or rustls (both pick a safe suite set internally).
-            //   --cert-status (OCSP must-staple) and --crlfile : no OCSP/CRL
-            //     enforcement hook in either stack.
+            //   --cert-status (OCSP must-staple) : rsurl does not request or
+            //     require an OCSP staple.
             "--ciphers" | "--tls13-ciphers" => {
                 let _ = next_val(&mut it, arg)?;
                 return Err(format!(
                     "{arg}: per-cipher selection is not supported (no backend exposes it)"
                 ));
             }
-            "--crlfile" => {
-                let _ = next_val(&mut it, arg)?;
-                return Err(
-                    "--crlfile: CRL-based revocation is not supported by either TLS backend"
-                        .to_string(),
-                );
-            }
             "--cert-status" => {
                 return Err(
-                    "--cert-status: OCSP stapling validation is not supported by either TLS backend"
+                    "--cert-status: OCSP-staple validation is not implemented (rsurl does not \
+                     request or require a stapled response)"
                         .to_string(),
                 );
             }
@@ -4138,6 +4139,8 @@ Options:
                            (SHA-256 of the leaf cert's SPKI); fail on mismatch
       --capath <dir>       trust extra CA certs from every file in <dir>
                            (in addition to system roots / --cacert)
+      --crlfile <file>     check the server chain against this CRL (PEM/DER;
+                           default backend only)
       --limit-rate <speed> cap download rate (e.g. 200k, 1M) on -o/-O downloads
   -y, --speed-time <s> / -Y, --speed-limit <bps>
                            abort an -o/-O download averaging below <bps>

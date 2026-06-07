@@ -126,6 +126,9 @@ pub struct Request {
     /// Directory of additional CA certificates to trust (curl `--capath`),
     /// added on top of the system roots / `--cacert` bundle.
     pub(crate) ca_path: Option<String>,
+    /// Path to a CRL file (curl `--crlfile`) to check the server chain against.
+    /// Honored by the purecrypto-tls backend; the rustls backend errors.
+    pub(crate) crl_file: Option<String>,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -220,6 +223,7 @@ impl Request {
             key_is_der: false,
             pinned_pubkey: None,
             ca_path: None,
+            crl_file: None,
         })
     }
 
@@ -443,6 +447,14 @@ impl Request {
     /// the system roots (or a `--cacert` bundle). Curl's `--capath`.
     pub fn ca_path(mut self, dir: &str) -> Self {
         self.ca_path = Some(dir.to_string());
+        self
+    }
+
+    /// Check the server certificate chain against the CRL in `path` (curl
+    /// `--crlfile`). Honored by the default purecrypto-tls backend; the
+    /// rustls-tls backend returns an error.
+    pub fn crl_file(mut self, path: &str) -> Self {
+        self.crl_file = Some(path.to_string());
         self
     }
 
@@ -1361,6 +1373,7 @@ pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
         && req.ca_path.is_none()
         && req.client_cert.is_none()
         && req.pinned_pubkey.is_none()
+        && req.crl_file.is_none()
 }
 
 fn pool_checkout_tls(req: &Request) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
@@ -1500,6 +1513,10 @@ pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls:
     // Public-key pinning.
     if let Some(spec) = &req.pinned_pubkey {
         opts.pinned_spki_sha256 = crate::tls::parse_pinned_pubkey(spec)?;
+    }
+    // CRL file (read here so a missing file errors before dialing).
+    if let Some(path) = &req.crl_file {
+        opts.crl_pem = Some(std::fs::read(path).map_err(Error::Io)?);
     }
     Ok(opts)
 }
@@ -2736,6 +2753,9 @@ mod tests {
         req.client_cert = None;
         req.pinned_pubkey = Some("sha256//AAAA".into());
         assert!(!tls_pool_eligible(&req)); // --pinnedpubkey
+        req.pinned_pubkey = None;
+        req.crl_file = Some("/tmp/crl.pem".into());
+        assert!(!tls_pool_eligible(&req)); // --crlfile
     }
 
     #[test]
@@ -2779,6 +2799,27 @@ mod tests {
     /// Base64-encode a 32-byte hash into curl's `sha256//BASE64` pin form.
     fn pin_to_sha256_spec(hash: &[u8; 32]) -> String {
         format!("sha256//{}", crate::websocket::base64_encode(hash))
+    }
+
+    #[test]
+    fn tls_opts_from_reads_crl_file() {
+        use std::io::Write;
+        // tls_opts_from only reads the file into `crl_pem`; the backend parses
+        // it at connect time, so any bytes round-trip here.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("rsurl_test_crl_{}.pem", std::process::id()));
+        let body = b"-----BEGIN X509 CRL-----\nMIIB\n-----END X509 CRL-----\n";
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(body)
+            .unwrap();
+        let req = Request::get("https://example.com/")
+            .unwrap()
+            .crl_file(path.to_str().unwrap());
+        assert!(!tls_pool_eligible(&req)); // a CRL'd request must not reuse a pool socket
+        let opts = tls_opts_from(&req, &[]).expect("build TlsOpts");
+        assert_eq!(opts.crl_pem.as_deref(), Some(body.as_slice()));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
