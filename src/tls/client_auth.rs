@@ -95,9 +95,57 @@ pub fn spki_pin_matches(leaf_der: &[u8], pins: &[[u8; 32]]) -> bool {
 /// pin check (purecrypto's x509 parser is always linked).
 pub fn leaf_spki_sha256(leaf_der: &[u8]) -> Option<[u8; 32]> {
     let cert = purecrypto::x509::Certificate::from_der(leaf_der.to_vec()).ok()?;
-    let pubkey = cert.subject_public_key().ok()?;
-    let spki = pubkey.to_spki_der();
-    Some(purecrypto::hash::sha256(&spki))
+    // Hash the certificate's SubjectPublicKeyInfo exactly as it was encoded on
+    // the wire (purecrypto 0.6.5 `spki_der()`), so the pin matches curl/OpenSSL
+    // even for a non-canonically-encoded SPKI — re-encoding from the parsed key
+    // could differ.
+    let spki = cert.spki_der().ok()?;
+    Some(purecrypto::hash::sha256(spki))
+}
+
+/// Map a curl `--ciphers` / `--tls13-ciphers` value (colon-separated cipher
+/// names) to the IANA wire IDs purecrypto can offer. Both OpenSSL names (TLS
+/// 1.2, e.g. `ECDHE-RSA-AES128-GCM-SHA256`) and IANA names (`TLS_*`, used by
+/// `--tls13-ciphers` and accepted as 1.2 aliases) are recognized. Unknown or
+/// unsupported names are rejected so a cipher restriction never silently
+/// becomes a no-op. purecrypto only negotiates the TLS 1.3 AEAD trio and the
+/// TLS 1.2 ECDHE-AEAD suites (no CBC/RC4), so only those map.
+pub fn cipher_names_to_ids(spec: &str) -> Result<Vec<u16>> {
+    let mut ids = Vec::new();
+    for raw in spec.split(':') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let id: u16 = match name.to_ascii_uppercase().as_str() {
+            // TLS 1.3 (IANA names; curl `--tls13-ciphers`).
+            "TLS_AES_128_GCM_SHA256" => 0x1301,
+            "TLS_AES_256_GCM_SHA384" => 0x1302,
+            "TLS_CHACHA20_POLY1305_SHA256" => 0x1303,
+            // TLS 1.2 ECDHE-AEAD — OpenSSL names (curl `--ciphers`) + IANA aliases.
+            "ECDHE-ECDSA-AES128-GCM-SHA256" | "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => 0xC02B,
+            "ECDHE-ECDSA-AES256-GCM-SHA384" | "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => 0xC02C,
+            "ECDHE-RSA-AES128-GCM-SHA256" | "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => 0xC02F,
+            "ECDHE-RSA-AES256-GCM-SHA384" | "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => 0xC030,
+            "ECDHE-RSA-CHACHA20-POLY1305" | "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => 0xCCA8,
+            "ECDHE-ECDSA-CHACHA20-POLY1305" | "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                0xCCA9
+            }
+            other => {
+                return Err(Error::BadResponse(format!(
+                    "cipher {other:?} is not one of the suites this build supports (TLS 1.3 \
+                     AEAD trio, or TLS 1.2 ECDHE-{{RSA,ECDSA}} with AES-GCM / CHACHA20-POLY1305)"
+                )))
+            }
+        };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(Error::BadResponse("cipher list is empty".into()));
+    }
+    Ok(ids)
 }
 
 /// Load a PEM certificate chain (one or more `CERTIFICATE` blocks, leaf first)
@@ -144,6 +192,10 @@ pub fn parse_signing_key(pem: &str, pass: Option<&str>) -> Result<SigningKey> {
         if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem_encrypted(pem, p) {
             return Ok(SigningKey::Ed25519(k));
         }
+        // Encrypted PKCS#8 ECDSA (purecrypto 0.6.5+).
+        if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem_encrypted(pem, p) {
+            return Ok(SigningKey::Ecdsa(k));
+        }
         if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem_encrypted(pem, p) {
             return Ok(SigningKey::Rsa(k));
         }
@@ -157,6 +209,9 @@ pub fn parse_signing_key(pem: &str, pass: Option<&str>) -> Result<SigningKey> {
     if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(pem) {
         return Ok(SigningKey::Ecdsa(k));
     }
+    if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_pem(pem) {
+        return Ok(SigningKey::Ecdsa(k));
+    }
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
         return Ok(SigningKey::Rsa(k));
     }
@@ -166,12 +221,11 @@ pub fn parse_signing_key(pem: &str, pass: Option<&str>) -> Result<SigningKey> {
 
     Err(Error::BadResponse(
         if pass.is_some() {
-            "client key: could not parse key (wrong --pass, or an encrypted ECDSA key, \
-             which is unsupported); expected Ed25519/RSA PKCS#8 (optionally encrypted), \
-             ECDSA SEC1, or RSA PKCS#1 PEM"
+            "client key: could not parse key (wrong --pass?); expected Ed25519/ECDSA/RSA \
+             PKCS#8 (optionally encrypted), ECDSA SEC1, or RSA PKCS#1 PEM"
         } else {
-            "client key: could not parse key; expected Ed25519 (PKCS#8), ECDSA (SEC1), \
-             or RSA (PKCS#1 or PKCS#8) PEM, or use --pass for an encrypted key"
+            "client key: could not parse key; expected Ed25519 (PKCS#8), ECDSA (SEC1 or \
+             PKCS#8), or RSA (PKCS#1 or PKCS#8) PEM, or use --pass for an encrypted key"
         }
         .into(),
     ))
@@ -190,6 +244,9 @@ pub fn parse_signing_key_der(der: &[u8], pass: Option<&str>) -> Result<SigningKe
         if let Ok(k) = Ed25519PrivateKey::from_pkcs8_der_encrypted(der, p) {
             return Ok(SigningKey::Ed25519(k));
         }
+        if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_der_encrypted(der, p) {
+            return Ok(SigningKey::Ecdsa(k));
+        }
         if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_der_encrypted(der, p) {
             return Ok(SigningKey::Rsa(k));
         }
@@ -201,6 +258,9 @@ pub fn parse_signing_key_der(der: &[u8], pass: Option<&str>) -> Result<SigningKe
     if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_der(der) {
         return Ok(SigningKey::Ecdsa(k));
     }
+    if let Ok(k) = BoxedEcdsaPrivateKey::from_pkcs8_der(der) {
+        return Ok(SigningKey::Ecdsa(k));
+    }
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_der(der) {
         return Ok(SigningKey::Rsa(k));
     }
@@ -209,7 +269,7 @@ pub fn parse_signing_key_der(der: &[u8], pass: Option<&str>) -> Result<SigningKe
     }
 
     Err(Error::BadResponse(
-        "client key (DER): could not parse; expected Ed25519/RSA PKCS#8 \
+        "client key (DER): could not parse; expected Ed25519/ECDSA/RSA PKCS#8 \
          (optionally encrypted), ECDSA SEC1, or RSA PKCS#1"
             .into(),
     ))
@@ -354,6 +414,37 @@ mod tests {
     #[test]
     fn empty_pins_is_a_match() {
         assert!(spki_pin_matches(b"whatever", &[]));
+    }
+
+    #[test]
+    fn cipher_names_map_to_iana_ids() {
+        // TLS 1.3 IANA names.
+        assert_eq!(
+            cipher_names_to_ids("TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256").unwrap(),
+            vec![0x1301, 0x1303]
+        );
+        // TLS 1.2 OpenSSL names.
+        assert_eq!(
+            cipher_names_to_ids("ECDHE-RSA-AES256-GCM-SHA384").unwrap(),
+            vec![0xC030]
+        );
+        // IANA alias for a 1.2 suite, case-insensitive, whitespace tolerated.
+        assert_eq!(
+            cipher_names_to_ids(" tls_ecdhe_ecdsa_with_aes_128_gcm_sha256 ").unwrap(),
+            vec![0xC02B]
+        );
+        // Order is preserved and duplicates collapse.
+        assert_eq!(
+            cipher_names_to_ids("TLS_AES_256_GCM_SHA384:TLS_AES_256_GCM_SHA384").unwrap(),
+            vec![0x1302]
+        );
+        // Unknown / unsupported (CBC, RC4, bogus) must error, not silently drop.
+        assert!(cipher_names_to_ids("ECDHE-RSA-AES128-SHA").is_err());
+        assert!(cipher_names_to_ids("RC4-MD5").is_err());
+        assert!(cipher_names_to_ids("NOPE").is_err());
+        // Empty list errors.
+        assert!(cipher_names_to_ids("").is_err());
+        assert!(cipher_names_to_ids(":  :").is_err());
     }
 
     #[test]

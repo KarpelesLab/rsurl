@@ -208,6 +208,10 @@ struct Args {
     /// `--crlfile <file>`: CRL to check the server chain against (honored on
     /// the default purecrypto-tls backend; the rustls backend errors).
     crl_file: Option<String>,
+    /// `--ciphers <list>` (TLS≤1.2) / `--tls13-ciphers <list>` (TLS 1.3):
+    /// restrict the offered cipher suites (honored on purecrypto-tls).
+    ciphers: Option<String>,
+    tls13_ciphers: Option<String>,
     /// Recognized-but-not-yet-enforced flags, kept so curl scripts/config files
     /// don't hard-fail. `--limit-rate`/`-y`/`-Y` need streaming downloads
     /// (enforced on the file-download path). We warn when they are no-ops.
@@ -1928,6 +1932,12 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(path) = &args.crl_file {
         req = req.crl_file(path);
     }
+    if let Some(list) = &args.ciphers {
+        req = req.ciphers(list);
+    }
+    if let Some(list) = &args.tls13_ciphers {
+        req = req.tls13_ciphers(list);
+    }
     if let Some(cert) = &args.cert {
         // curl allows an inline `-E cert:password`. Split on the first ':'
         // that isn't part of a Windows drive letter; on Unix a bare first ':'
@@ -2472,12 +2482,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             //     purecrypto or rustls (both pick a safe suite set internally).
             //   --cert-status (OCSP must-staple) : rsurl does not request or
             //     require an OCSP staple.
-            "--ciphers" | "--tls13-ciphers" => {
-                let _ = next_val(&mut it, arg)?;
-                return Err(format!(
-                    "{arg}: per-cipher selection is not supported (no backend exposes it)"
-                ));
-            }
+            "--ciphers" => a.ciphers = Some(next_val(&mut it, arg)?),
+            "--tls13-ciphers" => a.tls13_ciphers = Some(next_val(&mut it, arg)?),
             "--cert-status" => {
                 return Err(
                     "--cert-status: OCSP-staple validation is not implemented (rsurl does not \
@@ -4141,6 +4147,9 @@ Options:
                            (in addition to system roots / --cacert)
       --crlfile <file>     check the server chain against this CRL (PEM/DER;
                            default backend only)
+      --ciphers <list>     restrict TLS<=1.2 cipher suites (OpenSSL/IANA names,
+                           ':'-separated; default backend only)
+      --tls13-ciphers <l>  restrict TLS 1.3 cipher suites (IANA TLS_* names)
       --limit-rate <speed> cap download rate (e.g. 200k, 1M) on -o/-O downloads
   -y, --speed-time <s> / -Y, --speed-limit <bps>
                            abort an -o/-O download averaging below <bps>

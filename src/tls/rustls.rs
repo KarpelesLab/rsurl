@@ -65,6 +65,9 @@ pub struct TlsOpts {
     /// wire CRL checking; a non-`None` value is reported as unsupported (use
     /// the default purecrypto-tls backend, which honors it).
     pub crl_pem: Option<Vec<u8>>,
+    /// IANA cipher-suite IDs (curl `--ciphers`/`--tls13-ciphers`). The rustls
+    /// backend does not wire suite restriction; a non-empty value errors.
+    pub cipher_suites: Vec<u16>,
 }
 
 impl TlsOpts {
@@ -82,6 +85,7 @@ impl TlsOpts {
             key_is_der: false,
             pinned_spki_sha256: Vec::new(),
             crl_pem: None,
+            cipher_suites: Vec::new(),
         }
     }
 }
@@ -215,6 +219,13 @@ pub fn connect_over_tls<S: Read + Write>(
         return Err(Error::BadResponse(
             "--crlfile is not supported by the rustls-tls backend; \
              build with the default purecrypto-tls backend for CRL checking"
+                .into(),
+        ));
+    }
+    if !opts.cipher_suites.is_empty() {
+        return Err(Error::BadResponse(
+            "--ciphers/--tls13-ciphers is not supported by the rustls-tls backend; \
+             build with the default purecrypto-tls backend"
                 .into(),
         ));
     }

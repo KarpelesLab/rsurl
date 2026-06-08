@@ -43,7 +43,7 @@ idn = ["dep:idna"]
 [dependencies]
 # Required regardless of TLS backend: SHA1 + RNG (WebSocket, MQTT), X.509
 # parsing for verbose cert display, and the QUIC stack behind HTTP/3.
-purecrypto = "0.6.1"
+purecrypto = "0.6.5"
 # rustls-tls backend. `ring` is selected explicitly so cross-platform builds
 # don't pull in cmake/nasm (which the default `aws-lc-rs` provider needs on
 # Windows). `tls12` is opt-in in rustls 0.23; we want it on for parity with

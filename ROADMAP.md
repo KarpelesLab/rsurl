@@ -32,13 +32,14 @@ Delivered on `feature/pluggable-network` (all CI-gate-clean):
 - **M7 URL globbing**: `{a,b}`, `[1-100]`/`[a-z]` (`:step`, zero-pad), `-g`, `#N`.
 - **M6 (connection control, partial)**: `--connect-to`, `--unix-socket`.
 - **M2 (TLS)**: `--tlsv1.x` / `--tls-max` version pinning, **client certs /
-  mTLS** (`-E/--cert`, `--key`, `--pass`, `--cert-type`/`--key-type`),
-  **public-key pinning** (`--pinnedpubkey sha256//…`), and **`--capath`** on
-  both backends; **`--crlfile`** (CRL revocation) on the default purecrypto-tls
-  backend (the rustls-tls backend errors clearly — its `WebPkiServerVerifier`
-  CRL path isn't wired). `--ciphers`/`--tls13-ciphers` (no per-cipher selection
-  API in either backend) and `--cert-status` (rsurl requests no OCSP staple)
-  are documented-unsupported — accept-and-error, never silently ignored.
+  mTLS** (`-E/--cert`, `--key`, `--pass`, `--cert-type`/`--key-type` — incl.
+  encrypted Ed25519/ECDSA/RSA keys), **public-key pinning** (`--pinnedpubkey
+  sha256//…`, hashing the cert's on-wire SPKI), and **`--capath`** on both
+  backends. On the default purecrypto-tls backend: **`--crlfile`** (CRL
+  revocation) and **`--ciphers`/`--tls13-ciphers`** (cipher-suite restriction);
+  the rustls-tls backend errors clearly for those two. `--cert-status` (rsurl
+  requests no OCSP staple) is the only documented-unsupported TLS knob —
+  accept-and-error, never silently ignored.
 - **M9 (new protocols, partial)**: **SMTP/SMTPS** (EHLO/STARTTLS/AUTH/MAIL/RCPT/
   DATA via `--mail-from`/`--mail-rcpt`) and **TELNET** (IAC-stripping). New
   schemes: `smtp`(25)/`smtps`(465)/`telnet`(23).
@@ -152,10 +153,10 @@ Implemented across **both** TLS backends (`purecrypto-tls` default + `rustls-tls
   `--pass`, `--cert-type <PEM|DER>`, `--key-type <PEM|DER>`. The cert may embed
   the key (one file) or carry it separately via `--key`; `-E cert:secret` or
   `--pass` supply the key passphrase. Key parsing covers Ed25519 (PKCS#8),
-  ECDSA (SEC1), and RSA (PKCS#1/PKCS#8), plus encrypted PKCS#8 for Ed25519/RSA
-  on the purecrypto backend. (rustls backend: `rustls-pemfile` cannot decrypt
-  keys, so an encrypted key errors clearly; encrypted ECDSA is unsupported on
-  both backends — purecrypto has no encrypted-ECDSA loader.)
+  ECDSA (SEC1/PKCS#8), and RSA (PKCS#1/PKCS#8), plus **encrypted PKCS#8 for all
+  three** on the purecrypto backend (purecrypto 0.6.5 added the encrypted-ECDSA
+  loader). (rustls backend: `rustls-pemfile` cannot decrypt keys, so an
+  encrypted key errors clearly there.)
 - **Public-key pinning** ✅ `--pinnedpubkey sha256//BASE64[;sha256//...]`:
   after the handshake, SHA-256 of the leaf cert's DER SPKI must match a pin or
   the connection fails (`Error::BadResponse` "pinned public key …"). The bare
@@ -164,12 +165,15 @@ Implemented across **both** TLS backends (`purecrypto-tls` default + `rustls-tls
   <dir>` (adds every CA in the directory on top of the chosen base roots).
 - **Version control** ✅ `--tlsv1.0/1.1/1.2/1.3`, `--tls-max` (both backends).
 
-**`--crlfile`** (CRL revocation) is honored on the default purecrypto-tls
-backend (`ConfigBuilder::crls`); the rustls-tls backend returns a clear error
-rather than skip revocation (its `WebPkiServerVerifier` CRL path is not wired).
+- **Cipher restriction** ✅ `--ciphers` (TLS≤1.2 OpenSSL/IANA names) and
+  `--tls13-ciphers` (IANA `TLS_*`) → `ConfigBuilder::cipher_suites` on the
+  purecrypto-tls backend (purecrypto 0.6.5). Unknown/unsupported names error.
+- **CRL revocation** ✅ `--crlfile <file>` → `ConfigBuilder::crls` on the
+  purecrypto-tls backend. The rustls-tls backend returns a clear error for both
+  `--crlfile` and `--ciphers` (those builder paths aren't wired there) rather
+  than silently skipping revocation / a suite restriction.
 
-**Documented-unsupported (accept-and-error / warn, never silently ignore):**
-`--ciphers`/`--tls13-ciphers` — neither backend exposes per-cipher selection;
+**Documented-unsupported (accept-and-error, never silently ignore):**
 `--cert-status` (OCSP must-staple) — rsurl neither requests nor requires a
 stapled response.
 

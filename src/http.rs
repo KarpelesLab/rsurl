@@ -129,6 +129,11 @@ pub struct Request {
     /// Path to a CRL file (curl `--crlfile`) to check the server chain against.
     /// Honored by the purecrypto-tls backend; the rustls backend errors.
     pub(crate) crl_file: Option<String>,
+    /// Cipher-suite restriction (curl `--ciphers`, TLS≤1.2 OpenSSL names) +
+    /// (curl `--tls13-ciphers`, IANA names). Parsed to IANA IDs in
+    /// [`tls_opts_from`]. Honored by purecrypto-tls; the rustls backend errors.
+    pub(crate) ciphers: Option<String>,
+    pub(crate) tls13_ciphers: Option<String>,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -224,6 +229,8 @@ impl Request {
             pinned_pubkey: None,
             ca_path: None,
             crl_file: None,
+            ciphers: None,
+            tls13_ciphers: None,
         })
     }
 
@@ -455,6 +462,20 @@ impl Request {
     /// rustls-tls backend returns an error.
     pub fn crl_file(mut self, path: &str) -> Self {
         self.crl_file = Some(path.to_string());
+        self
+    }
+
+    /// Restrict the offered TLS≤1.2 cipher suites (curl `--ciphers`, a
+    /// colon-separated OpenSSL/IANA name list). Honored by purecrypto-tls.
+    pub fn ciphers(mut self, list: &str) -> Self {
+        self.ciphers = Some(list.to_string());
+        self
+    }
+
+    /// Restrict the offered TLS 1.3 cipher suites (curl `--tls13-ciphers`,
+    /// colon-separated IANA `TLS_*` names). Honored by purecrypto-tls.
+    pub fn tls13_ciphers(mut self, list: &str) -> Self {
+        self.tls13_ciphers = Some(list.to_string());
         self
     }
 
@@ -1374,6 +1395,8 @@ pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
         && req.client_cert.is_none()
         && req.pinned_pubkey.is_none()
         && req.crl_file.is_none()
+        && req.ciphers.is_none()
+        && req.tls13_ciphers.is_none()
 }
 
 fn pool_checkout_tls(req: &Request) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
@@ -1517,6 +1540,16 @@ pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls:
     // CRL file (read here so a missing file errors before dialing).
     if let Some(path) = &req.crl_file {
         opts.crl_pem = Some(std::fs::read(path).map_err(Error::Io)?);
+    }
+    // Cipher-suite restriction: combine --ciphers (TLS≤1.2) and --tls13-ciphers
+    // into one IANA-ID list; the backend intersects it per TLS version.
+    if let Some(spec) = &req.ciphers {
+        opts.cipher_suites
+            .extend(crate::tls::cipher_names_to_ids(spec)?);
+    }
+    if let Some(spec) = &req.tls13_ciphers {
+        opts.cipher_suites
+            .extend(crate::tls::cipher_names_to_ids(spec)?);
     }
     Ok(opts)
 }

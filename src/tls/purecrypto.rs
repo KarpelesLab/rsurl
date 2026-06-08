@@ -55,6 +55,9 @@ pub struct TlsOpts {
     /// Raw bytes of a CRL file (curl `--crlfile`) to check the server chain
     /// against. `None` disables CRL checking. PEM (`X509 CRL`) or DER.
     pub crl_pem: Option<Vec<u8>>,
+    /// IANA cipher-suite IDs to offer, in preference order (curl `--ciphers` /
+    /// `--tls13-ciphers`). Empty leaves purecrypto's full default set.
+    pub cipher_suites: Vec<u16>,
 }
 
 impl TlsOpts {
@@ -74,6 +77,7 @@ impl TlsOpts {
             key_is_der: false,
             pinned_spki_sha256: Vec::new(),
             crl_pem: None,
+            cipher_suites: Vec::new(),
         }
     }
 }
@@ -174,6 +178,11 @@ pub fn connect_over_tls<S: Read + Write>(
     }
     if let Some(v) = opts.max_version {
         builder = builder.max_version(to_pc_version(v));
+    }
+    // Cipher-suite restriction (curl `--ciphers`/`--tls13-ciphers`). purecrypto
+    // intersects this with the suites it supports, in the given order.
+    if !opts.cipher_suites.is_empty() {
+        builder = builder.cipher_suites(&opts.cipher_suites);
     }
     // Client certificate / mTLS (curl `-E`/`--cert` + `--key`/`--pass`).
     if let Some(cert_bytes) = &opts.client_cert {
