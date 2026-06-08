@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/rsurl/compare/v0.0.4...v0.0.5) - 2026-06-08
+
+### Other
+
+- wire purecrypto 0.6.5 fixes — --ciphers, encrypted ECDSA keys, faithful pinning
+- wire --crlfile (CRL revocation) on the purecrypto backend; fix wording
+- M2 client certs (mTLS), public-key pinning, and --capath (both backends)
+- receive interleaved RTP/RTCP after PLAY (M10) — roadmap complete
+- stream response bodies to a sink (completes M1)
+- finalize status — functional curl parity complete under no-C invariant
+- broaden the C ABI with ten common libcurl-shaped options (M11)
+- active-mode FTP (-P/--ftp-port) + roadmap scope correction (M10)
+- streaming decompression for single gzip/zstd/br downloads (rest of M1)
+- stream all non-HTTP downloads to a file through the sink (rest of M1)
+- --ftp-create-dirs + route FTP upload through the Client (M10)
+- honor -w on FTP downloads (size_download, time_total, …)
+- stream FTP/FTPS downloads to disk (rest of M1)
+- accept --basic and --ftp-skip-pasv-ip as honest confirmations
+- add man/rsurl.1 man page (M11) + README examples
+- --disable-epsv (skip EPSV, use PASV directly) (M10)
+- log --json/--remove-on-error/--no-clobber/-w extras/exit codes; mark NTLM out of scope
+- --remove-on-error and --no-clobber for downloads (M5/M11)
+- make CLI tests cross-platform (Windows CI green)
+- --json shortcut (POST JSON body + JSON Accept) (M4)
+- centralize transfer-error exit codes to match curl (M11)
+- -w %header{Name} and %{ssl_verify_result} (M5)
+- log SigV4, -y/-Y low-speed abort, -w phase timers, compat no-ops
+- -w phase timers (%{time_connect,appconnect,pretransfer,starttransfer}) (M5)
+- enforce -y/-Y low-speed abort + accept curl no-op flags (M5/M11)
+- AWS SigV4 request signing (--aws-sigv4) (M3)
+- roadmap progress — M1 streaming, M3 digest, M5 limits, M8 parallel
+- -Z/--parallel concurrent transfers (M8)
+- --oauth2-bearer and --data-ascii (M3/M4)
+- HTTP Digest authentication (M3)
+- streaming HTTP/1.1 downloads (M1) + enforce --limit-rate/-#/--max-filesize (M5)
+- roadmap progress — SMTP/TELNET, TLS pins, connect-to, unix-socket
+- minimal TELNET client (M9)
+- SMTP/SMTPS sending (M9)
+- roadmap progress log (network, Tiers A-C, M2/M4/M7 partials)
+- --tlsv1.x / --tls-max version pinning (M2)
+- --unix-socket via a UnixConnector (M6)
+- --connect-to (M6) — override the dial target, keep Host/SNI
+- --location-trusted and --post301/302/303 redirect controls (M4)
+- URL globbing (M7) — {a,b} alternation, [1-100]/[a-z] ranges, -g, #N
+- --retry-delay/--retry-max-time/--retry-connrefused/--retry-all-errors
+- -z, -e ;auto, --output-dir, --fail-with-body, --proto[-default]
+- getopt-style bundled short flags and attached values
+- add curl feature-parity roadmap
+- recognize -E/--limit-rate/-y/-Y/-# for compatibility (Tier C)
+- -K/--config files and --next multi-operation (partial Tier C)
+- Tier-B curl flags — netrc, -J, --retry, -4/-6, --resolve
+- add Tier-A curl flags to close the -h gap
+- route -x proxy through all schemes; no_proxy bypass; docs (phase 5)
+- UDP transport + SOCKS5 UDP ASSOCIATE for HTTP/3 and TFTP (phase 4)
+- Client/Session + thread connector through TCP protocols (phase 3)
+- route requests through a pluggable Connector (phase 2)
+- add pluggable Connector trait + built-in proxy connectors (phase 1)
+- bump purecrypto to 0.6.1 and puressh to 0.0.4
+- rustfmt the security-fix changes (cargo fmt --check)
+- fix pre-existing doc link and clippy lint blocking master CI
+- reject frame lengths exceeding usize (32-bit truncation in grease-frame path)
+- add wall-clock deadline to handshake read (slowloris hold)
+- make PEM root-bundle splitter skip malformed blocks instead of dropping the rest
+- reject signed/non-digit chunk-size and Content-Length (RFC 9112 framing parity)
+- don't re-ACK unvalidated source; add transfer deadline; fix TID comments
+- reject data port 0 in PASV/EPSV parsers
+- apply IP-literal scoping guard to cookies.txt load path
+- document borrow-invalidation and thread-safety contracts; fix doc example symbol
+- reject control bytes and over-long credentials in CONNECT
+- bound total buffered response size (OOM DoS)
+- fix panic on non-char-boundary split in status-line parsing (server DoS)
+- sanitize/guard server bytes written to a TTY (ANSI escape injection)
+- bound no-progress/control-frame floods (empty-DATA spin, SETTINGS/PING/Rapid-Reset DoS)
+- re-validate host after UTS-46 to block authority-delimiter injection
+- convert international (IDN) hostnames to punycode, on by default
+- enforce Domain= eTLD scoping with the real PSL (psl2), kill supercookies
+- enforce inbound flow-control window, reject peer overrun (FLOW_CONTROL_ERROR)
+- fail closed when an existing known_hosts file cannot be read (avoid silent TOFU accept-all)
+- bound filter-parser recursion depth to prevent stack-overflow DoS
+- cap packet remaining-length at 64 MiB to prevent pre-alloc memory exhaustion
+- reject backslash and percent in reg-name host (parser-differential host confusion)
+- bound status/header/chunk-size/trailer line reads to prevent server-driven OOM (DoS)
+- fix three confirmed security bugs in Set-Cookie handling
+- reject pre-TLS pipelined data before STARTTLS upgrade (CVE-2011-0411 class injection)
+- bound attacker-controlled QPACK literal lengths with checked_add (fix slice-index panic / remote DoS)
+
 ## [0.0.4](https://github.com/KarpelesLab/rsurl/compare/v0.0.3...v0.0.4) - 2026-05-30
 
 ### Other
