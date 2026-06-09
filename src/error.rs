@@ -26,6 +26,13 @@ pub enum Error {
     /// SFTP/SCP transfer). Carries a human-readable description; never the
     /// password or key material.
     Ssh(String),
+    /// Failed to decode a response body — an unsupported `Content-Type`
+    /// charset ([`crate::Response::text`]) or a deserialization failure
+    /// ([`crate::Response::json`]).
+    Decode(String),
+    /// [`crate::Response::error_for_status`] was called on a response whose
+    /// HTTP status was an error (>= 400). Carries the status and reason phrase.
+    Status { code: u16, reason: String },
 }
 
 impl fmt::Display for Error {
@@ -38,6 +45,14 @@ impl fmt::Display for Error {
             Error::UnexpectedEof => write!(f, "unexpected end of response"),
             Error::H2NotNegotiated => write!(f, "server did not select ALPN \"h2\""),
             Error::Ssh(m) => write!(f, "ssh error: {m}"),
+            Error::Decode(m) => write!(f, "decode error: {m}"),
+            Error::Status { code, reason } => {
+                if reason.is_empty() {
+                    write!(f, "HTTP status {code}")
+                } else {
+                    write!(f, "HTTP status {code} {reason}")
+                }
+            }
         }
     }
 }

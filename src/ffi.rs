@@ -445,9 +445,13 @@ pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
             Err(crate::Error::Io(_)) | Err(crate::Error::UnexpectedEof) => RsurlCode::Network,
             Err(crate::Error::BadResponse(_))
             | Err(crate::Error::H2NotNegotiated)
-            // `Ssh` cannot arise from this HTTP `req.send()` path, but the
-            // match must be exhaustive; treat it as a protocol/bad-response.
-            | Err(crate::Error::Ssh(_)) => RsurlCode::BadResponse,
+            // `Ssh`, `Decode`, and `Status` cannot arise from this HTTP
+            // `req.send()` path (the latter two are Response-method
+            // conveniences), but the match must be exhaustive; treat them all
+            // as a protocol/bad-response.
+            | Err(crate::Error::Ssh(_))
+            | Err(crate::Error::Decode(_))
+            | Err(crate::Error::Status { .. }) => RsurlCode::BadResponse,
             Err(crate::Error::InvalidUrl(_)) => RsurlCode::InvalidArg,
         }
     })

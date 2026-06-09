@@ -39,8 +39,14 @@ rustls-tls = ["dep:rustls", "dep:rustls-pemfile"]
 # compile in either way (they no-op without this feature). `idna` is pure Rust
 # (no C), so the no-C-toolchain guarantee is preserved.
 idn = ["dep:idna"]
+# `Response::json::<T>()` via serde + serde_json (both pure-Rust, no C). Off by
+# default so the base build pulls neither; enable with `--features json`.
+json = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
+# Optional, only for the `json` feature (`Response::json`). Pure Rust, no C.
+serde = { version = "1", optional = true, default-features = false }
+serde_json = { version = "1", optional = true }
 # Required regardless of TLS backend: SHA1 + RNG (WebSocket, MQTT), X.509
 # parsing for verbose cert display, and the QUIC stack behind HTTP/3.
 purecrypto = "0.6.5"

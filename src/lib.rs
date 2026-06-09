@@ -43,7 +43,10 @@ pub mod ffi;
 
 pub use crate::cookie::{Cookie, CookieJar};
 pub use crate::error::{Error, Result};
-pub use crate::http::{send_multiplexed, HttpVersionPref, ProxyConfig, Request, Response, Timing};
+pub use crate::http::{
+    send_multiplexed, send_multiplexed_traced, HttpVersionPref, ProxyConfig, Request, Response,
+    Timing,
+};
 pub use crate::net::Client;
 pub use crate::transfer::{transfer, transfer_url};
 pub use crate::url::Url;

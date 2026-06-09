@@ -536,6 +536,18 @@ impl Request {
         self
     }
 
+    /// Per-read inactivity timeout: the longest a single socket read may block
+    /// waiting for data. A fully stalled peer errors after this; a slow but
+    /// progressing transfer never trips it. Defaults to 60 s (see
+    /// [`Request::new`]); `None` disables it (block indefinitely). This is the
+    /// inactivity guard, distinct from the whole-operation cap [`max_time`].
+    ///
+    /// [`max_time`]: Self::max_time
+    pub fn read_timeout(mut self, d: Option<Duration>) -> Self {
+        self.read_timeout = d;
+        self
+    }
+
     /// Route through an outbound proxy. `spec` is curl-style:
     /// `scheme://[user:pass@]host:port`, or bare `host:port` (treated as
     /// `http://`). Recognised schemes: `http`, `https`, `socks4`, `socks4a`,
@@ -1187,6 +1199,76 @@ impl Response {
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
+
+    /// The `charset` parameter of the `Content-Type` header, lowercased and
+    /// unquoted, if present (e.g. `Some("utf-8")`).
+    fn charset(&self) -> Option<String> {
+        let ct = self.header("content-type")?;
+        for param in ct.split(';').skip(1) {
+            let param = param.trim();
+            let (k, v) = param.split_once('=')?;
+            if k.trim().eq_ignore_ascii_case("charset") {
+                return Some(v.trim().trim_matches('"').to_ascii_lowercase());
+            }
+        }
+        None
+    }
+
+    /// Decode the response body to a `String` using the `Content-Type` charset.
+    ///
+    /// The body has already been transparently decompressed (gzip/deflate/br/
+    /// zstd) before this point. UTF-8 (the default when no charset is declared)
+    /// is decoded lossily — invalid sequences become `U+FFFD`, like
+    /// `reqwest::Response::text`; ISO-8859-1 / Latin-1 is mapped directly. A
+    /// declared charset rsurl can't decode returns [`Error::Decode`] (use
+    /// [`Response::body`](Self::body) for the raw bytes).
+    pub fn text(&self) -> Result<String> {
+        match self.charset().as_deref() {
+            None | Some("utf-8") | Some("utf8") | Some("us-ascii") | Some("ascii") => {
+                Ok(String::from_utf8_lossy(&self.body).into_owned())
+            }
+            // Latin-1 code points are exactly Unicode U+00..=U+FF, so a byte→char
+            // map is a faithful decode (unlike windows-1252, which differs in
+            // 0x80–0x9F and is therefore rejected rather than mis-decoded).
+            Some("iso-8859-1") | Some("iso8859-1") | Some("latin1") => {
+                Ok(self.body.iter().map(|&b| b as char).collect())
+            }
+            Some(other) => Err(Error::Decode(format!(
+                "unsupported Content-Type charset {other:?}; \
+                 use Response::body for the raw {} bytes",
+                self.body.len()
+            ))),
+        }
+    }
+
+    /// Deserialize the response body as JSON into `T`. Requires the `json`
+    /// Cargo feature (pure-Rust `serde_json`, off by default).
+    ///
+    /// ```ignore
+    /// let issues: Vec<Issue> = rsurl::get(url)?.error_for_status()?.json()?;
+    /// ```
+    #[cfg(feature = "json")]
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body).map_err(|e| Error::Decode(format!("json: {e}")))
+    }
+
+    /// Consume the response, returning it unchanged for a 1xx–3xx status or
+    /// [`Error::Status`] for a 4xx/5xx one — the reqwest-style "turn an HTTP
+    /// error status into a `Result` error" convenience.
+    ///
+    /// ```ignore
+    /// let body = rsurl::get(url)?.error_for_status()?.text()?;
+    /// ```
+    pub fn error_for_status(self) -> Result<Self> {
+        if self.status >= 400 {
+            Err(Error::Status {
+                code: self.status,
+                reason: self.reason.clone(),
+            })
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
@@ -1613,7 +1695,29 @@ pub(crate) fn h3_should_fall_back(e: &Error) -> bool {
 /// dispatch over one connection, intended for callers that want to fan out
 /// independent requests to one host. For the redirect/cookie-aware single
 /// request path, use [`Request::send`] and friends.
-pub fn send_multiplexed(mut reqs: Vec<Request>, trace: &mut dyn Write) -> Vec<Result<Response>> {
+///
+/// ```no_run
+/// // Fan 100 GETs to one host over a single multiplexed HTTP/2 connection.
+/// let reqs: Vec<_> = (0..100)
+///     .map(|i| rsurl::Request::get(&format!("https://api.example.com/items/{i}")).unwrap())
+///     .collect();
+/// for r in rsurl::send_multiplexed(reqs) {
+///     if let Ok(resp) = r { let _ = resp.status; }
+/// }
+/// ```
+///
+/// Use [`send_multiplexed_traced`] to capture the `-v`-style protocol trace.
+pub fn send_multiplexed(reqs: Vec<Request>) -> Vec<Result<Response>> {
+    send_multiplexed_traced(reqs, &mut std::io::sink())
+}
+
+/// As [`send_multiplexed`], but writes the protocol trace (the `-v` `* > <`
+/// lines, interleaved per stream) to `trace`. Pass `&mut std::io::sink()` for
+/// no trace — or just call [`send_multiplexed`].
+pub fn send_multiplexed_traced(
+    mut reqs: Vec<Request>,
+    trace: &mut dyn Write,
+) -> Vec<Result<Response>> {
     // This path has no redirect loop, so normalise each request's host to
     // ASCII/punycode (IDN) here, before dispatch. Best-effort: an undecodable
     // internationalised host is left raw and surfaces as a per-request
@@ -2853,6 +2957,87 @@ mod tests {
         let opts = tls_opts_from(&req, &[]).expect("build TlsOpts");
         assert_eq!(opts.crl_pem.as_deref(), Some(body.as_slice()));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Build a bare `Response` for the body-ergonomics tests.
+    fn resp_with(content_type: Option<&str>, status: u16, body: &[u8]) -> Response {
+        let mut headers = Vec::new();
+        if let Some(ct) = content_type {
+            headers.push(("Content-Type".to_string(), ct.to_string()));
+        }
+        Response {
+            status,
+            reason: if status == 404 {
+                "Not Found".into()
+            } else {
+                "OK".into()
+            },
+            version: "HTTP/1.1".into(),
+            headers,
+            body: body.to_vec(),
+            timing: Timing::default(),
+        }
+    }
+
+    #[test]
+    fn response_text_decodes_charsets() {
+        // Default (no charset) → UTF-8.
+        assert_eq!(
+            resp_with(None, 200, "héllo".as_bytes()).text().unwrap(),
+            "héllo"
+        );
+        // Explicit, quoted, mixed-case charset param is honored.
+        assert_eq!(
+            resp_with(Some("text/plain; Charset=\"UTF-8\""), 200, b"hi")
+                .text()
+                .unwrap(),
+            "hi"
+        );
+        // Invalid UTF-8 decodes lossily (U+FFFD), never errors.
+        let lossy = resp_with(None, 200, b"a\xffb").text().unwrap();
+        assert_eq!(lossy, "a\u{fffd}b");
+        // Latin-1: byte 0xE9 is 'é'.
+        assert_eq!(
+            resp_with(Some("text/plain; charset=iso-8859-1"), 200, &[b'c', 0xE9])
+                .text()
+                .unwrap(),
+            "cé"
+        );
+        // An unsupported declared charset errors rather than mis-decoding.
+        let err = resp_with(Some("text/plain; charset=shift_jis"), 200, b"x").text();
+        assert!(matches!(err, Err(Error::Decode(_))), "got {err:?}");
+    }
+
+    #[test]
+    fn response_error_for_status() {
+        assert!(resp_with(None, 200, b"ok").error_for_status().is_ok());
+        assert!(resp_with(None, 302, b"").error_for_status().is_ok());
+        match resp_with(None, 404, b"nope").error_for_status() {
+            Err(Error::Status { code, reason }) => {
+                assert_eq!(code, 404);
+                assert_eq!(reason, "Not Found");
+            }
+            other => panic!("expected Status error, got {other:?}"),
+        }
+        assert!(matches!(
+            resp_with(None, 500, b"").error_for_status(),
+            Err(Error::Status { code: 500, .. })
+        ));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn response_json_deserializes() {
+        let r = resp_with(Some("application/json"), 200, br#"{"a":1,"b":["x","y"]}"#);
+        let v: serde_json::Value = r.json().expect("parse json");
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"][1], "y");
+        // Malformed JSON surfaces as Error::Decode, not a panic.
+        let bad = resp_with(Some("application/json"), 200, b"{not json");
+        assert!(matches!(
+            bad.json::<serde_json::Value>(),
+            Err(Error::Decode(_))
+        ));
     }
 
     #[test]

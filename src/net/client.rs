@@ -57,10 +57,38 @@ impl NetConfig {
 /// let body = client.transfer("https://example.com/").unwrap();
 /// # let _ = body;
 /// ```
+///
+/// # Sharing across threads (connection reuse)
+///
+/// `Client` is `Send + Sync` and cheap to [`Clone`] (it is just configuration),
+/// so wrap it in an [`Arc`] and share it. **Keep-alive connection reuse does
+/// not depend on holding one `Client`**, though: rsurl's HTTP/1.1 and HTTP/2
+/// idle-connection pools are *process-global*, so back-to-back requests to the
+/// same `host:port` — whether issued through one `Client`, several, or the
+/// free functions — reuse a warm connection automatically (TLS posture
+/// permitting). Fanning N requests at one host across a thread pool therefore
+/// reuses connections rather than dialing N times.
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// let client = Arc::new(rsurl::Client::new());
+/// let handles: Vec<_> = (0..16)
+///     .map(|_| {
+///         let c = Arc::clone(&client);
+///         std::thread::spawn(move || c.get("https://api.example.com/ping"))
+///     })
+///     .collect();
+/// for h in handles { let _ = h.join().unwrap(); }
+/// ```
+///
+/// For many requests to a *single* `https://` host, prefer
+/// [`send_multiplexed`](crate::send_multiplexed): one HTTP/2 connection carries
+/// every request as a concurrent stream, beating N separate connections.
 #[derive(Clone)]
 pub struct Client {
     connector: Arc<dyn Connector>,
     connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
     verify: bool,
     idn: bool,
     no_proxy: Vec<String>,
@@ -74,6 +102,7 @@ impl Default for Client {
         Client {
             connector: Arc::new(DirectConnector),
             connect_timeout: Some(Duration::from_secs(30)),
+            read_timeout: Some(Duration::from_secs(60)),
             verify: true,
             idn: true,
             no_proxy: Vec::new(),
@@ -104,9 +133,17 @@ impl Client {
         self
     }
 
-    /// Connect-phase timeout. `None` disables it.
+    /// Connect-phase timeout (default 30 s). `None` disables it.
     pub fn connect_timeout(mut self, d: Option<Duration>) -> Self {
         self.connect_timeout = d;
+        self
+    }
+
+    /// Per-read inactivity timeout for the requests this client builds (default
+    /// 60 s — so a stalled peer can't hang forever). `None` blocks
+    /// indefinitely. See [`Request::read_timeout`](crate::Request::read_timeout).
+    pub fn read_timeout(mut self, d: Option<Duration>) -> Self {
+        self.read_timeout = d;
         self
     }
 
@@ -191,7 +228,9 @@ impl Client {
             .verify_tls(self.verify)
             .idn(self.idn);
         let host = r.url().host.clone();
-        r = r.connector(self.effective_connector(&host));
+        r = r
+            .connector(self.effective_connector(&host))
+            .read_timeout(self.read_timeout);
         if let Some(t) = self.connect_timeout {
             r = r.connect_timeout(t);
         }
@@ -257,5 +296,18 @@ impl Client {
     /// TELNET: send `input`, return the received data (curl `telnet://`).
     pub fn telnet(&self, url: &Url, input: &[u8]) -> Result<Vec<u8>> {
         crate::telnet::run(url, input, &self.net_config_for(&url.host))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Client;
+
+    /// `Client` must stay `Send + Sync` so it can be wrapped in an `Arc` and
+    /// shared across threads (documented contract). A compile-time check.
+    #[test]
+    fn client_is_send_sync_and_clone() {
+        fn assert_send_sync<T: Send + Sync + Clone>() {}
+        assert_send_sync::<Client>();
     }
 }

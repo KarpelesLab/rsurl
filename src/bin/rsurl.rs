@@ -2539,6 +2539,16 @@ fn transfer_exit_code(e: &rsurl::Error) -> u8 {
         rsurl::Error::UnexpectedEof => 52,       // CURLE_GOT_NOTHING
         rsurl::Error::Ssh(_) => 79,              // CURLE_SSH
         rsurl::Error::H2NotNegotiated => 7,
+        // Library-API conveniences; they don't arise from the CLI transfer
+        // path, but the match must stay exhaustive.
+        rsurl::Error::Decode(_) => 23,
+        rsurl::Error::Status { code, .. } => {
+            if *code >= 400 {
+                22 // CURLE_HTTP_RETURNED_ERROR
+            } else {
+                7
+            }
+        }
         rsurl::Error::BadResponse(m) => {
             let m = m.to_ascii_lowercase();
             if m.contains("timed out") {

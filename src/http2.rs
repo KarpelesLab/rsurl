@@ -3573,6 +3573,11 @@ fn clone_error(e: &Error) -> Error {
         Error::UnexpectedEof => Error::UnexpectedEof,
         Error::H2NotNegotiated => Error::H2NotNegotiated,
         Error::Ssh(s) => Error::Ssh(s.clone()),
+        Error::Decode(s) => Error::Decode(s.clone()),
+        Error::Status { code, reason } => Error::Status {
+            code: *code,
+            reason: reason.clone(),
+        },
     }
 }
 
