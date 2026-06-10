@@ -59,12 +59,12 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     match url.scheme.as_str() {
         "imap" => {
             let sock = cfg.connect(&url.host, url.port)?;
-            run(Stream::Plain(sock), url)
+            run(Stream::Plain(sock), url, cfg.require_tls)
         }
         "imaps" => {
             let sock = cfg.connect(&url.host, url.port)?;
             let tls = connect_over(sock, &url.host)?;
-            run(Stream::Tls(Box::new(tls)), url)
+            run(Stream::Tls(Box::new(tls)), url, cfg.require_tls)
         }
         other => Err(Error::UnsupportedScheme(other.to_string())),
     }
@@ -140,7 +140,7 @@ impl Stream {
     }
 }
 
-fn run(mut sock: Stream, url: &Url) -> Result<Vec<u8>> {
+fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
     let mut buf = LineReader::new();
 
     // Read the unsolicited greeting. Must start with `* OK` (or `* PREAUTH`,
@@ -190,6 +190,11 @@ fn run(mut sock: Stream, url: &Url) -> Result<Vec<u8>> {
         // capabilities (e.g. LOGINDISABLED, AUTH=*) commonly change post-TLS.
         caps = request_capability(&mut sock, &mut buf, &mut tagger)?;
     }
+
+    // require-TLS (curl --ssl-reqd): if the connection is still plaintext after
+    // the STARTTLS step (not imaps, and STARTTLS wasn't negotiated), refuse to
+    // continue before LOGIN/AUTHENTICATE so credentials never travel in clear.
+    require_tls_ok(require_tls, sock.is_plain())?;
 
     // Authenticate, if we have credentials and aren't already PREAUTH.
     if !preauth {
@@ -269,6 +274,19 @@ fn run(mut sock: Stream, url: &Url) -> Result<Vec<u8>> {
     let _ = buf.read_response(&mut sock, &tag);
 
     Ok(body)
+}
+
+/// Enforce curl's `--ssl-reqd` for IMAP: when `require_tls` is set, the
+/// connection must no longer be plaintext (STARTTLS negotiated, or imaps://
+/// implicit TLS). Called after the STARTTLS step and before LOGIN/AUTHENTICATE,
+/// so credentials never travel in the clear.
+fn require_tls_ok(require_tls: bool, still_plain: bool) -> Result<()> {
+    if require_tls && still_plain {
+        return Err(Error::BadResponse(
+            "imap: TLS required (--ssl-reqd) but server did not offer STARTTLS".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Issue `CAPABILITY` and parse the untagged `* CAPABILITY ...` reply.
@@ -1341,6 +1359,42 @@ mod tests {
             .read_response_with_literals(&mut src, "a001")
             .expect_err("oversized literal must be rejected");
         assert!(matches!(err, Error::BadResponse(_)));
+    }
+
+    // -- require-TLS enforcement (curl --ssl-reqd) -------------------------
+
+    #[test]
+    fn require_tls_ok_passes_when_upgraded_or_disabled() {
+        // Disabled: plaintext is fine.
+        assert!(require_tls_ok(false, true).is_ok());
+        // Enabled but the connection is TLS (STARTTLS done / imaps): fine.
+        assert!(require_tls_ok(true, false).is_ok());
+    }
+
+    #[test]
+    fn require_tls_errors_on_plaintext_before_login() {
+        // Probe CAPABILITY against a server that does NOT advertise STARTTLS,
+        // then apply the require-TLS gate. It must reject before any LOGIN.
+        let script = b"* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n\
+                       a001 OK CAPABILITY completed\r\n";
+        let mut io = MockIo::new(script);
+        let mut lr = LineReader::new();
+        let mut tagger = Tagger::new();
+        let caps = request_capability(&mut io, &mut lr, &mut tagger).expect("caps");
+        assert!(!caps.has("STARTTLS"), "server has no STARTTLS");
+        // Still plaintext → the gate fails before authentication.
+        match require_tls_ok(true, true) {
+            Err(Error::BadResponse(m)) => assert!(m.contains("TLS required"), "got {m}"),
+            other => panic!("expected TLS required error, got {other:?}"),
+        }
+        // Only CAPABILITY was issued — no LOGIN/AUTHENTICATE on plaintext.
+        let sent = io.sent();
+        assert!(sent.contains("a001 CAPABILITY\r\n"), "{sent:?}");
+        assert!(!sent.contains("LOGIN"), "no LOGIN on plaintext: {sent:?}");
+        assert!(
+            !sent.contains("AUTHENTICATE"),
+            "no AUTH on plaintext: {sent:?}"
+        );
     }
 
     #[test]

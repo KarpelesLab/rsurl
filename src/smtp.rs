@@ -124,6 +124,13 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
         caps = ehlo(&mut io, &url.host)?;
     }
 
+    // require-TLS (curl --ssl-reqd): if the connection is still plaintext after
+    // the STARTTLS negotiation above (server didn't advertise it, or it was a
+    // plain smtp:// scheme with no upgrade), refuse to continue before any
+    // credentials or message data leave the host. smtps:// implicit TLS is a
+    // `Stream::Tls` here and so already satisfies the requirement.
+    require_tls_ok(cfg.require_tls, matches!(io.get_ref(), Stream::Plain(_)))?;
+
     // AUTH, if credentials were supplied.
     if let (Some(user), Some(pass)) = (opts.user, opts.pass) {
         authenticate(&mut io, &caps, user, pass)?;
@@ -151,6 +158,19 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
 
     let _ = send_line(&mut io, "QUIT");
     let _ = read_reply(&mut io);
+    Ok(())
+}
+
+/// Enforce curl's `--ssl-reqd` for SMTP: when `require_tls` is set, the
+/// connection must no longer be plaintext (STARTTLS negotiated, or smtps://
+/// implicit TLS). Called after the STARTTLS step and before any AUTH or
+/// message data is sent, so credentials never travel in the clear.
+fn require_tls_ok(require_tls: bool, still_plain: bool) -> Result<()> {
+    if require_tls && still_plain {
+        return Err(Error::BadResponse(
+            "smtp: TLS required (--ssl-reqd) but server did not offer STARTTLS".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -321,9 +341,21 @@ mod tests {
     }
 
     /// Minimal Read+Write transport for `read_reply`: replays a fixed script on
-    /// reads and discards writes.
+    /// reads and records writes (so tests can assert the command flow).
     struct MockIo {
         to_read: io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl MockIo {
+        fn new(script: &[u8]) -> Self {
+            Self {
+                to_read: io::Cursor::new(script.to_vec()),
+                written: Vec::new(),
+            }
+        }
+        fn sent(&self) -> String {
+            String::from_utf8_lossy(&self.written).into_owned()
+        }
     }
     impl Read for MockIo {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -332,6 +364,7 @@ mod tests {
     }
     impl Write for MockIo {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -341,9 +374,7 @@ mod tests {
 
     #[test]
     fn read_reply_parses_multiline() {
-        let io = MockIo {
-            to_read: io::Cursor::new(b"250-first\r\n250 second\r\n".to_vec()),
-        };
+        let io = MockIo::new(b"250-first\r\n250 second\r\n");
         let (code, text) = read_reply(&mut BufReader::new(io)).unwrap();
         assert_eq!(code, 250);
         assert_eq!(text, "first\nsecond");
@@ -354,12 +385,47 @@ mod tests {
         // A newline-less line larger than the 64 KiB cap (e.g. a hostile
         // greeting) must error rather than grow the buffer without limit.
         let data = vec![b'2'; 64 * 1024 + 1024];
-        let io = MockIo {
-            to_read: io::Cursor::new(data),
-        };
+        let io = MockIo::new(&data);
         match read_reply(&mut BufReader::new(io)) {
             Err(Error::BadResponse(m)) => assert!(m.contains("64 KiB"), "got {m}"),
             other => panic!("expected BadResponse(64 KiB), got {other:?}"),
         }
+    }
+
+    // -- require-TLS enforcement (curl --ssl-reqd) ------------------------
+
+    #[test]
+    fn require_tls_ok_passes_when_upgraded_or_disabled() {
+        // Disabled: plaintext is fine.
+        assert!(require_tls_ok(false, true).is_ok());
+        // Enabled but the connection is TLS (STARTTLS done / smtps): fine.
+        assert!(require_tls_ok(true, false).is_ok());
+    }
+
+    #[test]
+    fn require_tls_errors_on_plaintext_before_auth() {
+        // EHLO against a server that does NOT advertise STARTTLS, then the
+        // require-TLS gate. The gate must reject before any AUTH/MAIL is sent.
+        let mut io = BufReader::new(MockIo::new(
+            b"250-mail.example.com\r\n250 SIZE 10240000\r\n",
+        ));
+        let caps = ehlo(&mut io, "client.example").expect("ehlo");
+        assert!(
+            !caps.iter().any(|c| c == "STARTTLS"),
+            "server has no STARTTLS"
+        );
+        // Connection is still plaintext → require_tls must fail here.
+        match require_tls_ok(true, true) {
+            Err(Error::BadResponse(m)) => assert!(m.contains("TLS required"), "got {m}"),
+            other => panic!("expected TLS required error, got {other:?}"),
+        }
+        // Only EHLO was written — no AUTH/MAIL/RCPT leaked onto plaintext.
+        let sent = io.get_ref().sent();
+        assert!(sent.contains("EHLO client.example\r\n"), "{sent:?}");
+        assert!(!sent.contains("AUTH"), "no AUTH must be sent: {sent:?}");
+        assert!(
+            !sent.contains("MAIL FROM"),
+            "no MAIL must be sent: {sent:?}"
+        );
     }
 }

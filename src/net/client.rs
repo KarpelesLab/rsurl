@@ -27,6 +27,12 @@ pub(crate) struct NetConfig {
     /// Use active-mode FTP data connections (`EPRT`/`PORT`; the server dials
     /// back) instead of passive (curl `-P`/`--ftp-port`). Direct-only.
     pub(crate) ftp_active: bool,
+    /// Require TLS for mail protocols (curl `--ssl-reqd`): smtp/imap/pop3 must
+    /// upgrade to TLS (STARTTLS/STLS) before any credential or message data is
+    /// sent over the connection. A plaintext scheme whose server does not offer
+    /// the upgrade is rejected rather than transmitting in the clear. Implicit-
+    /// TLS schemes (smtps/imaps/pop3s) already satisfy this.
+    pub(crate) require_tls: bool,
 }
 
 impl Default for NetConfig {
@@ -38,6 +44,7 @@ impl Default for NetConfig {
             ftp_use_epsv: true,
             ftp_create_dirs: false,
             ftp_active: false,
+            require_tls: false,
         }
     }
 }
@@ -95,6 +102,7 @@ pub struct Client {
     ftp_use_epsv: bool,
     ftp_create_dirs: bool,
     ftp_active: bool,
+    require_tls: bool,
 }
 
 impl Default for Client {
@@ -109,6 +117,7 @@ impl Default for Client {
             ftp_use_epsv: true,
             ftp_create_dirs: false,
             ftp_active: false,
+            require_tls: false,
         }
     }
 }
@@ -181,6 +190,16 @@ impl Client {
         self
     }
 
+    /// Require TLS for mail protocols (curl `--ssl-reqd`). When `true`,
+    /// smtp/imap/pop3 transfers must negotiate STARTTLS/STLS before any
+    /// credentials or data are sent; if the server does not offer the upgrade
+    /// the transfer fails rather than continuing in cleartext. Implicit-TLS
+    /// schemes (smtps/imaps/pop3s) already satisfy it. Default `false`.
+    pub fn require_tls(mut self, on: bool) -> Self {
+        self.require_tls = on;
+        self
+    }
+
     /// Replace the no-proxy host-suffix list (curl `NO_PROXY`).
     pub fn no_proxy<I, S>(mut self, entries: I) -> Self
     where
@@ -218,6 +237,7 @@ impl Client {
             ftp_use_epsv: self.ftp_use_epsv,
             ftp_create_dirs: self.ftp_create_dirs,
             ftp_active: self.ftp_active,
+            require_tls: self.require_tls,
         }
     }
 

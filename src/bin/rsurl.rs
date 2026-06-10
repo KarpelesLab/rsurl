@@ -161,6 +161,9 @@ struct Args {
     no_clobber: bool,
     /// `--disable-epsv`: for FTP, skip `EPSV` and use `PASV` directly.
     disable_epsv: bool,
+    /// `--ssl-reqd`: require TLS for mail (smtp/imap/pop3) — the connection must
+    /// upgrade via STARTTLS/STLS before credentials or data are sent, else fail.
+    ssl_reqd: bool,
     /// `--ftp-create-dirs`: create missing remote directories before an FTP
     /// upload.
     ftp_create_dirs: bool,
@@ -2180,6 +2183,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--remove-on-error" => a.remove_on_error = true,
             "--no-clobber" => a.no_clobber = true,
             "--disable-epsv" => a.disable_epsv = true,
+            "--ssl-reqd" => a.ssl_reqd = true,
             "--ftp-create-dirs" => a.ftp_create_dirs = true,
             "-P" | "--ftp-port" => a.ftp_port = Some(next_val(&mut it, arg)?),
             // We always use passive mode (active/PORT is unimplemented), so
@@ -3008,7 +3012,8 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
         .idn(!args.no_idn)
         .ftp_use_epsv(!args.disable_epsv)
         .ftp_create_dirs(args.ftp_create_dirs)
-        .ftp_active(args.ftp_port.is_some());
+        .ftp_active(args.ftp_port.is_some())
+        .require_tls(args.ssl_reqd);
     if let Some(secs) = args.connect_timeout {
         c = c.connect_timeout(Some(Duration::from_secs(secs)));
     }
@@ -4138,6 +4143,8 @@ Options:
   -6, --ipv6               connect over IPv6 only
       --resolve <h:p:addr> use <addr> for <host>:<port> (static DNS)
       --disable-epsv       FTP: skip EPSV, use PASV directly
+      --ssl-reqd           mail (smtp/imap/pop3): require STARTTLS/STLS upgrade
+                           before sending credentials or data
   -P, --ftp-port <addr>    FTP: active mode (server connects back); <addr> is
                            accepted but the control-connection local IP is used
       --ftp-create-dirs    FTP: create missing remote dirs before upload (-T)
