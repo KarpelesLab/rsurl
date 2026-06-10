@@ -38,7 +38,7 @@ const SYSTEM_CA_PATHS: &[&str] = &[
 
 /// Knobs the caller can flip on a single TLS handshake. Same shape as the
 /// purecrypto backend so consumer code compiles against both unchanged.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct TlsOpts {
     pub alpn: Vec<Vec<u8>>,
     pub verify: bool,
@@ -87,6 +87,16 @@ impl TlsOpts {
             crl_pem: None,
             cipher_suites: Vec::new(),
         }
+    }
+}
+
+/// `TlsOpts` is public API with public fields, so `..Default::default()` in a
+/// downstream struct-update must NOT silently disable certificate verification
+/// (a `bool` derive would default `verify` to `false`). The safe default is the
+/// verifying configuration; opting out of verification must be explicit (`-k`).
+impl Default for TlsOpts {
+    fn default() -> Self {
+        TlsOpts::verifying()
     }
 }
 
@@ -582,4 +592,17 @@ fn map_rustls_version(v: rustls::ProtocolVersion) -> ProtocolVersion {
 
 fn rustls_err(e: rustls::Error) -> Error {
     Error::BadResponse(format!("tls: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_enables_verification() {
+        // TLS-2: a `#[derive(Default)]` would leave `verify == false`, silently
+        // disabling certificate verification for `..Default::default()` callers.
+        assert!(TlsOpts::default().verify);
+        assert!(TlsOpts::verifying().verify);
+    }
 }

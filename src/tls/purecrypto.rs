@@ -21,7 +21,7 @@ const READ_CHUNK: usize = 16 * 1024;
 /// to verify the chain, and an optional custom root store. Used by
 /// [`connect_over_tls`]; the older [`connect_over`] / [`connect_over_with_alpn`]
 /// wrappers fill this in with defaults.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct TlsOpts {
     /// ALPN protocol identifiers to offer (`b"h2"`, `b"http/1.1"`, ...).
     /// Empty means "don't offer ALPN".
@@ -79,6 +79,16 @@ impl TlsOpts {
             crl_pem: None,
             cipher_suites: Vec::new(),
         }
+    }
+}
+
+/// `TlsOpts` is public API with public fields, so `..Default::default()` in a
+/// downstream struct-update must NOT silently disable certificate verification
+/// (a `bool` derive would default `verify` to `false`). The safe default is the
+/// verifying configuration; opting out of verification must be explicit (`-k`).
+impl Default for TlsOpts {
+    fn default() -> Self {
+        TlsOpts::verifying()
     }
 }
 
@@ -431,4 +441,17 @@ fn tls_err(e: purecrypto::tls::Error) -> Error {
 
 fn io_tls(e: purecrypto::tls::Error) -> io::Error {
     io::Error::other(format!("tls: {e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_enables_verification() {
+        // TLS-2: a `#[derive(Default)]` would leave `verify == false`, silently
+        // disabling certificate verification for `..Default::default()` callers.
+        assert!(TlsOpts::default().verify);
+        assert!(TlsOpts::verifying().verify);
+    }
 }
