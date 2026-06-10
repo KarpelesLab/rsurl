@@ -210,6 +210,14 @@ pub struct TlsStream<S: Read + Write> {
     /// Snapshot of the peer certificate chain, leaf first, each DER-encoded.
     /// Owned so [`TlsStream::peer_certificates`] can return a borrow into it.
     peer_certs_der: Vec<Vec<u8>>,
+    /// TLS-1: set once the transport reached EOF *without* a `close_notify`
+    /// alert (rustls reports this as `UnexpectedEof`). A clean `close_notify`
+    /// leaves it `false`. `read()` still returns `Ok(0)` either way — only
+    /// this flag distinguishes them, so existing length-/chunked-framed and
+    /// HTTP/2 read paths are unaffected. The HTTP/1.x layer consults
+    /// [`TlsStream::was_truncated`] after an EOF-delimited body to reject a
+    /// truncation attack. Never reset once set.
+    dirty_eof: bool,
 }
 
 /// Establish a TLS 1.2/1.3 connection over an existing transport. Peer name
@@ -331,6 +339,7 @@ pub fn connect_over_tls<S: Read + Write>(
         version: None,
         alpn: None,
         peer_certs_der: Vec::new(),
+        dirty_eof: false,
     };
     s.run_handshake()?;
     s.snapshot_post_handshake();
@@ -441,6 +450,13 @@ impl<S: Read + Write> TlsStream<S> {
         &self.peer_certs_der
     }
 
+    /// TLS-1: `true` if the transport closed without a TLS `close_notify`
+    /// alert, i.e. a buffered EOF-delimited response may have been truncated
+    /// by an attacker injecting a TCP FIN/RST. See the `dirty_eof` field.
+    pub fn was_truncated(&self) -> bool {
+        self.dirty_eof
+    }
+
     fn run_handshake(&mut self) -> Result<()> {
         // Standard rustls drive-loop: keep stepping while the SM still
         // wants I/O, until is_handshaking() flips to false. Identical in
@@ -517,8 +533,12 @@ impl<S: Read + Write> Read for TlsStream<S> {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 // Many real servers close the TCP connection without sending
                 // close_notify. Map that to a clean EOF for parity with the
-                // purecrypto backend, which has the same behaviour.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
+                // purecrypto backend, but record it (TLS-1) so the HTTP layer
+                // can reject a truncated EOF-delimited body.
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.dirty_eof = true;
+                    return Ok(0);
+                }
                 Err(e) => return Err(e),
             }
             // No buffered plaintext — flush any pending output (post-handshake
@@ -535,7 +555,12 @@ impl<S: Read + Write> Read for TlsStream<S> {
                 return match self.conn.reader().read(dst) {
                     Ok(n) => Ok(n),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
+                    // TCP closed without close_notify and nothing buffered:
+                    // record the truncation (TLS-1) before the clean EOF.
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        self.dirty_eof = true;
+                        Ok(0)
+                    }
                     Err(e) => Err(e),
                 };
             }

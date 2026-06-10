@@ -2461,7 +2461,10 @@ fn read_response<R: Read>(
     r: &mut BufReader<R>,
     method: &str,
     trace: &mut dyn Write,
-) -> Result<Response> {
+) -> Result<Response>
+where
+    BufReader<R>: TruncationAware,
+{
     read_response_timed(r, method, None, trace)
 }
 
@@ -2472,7 +2475,10 @@ fn read_response_timed<R: Read>(
     method: &str,
     start: Option<std::time::Instant>,
     trace: &mut dyn Write,
-) -> Result<Response> {
+) -> Result<Response>
+where
+    BufReader<R>: TruncationAware,
+{
     let Head {
         version,
         status,
@@ -2595,7 +2601,7 @@ fn parse_content_length(headers: &[(String, String)]) -> Result<Option<u64>> {
     Ok(seen)
 }
 
-fn read_body<R: BufRead>(
+fn read_body<R: BufRead + TruncationAware>(
     r: &mut R,
     headers: &[(String, String)],
     _version: &str,
@@ -2659,6 +2665,13 @@ fn read_body<R: BufRead>(
         None => {
             // No content-length, no chunked — read until EOF (Connection: close).
             r.take(MAX_BODY_BYTES as u64).read_to_end(&mut body)?;
+            // TLS-1: an EOF-delimited body is framed *by the connection close*.
+            // If the TLS transport closed without a `close_notify`, the body
+            // may have been truncated by an attacker (TCP FIN/RST injection),
+            // so reject it rather than return a silently-short body.
+            if r.response_truncated() {
+                return Err(Error::UnexpectedEof);
+            }
         }
     }
     Ok(body)
@@ -2720,15 +2733,87 @@ fn read_chunked<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
 }
 
 /// Any bidirectional byte stream — lets the streaming download path hold a
-/// plain or TLS connection behind one boxed type.
-trait Rw: Read + Write {}
-impl<T: Read + Write + ?Sized> Rw for T {}
+/// plain or TLS connection behind one boxed type. `truncated()` reports
+/// whether the stream closed without a TLS `close_notify` (TLS-1); only the
+/// two concrete types we actually box are implemented, so the boxed value can
+/// answer the question without downcasting.
+trait Rw: Read + Write {
+    /// See [`TruncationAware::response_truncated`]. Default `false` for the
+    /// plaintext transport, which has no `close_notify` to miss.
+    fn truncated(&self) -> bool {
+        false
+    }
+}
+impl Rw for TcpStream {}
+impl Rw for crate::tls::TlsStream<TcpStream> {
+    fn truncated(&self) -> bool {
+        self.was_truncated()
+    }
+}
+
+/// TLS-1: whether a reader hit transport EOF *without* a TLS `close_notify`,
+/// i.e. an EOF-delimited (`Connection: close`) response body may have been
+/// truncated by an active attacker injecting a TCP FIN/RST. Non-TLS readers
+/// and the purecrypto backend (pending KarpelesLab/purecrypto#30) report
+/// `false` — they cannot distinguish a clean shutdown from a truncation.
+///
+/// Consulted *only* in the EOF-delimited branch of [`read_body`]/[`stream_body`];
+/// length-delimited, chunked, and HTTP/2 paths never call it, so they keep
+/// tolerating a missing `close_notify` exactly as before.
+pub(crate) trait TruncationAware {
+    fn response_truncated(&self) -> bool;
+}
+
+impl TruncationAware for TcpStream {
+    fn response_truncated(&self) -> bool {
+        false
+    }
+}
+
+impl TruncationAware for crate::tls::TlsStream<TcpStream> {
+    fn response_truncated(&self) -> bool {
+        self.was_truncated()
+    }
+}
+
+// The connector (SOCKS / HTTPS-proxy / caller-supplied transport) path reads
+// through a `Box<dyn NetStream>` directly, optionally wrapped in TLS.
+impl TruncationAware for Box<dyn NetStream> {
+    fn response_truncated(&self) -> bool {
+        false
+    }
+}
+
+impl TruncationAware for crate::tls::TlsStream<Box<dyn NetStream>> {
+    fn response_truncated(&self) -> bool {
+        self.was_truncated()
+    }
+}
+
+impl TruncationAware for Box<dyn Rw> {
+    fn response_truncated(&self) -> bool {
+        (**self).truncated()
+    }
+}
+
+impl<R: TruncationAware + ?Sized> TruncationAware for BufReader<R> {
+    fn response_truncated(&self) -> bool {
+        self.get_ref().response_truncated()
+    }
+}
+
+#[cfg(test)]
+impl TruncationAware for std::io::Cursor<Vec<u8>> {
+    fn response_truncated(&self) -> bool {
+        false
+    }
+}
 
 /// Stream the response body to `sink` instead of buffering it, returning the
 /// number of bytes written. Mirrors [`read_body`]'s framing (no-body statuses,
 /// chunked, Content-Length, EOF) but does not decompress — callers use this
 /// only when there is no `Content-Encoding`.
-fn stream_body<R: BufRead, W: Write + ?Sized>(
+fn stream_body<R: BufRead + TruncationAware, W: Write + ?Sized>(
     r: &mut R,
     sink: &mut W,
     headers: &[(String, String)],
@@ -2759,7 +2844,15 @@ fn stream_body<R: BufRead, W: Write + ?Sized>(
             }
             Ok(n)
         }
-        None => Ok(io::copy(&mut r.by_ref().take(MAX_BODY_BYTES as u64), sink)?),
+        None => {
+            // EOF-delimited: see the TLS-1 note in `read_body`. Reject a body
+            // whose framing close was an unauthenticated transport EOF.
+            let n = io::copy(&mut r.by_ref().take(MAX_BODY_BYTES as u64), sink)?;
+            if r.response_truncated() {
+                return Err(Error::UnexpectedEof);
+            }
+            Ok(n)
+        }
     }
 }
 
@@ -3284,6 +3377,82 @@ mod tests {
         ];
         let mut r = BufReader::new(Cursor::new(b"abcd".to_vec()));
         assert!(read_body(&mut r, &headers, "HTTP/1.1", 200, "GET").is_err());
+    }
+
+    /// A `BufRead` whose [`TruncationAware`] verdict is configurable, to drive
+    /// the TLS-1 EOF-delimited truncation checks in `read_body`/`stream_body`.
+    struct TruncReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        truncated: bool,
+    }
+    impl Read for TruncReader {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(b)
+        }
+    }
+    impl BufRead for TruncReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.inner.fill_buf()
+        }
+        fn consume(&mut self, n: usize) {
+            self.inner.consume(n)
+        }
+    }
+    impl TruncationAware for TruncReader {
+        fn response_truncated(&self) -> bool {
+            self.truncated
+        }
+    }
+
+    #[test]
+    fn read_body_rejects_truncated_eof_delimited() {
+        // No Content-Length and no chunked → EOF-delimited. A TLS close
+        // without close_notify (truncated == true) must be rejected (TLS-1).
+        let headers: Vec<(String, String)> = vec![];
+        let mut r = TruncReader {
+            inner: std::io::Cursor::new(b"partial body".to_vec()),
+            truncated: true,
+        };
+        let err = read_body(&mut r, &headers, "HTTP/1.1", 200, "GET").unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_body_accepts_clean_eof_delimited() {
+        // Same EOF-delimited body, but a clean close_notify (truncated ==
+        // false) yields the full body.
+        let headers: Vec<(String, String)> = vec![];
+        let mut r = TruncReader {
+            inner: std::io::Cursor::new(b"complete body".to_vec()),
+            truncated: false,
+        };
+        let body = read_body(&mut r, &headers, "HTTP/1.1", 200, "GET").unwrap();
+        assert_eq!(body, b"complete body");
+    }
+
+    #[test]
+    fn read_body_ignores_truncation_for_content_length() {
+        // A length-delimited body is framed by Content-Length, not the close,
+        // so a missing close_notify is irrelevant and must NOT error.
+        let headers = vec![("Content-Length".to_string(), "5".to_string())];
+        let mut r = TruncReader {
+            inner: std::io::Cursor::new(b"hello".to_vec()),
+            truncated: true,
+        };
+        let body = read_body(&mut r, &headers, "HTTP/1.1", 200, "GET").unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn stream_body_rejects_truncated_eof_delimited() {
+        let headers: Vec<(String, String)> = vec![];
+        let mut r = TruncReader {
+            inner: std::io::Cursor::new(b"partial".to_vec()),
+            truncated: true,
+        };
+        let mut sink: Vec<u8> = Vec::new();
+        let err = stream_body(&mut r, &mut sink, &headers, 200, "GET").unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof));
     }
 
     #[test]

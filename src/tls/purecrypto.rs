@@ -361,6 +361,20 @@ impl<S: Read + Write> TlsStream<S> {
         self.conn.peer_certificates()
     }
 
+    /// TLS-1: whether the transport closed without a TLS `close_notify` (a
+    /// possible response truncation).
+    ///
+    /// purecrypto's `tls::Connection` does not yet expose whether a
+    /// `close_notify` alert was received (tracked upstream as
+    /// KarpelesLab/purecrypto#30): after EOF a truncation and a clean shutdown
+    /// look identical here. Until that lands we conservatively report `false`
+    /// (no truncation) — reporting `true` would reject every legitimate
+    /// EOF-delimited response on this backend. Once purecrypto exposes the
+    /// bit, return `self.seen_eof && !self.conn.received_close_notify()`.
+    pub fn was_truncated(&self) -> bool {
+        false
+    }
+
     fn run_handshake(&mut self) -> Result<()> {
         let mut buf = [0u8; READ_CHUNK];
         loop {
