@@ -334,6 +334,11 @@ pub fn connect_over_tls<S: Read + Write>(
     };
     s.run_handshake()?;
     s.snapshot_post_handshake();
+    // TLS-4: no SAN-less-leaf check is needed here. webpki (used by the rustls
+    // verifier) already rejects a leaf that has no Subject Alternative Name —
+    // it does not fall back to Common Name matching — so a SAN-less server cert
+    // fails the handshake above. Only the purecrypto backend, which still has a
+    // CN fallback, needs the explicit post-handshake check.
     // Public-key pinning (curl `--pinnedpubkey`): hash the leaf cert SPKI and
     // require a match against at least one pin. SPKI extraction uses
     // purecrypto's x509 parser (always linked), shared with the other backend.

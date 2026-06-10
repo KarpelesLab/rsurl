@@ -263,6 +263,22 @@ pub fn connect_over_tls<S: Read + Write>(
         seen_eof: false,
     };
     s.run_handshake()?;
+    // TLS-4: reject a server leaf with no Subject Alternative Name. purecrypto's
+    // hostname check falls back to Common Name when the leaf has no SAN; CN
+    // matching is deprecated and rejected by webpki/browsers and the rustls
+    // backend, so align the default backend with modern standards. Only meaningful
+    // when we actually verified the chain (`-k` skips hostname verification too).
+    if opts.verify {
+        if let Some(der) = s.peer_certificates().first() {
+            if !client_auth::leaf_has_san(der) {
+                return Err(Error::BadResponse(
+                    "server certificate has no Subject Alternative Name \
+                     (CN fallback is not accepted)"
+                        .into(),
+                ));
+            }
+        }
+    }
     // Public-key pinning (curl `--pinnedpubkey`): after the handshake, hash the
     // leaf cert's SPKI and require a match against at least one pin.
     if !opts.pinned_spki_sha256.is_empty() {

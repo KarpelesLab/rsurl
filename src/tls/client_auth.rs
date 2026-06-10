@@ -103,6 +103,34 @@ pub fn leaf_spki_sha256(leaf_der: &[u8]) -> Option<[u8; 32]> {
     Some(purecrypto::hash::sha256(spki))
 }
 
+/// TLS-4: return `true` if the server leaf certificate has at least one
+/// Subject Alternative Name. Used by the purecrypto backend to reject a
+/// SAN-less leaf (which would otherwise fall back to deprecated Common Name
+/// matching — rejected by webpki/browsers and the rustls backend).
+///
+/// On a parse failure we return `true` (treat as "has SAN") on purpose: the
+/// chain was already cryptographically verified during the handshake, so a
+/// failure to *re-parse* the same DER here is our bug, not a security hole —
+/// returning `false` would wrongly reject a connection that already passed
+/// verification. Only a cert that parses cleanly AND carries no SAN at all is
+/// reported as SAN-less.
+//
+// Only the purecrypto backend calls this (the rustls/webpki verifier already
+// rejects SAN-less leaves), so gate it to that backend to avoid a dead-code
+// warning in the rustls build.
+#[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+pub fn leaf_has_san(leaf_der: &[u8]) -> bool {
+    let Ok(cert) = purecrypto::x509::Certificate::from_der(leaf_der.to_vec()) else {
+        return true; // re-parse failure: don't mask an already-verified chain
+    };
+    match cert.subject_alt_names() {
+        Ok(sans) => !sans.is_empty(),
+        // SAN extension present but unparseable is, again, our-bug territory;
+        // don't reject an already-verified connection over it.
+        Err(_) => true,
+    }
+}
+
 /// Map a curl `--ciphers` / `--tls13-ciphers` value (colon-separated cipher
 /// names) to the IANA wire IDs purecrypto can offer. Both OpenSSL names (TLS
 /// 1.2, e.g. `ECDHE-RSA-AES128-GCM-SHA256`) and IANA names (`TLS_*`, used by
@@ -356,6 +384,27 @@ pub(crate) fn tests_support_ed25519_leaf() -> (Vec<u8>, String) {
     (cert.to_der().to_vec(), key.to_pkcs8_pem())
 }
 
+/// Build a deterministic self-signed Ed25519 leaf with NO Subject Alternative
+/// Name (an empty `dns_names` slice omits the SAN extension entirely — see
+/// purecrypto's `legacy_extensions`). Used to exercise the TLS-4 SAN-less
+/// rejection path. Only the purecrypto backend exercises `leaf_has_san`.
+#[cfg(all(test, feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+pub(crate) fn tests_support_ed25519_leaf_no_san() -> Vec<u8> {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let key = Ed25519PrivateKey::from_bytes([9u8; 32]);
+    let dn = DistinguishedName::common_name("rsurl-test-no-san");
+    let validity = Validity::new(
+        Time::utc(2020, 1, 1, 0, 0, 0),
+        Time::utc(2099, 1, 1, 0, 0, 0),
+    );
+    let signer = CertSigner::Ed25519(&key);
+    let cert = Certificate::self_signed_general(&signer, &dn, &validity, 1, false, &[])
+        .expect("self-signed cert (no SAN)");
+    cert.to_der().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +503,26 @@ mod tests {
     }
 
     use super::tests_support_ed25519_leaf as test_ed25519_leaf;
+
+    #[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+    use super::tests_support_ed25519_leaf_no_san as test_ed25519_leaf_no_san;
+
+    #[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+    #[test]
+    fn leaf_has_san_distinguishes_present_and_absent() {
+        // TLS-4: a leaf with a SAN ("localhost") is accepted; a leaf with no
+        // SAN at all is reported as SAN-less so the purecrypto backend can
+        // reject the deprecated CN fallback.
+        let (with_san, _key) = test_ed25519_leaf();
+        assert!(leaf_has_san(&with_san));
+
+        let no_san = test_ed25519_leaf_no_san();
+        assert!(!leaf_has_san(&no_san));
+
+        // A re-parse failure must NOT be treated as SAN-less (it would wrongly
+        // reject an already-verified chain), so garbage returns `true`.
+        assert!(leaf_has_san(b"not a certificate"));
+    }
 
     #[test]
     fn spki_extraction_and_pin_match() {
