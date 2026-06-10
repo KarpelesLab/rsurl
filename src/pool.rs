@@ -51,11 +51,26 @@ const POOL_PER_KEY_CAP: usize = 4;
 const POOL_GLOBAL_CAP: usize = 32;
 
 /// Identity of a connection's destination authority.
+///
+/// `scheme`/`host`/`port` are the request URL's authority (and stay the
+/// Host/SNI). `effective_target` is the dial-target discriminator: the
+/// post-`--connect-to`/`--resolve` endpoint a request would physically dial.
+/// It is `None` in the overwhelmingly common case (no overrides), so default
+/// requests pool together exactly as before. When `--connect-to` remaps the
+/// host:port, or `--resolve` pins an IP for this (host,port), the discriminator
+/// is `Some(..)` — so a pooled socket is only reused by a request that would
+/// dial the *same* backend. Without this, two requests sharing a URL authority
+/// but with different `--connect-to`/`--resolve` settings could reuse a socket
+/// physically connected to a different backend (connection confusion). See
+/// `pool_key_for` in `src/http.rs` for how the discriminator is computed.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct Key {
     pub scheme: String,
     pub host: String,
     pub port: u16,
+    /// Effective dial target after `--connect-to`/`--resolve`. `None` when no
+    /// override applies to this (host,port).
+    pub effective_target: Option<(String, u16)>,
 }
 
 /// Generic over the transport so the same code drives both the plain and
@@ -150,6 +165,7 @@ mod tests {
             scheme: "http".into(),
             host: host.into(),
             port,
+            effective_target: None,
         }
     }
 

@@ -1314,7 +1314,7 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // semantics — out of scope for this milestone.
     let direct = req.proxy.is_none() || proxy_bypassed(&req);
     if direct {
-        if let Some(bufrd) = pool_checkout_plain(&req.url) {
+        if let Some(bufrd) = pool_checkout_plain(&req) {
             let _ = writeln!(trace, "* Reusing existing connection from pool");
             match perform_on_pooled_plain(bufrd, &req, trace) {
                 Ok(resp) => return Ok(resp),
@@ -1426,7 +1426,7 @@ fn finalize_plain(
         crate::pool::plain()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .release(pool_key_for(&req.url), bufrd);
+            .release(pool_key_for(req), bufrd);
         let _ = writeln!(trace, "* Connection kept alive (pooled)");
     } else {
         let _ = writeln!(trace, "* Connection closed");
@@ -1461,19 +1461,57 @@ fn stale_or_hard(e: Error) -> PooledError {
     }
 }
 
-pub(crate) fn pool_key_for(u: &Url) -> crate::pool::Key {
+/// Compute the dial-target discriminator for the pool key from the
+/// `--connect-to` and `--resolve` overrides that would steer this request's
+/// physical dial. Returns `None` when neither override touches the URL's
+/// (host,port) — the common case — so default requests pool together exactly
+/// as before. Mirrors the dial logic in [`tcp_connect`] on the direct
+/// (non-proxy) path, which is the only path that pools:
+///
+/// * `--connect-to` remaps host:port — fold the remapped endpoint in.
+/// * `--resolve` pins an IP for the (post-connect-to) host:port — fold the IP
+///   (as a host string) in, so two requests pinning different IPs never share.
+///
+/// Keeping the Host/SNI as the URL's is unaffected; this only discriminates
+/// *which backend* a parked socket is physically connected to.
+fn effective_dial_target(
+    connect_to: &[(String, u16, String, u16)],
+    resolve: &[(String, u16, std::net::IpAddr)],
+    host: &str,
+    port: u16,
+) -> Option<(String, u16)> {
+    let (dial_host, dial_port) = apply_connect_to(connect_to, host, port);
+    let remapped = dial_host != host || dial_port != port;
+    // --resolve pins a fixed IP for the (post-connect-to) host:port.
+    let pinned_ip = resolve
+        .iter()
+        .find(|(h, p, _)| *p == dial_port && h.eq_ignore_ascii_case(&dial_host))
+        .map(|(_, _, ip)| *ip);
+    match pinned_ip {
+        // A pinned IP fully determines the backend; key on the literal IP so
+        // two requests pinning different IPs for the same authority never
+        // share a socket.
+        Some(ip) => Some((ip.to_string(), dial_port)),
+        None if remapped => Some((dial_host, dial_port)),
+        None => None,
+    }
+}
+
+pub(crate) fn pool_key_for(req: &Request) -> crate::pool::Key {
+    let u = &req.url;
     crate::pool::Key {
         scheme: u.scheme.clone(),
         host: u.host.clone(),
         port: u.port,
+        effective_target: effective_dial_target(&req.connect_to, &req.resolve, &u.host, u.port),
     }
 }
 
-fn pool_checkout_plain(u: &Url) -> Option<BufReader<TcpStream>> {
+fn pool_checkout_plain(req: &Request) -> Option<BufReader<TcpStream>> {
     crate::pool::plain()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .checkout(&pool_key_for(u))
+        .checkout(&pool_key_for(req))
 }
 
 /// True iff this request's TLS posture matches what a pooled socket can be
@@ -1501,7 +1539,7 @@ fn pool_checkout_tls(req: &Request) -> Option<BufReader<crate::tls::TlsStream<Tc
     crate::pool::tls()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .checkout(&pool_key_for(&req.url))
+        .checkout(&pool_key_for(req))
 }
 
 /// Server-side keep-alive eligibility. Caller must also have read the body
@@ -1892,7 +1930,7 @@ fn finalize_tls(
         crate::pool::tls()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .release(pool_key_for(&req.url), bufrd);
+            .release(pool_key_for(req), bufrd);
         let _ = writeln!(trace, "* Connection kept alive (pooled)");
     } else {
         let _ = writeln!(trace, "* Connection closed");
@@ -2924,6 +2962,96 @@ mod tests {
         req.pinned_pubkey = None;
         req.crl_file = Some("/tmp/crl.pem".into());
         assert!(!tls_pool_eligible(&req)); // --crlfile
+    }
+
+    #[test]
+    fn pool_key_no_overrides_pools_together() {
+        // Two plain requests to the same authority with no --connect-to /
+        // --resolve must produce identical keys (so they share a pooled
+        // socket) — the common case, unchanged by this fix.
+        let a = Request::get("http://example.com/a").unwrap();
+        let b = Request::get("http://example.com/b").unwrap();
+        let ka = pool_key_for(&a);
+        let kb = pool_key_for(&b);
+        assert_eq!(ka, kb);
+        assert_eq!(ka.effective_target, None);
+    }
+
+    #[test]
+    fn pool_key_connect_to_distinguishes_dial_target() {
+        // Same URL authority, but --connect-to remaps the dial target. The
+        // keys must differ so a socket dialed to one backend isn't reused for
+        // a request that would dial elsewhere (connection confusion).
+        let plain = Request::get("http://example.com/").unwrap();
+        let remapped = Request::get("http://example.com/").unwrap().connect_to(
+            "example.com",
+            80,
+            "10.0.0.1",
+            8080,
+        );
+        let kp = pool_key_for(&plain);
+        let kr = pool_key_for(&remapped);
+        assert_ne!(kp, kr);
+        // SNI/Host (host,port) are unchanged — only the discriminator moves.
+        assert_eq!(kr.host, "example.com");
+        assert_eq!(kr.port, 80);
+        assert_eq!(kr.effective_target, Some(("10.0.0.1".to_string(), 8080)));
+        assert_eq!(kp.effective_target, None);
+    }
+
+    #[test]
+    fn pool_key_resolve_distinguishes_pinned_ip() {
+        // Same URL authority, but --resolve pins different IPs. Each must get
+        // a distinct key, and neither must equal the no-override key.
+        let plain = Request::get("http://example.com/").unwrap();
+        let to_a = Request::get("http://example.com/").unwrap().resolve_addr(
+            "example.com",
+            80,
+            "10.0.0.1".parse().unwrap(),
+        );
+        let to_b = Request::get("http://example.com/").unwrap().resolve_addr(
+            "example.com",
+            80,
+            "10.0.0.2".parse().unwrap(),
+        );
+        let kp = pool_key_for(&plain);
+        let ka = pool_key_for(&to_a);
+        let kb = pool_key_for(&to_b);
+        assert_ne!(ka, kb);
+        assert_ne!(ka, kp);
+        assert_ne!(kb, kp);
+        assert_eq!(ka.effective_target, Some(("10.0.0.1".to_string(), 80)));
+        assert_eq!(kb.effective_target, Some(("10.0.0.2".to_string(), 80)));
+    }
+
+    #[test]
+    fn pool_key_non_matching_override_is_transparent() {
+        // A --connect-to / --resolve rule that doesn't match this (host,port)
+        // must leave the discriminator None so pooling is unaffected.
+        let req = Request::get("http://example.com/")
+            .unwrap()
+            .connect_to("other.example", 80, "10.0.0.1", 9000)
+            .resolve_addr("other.example", 80, "10.0.0.2".parse().unwrap());
+        assert_eq!(pool_key_for(&req).effective_target, None);
+        // And it equals the bare request's key.
+        let bare = Request::get("http://example.com/").unwrap();
+        assert_eq!(pool_key_for(&req), pool_key_for(&bare));
+    }
+
+    #[test]
+    fn effective_dial_target_resolve_follows_connect_to() {
+        // --connect-to remaps to backend:8080, then --resolve pins that
+        // remapped host:port to an IP. The discriminator should reflect the
+        // pinned IP at the remapped port — matching tcp_connect's order.
+        let connect_to = vec![(
+            "example.com".to_string(),
+            80,
+            "backend".to_string(),
+            8080u16,
+        )];
+        let resolve = vec![("backend".to_string(), 8080u16, "10.0.0.5".parse().unwrap())];
+        let t = effective_dial_target(&connect_to, &resolve, "example.com", 80);
+        assert_eq!(t, Some(("10.0.0.5".to_string(), 8080)));
     }
 
     #[test]
