@@ -28,7 +28,14 @@ impl Url {
         }
         let scheme = scheme.to_ascii_lowercase();
 
-        let (authority, path) = match rest.find('/') {
+        // The authority ends at the FIRST of `/`, `?`, or `#` (RFC 3986 §3.2 /
+        // WHATWG / curl). Terminating only on `/` would let a `?` or `#` smuggle
+        // an `@` into what `rfind('@')` then treats as the authority, so that
+        // `http://expected.com?x=@attacker.com` resolves to host `attacker.com`
+        // (NET-1: authority confusion / SSRF / host-allowlist bypass). Whatever
+        // follows the delimiter (the `/`, `?`, or `#` and the rest) is the path
+        // and keeps its query/fragment for the downstream handling below.
+        let (authority, path) = match rest.find(['/', '?', '#']) {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
@@ -508,6 +515,43 @@ mod tests {
         let base = Url::parse("http://a.example/").unwrap();
         assert!(resolve(&base, "http://evil\r\nX: y/").is_err());
         assert!(resolve(&base, "/foo\r\nX: y").is_err());
+    }
+
+    #[test]
+    fn authority_ends_at_query_not_at_userinfo_at() {
+        // NET-1: a `?` must terminate the authority before `rfind('@')` runs,
+        // so the `@` lives in the query and cannot hijack the host.
+        let u = Url::parse("http://expected.com?x=@attacker.com").unwrap();
+        assert_eq!(u.host, "expected.com");
+        assert_eq!(u.userinfo, None);
+        assert_eq!(u.path, "?x=@attacker.com");
+    }
+
+    #[test]
+    fn authority_ends_at_fragment_not_at_userinfo_at() {
+        // NET-1: a `#` must terminate the authority too; the fragment (with its
+        // `@`) is then stripped and the host stays `expected.com`.
+        let u = Url::parse("http://expected.com#@attacker.com/").unwrap();
+        assert_eq!(u.host, "expected.com");
+        assert_eq!(u.userinfo, None);
+        assert_eq!(u.path, "");
+    }
+
+    #[test]
+    fn userinfo_host_path_query_fragment_all_parse() {
+        let u = Url::parse("http://user:pass@host/path?q#f").unwrap();
+        assert_eq!(u.userinfo.as_deref(), Some("user:pass"));
+        assert_eq!(u.host, "host");
+        assert_eq!(u.port, 80);
+        assert_eq!(u.path, "/path?q");
+    }
+
+    #[test]
+    fn normal_url_with_query_and_fragment_unchanged() {
+        let u = Url::parse("http://h/p?a=b#frag").unwrap();
+        assert_eq!(u.host, "h");
+        assert_eq!(u.path, "/p?a=b");
+        assert_eq!(u.userinfo, None);
     }
 
     #[test]
