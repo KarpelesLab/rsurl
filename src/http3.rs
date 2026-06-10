@@ -969,6 +969,17 @@ pub(crate) mod qpack {
                 p += value.1;
                 (name, value.0)
             };
+            // Reject malformed/forbidden octets in field names and values
+            // (RFC 9114 §10.3). Covers every code path — indexed-static,
+            // indexed-dynamic, post-base, and all literal variants — so a
+            // malicious peer can't smuggle CR/LF/NUL or non-token name bytes
+            // through to a re-serializing consumer (header/response splitting,
+            // trace corruption).
+            if !header_octets_ok(entry.0.as_bytes(), entry.1.as_bytes()) {
+                return Err(Error::BadResponse(
+                    "qpack: forbidden octet in decoded header".into(),
+                ));
+            }
             list_size = list_size
                 .saturating_add(entry.0.len())
                 .saturating_add(entry.1.len())
@@ -981,6 +992,56 @@ pub(crate) mod qpack {
             out.push(entry);
         }
         Ok(out)
+    }
+
+    /// Validate a decoded QPACK field per RFC 9114 §10.3 / RFC 7230 token
+    /// rules.
+    ///
+    /// Returns `false` (caller rejects with `Error::BadResponse`) when:
+    /// - the name is empty,
+    /// - the name contains an uppercase ASCII letter or any byte outside the
+    ///   RFC 7230 token set, EXCEPT that a single leading `:` is permitted so
+    ///   pseudo-headers like `:status` pass,
+    /// - the value contains `NUL` (0x00), `LF` (0x0a), or `CR` (0x0d).
+    ///
+    /// Values may otherwise carry any printable byte, spaces, and tabs.
+    fn header_octets_ok(name: &[u8], value: &[u8]) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        // A leading `:` marks a pseudo-header; the rest must still be a token.
+        let name_rest = if name[0] == b':' { &name[1..] } else { name };
+        if name_rest.is_empty() {
+            return false;
+        }
+        if !name_rest.iter().all(|&c| is_token_char(c)) {
+            return false;
+        }
+        !value.iter().any(|&c| c == 0x00 || c == 0x0a || c == 0x0d)
+    }
+
+    /// RFC 7230 token char: `!#$%&'*+-.^_`|~`, digits, and lowercase letters.
+    /// Uppercase letters are deliberately excluded (HTTP/3 names are lowercase).
+    fn is_token_char(c: u8) -> bool {
+        c.is_ascii_digit()
+            || c.is_ascii_lowercase()
+            || matches!(
+                c,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
     }
 
     /// Field-line relative index → absolute index (RFC 9204 §3.2.6): the
@@ -2509,6 +2570,77 @@ mod tests {
             fields,
             vec![("custom-key".to_string(), "custom-value".to_string())]
         );
+    }
+
+    #[test]
+    fn qpack_decode_rejects_crlf_in_value() {
+        // x-h: "evil\r\nset-cookie: x=1" — response-splitting payload.
+        let buf = qpack::encode_field_section(&[(
+            "x-h".to_string(),
+            "evil\r\nset-cookie: x=1".to_string(),
+        )]);
+        let err = qpack::decode_field_section(&buf).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn qpack_decode_rejects_lf_in_value() {
+        let buf = qpack::encode_field_section(&[("x-h".to_string(), "a\nb".to_string())]);
+        assert!(matches!(
+            qpack::decode_field_section(&buf).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn qpack_decode_rejects_nul_in_value() {
+        let buf = qpack::encode_field_section(&[("x-h".to_string(), "a\x00b".to_string())]);
+        assert!(matches!(
+            qpack::decode_field_section(&buf).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn qpack_decode_rejects_uppercase_name() {
+        let buf = qpack::encode_field_section(&[("X-Bad".to_string(), "ok".to_string())]);
+        assert!(matches!(
+            qpack::decode_field_section(&buf).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn qpack_decode_rejects_empty_name() {
+        let buf = qpack::encode_field_section(&[("".to_string(), "ok".to_string())]);
+        assert!(matches!(
+            qpack::decode_field_section(&buf).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn qpack_decode_accepts_normal_header_and_pseudo() {
+        // Ordinary header (spaces in value) + a tab in another value (allowed)
+        // + a pseudo-header must all decode cleanly.
+        let buf = qpack::encode_field_section(&[
+            (
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            ),
+            ("x-h".to_string(), "a\tb".to_string()),
+            (":status".to_string(), "200".to_string()),
+        ]);
+        let fields = qpack::decode_field_section(&buf).expect("decode");
+        assert_eq!(
+            fields[0],
+            (
+                "content-type".to_string(),
+                "text/html; charset=utf-8".to_string()
+            )
+        );
+        assert_eq!(fields[1], ("x-h".to_string(), "a\tb".to_string()));
+        assert_eq!(fields[2], (":status".to_string(), "200".to_string()));
     }
 
     #[test]
