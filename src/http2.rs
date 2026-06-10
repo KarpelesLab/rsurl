@@ -1154,6 +1154,16 @@ impl Decoder {
                 let value = self.read_string(buf, &mut pos)?;
                 entry = (name, value);
             }
+            // Reject malformed/forbidden octets in field names and values
+            // (RFC 9113 §8.2.1). This covers every code path — indexed,
+            // literal, and table-sourced — so a malicious peer can't smuggle
+            // CR/LF/NUL or non-token name bytes through to a re-serializing
+            // consumer (header/response splitting, trace corruption).
+            if !header_octets_ok(entry.0.as_bytes(), entry.1.as_bytes()) {
+                return Err(Error::BadResponse(
+                    "hpack: forbidden octet in decoded header".into(),
+                ));
+            }
             list_size = list_size
                 .saturating_add(entry.0.len())
                 .saturating_add(entry.1.len())
@@ -1167,6 +1177,55 @@ impl Decoder {
         }
         Ok(out)
     }
+}
+
+/// Validate a decoded HPACK field per RFC 9113 §8.2.1 / RFC 7230 token rules.
+///
+/// Returns `false` (caller rejects with `Error::BadResponse`) when:
+/// - the name is empty,
+/// - the name contains an uppercase ASCII letter or any byte outside the
+///   RFC 7230 token set, EXCEPT that a single leading `:` is permitted so
+///   pseudo-headers like `:status` pass,
+/// - the value contains `NUL` (0x00), `LF` (0x0a), or `CR` (0x0d).
+///
+/// Values may otherwise carry any printable byte, spaces, and tabs.
+fn header_octets_ok(name: &[u8], value: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // A leading `:` marks a pseudo-header; the remainder must still be a token.
+    let name_rest = if name[0] == b':' { &name[1..] } else { name };
+    if name_rest.is_empty() {
+        return false;
+    }
+    if !name_rest.iter().all(|&c| is_token_char(c)) {
+        return false;
+    }
+    !value.iter().any(|&c| c == 0x00 || c == 0x0a || c == 0x0d)
+}
+
+/// RFC 7230 token char: `!#$%&'*+-.^_`|~`, digits, and lowercase letters.
+/// Uppercase letters are deliberately excluded (HTTP/2 names are lowercase).
+fn is_token_char(c: u8) -> bool {
+    c.is_ascii_digit()
+        || c.is_ascii_lowercase()
+        || matches!(
+            c,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// Huffman-encode `input` per RFC 7541 §5.2: concatenate the per-symbol
@@ -3900,6 +3959,85 @@ mod tests {
         assert_eq!(got, vec![("custom-key".into(), "custom-header".into())]);
         // And the dynamic table should now hold the new entry.
         assert_eq!(dec.dyn_table.len(), 1);
+    }
+
+    /// Build a literal-without-indexing block (0x00 marker) with a raw
+    /// (non-Huffman) literal name and value. Used to drive forbidden-octet
+    /// rejection tests directly at the decode boundary.
+    fn raw_literal_block(name: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0x00u8];
+        buf.push(name.len() as u8); // 7-bit length, high bit 0 = raw
+        buf.extend_from_slice(name);
+        buf.push(value.len() as u8);
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    #[test]
+    fn hpack_decode_rejects_crlf_in_value() {
+        // x: "evil\r\nset-cookie: x=1" — classic response-splitting payload.
+        let block = raw_literal_block(b"x-h", b"evil\r\nset-cookie: x=1");
+        let mut dec = Decoder::new();
+        let err = dec.decode_block(&block).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn hpack_decode_rejects_lf_in_value() {
+        let block = raw_literal_block(b"x-h", b"a\nb");
+        let mut dec = Decoder::new();
+        assert!(matches!(
+            dec.decode_block(&block).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn hpack_decode_rejects_nul_in_value() {
+        let block = raw_literal_block(b"x-h", b"a\x00b");
+        let mut dec = Decoder::new();
+        assert!(matches!(
+            dec.decode_block(&block).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn hpack_decode_rejects_uppercase_name() {
+        let block = raw_literal_block(b"X-Bad", b"ok");
+        let mut dec = Decoder::new();
+        assert!(matches!(
+            dec.decode_block(&block).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn hpack_decode_rejects_empty_name() {
+        let block = raw_literal_block(b"", b"ok");
+        let mut dec = Decoder::new();
+        assert!(matches!(
+            dec.decode_block(&block).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    #[test]
+    fn hpack_decode_accepts_normal_header_and_pseudo() {
+        // Ordinary header with spaces/tabs in the value, plus a pseudo-header.
+        let mut block = raw_literal_block(b"content-type", b"text/html; charset=utf-8");
+        block.extend(raw_literal_block(b":status", b"200"));
+        let mut dec = Decoder::new();
+        let got = dec.decode_block(&block).unwrap();
+        assert_eq!(
+            got[0],
+            ("content-type".into(), "text/html; charset=utf-8".into())
+        );
+        assert_eq!(got[1], (":status".into(), "200".into()));
+        // A tab in the value is allowed (only NUL/CR/LF are forbidden).
+        let tabbed = raw_literal_block(b"x-h", b"a\tb");
+        let mut dec2 = Decoder::new();
+        assert!(dec2.decode_block(&tabbed).is_ok());
     }
 
     #[test]
