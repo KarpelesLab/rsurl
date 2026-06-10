@@ -1530,6 +1530,22 @@ fn send_inner(
         )));
     }
 
+    // `--pinnedpubkey` over HTTP/3: the pin can only be checked *after* the
+    // handshake by hashing the server leaf's SPKI, but `QuicConnection`
+    // exposes no peer-certificate accessor yet (KarpelesLab/purecrypto#31), so
+    // there is no way to honour the pin. Fail loudly rather than silently
+    // dropping the protection — a user who pins must not believe they are
+    // pinned when they are not. (The SAN-required hostname verification added
+    // on the TLS path likewise cannot run on h3 until #31 lands.)
+    if req.pinned_pubkey.is_some() {
+        return Err(Error::UnsupportedScheme(
+            "public-key pinning (--pinnedpubkey) is not yet supported over HTTP/3 \
+             (pending purecrypto peer-certificate access, KarpelesLab/purecrypto#31); \
+             retry without --http3"
+                .into(),
+        ));
+    }
+
     let mut conn = build_client(&req)?;
     let (sock, peer) = open_udp(&req)?;
     let _ = writeln!(trace, "*   Trying {peer} (UDP)...");
@@ -1664,22 +1680,77 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
     // pointed the public `crate::tls::*` API at rustls, HTTP/3 still loads
     // its trust anchors through purecrypto. Going through `pc_roots` directly
     // sidesteps the active backend.
-    // Honor `--cacert <file>` (custom trust anchors) and `-k`/`--insecure`
-    // (`req.verify_tls == false`), mirroring the HTTP/1.1 path's
-    // `tls_opts_from` / `pc_roots::load_from_file`. Fail closed: when
+    // Honor the same TLS knobs as the HTTP/1.1+2 path's `tls_opts_from`, so a
+    // user who sets `--capath` / `--crlfile` / `--ciphers` / `--tls13-ciphers`
+    // gets the same protection over h3 as over h2. Fail closed: when
     // verification is on we still need a usable root store.
-    let roots = match &req.ca_bundle {
+    //
+    // Base trust store: `--cacert <file>` replaces the system roots; otherwise
+    // load the system bundle. `--capath <dir>` then *adds* a directory of CAs
+    // on top of whichever base is in effect (curl semantics). Going through
+    // `pc_roots` directly sidesteps the active `crate::tls::*` backend (which
+    // may be rustls), because QUIC always needs a purecrypto root store.
+    let mut roots = match &req.ca_bundle {
         Some(path) => crate::tls::pc_roots::load_from_file(path)?,
         None => crate::tls::pc_roots::load_system_roots()?,
     };
-    let tls = purecrypto::tls::Config::builder()
+    if let Some(dir) = &req.ca_path {
+        crate::tls::pc_roots::add_from_dir(&mut roots, dir)?;
+    }
+
+    let mut builder = purecrypto::tls::Config::builder()
         .tls_only()
         .roots(roots)
         .server_name(req.url.host.clone())
         .verify_certificates(req.verify_tls)
         // RFC 9114 §3.1 — HTTP/3 is selected via ALPN identifier "h3".
-        .alpn(vec![b"h3".to_vec()])
-        .build();
+        .alpn(vec![b"h3".to_vec()]);
+
+    // CRL-based revocation (`--crlfile`). The `Request` stores the *path*; read
+    // it here so a missing/unreadable file surfaces as an `Error` before we
+    // dial. curl's `--crlfile` accepts a concatenation of PEM `X509 CRL`
+    // blocks, so split every block and add each (a single `add_pem` only
+    // consumes the first); fall back to raw DER when no PEM armor is present.
+    // This mirrors the purecrypto TLS backend in `src/tls/purecrypto.rs`.
+    if let Some(path) = &req.crl_file {
+        let crl_bytes = std::fs::read(path).map_err(Error::Io)?;
+        let mut store = purecrypto::tls::CrlStore::new();
+        let blocks = std::str::from_utf8(&crl_bytes)
+            .ok()
+            .map(|pem| crate::tls::pc_roots::pem_blocks_labelled(pem, "X509 CRL"))
+            .unwrap_or_default();
+        if !blocks.is_empty() {
+            for block in &blocks {
+                store
+                    .add_pem(block)
+                    .map_err(|_| Error::BadResponse("--crlfile: invalid PEM CRL block".into()))?;
+            }
+        } else {
+            store
+                .add_der(crl_bytes)
+                .map_err(|_| Error::BadResponse("--crlfile: not a valid PEM or DER CRL".into()))?;
+        }
+        builder = builder.crls(store);
+    }
+
+    // Cipher-suite restriction: combine `--ciphers` (TLS≤1.2) and
+    // `--tls13-ciphers` into one IANA-ID list, exactly like `tls_opts_from`;
+    // purecrypto intersects it with the suites it supports, in order.
+    let mut cipher_ids: Vec<u16> = Vec::new();
+    if let Some(spec) = &req.ciphers {
+        cipher_ids.extend(crate::tls::cipher_names_to_ids(spec)?);
+    }
+    if let Some(spec) = &req.tls13_ciphers {
+        cipher_ids.extend(crate::tls::cipher_names_to_ids(spec)?);
+    }
+    if !cipher_ids.is_empty() {
+        builder = builder.cipher_suites(&cipher_ids);
+    }
+
+    // NOTE: `--pinnedpubkey` is rejected up front in `send_inner` (it needs a
+    // peer-certificate accessor that `QuicConnection` lacks — purecrypto#31),
+    // so no pin handling is wired here.
+    let tls = builder.build();
 
     let transport_params = TransportParameters {
         max_idle_timeout_ms: Some(30_000),
@@ -2685,6 +2756,26 @@ mod tests {
         let err = send(req, &mut std::io::sink()).unwrap_err();
         match err {
             Error::UnsupportedScheme(_) => {}
+            other => panic!("expected UnsupportedScheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_rejects_pinned_pubkey() {
+        // `--pinnedpubkey` cannot be honoured over HTTP/3 yet: the pin is
+        // checked post-handshake against the server leaf's SPKI, but
+        // `QuicConnection` exposes no peer-certificate accessor
+        // (KarpelesLab/purecrypto#31). Rather than silently dropping the
+        // protection, `send` must reject the request up front.
+        let req = Request::get("https://example.com/")
+            .unwrap()
+            .pinned_pubkey("sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        let err = send(req, &mut std::io::sink()).unwrap_err();
+        match err {
+            Error::UnsupportedScheme(m) => assert!(
+                m.contains("--pinnedpubkey") && m.contains("HTTP/3"),
+                "unexpected message: {m}"
+            ),
             other => panic!("expected UnsupportedScheme, got {other:?}"),
         }
     }
