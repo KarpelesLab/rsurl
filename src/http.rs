@@ -850,6 +850,12 @@ impl Request {
                         )));
                     }
                     let mut next_url = crate::url::resolve(&req.url, &location)?;
+                    // Only http/https are drivable here; reject e.g. a
+                    // `gopher://`/`ftp://` Location rather than silently
+                    // treating it as plaintext HTTP (mirrors `send_once`).
+                    if next_url.scheme != "http" && next_url.scheme != "https" {
+                        return Err(Error::UnsupportedScheme(next_url.scheme.clone()));
+                    }
                     next_url.set_idn(req.idn)?;
                     let _ = writeln!(
                         trace,
@@ -1051,7 +1057,14 @@ impl Request {
                     (digest_creds.as_ref(), resp.header("www-authenticate"))
                 {
                     let scheme = chal.trim_start();
-                    if scheme.len() >= 6 && scheme[..6].eq_ignore_ascii_case("digest") {
+                    // Byte-index slicing here would panic if offset 6 is not a
+                    // UTF-8 char boundary, so compare the raw bytes instead —
+                    // `chal` is the attacker-controlled WWW-Authenticate value.
+                    if scheme
+                        .as_bytes()
+                        .get(..6)
+                        .is_some_and(|b| b.eq_ignore_ascii_case(b"digest"))
+                    {
                         if let Some(h) =
                             crate::digest::authorization(u, p, &req.method, &req.url.path, chal)
                         {
@@ -2595,7 +2608,11 @@ fn read_body<R: BufRead>(
             if len > MAX_BODY_BYTES as u64 {
                 return Err(Error::BadResponse(format!("body too large: {len}")));
             }
-            body.reserve(len as usize);
+            // Reserve only a modest amount up front and let the Vec grow as
+            // bytes actually arrive: a peer can claim Content-Length up to
+            // MAX_BODY_BYTES (256 MiB) without sending anything, so reserving
+            // the full claim would let it force a large allocation for free.
+            body.reserve(len.min(64 * 1024) as usize);
             r.take(len).read_to_end(&mut body)?;
             if (body.len() as u64) < len {
                 return Err(Error::UnexpectedEof);
@@ -2635,12 +2652,19 @@ fn read_chunked<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
             return Err(Error::BadResponse("body too large".into()));
         }
         if size == 0 {
-            // Consume trailers until empty line.
+            // Consume trailers until empty line. Each line is capped, but the
+            // total trailer block must be bounded too — otherwise a server can
+            // stream non-empty trailer lines forever and pin the thread.
+            let mut trailer_bytes: usize = 0;
             loop {
                 let mut t = String::new();
                 let n = read_line_capped(r, &mut t, MAX_HEADER_BYTES)?;
                 if n == 0 || t.trim_end_matches(['\r', '\n']).is_empty() {
                     break;
+                }
+                trailer_bytes = trailer_bytes.saturating_add(n);
+                if trailer_bytes > MAX_HEADER_BYTES {
+                    return Err(Error::BadResponse("trailer block too large".into()));
                 }
             }
             break;
@@ -2725,11 +2749,18 @@ fn stream_chunked<R: BufRead, W: Write + ?Sized>(r: &mut R, sink: &mut W) -> Res
             return Err(Error::BadResponse("body too large".into()));
         }
         if size == 0 {
+            // Bound the total trailer block (each line is already capped) so a
+            // server can't stream non-empty trailer lines forever.
+            let mut trailer_bytes: usize = 0;
             loop {
                 let mut t = String::new();
                 let n = read_line_capped(r, &mut t, MAX_HEADER_BYTES)?;
                 if n == 0 || t.trim_end_matches(['\r', '\n']).is_empty() {
                     break;
+                }
+                trailer_bytes = trailer_bytes.saturating_add(n);
+                if trailer_bytes > MAX_HEADER_BYTES {
+                    return Err(Error::BadResponse("trailer block too large".into()));
                 }
             }
             break;
@@ -3229,6 +3260,66 @@ mod tests {
         assert_eq!(body.len(), 10 + 31);
         assert_eq!(&body[..10], b"0123456789");
         assert!(body[10..].iter().all(|&b| b == b'x'));
+    }
+
+    #[test]
+    fn read_chunked_rejects_oversized_trailer_block() {
+        use std::io::Cursor;
+        // After the terminating zero chunk, a server streams non-empty trailer
+        // lines without ever sending the closing empty line. Each line is short
+        // enough to pass the per-line cap, so only a cumulative bound stops it.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"0\r\n");
+        let line = b"X-Trailer: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+        // Enough lines to exceed MAX_HEADER_BYTES in aggregate.
+        let reps = (MAX_HEADER_BYTES / line.len()) + 16;
+        for _ in 0..reps {
+            payload.extend_from_slice(line);
+        }
+        let mut r = BufReader::new(Cursor::new(payload));
+        let err = read_chunked(&mut r).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn stream_chunked_rejects_oversized_trailer_block() {
+        use std::io::Cursor;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"0\r\n");
+        let line = b"X-Trailer: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n";
+        let reps = (MAX_HEADER_BYTES / line.len()) + 16;
+        for _ in 0..reps {
+            payload.extend_from_slice(line);
+        }
+        let mut r = BufReader::new(Cursor::new(payload));
+        let mut sink = Vec::new();
+        let err = stream_chunked(&mut r, &mut sink).unwrap_err();
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn digest_scheme_detection_is_char_boundary_safe() {
+        // Mirrors the WWW-Authenticate scheme check in `send_to`. A value whose
+        // byte offset 6 lands inside a multibyte UTF-8 char must not panic and
+        // must be treated as non-Digest. `"Digé…"` is 4 ASCII + a 2-byte 'é',
+        // so offset 6 is mid-char.
+        fn is_digest(chal: &str) -> bool {
+            let scheme = chal.trim_start();
+            scheme
+                .as_bytes()
+                .get(..6)
+                .is_some_and(|b| b.eq_ignore_ascii_case(b"digest"))
+        }
+        // No panic on a non-char-boundary at offset 6, and not treated as Digest.
+        assert!(!is_digest("Digé realm=\"x\""));
+        // Multibyte right at the front also must not panic.
+        assert!(!is_digest("é"));
+        assert!(!is_digest("\u{1f600}abcdef"));
+        // Genuine schemes still match / not, by ASCII prefix.
+        assert!(is_digest("Digest realm=\"x\""));
+        assert!(is_digest("  digest realm=\"x\""));
+        assert!(!is_digest("Basic realm=\"x\""));
+        assert!(!is_digest("Dig"));
     }
 
     #[test]
