@@ -1530,26 +1530,23 @@ fn send_inner(
         )));
     }
 
-    // `--pinnedpubkey` over HTTP/3: the pin can only be checked *after* the
-    // handshake by hashing the server leaf's SPKI, but `QuicConnection`
-    // exposes no peer-certificate accessor yet (KarpelesLab/purecrypto#31), so
-    // there is no way to honour the pin. Fail loudly rather than silently
-    // dropping the protection — a user who pins must not believe they are
-    // pinned when they are not. (The SAN-required hostname verification added
-    // on the TLS path likewise cannot run on h3 until #31 lands.)
-    if req.pinned_pubkey.is_some() {
-        return Err(Error::UnsupportedScheme(
-            "public-key pinning (--pinnedpubkey) is not yet supported over HTTP/3 \
-             (pending purecrypto peer-certificate access, KarpelesLab/purecrypto#31); \
-             retry without --http3"
-                .into(),
-        ));
-    }
+    // `--pinnedpubkey`: parse the spec up front so a malformed value fails
+    // fast (before any network I/O), mirroring the TCP path's `tls_opts_from`.
+    // The pins are checked against the server leaf *after* the handshake, now
+    // that `QuicConnection` exposes the peer chain (KarpelesLab/purecrypto#31).
+    let pins = match &req.pinned_pubkey {
+        Some(spec) => crate::tls::parse_pinned_pubkey(spec)?,
+        None => Vec::new(),
+    };
 
     let mut conn = build_client(&req)?;
     let (sock, peer) = open_udp(&req)?;
     let _ = writeln!(trace, "*   Trying {peer} (UDP)...");
     handshake(&mut conn, &*sock, peer, req.read_timeout)?;
+    // Post-handshake certificate policy, identical to the TCP TLS path now
+    // that purecrypto surfaces the QUIC peer chain (purecrypto#31): a
+    // SAN-required hostname check (TLS-4) and public-key pinning.
+    verify_peer_certificates(&conn, &req, &pins)?;
     let _ = writeln!(
         trace,
         "* Connected to {} ({}) port {} (QUIC)",
@@ -1557,14 +1554,22 @@ fn send_inner(
         peer.ip(),
         peer.port()
     );
-    // QUIC carries its own TLS 1.3 handshake inside the transport, so the
-    // `crate::tls::TlsStream` accessors used by `write_tls_info` (negotiated
-    // version, ALPN, peer certificate chain) don't apply to a `QuicConnection`
-    // — purecrypto 0.2 exposes no public accessor for them. Emit the minimal
-    // equivalent: ALPN is "h3" by construction (we only offer that), and the
-    // handshake completing means the cert chain verified.
+    // QUIC carries its own TLS 1.3 handshake inside the transport. purecrypto
+    // 0.6.8 exposes the negotiated ALPN (and the peer chain, used by
+    // `verify_peer_certificates` above); report the real value.
     let _ = writeln!(trace, "* QUIC connected, TLS 1.3 handshake complete");
-    let _ = writeln!(trace, "* ALPN: server accepted h3");
+    match conn.alpn_protocol() {
+        Some(p) => {
+            let _ = writeln!(
+                trace,
+                "* ALPN: server accepted {}",
+                String::from_utf8_lossy(p)
+            );
+        }
+        None => {
+            let _ = writeln!(trace, "* ALPN: no protocol negotiated");
+        }
+    }
     let _ = writeln!(trace, "* using HTTP/3");
 
     // RFC 9114 §6.2.1 — open a unidirectional control stream and send
@@ -1667,6 +1672,50 @@ fn process_uni_stream(state: &mut Http3State, sid: u64) -> Result<()> {
         // control SETTINGS don't change our literal-only request encoding.
         _ => {
             entry.buf.clear();
+        }
+    }
+    Ok(())
+}
+
+/// Post-handshake server-certificate policy for HTTP/3, mirroring the TCP TLS
+/// path ([`crate::tls::connect_over_tls`]): a SAN-required hostname check
+/// (TLS-4, no Common-Name fallback) when verifying, and public-key pinning
+/// (`--pinnedpubkey`). Uses the peer chain `QuicConnection` exposes as of
+/// purecrypto 0.6.8 (KarpelesLab/purecrypto#31). The QUIC handshake itself has
+/// already verified the chain against the roots unless `--insecure`.
+fn verify_peer_certificates(conn: &QuicConnection, req: &Request, pins: &[[u8; 32]]) -> Result<()> {
+    let leaf = conn.peer_certificates().first().map(Vec::as_slice);
+
+    // SAN-required hostname verification (TLS-4): reject a leaf that carries no
+    // Subject Alternative Name (purecrypto's verifier would otherwise fall
+    // back to the deprecated Common Name). Only meaningful when verifying.
+    if req.verify_tls {
+        match leaf {
+            Some(der) if crate::tls::client_auth::leaf_has_san(der) => {}
+            Some(_) => {
+                return Err(Error::BadResponse(
+                    "server certificate has no Subject Alternative Name \
+                     (CN fallback is not accepted)"
+                        .into(),
+                ))
+            }
+            // No chain surfaced: the handshake's own verification (gated on
+            // verify_certificates) is the authority; nothing to add here.
+            None => {}
+        }
+    }
+
+    // Public-key pinning (curl `--pinnedpubkey`): require the leaf SPKI to
+    // match at least one pin. Enforced even under `--insecure`, exactly like
+    // the TCP path.
+    if !pins.is_empty() {
+        match leaf {
+            Some(der) if crate::tls::client_auth::spki_pin_matches(der, pins) => {}
+            _ => {
+                return Err(Error::BadResponse(
+                    "pinned public key does not match server certificate".into(),
+                ))
+            }
         }
     }
     Ok(())
@@ -2761,23 +2810,22 @@ mod tests {
     }
 
     #[test]
-    fn send_rejects_pinned_pubkey() {
-        // `--pinnedpubkey` cannot be honoured over HTTP/3 yet: the pin is
-        // checked post-handshake against the server leaf's SPKI, but
-        // `QuicConnection` exposes no peer-certificate accessor
-        // (KarpelesLab/purecrypto#31). Rather than silently dropping the
-        // protection, `send` must reject the request up front.
+    fn send_rejects_malformed_pinned_pubkey() {
+        // `--pinnedpubkey` is honoured over HTTP/3 (the pin is checked
+        // post-handshake against the server leaf, purecrypto#31). A malformed
+        // pin spec is rejected up front, before any network I/O, mirroring the
+        // TCP path's `tls_opts_from`. (A *well-formed* pin would proceed to a
+        // real handshake, which a unit test can't exercise offline.)
         let req = Request::get("https://example.com/")
             .unwrap()
-            .pinned_pubkey("sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+            .pinned_pubkey("not-a-valid-pin-spec");
         let err = send(req, &mut std::io::sink()).unwrap_err();
-        match err {
-            Error::UnsupportedScheme(m) => assert!(
-                m.contains("--pinnedpubkey") && m.contains("HTTP/3"),
-                "unexpected message: {m}"
-            ),
-            other => panic!("expected UnsupportedScheme, got {other:?}"),
-        }
+        // Parsing happens after the https-scheme check and before the dial, so
+        // this must NOT be a connection/UDP error.
+        assert!(
+            !matches!(err, Error::Io(_)),
+            "expected a pin-parse error before any network I/O, got {err:?}"
+        );
     }
 
     #[test]

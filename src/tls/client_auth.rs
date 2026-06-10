@@ -115,10 +115,11 @@ pub fn leaf_spki_sha256(leaf_der: &[u8]) -> Option<[u8; 32]> {
 /// verification. Only a cert that parses cleanly AND carries no SAN at all is
 /// reported as SAN-less.
 //
-// Only the purecrypto backend calls this (the rustls/webpki verifier already
-// rejects SAN-less leaves), so gate it to that backend to avoid a dead-code
-// warning in the rustls build.
-#[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+// Called by the purecrypto TLS backend (the rustls/webpki verifier already
+// rejects SAN-less leaves) AND by the always-compiled HTTP/3 path, which runs
+// the same post-handshake check over QUIC regardless of the active TLS
+// backend — so this is not gated to a backend. The body only uses
+// `purecrypto::x509`, which is always linked.
 pub fn leaf_has_san(leaf_der: &[u8]) -> bool {
     let Ok(cert) = purecrypto::x509::Certificate::from_der(leaf_der.to_vec()) else {
         return true; // re-parse failure: don't mask an already-verified chain
