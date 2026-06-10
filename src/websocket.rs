@@ -580,18 +580,25 @@ fn finish_data_message(
     compressed: bool,
     pmd: Option<&mut Pmd>,
 ) -> Result<Message> {
-    if compressed {
+    let payload = if compressed {
         let pmd = pmd.ok_or_else(|| {
             Error::BadResponse("compressed WS message without negotiated permessage-deflate".into())
         })?;
-        let inflated = pmd.inflate_message(&payload)?;
-        Ok(Message::Data {
-            opcode,
-            payload: inflated,
-        })
+        pmd.inflate_message(&payload)?
     } else {
-        Ok(Message::Data { opcode, payload })
+        payload
+    };
+    // RFC 6455 §8.1: a TEXT message MUST carry valid UTF-8; a receiver fails
+    // the connection on invalid UTF-8. We validate the fully reassembled
+    // (and, if applicable, inflated) buffer so a multibyte sequence split
+    // across fragments still validates correctly. BINARY frames are opaque
+    // and are never validated.
+    if opcode == OPCODE_TEXT && std::str::from_utf8(&payload).is_err() {
+        return Err(Error::BadResponse(
+            "WS TEXT message payload is not valid UTF-8".into(),
+        ));
     }
+    Ok(Message::Data { opcode, payload })
 }
 
 /// Append `chunk` to the reassembly buffer, enforcing the cumulative cap.
@@ -1176,6 +1183,51 @@ mod tests {
             Message::Data {
                 opcode: OPCODE_TEXT,
                 payload: b"Hello world".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_text_message_is_rejected() {
+        // 0xff is never valid UTF-8; a TEXT message carrying it must fail the
+        // connection per RFC 6455 §8.1.
+        let inbound = server_frame(true, OPCODE_TEXT, &[0xff, 0xfe]);
+        let mut s = MockStream::new(inbound);
+        let err = read_message(&mut s, None).expect_err("invalid utf-8 TEXT must be rejected");
+        match err {
+            Error::BadResponse(m) => assert!(m.contains("UTF-8"), "unexpected message: {m}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_binary_message_is_accepted() {
+        // The same bytes in a BINARY message are fine — BINARY is opaque.
+        let inbound = server_frame(true, OPCODE_BINARY, &[0xff, 0xfe]);
+        let mut s = MockStream::new(inbound);
+        let msg = read_message(&mut s, None).expect("binary is not utf-8 validated");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_BINARY,
+                payload: vec![0xff, 0xfe],
+            }
+        );
+    }
+
+    #[test]
+    fn valid_utf8_text_message_passes() {
+        // Multibyte UTF-8 (é = 0xc3 0xa9) split across two fragments still
+        // validates because we check the reassembled buffer.
+        let mut inbound = server_frame(false, OPCODE_TEXT, &[0xc3]);
+        inbound.extend(server_frame(true, OPCODE_CONT, &[0xa9]));
+        let mut s = MockStream::new(inbound);
+        let msg = read_message(&mut s, None).expect("valid utf-8 across fragments");
+        assert_eq!(
+            msg,
+            Message::Data {
+                opcode: OPCODE_TEXT,
+                payload: "é".as_bytes().to_vec(),
             }
         );
     }
