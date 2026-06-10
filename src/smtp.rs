@@ -222,18 +222,30 @@ fn send_line<R: Read + Write>(io: &mut BufReader<R>, line: &str) -> Result<()> {
 /// Read a (possibly multi-line) SMTP reply. Lines look like `250-text`
 /// (continuation) or `250 text` (final). Returns `(code, joined_text)`.
 fn read_reply<R: Read + Write>(io: &mut BufReader<R>) -> Result<(u16, String)> {
+    const MAX_REPLY_BYTES: usize = 64 * 1024;
     let mut text = String::new();
     let mut total = 0usize;
     loop {
-        let mut line = String::new();
-        let n = io.read_line(&mut line)?;
+        // Bound each line read: `read_line`/`read_until` are otherwise
+        // unbounded, so a server (or MITM on plaintext smtp://) that sends a
+        // single line with no `\n` — e.g. a multi-gigabyte greeting read right
+        // after connect — would make us allocate forever before the running
+        // cap below is ever checked. Cap the per-line reader at the remaining
+        // reply budget plus one byte, so we can tell "line is exactly at the
+        // limit" from "line overran the limit".
+        let line_cap = MAX_REPLY_BYTES - total;
+        let mut raw = Vec::new();
+        let n = (&mut *io)
+            .take(line_cap as u64 + 1)
+            .read_until(b'\n', &mut raw)?;
         if n == 0 {
             return Err(Error::UnexpectedEof);
         }
-        total += n;
-        if total > 64 * 1024 {
+        if raw.len() > line_cap {
             return Err(Error::BadResponse("smtp: reply exceeds 64 KiB".into()));
         }
+        total += n;
+        let line = String::from_utf8_lossy(&raw);
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.len() < 3 || !trimmed.as_bytes()[..3].iter().all(u8::is_ascii_digit) {
             return Err(Error::BadResponse(format!(
@@ -306,5 +318,48 @@ mod tests {
     fn reject_ctl_blocks_crlf() {
         assert!(reject_ctl("a@b\r\nDATA", "mail-from").is_err());
         assert!(reject_ctl("a@b.com", "mail-from").is_ok());
+    }
+
+    /// Minimal Read+Write transport for `read_reply`: replays a fixed script on
+    /// reads and discards writes.
+    struct MockIo {
+        to_read: io::Cursor<Vec<u8>>,
+    }
+    impl Read for MockIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.to_read.read(buf)
+        }
+    }
+    impl Write for MockIo {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_reply_parses_multiline() {
+        let io = MockIo {
+            to_read: io::Cursor::new(b"250-first\r\n250 second\r\n".to_vec()),
+        };
+        let (code, text) = read_reply(&mut BufReader::new(io)).unwrap();
+        assert_eq!(code, 250);
+        assert_eq!(text, "first\nsecond");
+    }
+
+    #[test]
+    fn read_reply_aborts_on_unbounded_single_line() {
+        // A newline-less line larger than the 64 KiB cap (e.g. a hostile
+        // greeting) must error rather than grow the buffer without limit.
+        let data = vec![b'2'; 64 * 1024 + 1024];
+        let io = MockIo {
+            to_read: io::Cursor::new(data),
+        };
+        match read_reply(&mut BufReader::new(io)) {
+            Err(Error::BadResponse(m)) => assert!(m.contains("64 KiB"), "got {m}"),
+            other => panic!("expected BadResponse(64 KiB), got {other:?}"),
+        }
     }
 }
