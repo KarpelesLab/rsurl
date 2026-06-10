@@ -113,15 +113,23 @@ fn parse_into_store(pem: &str, path: &str) -> Result<RootCertStore> {
 /// Yield each `-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----`
 /// block from a PEM string as its own string.
 pub(crate) fn pem_blocks(pem: &str) -> Vec<String> {
-    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
-    const END: &str = "-----END CERTIFICATE-----";
+    pem_blocks_labelled(pem, "CERTIFICATE")
+}
+
+/// Like [`pem_blocks`] but for an arbitrary RFC 7468 `label` (e.g. `X509 CRL`).
+/// Yields each `-----BEGIN <label>-----...-----END <label>-----` block as its
+/// own string, tolerating junk between blocks and unterminated/stray headers.
+pub(crate) fn pem_blocks_labelled(pem: &str, label: &str) -> Vec<String> {
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let (begin, end): (&str, &str) = (&begin, &end);
     let mut out = Vec::new();
     let mut rest = pem;
-    while let Some(start) = rest.find(BEGIN) {
+    while let Some(start) = rest.find(begin) {
         let after_begin = &rest[start..];
         // Body of this candidate block is everything past its own header.
-        let body = &after_begin[BEGIN.len()..];
-        let Some(end_rel) = body.find(END) else {
+        let body = &after_begin[begin.len()..];
+        let Some(end_rel) = body.find(end) else {
             // This BEGIN has no matching END anywhere after it. Don't abort the
             // whole scan and discard every later block — skip just past this
             // BEGIN and keep looking for the next well-formed block.
@@ -131,7 +139,7 @@ pub(crate) fn pem_blocks(pem: &str) -> Vec<String> {
         // If another BEGIN appears before that END, this BEGIN is unterminated
         // (its body is garbage and the END belongs to a later block). Skip past
         // this BEGIN and re-scan, so the later block isn't swallowed whole.
-        if let Some(next_begin) = body.find(BEGIN) {
+        if let Some(next_begin) = body.find(begin) {
             if next_begin < end_rel {
                 rest = body;
                 continue;
@@ -139,7 +147,7 @@ pub(crate) fn pem_blocks(pem: &str) -> Vec<String> {
         }
         // `add_pem` remains the authority on what's actually trusted; we only
         // slice candidate blocks here.
-        let end_abs = start + BEGIN.len() + end_rel + END.len();
+        let end_abs = start + begin.len() + end_rel + end.len();
         out.push(rest[start..end_abs].to_string());
         rest = &rest[end_abs..];
     }

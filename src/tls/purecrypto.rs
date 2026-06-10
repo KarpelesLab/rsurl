@@ -209,13 +209,23 @@ pub fn connect_over_tls<S: Read + Write>(
     // handshake time if the leaf/intermediates appear on a supplied CRL.
     if let Some(crl_bytes) = &opts.crl_pem {
         let mut store = CrlStore::new();
-        // Try PEM (`X509 CRL`) first, then raw DER. A single file with one CRL
-        // is the common case; `add_pem` consumes the first `X509 CRL` block.
-        let pem_ok = std::str::from_utf8(crl_bytes)
+        // curl's --crlfile accepts a *concatenation* of PEM CRLs. Split out
+        // every `X509 CRL` block and add each one — `add_pem` only consumes the
+        // first block, so feeding it the whole file would silently drop the
+        // revocations in the 2nd+ CRL. A block that fails to parse is surfaced
+        // as an error rather than dropped.
+        let blocks = std::str::from_utf8(crl_bytes)
             .ok()
-            .map(|s| store.add_pem(s).is_ok())
-            .unwrap_or(false);
-        if !pem_ok {
+            .map(crl_pem_blocks)
+            .unwrap_or_default();
+        if !blocks.is_empty() {
+            for block in &blocks {
+                store
+                    .add_pem(block)
+                    .map_err(|_| Error::BadResponse("--crlfile: invalid PEM CRL block".into()))?;
+            }
+        } else {
+            // No PEM CRL blocks found — treat the file as raw DER (single CRL).
             store
                 .add_der(crl_bytes.clone())
                 .map_err(|_| Error::BadResponse("--crlfile: not a valid PEM or DER CRL".into()))?;
@@ -246,6 +256,13 @@ pub fn connect_over_tls<S: Read + Write>(
         }
     }
     Ok(s)
+}
+
+/// Split a `--crlfile` PEM body into its individual `X509 CRL` blocks. Mirrors
+/// the certificate splitter in [`super::pc_roots`] so a concatenation of CRLs
+/// (which curl accepts) is fully honoured instead of only the first block.
+fn crl_pem_blocks(pem: &str) -> Vec<String> {
+    pc_roots::pem_blocks_labelled(pem, "X509 CRL")
 }
 
 /// Parse the client cert chain + signing key from raw file bytes, honouring the
@@ -453,5 +470,34 @@ mod tests {
         // disabling certificate verification for `..Default::default()` callers.
         assert!(TlsOpts::default().verify);
         assert!(TlsOpts::verifying().verify);
+    }
+
+    #[test]
+    fn crl_pem_blocks_splits_concatenated_crls() {
+        // TLS-3: curl's --crlfile accepts a concatenation of PEM CRLs. The
+        // splitter must yield every `X509 CRL` block (not just the first), so
+        // revocations in the 2nd+ CRL aren't silently dropped.
+        let pem = "-----BEGIN X509 CRL-----\nAAA\n-----END X509 CRL-----\n\
+            noise between blocks\n\
+            -----BEGIN X509 CRL-----\nBBB\n-----END X509 CRL-----\n";
+        let blocks = crl_pem_blocks(pem);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].contains("AAA"));
+        assert!(blocks[1].contains("BBB"));
+    }
+
+    #[test]
+    fn crl_pem_blocks_single_unchanged() {
+        let pem = "-----BEGIN X509 CRL-----\nAAA\n-----END X509 CRL-----\n";
+        let blocks = crl_pem_blocks(pem);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].contains("AAA"));
+    }
+
+    #[test]
+    fn crl_pem_blocks_empty_for_der() {
+        // Raw DER (no PEM armor) yields no blocks, so the caller falls back to
+        // `add_der` for the single-CRL DER case.
+        assert!(crl_pem_blocks("not a pem armored crl at all").is_empty());
     }
 }
