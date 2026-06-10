@@ -716,11 +716,30 @@ impl LineReader {
     /// an empty string + error if the socket closes mid-line.
     fn read_line<S: Read>(&mut self, sock: &mut S) -> Result<String> {
         let mut tmp = [0u8; 4096];
+        // How far into `self.buf` we've already scanned for CRLF. Avoids
+        // re-scanning the whole accumulation on every read (otherwise a long
+        // line would make `read_line` O(n^2)); only the freshly-read tail is
+        // examined, backing up one byte so a CRLF straddling two reads is seen.
+        let mut scanned = 0usize;
         loop {
-            if let Some(pos) = find_crlf(&self.buf) {
+            if let Some(rel) = find_crlf(&self.buf[scanned..]) {
+                let pos = scanned + rel;
                 let line_bytes: Vec<u8> = self.buf.drain(..pos + 2).collect();
                 let without_crlf = &line_bytes[..line_bytes.len() - 2];
                 return Ok(String::from_utf8_lossy(without_crlf).into_owned());
+            }
+            scanned = self.buf.len().saturating_sub(1);
+            // Per-line bound: the aggregate `MAX_RESPONSE_BYTES` guard in
+            // `read_response_with_literals` only runs between completed lines,
+            // so a server that streams endless bytes with no CRLF would grow
+            // `self.buf` without limit before that guard ever fires. Abort once
+            // a single CRLF-less accumulation exceeds the response cap. (This
+            // is distinct from literal byte reads, which go through
+            // `read_exact` and are bounded by `MAX_LITERAL_BYTES`.)
+            if self.buf.len() > MAX_RESPONSE_BYTES {
+                return Err(Error::BadResponse(format!(
+                    "imap: response line exceeds maximum {MAX_RESPONSE_BYTES} bytes"
+                )));
             }
             let n = sock.read(&mut tmp)?;
             if n == 0 {
@@ -1162,6 +1181,20 @@ mod tests {
         let mut io = MockIo::new(&script);
         let mut lr = LineReader::new();
         match lr.read_response_with_literals(&mut io, "a001") {
+            Err(Error::BadResponse(m)) => assert!(m.contains("maximum"), "got {m}"),
+            other => panic!("expected BadResponse(maximum), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_line_aborts_on_endless_crlf_less_stream() {
+        // A server that streams bytes with no CRLF would otherwise grow
+        // `LineReader::buf` without limit, since the aggregate cap only runs
+        // between completed lines. The per-line bound must abort first.
+        let data = vec![b'x'; MAX_RESPONSE_BYTES + 4096];
+        let mut io = MockIo::new(&data);
+        let mut lr = LineReader::new();
+        match lr.read_line(&mut io) {
             Err(Error::BadResponse(m)) => assert!(m.contains("maximum"), "got {m}"),
             other => panic!("expected BadResponse(maximum), got {other:?}"),
         }
