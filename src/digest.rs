@@ -28,9 +28,27 @@ pub(crate) fn authorization(
     let p = parse_params(body);
     let realm = p.get("realm")?;
     let nonce = p.get("nonce")?;
-    let algorithm = p.get("algorithm").map(String::as_str).unwrap_or("MD5");
-    let use_sha = algorithm.to_ascii_uppercase().starts_with("SHA-256");
-    let sess = algorithm.to_ascii_uppercase().ends_with("-SESS");
+    // Fail closed on attacker-controlled challenge values that would break out
+    // of the quoted-string params we emit (a `"` in realm could forge
+    // auth-params). RFC 7616 quoted strings can't carry these unescaped, and
+    // we'd rather refuse than risk header injection — see `is_safe_quoted`.
+    if !is_safe_quoted(realm) || !is_safe_quoted(nonce) {
+        return None;
+    }
+
+    // Recognise exactly the algorithms we implement, case-insensitively. An
+    // unknown token (typo, attacker-chosen, or an algorithm we don't support
+    // such as SHA-512-256) must FAIL CLOSED rather than silently degrade to
+    // MD5 while echoing the server's algorithm string in the header.
+    let raw_alg = p.get("algorithm").map(String::as_str);
+    let (algorithm, use_sha, sess) = match raw_alg {
+        None => ("MD5", false, false),
+        Some(a) if a.eq_ignore_ascii_case("MD5") => ("MD5", false, false),
+        Some(a) if a.eq_ignore_ascii_case("MD5-sess") => ("MD5-sess", false, true),
+        Some(a) if a.eq_ignore_ascii_case("SHA-256") => ("SHA-256", true, false),
+        Some(a) if a.eq_ignore_ascii_case("SHA-256-sess") => ("SHA-256-sess", true, true),
+        Some(_) => return None,
+    };
     // qop: pick "auth" if offered.
     let qop_auth = p
         .get("qop")
@@ -63,9 +81,15 @@ pub(crate) fn authorization(
          uri=\"{uri}\", response=\"{response}\""
     );
     if let Some(opaque) = p.get("opaque") {
+        // Same quoted-string break-out hazard as realm/nonce.
+        if !is_safe_quoted(opaque) {
+            return None;
+        }
         out.push_str(&format!(", opaque=\"{opaque}\""));
     }
-    if p.contains_key("algorithm") {
+    if raw_alg.is_some() {
+        // Echo the algorithm we actually selected (a recognised token), never
+        // the raw challenge string.
         out.push_str(&format!(", algorithm={algorithm}"));
     }
     if qop_auth {
@@ -126,6 +150,16 @@ fn parse_params(s: &str) -> HashMap<String, String> {
     map
 }
 
+/// `true` if `v` is safe to interpolate verbatim into a `"..."` auth-param.
+/// We reject the characters that could break out of (or corrupt) the quoted
+/// string — `"` and `\` (escape/quote chars) and the control bytes CR, LF, NUL
+/// — so an attacker-controlled `realm`/`nonce`/`opaque` can't forge additional
+/// auth-params or split the header.
+fn is_safe_quoted(v: &str) -> bool {
+    !v.bytes()
+        .any(|b| b == b'"' || b == b'\\' || b == b'\r' || b == b'\n' || b == 0)
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -182,6 +216,36 @@ mod tests {
         assert!(h.contains("uri=\"/dir/index.html\""));
         assert!(h.contains("response=\""));
         assert!(h.contains("opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""));
+    }
+
+    #[test]
+    fn unknown_algorithm_fails_closed() {
+        // SHA-512-256 is a real RFC 7616 algorithm we do NOT implement; it must
+        // not silently degrade to MD5.
+        let chal = "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256";
+        assert!(authorization("u", "p", "GET", "/", chal).is_none());
+        // A bogus/typo token likewise fails closed.
+        let chal2 = "Digest realm=\"r\", nonce=\"n\", algorithm=MD6";
+        assert!(authorization("u", "p", "GET", "/", chal2).is_none());
+    }
+
+    #[test]
+    fn sha256_algorithm_echoed_as_selected() {
+        let chal = "Digest realm=\"r\", nonce=\"n\", algorithm=sha-256";
+        let h = authorization("u", "p", "GET", "/", chal).unwrap();
+        // The emitted token reflects the selected algorithm (canonical form),
+        // not the raw lowercase challenge string.
+        assert!(h.contains("algorithm=SHA-256"), "got: {h}");
+    }
+
+    #[test]
+    fn quoted_value_breakout_rejected() {
+        // A `"` in realm could otherwise forge auth-params.
+        let chal = "Digest realm=\"r\\\"x\", nonce=\"n\"";
+        assert!(authorization("u", "p", "GET", "/", chal).is_none());
+        // CRLF in nonce would split the header.
+        let chal2 = "Digest realm=\"r\", nonce=\"n\r\nX: y\"";
+        assert!(authorization("u", "p", "GET", "/", chal2).is_none());
     }
 
     #[test]
