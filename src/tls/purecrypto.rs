@@ -362,17 +362,15 @@ impl<S: Read + Write> TlsStream<S> {
     }
 
     /// TLS-1: whether the transport closed without a TLS `close_notify` (a
-    /// possible response truncation).
+    /// possible response truncation by an attacker injecting a TCP FIN/RST).
     ///
-    /// purecrypto's `tls::Connection` does not yet expose whether a
-    /// `close_notify` alert was received (tracked upstream as
-    /// KarpelesLab/purecrypto#30): after EOF a truncation and a clean shutdown
-    /// look identical here. Until that lands we conservatively report `false`
-    /// (no truncation) — reporting `true` would reject every legitimate
-    /// EOF-delimited response on this backend. Once purecrypto exposes the
-    /// bit, return `self.seen_eof && !self.conn.received_close_notify()`.
+    /// True only once we've actually seen transport EOF *and* the peer never
+    /// delivered a `close_notify` alert. `received_close_notify()` (purecrypto
+    /// 0.6.8, KarpelesLab/purecrypto#30) distinguishes a graceful shutdown
+    /// from a truncation. The HTTP/1.x layer consults this after an
+    /// EOF-delimited body; see `http::read_body`.
     pub fn was_truncated(&self) -> bool {
-        false
+        self.seen_eof && !self.conn.received_close_notify()
     }
 
     fn run_handshake(&mut self) -> Result<()> {
