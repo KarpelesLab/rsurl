@@ -8,6 +8,7 @@
 use std::io::{self, Read, Write};
 
 use purecrypto::tls::{Config, Connection, CrlStore, HandshakeStatus};
+use zeroize::Zeroize;
 
 use super::common::ProtocolVersion;
 use super::{client_auth, pc_roots};
@@ -92,6 +93,22 @@ impl Default for TlsOpts {
     }
 }
 
+/// TLS-5: wipe the client private-key material on drop. `TlsOpts` holds the
+/// raw `--key` bytes and the `--pass` passphrase in plain heap and derives
+/// `Clone`, so without this the decrypted key bytes would linger in freed
+/// memory. A manual `Drop` is the least invasive fix: it keeps the public
+/// field types (`Option<Vec<u8>>` / `Option<String>`) unchanged so the
+/// `http.rs` call sites still compile, and zeroizes in place via zeroize's
+/// `impl Zeroize for Option<T: Zeroize>` (and `for Vec<u8>` / `for String`).
+/// `Drop` + `Clone` coexist fine in Rust (only `Drop` + `Copy` conflict, and
+/// `TlsOpts` is not `Copy`); each clone wipes its own copy when dropped.
+impl Drop for TlsOpts {
+    fn drop(&mut self) {
+        self.client_key.zeroize();
+        self.client_key_pass.zeroize();
+    }
+}
+
 /// Map the backend-neutral version to purecrypto's, clamping to the 1.2–1.3
 /// range the stack supports.
 fn to_pc_version(v: ProtocolVersion) -> purecrypto::tls::ProtocolVersion {
@@ -169,9 +186,13 @@ pub fn connect_over_with_alpn<S: Read + Write>(
 pub fn connect_over_tls<S: Read + Write>(
     transport: S,
     sni: &str,
-    opts: TlsOpts,
+    mut opts: TlsOpts,
 ) -> Result<TlsStream<S>> {
-    let roots = match opts.roots {
+    // `TlsOpts` has a `Drop` impl (TLS-5: it zeroizes the key material), which
+    // forbids moving fields out by value. Take the owned fields we hand to the
+    // builder via `Option::take` / `mem::take` so the struct stays whole and
+    // its `Drop` still runs.
+    let roots = match opts.roots.take() {
         Some(r) => r,
         None => load_system_roots()?,
     };
@@ -181,7 +202,7 @@ pub fn connect_over_tls<S: Read + Write>(
         .server_name(sni.to_string())
         .verify_certificates(opts.verify);
     if !opts.alpn.is_empty() {
-        builder = builder.alpn(opts.alpn);
+        builder = builder.alpn(std::mem::take(&mut opts.alpn));
     }
     if let Some(v) = opts.min_version {
         builder = builder.min_version(to_pc_version(v));

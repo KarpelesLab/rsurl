@@ -19,6 +19,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{ring as crypto, CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme};
+use zeroize::Zeroize;
 
 use super::client_auth;
 use super::common::ProtocolVersion;
@@ -97,6 +98,20 @@ impl TlsOpts {
 impl Default for TlsOpts {
     fn default() -> Self {
         TlsOpts::verifying()
+    }
+}
+
+/// TLS-5: wipe the client private-key material on drop, mirroring the
+/// purecrypto backend. `TlsOpts` holds the raw `--key` bytes and the `--pass`
+/// passphrase in plain heap and derives `Clone`, so without this the key bytes
+/// would linger in freed memory. The manual `Drop` keeps the public field
+/// types unchanged (so the `http.rs` call sites compile) and zeroizes in place
+/// via zeroize's `Option`/`Vec<u8>`/`String` impls. `Drop` + `Clone` coexist
+/// fine (only `Drop` + `Copy` conflict; `TlsOpts` is not `Copy`).
+impl Drop for TlsOpts {
+    fn drop(&mut self) {
+        self.client_key.zeroize();
+        self.client_key_pass.zeroize();
     }
 }
 
@@ -221,8 +236,12 @@ pub fn connect_over_with_alpn<S: Read + Write>(
 pub fn connect_over_tls<S: Read + Write>(
     transport: S,
     sni: &str,
-    opts: TlsOpts,
+    mut opts: TlsOpts,
 ) -> Result<TlsStream<S>> {
+    // `TlsOpts` has a `Drop` impl (TLS-5: it zeroizes the key material), which
+    // forbids moving fields out by value. Take the owned `roots`/`alpn` via
+    // `Option::take` / `mem::take` so the struct stays whole and its `Drop`
+    // still runs.
     // CRL checking (curl `--crlfile`) is only wired on the purecrypto-tls
     // backend; refuse it here rather than silently skip revocation.
     if opts.crl_pem.is_some() {
@@ -239,7 +258,7 @@ pub fn connect_over_tls<S: Read + Write>(
                 .into(),
         ));
     }
-    let roots = match opts.roots {
+    let roots = match opts.roots.take() {
         Some(r) => r,
         None => load_system_roots()?,
     };
@@ -300,7 +319,7 @@ pub fn connect_over_tls<S: Read + Write>(
             .map_err(rustls_err)?,
         (false, None) => dangerous.with_no_client_auth(),
     };
-    config.alpn_protocols = opts.alpn;
+    config.alpn_protocols = std::mem::take(&mut opts.alpn);
 
     let server_name: ServerName<'static> = ServerName::try_from(sni.to_string())
         .map_err(|e| Error::BadResponse(format!("invalid SNI {sni:?}: {e}")))?;
