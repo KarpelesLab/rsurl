@@ -118,8 +118,9 @@ impl UdpTransport for DirectUdp {
 /// it tears the relay down (RFC 1928 §7).
 pub(crate) struct Socks5UdpTransport {
     _control: TcpStream,
+    /// Connected (NET-2) to the proxy's UDP relay endpoint, so the kernel only
+    /// delivers datagrams sourced from the proxy.
     relay: UdpSocket,
-    relay_addr: SocketAddr,
 }
 
 impl Socks5UdpTransport {
@@ -142,13 +143,18 @@ impl Socks5UdpTransport {
             "[::]:0"
         };
         let relay = UdpSocket::bind(bind)?;
+        // NET-2: connect the relay socket to the proxy's UDP endpoint so the
+        // kernel drops datagrams from any other source. Without this, an
+        // attacker who can reach the client's ephemeral relay port could inject
+        // a forged datagram carrying an attacker-chosen encapsulated source,
+        // defeating TFTP TID validation and poisoning QUIC/TFTP routing.
+        relay.connect(relay_addr)?;
         // Reset the control socket's timeouts now the handshake is done.
         control.set_read_timeout(None)?;
         control.set_write_timeout(None)?;
         Ok(Socks5UdpTransport {
             _control: control,
             relay,
-            relay_addr,
         })
     }
 }
@@ -156,13 +162,17 @@ impl Socks5UdpTransport {
 impl UdpTransport for Socks5UdpTransport {
     fn send_to(&self, buf: &[u8], peer: SocketAddr) -> io::Result<usize> {
         let dgram = encode_udp_header(peer, buf);
-        self.relay.send_to(&dgram, self.relay_addr)?;
+        // The relay socket is connected to the proxy endpoint (NET-2), so send
+        // targets it implicitly and the kernel filters inbound to that peer.
+        self.relay.send(&dgram)?;
         // Report the caller's payload length as "sent".
         Ok(buf.len())
     }
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let mut scratch = vec![0u8; buf.len().saturating_add(MAX_UDP_HEADER)];
-        let (n, _from) = self.relay.recv_from(&mut scratch)?;
+        // Connected socket: the kernel only delivers datagrams from the proxy
+        // relay endpoint, so the decapsulated source below is trustworthy.
+        let n = self.relay.recv(&mut scratch)?;
         let (src, data) = decode_udp_header(&scratch[..n])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let m = data.len().min(buf.len());
@@ -340,6 +350,77 @@ mod tests {
 
         drop(t); // closes the control connection
         relay_thread.join().unwrap();
+        ctrl.join().unwrap();
+    }
+
+    /// NET-2 regression: after ASSOCIATE the relay socket is `connect()`ed to
+    /// the proxy endpoint, so a forged datagram from any *other* source must be
+    /// dropped by the kernel rather than decapsulated and trusted. We send a
+    /// well-formed (but spoofed) SOCKS5 UDP datagram from an unrelated socket
+    /// and assert `recv_from` never returns it (it times out instead).
+    #[test]
+    fn socks5_udp_rejects_foreign_source() {
+        use std::io::{Read, Write};
+        use std::net::{Ipv4Addr, TcpListener};
+        use std::thread;
+
+        let control = TcpListener::bind("127.0.0.1:0").unwrap();
+        let control_addr = control.local_addr().unwrap();
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+
+        let ctrl = thread::spawn(move || {
+            let (mut s, _) = control.accept().unwrap();
+            let mut greet = [0u8; 3];
+            s.read_exact(&mut greet).unwrap();
+            s.write_all(&[0x05, 0x00]).unwrap();
+            let mut req = [0u8; 10];
+            s.read_exact(&mut req).unwrap();
+            assert_eq!(req[1], 0x03, "expected UDP ASSOCIATE");
+            let mut reply = vec![0x05, 0x00, 0x00, 0x01];
+            match relay_addr.ip() {
+                IpAddr::V4(v4) => reply.extend_from_slice(&v4.octets()),
+                IpAddr::V6(_) => unreachable!(),
+            }
+            reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+            s.write_all(&reply).unwrap();
+            let mut sink = [0u8; 1];
+            let _ = s.read(&mut sink);
+        });
+
+        let t = Socks5UdpTransport::connect("127.0.0.1", control_addr.port(), None).unwrap();
+        // Learn the client's bound relay port so the attacker can target it.
+        let victim = t.local_addr().unwrap();
+        t.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+
+        // Attacker: a different socket spoofs a valid SOCKS5 UDP datagram
+        // claiming to come from `server`, aimed at the victim's relay port.
+        let server = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 4433);
+        let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let forged = encode_udp_header(server, b"evil");
+        attacker
+            .send_to(
+                &forged,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), victim.port()),
+            )
+            .unwrap();
+
+        // The connected socket must not deliver the attacker's datagram; the
+        // read times out (WouldBlock / TimedOut) instead of returning it.
+        let mut buf = [0u8; 1024];
+        match t.recv_from(&mut buf) {
+            Err(e) => assert!(
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+                "expected a timeout, got {e:?}"
+            ),
+            Ok((n, src)) => panic!("forged datagram accepted: {n} bytes from {src}"),
+        }
+
+        drop(t);
         ctrl.join().unwrap();
     }
 }
