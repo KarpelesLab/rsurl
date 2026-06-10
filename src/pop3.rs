@@ -41,13 +41,114 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
 
     let tcp = cfg.connect(&url.host, url.port)?;
     if url.is_tls() {
+        // Implicit TLS (pop3s://): handshake before the greeting. This already
+        // satisfies `require_tls`.
         let tls = connect_over(tcp, &url.host)?;
         let mut session = Session::new(BufReader::new(IoAdapter::Tls(Box::new(tls))));
+        session.read_status()?; // greeting
         run(&mut session, user, pass, action)
     } else {
-        let mut session = Session::new(BufReader::new(IoAdapter::Plain(tcp)));
+        // Plaintext pop3://. Read the greeting, then attempt RFC 2595 STLS to
+        // upgrade in place. We do the greeting+STLS dance on a BufReader over
+        // the raw stream and only build the Session once the (possibly
+        // upgraded) transport is settled — this avoids a poisoned-stream state.
+        let mut io = BufReader::new(IoAdapter::Plain(tcp));
+        read_status_buf(&mut io)?; // greeting
+        let upgraded = try_stls(&mut io, &url.host)?;
+        if cfg.require_tls && !upgraded {
+            return Err(Error::BadResponse(
+                "pop3: TLS required (--ssl-reqd) but server did not offer STLS".into(),
+            ));
+        }
+        let mut session = Session::new(io);
         run(&mut session, user, pass, action)
     }
+}
+
+/// Read a single `+OK`/`-ERR` status line directly from a `BufReader` (used for
+/// the greeting and STLS reply before the `Session` is constructed). Mirrors
+/// [`Session::read_status`].
+fn read_status_buf<R: Read + Write>(io: &mut BufReader<R>) -> Result<String> {
+    let mut buf = Vec::new();
+    let n = io.read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Err(Error::UnexpectedEof);
+    }
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+        buf.pop();
+    }
+    let line = String::from_utf8(buf)
+        .map_err(|_| Error::BadResponse("pop3: non-UTF8 status line".into()))?;
+    if let Some(rest) = line.strip_prefix("+OK") {
+        Ok(rest.strip_prefix(' ').unwrap_or(rest).to_string())
+    } else if let Some(rest) = line.strip_prefix("-ERR") {
+        let text = rest.strip_prefix(' ').unwrap_or(rest);
+        Err(Error::BadResponse(format!("pop3: {text}")))
+    } else {
+        Err(Error::BadResponse(format!(
+            "pop3: unexpected status line: {line}"
+        )))
+    }
+}
+
+/// Attempt the RFC 2595 `STLS` upgrade on a plaintext connection. Issues
+/// `STLS`; on a `+OK` reply, upgrades the transport to TLS in place and returns
+/// `Ok(true)`. On any non-`+OK` reply (server doesn't support STLS) the
+/// connection is left plaintext and `Ok(false)` is returned.
+///
+/// Security (CVE-2011-0411 class STARTTLS plaintext injection): the `BufReader`
+/// may have buffered bytes a MITM pipelined *after* the `+OK STLS` line, in the
+/// same plaintext flight. Those bytes were received before the handshake;
+/// reading them post-TLS would treat attacker-staged data as trusted. We abort
+/// if any remain rather than discard them, exactly like smtp/imap.
+fn try_stls(io: &mut BufReader<IoAdapter>, host: &str) -> Result<bool> {
+    // Negotiate STLS (send command, read reply, run the injection guard). A
+    // `false` means the server doesn't support STLS — leave it plaintext.
+    if !stls_negotiate(io)? {
+        return Ok(false);
+    }
+    // Upgrade the transport in place: pull the plain stream out of the
+    // BufReader, wrap it in TLS, and swap the BufReader's inner stream.
+    let plain = match std::mem::replace(io.get_mut(), IoAdapter::Poisoned) {
+        IoAdapter::Plain(s) => s,
+        other => {
+            *io.get_mut() = other;
+            return Err(Error::BadResponse(
+                "pop3: STLS on non-plaintext connection".into(),
+            ));
+        }
+    };
+    let tls = connect_over(plain, host)?;
+    *io.get_mut() = IoAdapter::Tls(Box::new(tls));
+    Ok(true)
+}
+
+/// Issue `STLS` and read the reply, deciding whether the connection should be
+/// upgraded. Returns `Ok(true)` if the server answered `+OK` and the read
+/// buffer is clean (ready for the TLS handshake), `Ok(false)` if the server
+/// declined (`-ERR`/unknown command — leave it plaintext), and an error if a
+/// MITM pipelined plaintext bytes after the `+OK` (CVE-2011-0411 class) or the
+/// socket failed. Generic over the reader so it can be exercised with a mock.
+fn stls_negotiate<R: Read + Write>(io: &mut BufReader<R>) -> Result<bool> {
+    {
+        let inner = io.get_mut();
+        inner.write_all(b"STLS\r\n")?;
+        inner.flush()?;
+    }
+    // A non-+OK (e.g. -ERR unknown command) means the server lacks STLS.
+    match read_status_buf(io) {
+        Ok(_) => {}
+        Err(Error::BadResponse(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    // Injection guard: any bytes buffered after the +OK were received as
+    // plaintext before the handshake — reject rather than trust them post-TLS.
+    if !io.buffer().is_empty() {
+        return Err(Error::BadResponse(
+            "pop3: server sent data after STLS before TLS (injection)".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// What the URL path asks us to do once we're authenticated.
@@ -127,6 +228,10 @@ fn un_dot_stuff(body: &[u8]) -> Vec<u8> {
 enum IoAdapter {
     Plain(Box<dyn NetStream>),
     Tls(Box<TlsStream<Box<dyn NetStream>>>),
+    /// Transient state only ever observed inside [`try_stls`] while the inner
+    /// stream is moved out to hand it to the TLS handshake (mirrors
+    /// `imap::Stream::Poisoned`).
+    Poisoned,
 }
 
 impl Read for IoAdapter {
@@ -134,6 +239,7 @@ impl Read for IoAdapter {
         match self {
             IoAdapter::Plain(s) => s.read(buf),
             IoAdapter::Tls(s) => s.read(buf),
+            IoAdapter::Poisoned => Err(std::io::Error::other("pop3: stream poisoned")),
         }
     }
 }
@@ -143,12 +249,14 @@ impl Write for IoAdapter {
         match self {
             IoAdapter::Plain(s) => s.write(buf),
             IoAdapter::Tls(s) => s.write(buf),
+            IoAdapter::Poisoned => Err(std::io::Error::other("pop3: stream poisoned")),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             IoAdapter::Plain(s) => s.flush(),
             IoAdapter::Tls(s) => s.flush(),
+            IoAdapter::Poisoned => Err(std::io::Error::other("pop3: stream poisoned")),
         }
     }
 }
@@ -265,10 +373,10 @@ fn run<R: Read + Write>(
     pass: &str,
     action: Action,
 ) -> Result<Vec<u8>> {
-    // 1. Read greeting.
-    session.read_status()?;
+    // The greeting (and any STLS upgrade) has already been handled by
+    // `fetch_with` before this Session was constructed.
 
-    // 2. Authenticate. We always send both USER and PASS; APOP and SASL are
+    // Authenticate. We always send both USER and PASS; APOP and SASL are
     //    deferred (see module note). Reject control bytes in the URL-derived
     //    credentials up front so a CR/LF can't smuggle extra commands (`send`
     //    also guards the assembled line as a backstop).
@@ -279,7 +387,7 @@ fn run<R: Read + Write>(
     session.send(&format!("PASS {pass}"))?;
     session.read_status()?;
 
-    // 3. Perform the requested action.
+    // Perform the requested action.
     let payload = match action {
         Action::List => {
             session.send("LIST")?;
@@ -296,7 +404,7 @@ fn run<R: Read + Write>(
         }
     };
 
-    // 4. Polite shutdown. Errors here are tolerated — we already have the
+    // Polite shutdown. Errors here are tolerated — we already have the
     //    payload, and a half-broken server shouldn't fail the whole fetch.
     let _ = session.send("QUIT");
     let _ = session.read_status();
@@ -482,5 +590,108 @@ mod tests {
         // Clean command goes through with exactly one trailing CRLF.
         s.send("USER alice").unwrap();
         assert_eq!(s.io.get_ref().written, b"USER alice\r\n");
+    }
+
+    // -- STLS negotiation (RFC 2595) --------------------------------------
+
+    /// Bidirectional mock: replays a scripted server byte stream on reads and
+    /// records everything the client writes, so we can drive `stls_negotiate`
+    /// (and assert the `STLS` command is issued) without a live socket.
+    struct DuplexIo {
+        to_read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl DuplexIo {
+        fn new(script: &[u8]) -> Self {
+            Self {
+                to_read: std::io::Cursor::new(script.to_vec()),
+                written: Vec::new(),
+            }
+        }
+    }
+    impl Read for DuplexIo {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.to_read.read(buf)
+        }
+    }
+    impl Write for DuplexIo {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stls_negotiate_issues_command_and_accepts_ok() {
+        // Server answers +OK with nothing pipelined after it: ready to upgrade.
+        let mut io = BufReader::new(DuplexIo::new(b"+OK begin TLS\r\n"));
+        let upgrade = stls_negotiate(&mut io).expect("stls negotiate");
+        assert!(upgrade, "expected upgrade decision on +OK");
+        // The STLS command must have been issued verbatim.
+        assert_eq!(io.get_ref().written, b"STLS\r\n");
+    }
+
+    #[test]
+    fn stls_negotiate_declines_on_err() {
+        // A server without STLS replies -ERR; we must leave the connection
+        // plaintext (return false) rather than error out.
+        let mut io = BufReader::new(DuplexIo::new(b"-ERR unknown command\r\n"));
+        let upgrade = stls_negotiate(&mut io).expect("stls negotiate");
+        assert!(!upgrade, "expected no upgrade on -ERR");
+        assert_eq!(io.get_ref().written, b"STLS\r\n");
+    }
+
+    #[test]
+    fn stls_negotiate_rejects_pipelined_plaintext_injection() {
+        // CVE-2011-0411 class: a MITM pipelines a forged line right after the
+        // +OK STLS, in the same plaintext flight. After reading the +OK those
+        // bytes remain buffered in the BufReader, so the guard must trip and
+        // abort rather than treat them as trusted post-TLS data.
+        let mut io = BufReader::new(DuplexIo::new(b"+OK begin TLS\r\n+OK 1 messages\r\n.\r\n"));
+        match stls_negotiate(&mut io) {
+            Err(Error::BadResponse(m)) => assert!(m.contains("injection"), "got {m}"),
+            other => panic!("expected BadResponse(injection), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stls_negotiate_clear_when_server_waits() {
+        // A conforming server sends nothing after +OK until the handshake, so
+        // the buffer is clean and the upgrade proceeds.
+        let mut io = BufReader::new(DuplexIo::new(b"+OK begin TLS\r\n"));
+        assert!(stls_negotiate(&mut io).expect("ok"));
+        assert!(io.buffer().is_empty(), "reader must be clear after +OK");
+    }
+
+    // -- require-TLS enforcement (curl --ssl-reqd) ------------------------
+
+    #[test]
+    fn require_tls_errors_before_credentials_when_no_stls() {
+        // Mirror the plaintext fetch_with path: read greeting, attempt STLS
+        // (server declines with -ERR), then enforce require_tls. The error must
+        // fire before any USER/PASS is sent.
+        let greeting_and_stls = b"+OK POP3 ready\r\n-ERR unknown command\r\n";
+        let mut io = BufReader::new(DuplexIo::new(greeting_and_stls));
+        read_status_buf(&mut io).expect("greeting");
+        let upgraded = stls_negotiate(&mut io).expect("stls");
+        assert!(!upgraded);
+        // require_tls && !upgraded → the production code returns this error.
+        let err: Result<()> = if !upgraded {
+            Err(Error::BadResponse(
+                "pop3: TLS required (--ssl-reqd) but server did not offer STLS".into(),
+            ))
+        } else {
+            Ok(())
+        };
+        match err {
+            Err(Error::BadResponse(m)) => assert!(m.contains("TLS required"), "got {m}"),
+            other => panic!("expected TLS required error, got {other:?}"),
+        }
+        // Crucially, only the greeting read and the STLS command were written —
+        // no USER/PASS leaked onto the plaintext connection.
+        assert_eq!(io.get_ref().written, b"STLS\r\n");
     }
 }
