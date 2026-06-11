@@ -50,7 +50,7 @@ pub use crate::http::{
 pub use crate::net::Client;
 pub use crate::transfer::{transfer, transfer_url};
 pub use crate::url::Url;
-pub use crate::websocket::{WebSocket, WsMessage};
+pub use crate::websocket::{WebSocket, WsClose, WsEvent, WsFrame, WsMessage, WsOpcode};
 
 /// Perform an HTTP GET against `url` and return the full response.
 pub fn get<U: AsRef<str>>(url: U) -> Result<Response> {
