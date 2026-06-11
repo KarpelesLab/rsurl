@@ -95,6 +95,11 @@ psl2 = { version = "0.1", default-features = false }
 # `default-features = false`, so no extra transitive deps come along.
 idna = { version = "1", optional = true, default-features = false, features = ["alloc", "compiled_data"] }
 
+[dev-dependencies]
+# Used only by the WebSocket integration test's in-process echo server to
+# compute the `Sec-WebSocket-Accept` SHA-1 (already a normal dependency).
+purecrypto = "0.6.8"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

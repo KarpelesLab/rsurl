@@ -418,7 +418,13 @@ pub struct WebSocket {
     /// not support cloning (e.g. some custom connectors).
     ctl: Option<Box<dyn crate::net::NetStream>>,
     pmd: Option<Pmd>,
-    closed: bool,
+    /// We have sent a close frame; no more data frames may be sent. We may
+    /// still `recv` to drain the peer's replies and its own close (RFC 6455
+    /// §5.5.1 closing handshake).
+    send_closed: bool,
+    /// The peer has closed (a close frame was received, or the transport hit
+    /// EOF); `recv` yields nothing further.
+    recv_closed: bool,
     compression: bool,
     /// Auto-reply to incoming pings with a pong (default `true`). When `false`,
     /// [`recv_event`](WebSocket::recv_event) surfaces pings without answering
@@ -487,7 +493,8 @@ impl WebSocket {
             stream,
             ctl,
             pmd,
-            closed: false,
+            send_closed: false,
+            recv_closed: false,
             compression,
             auto_pong: true,
         })
@@ -499,10 +506,11 @@ impl WebSocket {
         self.compression
     }
 
-    /// Whether the connection has been closed (by us via [`close`](Self::close)
-    /// or by observing the peer's close in [`recv`](Self::recv)).
+    /// Whether the connection is closed or closing — either we sent a close
+    /// frame ([`close`](Self::close)) or the peer closed (observed in
+    /// [`recv`](Self::recv)).
     pub fn is_closed(&self) -> bool {
-        self.closed
+        self.send_closed || self.recv_closed
     }
 
     /// Set the per-read inactivity timeout for [`recv`](Self::recv). `None`
@@ -596,7 +604,7 @@ impl WebSocket {
     /// received message is always handled internally (pings answered) and is
     /// not surfaced, so reassembly is never interrupted.
     pub fn recv_event(&mut self) -> Result<WsEvent> {
-        if self.closed {
+        if self.recv_closed {
             return Ok(WsEvent::Close(None));
         }
         let mut frag_opcode: Option<u8> = None;
@@ -630,12 +638,16 @@ impl WebSocket {
                         return Ok(WsEvent::Pong(frame.payload));
                     }
                     OPCODE_CLOSE => {
-                        // Echo the close (masked, best-effort) and report it.
-                        if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
-                            let _ = self.stream.write_all(&close);
-                            let _ = self.stream.flush();
+                        // Echo the close (masked, best-effort) unless we already
+                        // sent one — then this frame is the peer's echo of ours.
+                        if !self.send_closed {
+                            if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
+                                let _ = self.stream.write_all(&close);
+                                let _ = self.stream.flush();
+                            }
+                            self.send_closed = true;
                         }
-                        self.closed = true;
+                        self.recv_closed = true;
                         return Ok(WsEvent::Close(parse_close_payload(&frame.payload)));
                     }
                     other => {
@@ -774,10 +786,10 @@ impl WebSocket {
     /// Idempotent. Drain the peer's close echo with a final [`recv`](Self::recv)
     /// if you need a clean shutdown handshake.
     pub fn close(&mut self) -> Result<()> {
-        if self.closed {
+        if self.send_closed {
             return Ok(());
         }
-        self.closed = true;
+        self.send_closed = true;
         let frame = build_client_frame(OPCODE_CLOSE, &[])?;
         self.stream.write_all(&frame).map_err(Error::Io)?;
         self.stream.flush().map_err(Error::Io)?;
@@ -789,7 +801,7 @@ impl WebSocket {
     /// 1000 (normal closure); the reason (UTF-8) plus the 2-byte code must fit
     /// in a control frame (≤ 125 bytes).
     pub fn close_with(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.closed {
+        if self.send_closed {
             return Ok(());
         }
         let mut payload = Vec::with_capacity(2 + reason.len());
@@ -802,7 +814,7 @@ impl WebSocket {
                 MAX_CONTROL_PAYLOAD - 2
             )));
         }
-        self.closed = true;
+        self.send_closed = true;
         let frame = build_client_frame(OPCODE_CLOSE, &payload)?;
         self.stream.write_all(&frame).map_err(Error::Io)?;
         self.stream.flush().map_err(Error::Io)?;
@@ -810,7 +822,7 @@ impl WebSocket {
     }
 
     fn ensure_open(&self) -> Result<()> {
-        if self.closed {
+        if self.send_closed {
             return Err(Error::BadResponse(
                 "websocket: the connection is closed".into(),
             ));
@@ -2349,7 +2361,8 @@ mod tests {
             stream: Box::new(mock),
             ctl: None,
             pmd,
-            closed: false,
+            send_closed: false,
+            recv_closed: false,
             compression,
             auto_pong: true,
         }

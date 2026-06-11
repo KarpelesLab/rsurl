@@ -270,8 +270,15 @@ impl Client {
     pub fn websocket(&self, url: &str) -> Result<crate::websocket::WebSocket> {
         let mut url = Url::parse(url)?;
         url.set_idn(self.idn)?;
+        self.websocket_url(&url)
+    }
+
+    /// Like [`Client::websocket`] but from an already-parsed [`Url`] (IDN
+    /// normalization is the caller's responsibility, e.g. via
+    /// [`Url::set_idn`]). Used by the CLI, which parses the URL once up front.
+    pub fn websocket_url(&self, url: &Url) -> Result<crate::websocket::WebSocket> {
         let cfg = self.net_config_for(&url.host);
-        crate::websocket::WebSocket::open(&url, &cfg, self.read_timeout)
+        crate::websocket::WebSocket::open(url, &cfg, self.read_timeout)
     }
 
     /// Run the default operation for the URL's scheme and return its payload,

@@ -51,7 +51,7 @@
 //!     -V, --version            print version
 
 use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -1676,6 +1676,11 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
     // options (-X, -H, -d, ...) are ignored for them in this milestone.
     if !matches!(parsed_url.scheme.as_str(), "http" | "https") {
+        // WebSocket: persistent, interactive-ish client (curl never built its
+        // CLI side). Send `-d`/piped-stdin messages, print received ones.
+        if matches!(parsed_url.scheme.as_str(), "ws" | "wss") {
+            return run_websocket(&parsed_url, args);
+        }
         // RTSP honours `-X`/`--request` to select the control method
         // (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN); default is DESCRIBE.
         if parsed_url.scheme == "rtsp" {
@@ -3045,6 +3050,203 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
         }
     }
     Ok(c)
+}
+
+/// Collect the WebSocket messages to send before listening. `-d`/`--data*`
+/// becomes a single message (text if valid UTF-8, else binary). Otherwise, if
+/// stdin is piped (not a TTY), each line becomes a text message (or the whole
+/// input becomes one binary message if it is not UTF-8). A TTY with no `-d`
+/// means "subscribe": send nothing and just print what arrives.
+fn ws_outgoing(args: &Args) -> std::result::Result<Vec<rsurl::WsMessage>, String> {
+    if !args.data_parts.is_empty() {
+        let bytes = assemble_form_body(&args.data_parts)?.unwrap_or_default();
+        return Ok(vec![bytes_to_ws_message(bytes)]);
+    }
+    if !io::stdin().is_terminal() {
+        let mut buf = Vec::new();
+        io::stdin()
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("reading stdin: {e}"))?;
+        if buf.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Ok(match std::str::from_utf8(&buf) {
+            Ok(s) => s
+                .lines()
+                .map(|l| rsurl::WsMessage::Text(l.to_string()))
+                .collect(),
+            Err(_) => vec![rsurl::WsMessage::Binary(buf)],
+        });
+    }
+    Ok(Vec::new())
+}
+
+fn bytes_to_ws_message(bytes: Vec<u8>) -> rsurl::WsMessage {
+    match String::from_utf8(bytes) {
+        Ok(s) => rsurl::WsMessage::Text(s),
+        Err(e) => rsurl::WsMessage::Binary(e.into_bytes()),
+    }
+}
+
+/// Drive a persistent WebSocket from the command line: open the connection,
+/// send any `-d`/stdin messages, then print every message the server sends
+/// until it closes (or, in send mode, until the connection goes idle past the
+/// read timeout / `-m`). Incoming pings are auto-ponged by the library.
+fn run_websocket(url: &Url, args: &Args) -> u8 {
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: --proxy: {e}");
+            }
+            return 5;
+        }
+    };
+
+    let outgoing = match ws_outgoing(args) {
+        Ok(m) => m,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            return 2;
+        }
+    };
+    let subscribe = outgoing.is_empty();
+
+    let mut ws = match client.websocket_url(url) {
+        Ok(w) => w,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            return transfer_exit_code(&e);
+        }
+    };
+
+    if args.verbose {
+        let path = if url.path.is_empty() { "/" } else { &url.path };
+        eprintln!(
+            "* WebSocket connected to {}://{}:{}{path}",
+            url.scheme, url.host, url.port
+        );
+        if ws.compression_enabled() {
+            eprintln!("* permessage-deflate negotiated");
+        }
+    }
+
+    // Send phase.
+    for m in &outgoing {
+        if let Err(e) = ws.send(m) {
+            if show_errors(args) {
+                eprintln!("rsurl: send: {e}");
+            }
+            return transfer_exit_code(&e);
+        }
+        if args.verbose {
+            let kind = match m {
+                rsurl::WsMessage::Text(_) => "TEXT",
+                rsurl::WsMessage::Binary(_) => "BINARY",
+            };
+            eprintln!("* > {kind} {} bytes", m.as_bytes().len());
+        }
+    }
+
+    // In send mode (we have a finite set of messages from `-d`/piped stdin),
+    // signal that we are done so the server can complete the closing handshake.
+    // We can still drain its replies + close echo below (send vs recv close are
+    // tracked separately). Subscribe mode never sends a close — it listens.
+    if !subscribe {
+        let _ = ws.close();
+        if args.verbose {
+            eprintln!("* > CLOSE");
+        }
+    }
+
+    // Receive bound: `-m`/--max-time caps the wait in either mode; otherwise
+    // subscribe blocks indefinitely and send mode keeps the client's default
+    // idle read timeout so the tool returns once the exchange goes quiet.
+    match args.max_time {
+        Some(secs) => {
+            let _ = ws.set_read_timeout(Some(Duration::from_secs(secs)));
+        }
+        None if subscribe => {
+            let _ = ws.set_read_timeout(None);
+        }
+        None => {}
+    }
+
+    let mut out: Box<dyn Write> = match &args.output {
+        Some(path) if path != "-" => match create_output_file(path, args) {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: open {path}: {e}");
+                }
+                return 23;
+            }
+        },
+        _ => Box::new(io::stdout().lock()),
+    };
+
+    let mut code = 0u8;
+    loop {
+        match ws.recv_event() {
+            Ok(rsurl::WsEvent::Text(t)) => {
+                let _ = out.write_all(t.as_bytes());
+                let _ = out.write_all(b"\n");
+                let _ = out.flush();
+            }
+            Ok(rsurl::WsEvent::Binary(b)) => {
+                let _ = out.write_all(&b);
+                let _ = out.flush();
+            }
+            Ok(rsurl::WsEvent::Ping(_)) => {
+                if args.verbose {
+                    eprintln!("* < PING (auto-pong sent)");
+                }
+            }
+            Ok(rsurl::WsEvent::Pong(_)) => {
+                if args.verbose {
+                    eprintln!("* < PONG");
+                }
+            }
+            Ok(rsurl::WsEvent::Close(c)) => {
+                if args.verbose {
+                    match c {
+                        Some(cl) => eprintln!("* < CLOSE {} {}", cl.code, cl.reason),
+                        None => eprintln!("* < CLOSE"),
+                    }
+                }
+                break;
+            }
+            // An idle read timeout (or, in send mode, the default) ends the
+            // session cleanly rather than as an error.
+            Err(rsurl::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if args.verbose {
+                    eprintln!("* idle, closing");
+                }
+                break;
+            }
+            // Server dropped the TCP connection without a close frame.
+            Err(rsurl::Error::UnexpectedEof) => break,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                code = transfer_exit_code(&e);
+                break;
+            }
+        }
+    }
+
+    let _ = ws.close();
+    code
 }
 
 /// Send a message over SMTP/SMTPS: `--mail-from`, `--mail-rcpt` (repeatable),
