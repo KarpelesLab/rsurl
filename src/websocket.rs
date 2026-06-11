@@ -417,8 +417,8 @@ impl WebSocket {
 
     /// Set the per-read inactivity timeout for [`recv`](Self::recv). `None`
     /// blocks indefinitely (suitable for a connection that waits on sparse
-    /// server pushes). Errors if the transport does not support a control
-    /// handle (see [`WebSocket::ctl`]).
+    /// server pushes). Errors if the transport does not support a cloned socket
+    /// control handle (e.g. some custom connectors).
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
         match &self.ctl {
             Some(c) => c.set_read_timeout(dur).map_err(Error::Io),
