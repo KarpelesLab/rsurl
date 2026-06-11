@@ -1,5 +1,12 @@
 //! WebSocket support (RFC 6455).
 //!
+//! Two entry points:
+//!   * [`WebSocket`] — a **persistent** connection: open it once with
+//!     [`WebSocket::connect`] (or [`Client::websocket`](crate::net::Client::websocket)
+//!     for proxy/timeout/TLS control) and exchange many messages over its
+//!     lifetime via `send_text`/`send_binary`/`recv`/`ping`/`close`.
+//!   * [`fetch`] — a one-shot: open, read a single message, close.
+//!
 //! WS handshakes are HTTP/1.1 `Upgrade: websocket` requests followed by
 //! binary/text frames. We perform the handshake by hand (so we can sit on the
 //! raw stream without buffered-reader leftovers eating into the frame
