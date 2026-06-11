@@ -238,6 +238,282 @@ fn tcp_connect(url: &Url, cfg: &crate::net::NetConfig) -> Result<Box<dyn crate::
     Ok(stream)
 }
 
+// ===========================================================================
+// Persistent client API
+// ===========================================================================
+
+/// Bounded write timeout for a persistent connection's outgoing frames, so a
+/// stuck send can't hang forever. The *read* timeout is configurable (see
+/// [`WebSocket::set_read_timeout`]) because a long-lived client legitimately
+/// waits on sparse server pushes.
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A message exchanged over a [`WebSocket`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsMessage {
+    /// A UTF-8 text message (RFC 6455 opcode 0x1). On receive, the payload has
+    /// already been validated as UTF-8 (§8.1).
+    Text(String),
+    /// A binary message (opcode 0x2); opaque bytes.
+    Binary(Vec<u8>),
+}
+
+impl WsMessage {
+    /// The payload as bytes (the UTF-8 bytes for a text message).
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            WsMessage::Text(s) => s.as_bytes(),
+            WsMessage::Binary(b) => b,
+        }
+    }
+
+    /// The text, if this is a [`WsMessage::Text`].
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            WsMessage::Text(s) => Some(s),
+            WsMessage::Binary(_) => None,
+        }
+    }
+
+    /// Consume the message into its raw payload bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            WsMessage::Text(s) => s.into_bytes(),
+            WsMessage::Binary(b) => b,
+        }
+    }
+}
+
+/// Object-safe `Read + Write + Send` for the WS data path, so a [`WebSocket`]
+/// can hold a plaintext (`ws://`) or TLS-wrapped (`wss://`) connection behind
+/// one boxed type. Blanket-implemented for every such stream.
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send + ?Sized> ReadWrite for T {}
+
+/// A live, persistent WebSocket connection (RFC 6455).
+///
+/// Open one with [`WebSocket::connect`] for the common case, or
+/// [`Client::websocket`](crate::net::Client::websocket) to control the
+/// transport (proxy, timeouts, TLS verification). Then exchange messages over
+/// the connection's lifetime:
+///
+/// ```no_run
+/// use rsurl::websocket::{WebSocket, WsMessage};
+/// let mut ws = WebSocket::connect("wss://example.com/socket")?;
+/// ws.send_text("hello")?;
+/// while let Some(msg) = ws.recv()? {
+///     match msg {
+///         WsMessage::Text(t) => println!("text: {t}"),
+///         WsMessage::Binary(b) => println!("{} binary bytes", b.len()),
+///     }
+/// }
+/// ws.close()?;
+/// # Ok::<(), rsurl::Error>(())
+/// ```
+///
+/// Incoming **ping** frames are answered with pongs and unsolicited **pongs**
+/// are ignored automatically inside [`recv`](WebSocket::recv); a peer
+/// **close** is surfaced as `recv` returning `Ok(None)`. permessage-deflate
+/// (RFC 7692) is negotiated transparently when the server supports it.
+///
+/// The API is single-threaded: drive `send`/`recv` from one thread. (The type
+/// is `Send`, so you may move the whole connection between threads; just don't
+/// call it from two at once.)
+pub struct WebSocket {
+    stream: Box<dyn ReadWrite>,
+    /// A cloned handle to the underlying socket (same OS fd) kept only to
+    /// adjust the read timeout — the data path may be TLS-wrapped and own the
+    /// socket, so this side-channel reaches it. `None` if the transport does
+    /// not support cloning (e.g. some custom connectors).
+    ctl: Option<Box<dyn crate::net::NetStream>>,
+    pmd: Option<Pmd>,
+    closed: bool,
+    compression: bool,
+}
+
+impl WebSocket {
+    /// Open a WebSocket to `url` (`ws://` or `wss://`) with default settings
+    /// (direct transport, TLS verification on, 60 s read timeout). For proxy,
+    /// timeout, or `-k`/insecure control, use
+    /// [`Client::websocket`](crate::net::Client::websocket).
+    pub fn connect(url: &str) -> Result<WebSocket> {
+        crate::net::Client::new().websocket(url)
+    }
+
+    /// Open a connection using an already-built [`NetConfig`] and the caller's
+    /// persistent read timeout. Used by [`Client::websocket`].
+    pub(crate) fn open(
+        url: &Url,
+        cfg: &crate::net::NetConfig,
+        read_timeout: Option<Duration>,
+    ) -> Result<WebSocket> {
+        let (stream, ctl, pmd): (Box<dyn ReadWrite>, _, _) = match url.scheme.as_str() {
+            "ws" => {
+                let mut data = cfg.connect(&url.host, url.port)?;
+                data.set_write_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                // Bound each handshake read; the wall-clock HANDSHAKE_DEADLINE
+                // inside `handshake` defeats a slow drip on top of this.
+                data.set_read_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                let ctl = data.try_clone_box().ok();
+                let pmd = handshake(&mut data, url)?;
+                (Box::new(data), ctl, pmd)
+            }
+            "wss" => {
+                let data = cfg.connect(&url.host, url.port)?;
+                data.set_write_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                data.set_read_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                // Clone the raw socket for timeout control *before* the TLS
+                // layer takes ownership of it.
+                let ctl = data.try_clone_box().ok();
+                // Honour the client's verification setting (`-k` => verify off);
+                // wss otherwise verifies against the system roots like `fetch`.
+                let mut opts = crate::tls::TlsOpts::verifying();
+                opts.verify = cfg.verify;
+                let mut tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
+                let pmd = handshake(&mut tls, url)?;
+                (Box::new(tls), ctl, pmd)
+            }
+            other => return Err(Error::UnsupportedScheme(other.to_string())),
+        };
+
+        // The handshake is done; switch to the caller's persistent read timeout
+        // (which may be `None` to block indefinitely on a quiet connection).
+        if let Some(c) = &ctl {
+            let _ = c.set_read_timeout(read_timeout);
+        }
+
+        let compression = pmd.is_some();
+        Ok(WebSocket {
+            stream,
+            ctl,
+            pmd,
+            closed: false,
+            compression,
+        })
+    }
+
+    /// Whether permessage-deflate (RFC 7692) was negotiated for this
+    /// connection.
+    pub fn compression_enabled(&self) -> bool {
+        self.compression
+    }
+
+    /// Whether the connection has been closed (by us via [`close`](Self::close)
+    /// or by observing the peer's close in [`recv`](Self::recv)).
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Set the per-read inactivity timeout for [`recv`](Self::recv). `None`
+    /// blocks indefinitely (suitable for a connection that waits on sparse
+    /// server pushes). Errors if the transport does not support a control
+    /// handle (see [`WebSocket::ctl`]).
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        match &self.ctl {
+            Some(c) => c.set_read_timeout(dur).map_err(Error::Io),
+            None => Err(Error::BadResponse(
+                "websocket: this transport does not support changing the read timeout".into(),
+            )),
+        }
+    }
+
+    /// Send a UTF-8 text message (opcode 0x1).
+    pub fn send_text(&mut self, text: &str) -> Result<()> {
+        self.ensure_open()?;
+        send_message(
+            &mut self.stream,
+            OPCODE_TEXT,
+            text.as_bytes(),
+            self.pmd.as_mut(),
+        )
+    }
+
+    /// Send a binary message (opcode 0x2).
+    pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+        self.ensure_open()?;
+        send_message(&mut self.stream, OPCODE_BINARY, data, self.pmd.as_mut())
+    }
+
+    /// Send a [`WsMessage`].
+    pub fn send(&mut self, msg: &WsMessage) -> Result<()> {
+        match msg {
+            WsMessage::Text(s) => self.send_text(s),
+            WsMessage::Binary(b) => self.send_binary(b),
+        }
+    }
+
+    /// Send a ping with `payload` (≤ 125 bytes per RFC 6455 §5.5). The peer's
+    /// pong is consumed silently by the next [`recv`](Self::recv).
+    pub fn ping(&mut self, payload: &[u8]) -> Result<()> {
+        self.ensure_open()?;
+        if payload.len() > MAX_CONTROL_PAYLOAD {
+            return Err(Error::BadResponse(format!(
+                "websocket: ping payload too large: {} bytes (max {MAX_CONTROL_PAYLOAD})",
+                payload.len()
+            )));
+        }
+        let frame = build_client_frame(OPCODE_PING, payload)?;
+        self.stream.write_all(&frame).map_err(Error::Io)?;
+        self.stream.flush().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Block until the next data message arrives, answering any interleaved
+    /// ping/pong control frames automatically. Returns `Ok(None)` when the
+    /// peer closes the connection (a close is also answered automatically);
+    /// every subsequent call then returns `Ok(None)`.
+    pub fn recv(&mut self) -> Result<Option<WsMessage>> {
+        if self.closed {
+            return Ok(None);
+        }
+        match read_message(&mut self.stream, self.pmd.as_mut())? {
+            Message::Data { opcode, payload } => {
+                if opcode == OPCODE_TEXT {
+                    // `finish_data_message` already validated UTF-8; re-check
+                    // defensively rather than assume.
+                    let s = String::from_utf8(payload).map_err(|_| {
+                        Error::BadResponse("WS TEXT message payload is not valid UTF-8".into())
+                    })?;
+                    Ok(Some(WsMessage::Text(s)))
+                } else {
+                    Ok(Some(WsMessage::Binary(payload)))
+                }
+            }
+            Message::Closed => {
+                self.closed = true;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Send a close frame (masked, per §5.3) and mark the connection closed.
+    /// Idempotent. Drain the peer's close echo with a final [`recv`](Self::recv)
+    /// if you need a clean shutdown handshake.
+    pub fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let frame = build_client_frame(OPCODE_CLOSE, &[])?;
+        self.stream.write_all(&frame).map_err(Error::Io)?;
+        self.stream.flush().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            return Err(Error::BadResponse(
+                "websocket: the connection is closed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Drive the HTTP/1.1 upgrade handshake on `stream`. After this returns, the
 /// stream sits at the first byte of the first WS frame.
 ///
@@ -617,15 +893,13 @@ fn accumulate(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
 
 /// Send a masked client data frame. `opcode` must be [`OPCODE_TEXT`] or
 /// [`OPCODE_BINARY`]; the payload is masked per RFC 6455 §5.3 using the
-/// crate's CSPRNG. Exposed for a transfer/CLI layer to drive the send side
-/// (not yet wired into the one-shot `fetch` path, hence `dead_code`).
+/// crate's CSPRNG. Drives the send side of the persistent [`WebSocket`] API.
 ///
 /// When `pmd` is `Some` (permessage-deflate was negotiated), the payload is
 /// raw-DEFLATE-compressed (RFC 7692 §7.2.1) and the frame's RSV1 bit is set.
 /// We always compress and never carry encoder context across messages, so
 /// each message is an independent stream (consistent with our
 /// `client_no_context_takeover` offer).
-#[allow(dead_code)]
 fn send_message<S: Write>(
     stream: &mut S,
     opcode: u8,
@@ -1679,5 +1953,133 @@ mod tests {
                 payload: b"plain text, no rsv1".to_vec(),
             }
         );
+    }
+
+    // ---- Persistent WebSocket API ----
+
+    use std::sync::{Arc, Mutex};
+
+    /// A `Send` in-memory duplex usable as a [`WebSocket`] data path: `inbound`
+    /// is the server→client byte stream (drained by `read`); `sent` captures
+    /// client→server bytes. `Clone` shares both, so a test can keep a handle to
+    /// inspect `sent` after moving a clone into the `WebSocket`.
+    #[derive(Clone)]
+    struct SharedMock {
+        inbound: Arc<Mutex<Cursor<Vec<u8>>>>,
+        sent: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedMock {
+        fn new(inbound: Vec<u8>) -> Self {
+            SharedMock {
+                inbound: Arc::new(Mutex::new(Cursor::new(inbound))),
+                sent: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn sent(&self) -> Vec<u8> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl Read for SharedMock {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inbound.lock().unwrap().read(buf)
+        }
+    }
+
+    impl Write for SharedMock {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sent.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a [`WebSocket`] driven by an in-memory `mock` (no real socket, so
+    /// no control handle / timeouts).
+    fn ws_over(mock: SharedMock, pmd: Option<Pmd>) -> WebSocket {
+        let compression = pmd.is_some();
+        WebSocket {
+            stream: Box::new(mock),
+            ctl: None,
+            pmd,
+            closed: false,
+            compression,
+        }
+    }
+
+    #[test]
+    fn websocket_recv_maps_text_binary_and_close() {
+        let mut inbound = Vec::new();
+        inbound.extend(server_frame(true, OPCODE_TEXT, b"hello"));
+        inbound.extend(server_frame(true, OPCODE_BINARY, &[1, 2, 3]));
+        inbound.extend(server_frame(true, OPCODE_CLOSE, &[]));
+        let mut ws = ws_over(SharedMock::new(inbound), None);
+
+        assert_eq!(ws.recv().unwrap(), Some(WsMessage::Text("hello".into())));
+        assert_eq!(ws.recv().unwrap(), Some(WsMessage::Binary(vec![1, 2, 3])));
+        // Peer close → Ok(None), and the connection is now closed for good.
+        assert_eq!(ws.recv().unwrap(), None);
+        assert!(ws.is_closed());
+        assert_eq!(ws.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn websocket_send_text_writes_one_masked_text_frame() {
+        let mock = SharedMock::new(Vec::new());
+        let mut ws = ws_over(mock.clone(), None);
+        ws.send_text("hi there").unwrap();
+        let frames = decode_sent(&mock.sent());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, OPCODE_TEXT);
+        assert_eq!(frames[0].1, b"hi there");
+    }
+
+    #[test]
+    fn websocket_close_sends_close_frame_and_blocks_further_sends() {
+        let mock = SharedMock::new(Vec::new());
+        let mut ws = ws_over(mock.clone(), None);
+        ws.close().unwrap();
+        let frames = decode_sent(&mock.sent());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, OPCODE_CLOSE);
+        assert!(ws.is_closed());
+        // Sending after close is an error; close is idempotent.
+        assert!(ws.send_text("nope").is_err());
+        ws.close().unwrap();
+    }
+
+    #[test]
+    fn websocket_recv_autoresponds_ping_with_pong() {
+        let mut inbound = Vec::new();
+        inbound.extend(server_frame(true, OPCODE_PING, b"pingdata"));
+        inbound.extend(server_frame(true, OPCODE_TEXT, b"after ping"));
+        let mock = SharedMock::new(inbound);
+        let mut ws = ws_over(mock.clone(), None);
+
+        assert_eq!(
+            ws.recv().unwrap(),
+            Some(WsMessage::Text("after ping".into()))
+        );
+        // The interleaved ping must have been answered with a pong echoing its
+        // application data, before the text message was returned.
+        let frames = decode_sent(&mock.sent());
+        assert!(
+            frames
+                .iter()
+                .any(|(op, pl)| *op == OPCODE_PONG && pl.as_slice() == b"pingdata"),
+            "expected an automatic PONG echoing the ping data, got {frames:?}"
+        );
+    }
+
+    #[test]
+    fn websocket_recv_inflates_compressed_message() {
+        let payload = "compress me ".repeat(8);
+        let inbound = server_frame_rsv1(true, OPCODE_TEXT, &pmd_compress(payload.as_bytes()));
+        let mut ws = ws_over(SharedMock::new(inbound), Some(test_pmd()));
+        assert!(ws.compression_enabled());
+        assert_eq!(ws.recv().unwrap(), Some(WsMessage::Text(payload)));
     }
 }

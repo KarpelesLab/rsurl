@@ -262,6 +262,18 @@ impl Client {
         self.request("GET", url)?.send()
     }
 
+    /// Open a persistent WebSocket connection (`ws://` or `wss://`) over this
+    /// client's transport, honouring its connect/read timeouts, proxy, IDN, and
+    /// TLS-verification settings. The returned
+    /// [`WebSocket`](crate::websocket::WebSocket) exchanges messages over the
+    /// lifetime of the connection — see its docs for the send/recv API.
+    pub fn websocket(&self, url: &str) -> Result<crate::websocket::WebSocket> {
+        let mut url = Url::parse(url)?;
+        url.set_idn(self.idn)?;
+        let cfg = self.net_config_for(&url.host);
+        crate::websocket::WebSocket::open(&url, &cfg, self.read_timeout)
+    }
+
     /// Run the default operation for the URL's scheme and return its payload,
     /// dialing through this client's transport. Mirrors [`crate::transfer`].
     pub fn transfer(&self, url_str: &str) -> Result<Vec<u8>> {
