@@ -1193,7 +1193,7 @@ pub struct Response {
     pub timing: Timing,
     /// The effective URL the response came from — the last hop after any
     /// redirects (curl `CURLINFO_EFFECTIVE_URL`). Set by the buffered
-    /// [`send`](Request::send)/[`send_to`] path; empty on the streaming and
+    /// [`send`](Request::send) / `send_to` path; empty on the streaming and
     /// HTTP/2-multiplexed paths, where callers should fall back to the
     /// requested URL.
     pub final_url: String,
