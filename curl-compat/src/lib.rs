@@ -20,6 +20,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod consts;
+mod easy;
 mod version;
 
 pub use consts::*;
