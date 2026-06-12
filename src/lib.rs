@@ -13,6 +13,7 @@ mod digest;
 mod error;
 mod http;
 mod idn;
+pub mod multi;
 mod pool;
 mod sigv4;
 mod smtp;
@@ -47,6 +48,7 @@ pub use crate::http::{
     send_multiplexed, send_multiplexed_traced, HttpVersionPref, ProxyConfig, Request, Response,
     Timing,
 };
+pub use crate::multi::{EasyId, Multi};
 pub use crate::net::Client;
 pub use crate::transfer::{transfer, transfer_url};
 pub use crate::url::Url;
