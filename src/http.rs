@@ -950,6 +950,7 @@ impl Request {
                             headers: crate::compress::strip_after_decode(head.headers),
                             body: Vec::new(),
                             timing,
+                            final_url: url_to_string(&req.url),
                         });
                     }
                 }
@@ -970,6 +971,7 @@ impl Request {
                     headers,
                     body: Vec::new(),
                     timing,
+                    final_url: url_to_string(&req.url),
                 });
             }
             let n = stream_body(&mut bufrd, sink, &head.headers, head.status, &req.method)?;
@@ -981,6 +983,7 @@ impl Request {
                 headers: head.headers,
                 body: Vec::new(),
                 timing,
+                final_url: url_to_string(&req.url),
             });
         }
     }
@@ -1047,7 +1050,7 @@ impl Request {
                     snapshot.headers.push(("Cookie".to_string(), val));
                 }
             }
-            let resp = snapshot.send_once(trace)?;
+            let mut resp = snapshot.send_once(trace)?;
             if let Some(j) = jar.as_deref_mut() {
                 j.ingest_response(&req.url, &resp.headers);
             }
@@ -1078,6 +1081,7 @@ impl Request {
                 }
             }
             if !req.follow_redirects || !is_redirect_status(resp.status) {
+                resp.final_url = url_to_string(&req.url);
                 return Ok(resp);
             }
             if hops_left == 0 {
@@ -1088,7 +1092,11 @@ impl Request {
             }
             let location = match resp.header("location") {
                 Some(l) => l.to_string(),
-                None => return Ok(resp), // 3xx without Location — give it back.
+                None => {
+                    // 3xx without Location — give it back as the final response.
+                    resp.final_url = url_to_string(&req.url);
+                    return Ok(resp);
+                }
             };
             let mut next_url = crate::url::resolve(&req.url, &location)?;
             // Apply the same IDN normalisation to the redirect target so the
@@ -1183,6 +1191,12 @@ pub struct Response {
     /// the direct HTTP/1.1 + HTTPS paths; left empty on reused (pooled)
     /// connections and the HTTP/2 / HTTP/3 backends (see [`Timing`]).
     pub timing: Timing,
+    /// The effective URL the response came from — the last hop after any
+    /// redirects (curl `CURLINFO_EFFECTIVE_URL`). Set by the buffered
+    /// [`send`](Request::send)/[`send_to`] path; empty on the streaming and
+    /// HTTP/2-multiplexed paths, where callers should fall back to the
+    /// requested URL.
+    pub final_url: String,
 }
 
 /// Per-phase wall-clock timings for `--write-out` (`%{time_connect}` etc.),
@@ -2502,6 +2516,9 @@ where
             starttransfer,
             ..Default::default()
         },
+        // The redirect-following `send_to` overwrites this with the effective
+        // URL; this low-level path has no URL of its own.
+        final_url: String::new(),
     })
 }
 
@@ -3228,6 +3245,7 @@ mod tests {
             headers,
             body: body.to_vec(),
             timing: Timing::default(),
+            final_url: String::new(),
         }
     }
 

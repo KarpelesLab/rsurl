@@ -411,6 +411,40 @@ fn cookie_traverses_redirect_chain() {
     );
 }
 
+/// `Response::final_url` reports the effective URL after a redirect (the value
+/// behind curl's `CURLINFO_EFFECTIVE_URL`); without a redirect it is the
+/// requested URL.
+#[test]
+fn final_url_reflects_redirect_target() {
+    let server = TestServer::start(move |req: SReq| {
+        if req.path == "/start" {
+            SResp::status(302).header("Location", "/dest")
+        } else {
+            SResp::ok("here")
+        }
+    });
+
+    let resp = Request::get(&server.url("/start"))
+        .unwrap()
+        .follow_redirects(true)
+        .send()
+        .unwrap();
+    assert_eq!(resp.body, b"here");
+    assert!(
+        resp.final_url.ends_with("/dest"),
+        "final_url should be the redirect target, got {:?}",
+        resp.final_url
+    );
+
+    // No redirect: final_url is the requested URL.
+    let direct = Request::get(&server.url("/dest")).unwrap().send().unwrap();
+    assert!(
+        direct.final_url.ends_with("/dest"),
+        "{:?}",
+        direct.final_url
+    );
+}
+
 /// `send_with_jar` without any Set-Cookie response leaves the jar empty
 /// and never inserts a stray `Cookie:` request header.
 #[test]

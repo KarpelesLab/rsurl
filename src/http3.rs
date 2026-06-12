@@ -2393,6 +2393,7 @@ fn finalize_response(
             headers: hdrs,
             body: Vec::new(),
             timing: crate::http::Timing::default(),
+            final_url: String::new(),
         });
     }
     Ok(Response {
@@ -2403,6 +2404,7 @@ fn finalize_response(
         headers: hdrs,
         body,
         timing: crate::http::Timing::default(),
+        final_url: String::new(),
     })
 }
 
