@@ -1,0 +1,26 @@
+[package]
+name = "curl-compat"
+version = "0.0.6"
+edition = "2021"
+rust-version = "1.95"
+authors = ["Karpelès Lab Inc."]
+description = "libcurl-ABI-compatible C drop-in built on rsurl (optional)."
+license = "MIT"
+repository = "https://github.com/KarpelesLab/rsurl"
+publish = false
+
+# The cdylib is named `curl` so the output is `libcurl.so` / `libcurl.dylib` /
+# `curl.dll`; build.rs sets the `libcurl.so.4` SONAME and the symbol-version
+# script on ELF targets. The staticlib (`libcurl.a`) is used by the C smoke
+# tests and for static linking.
+[lib]
+name = "curl"
+# `rlib` lets the in-crate integration harness build; `cdylib`/`staticlib` are
+# the artifacts a C program links against.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# Reuse the same TLS backend the parent crate defaults to. No default features
+# here so a `--no-default-features --features rustls-tls` parent build can be
+# matched by passing the same to `-p curl-compat`.
+rsurl = { path = "..", default-features = false, features = ["purecrypto-tls", "idn"] }

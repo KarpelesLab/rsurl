@@ -1,0 +1,18 @@
+# Linker version script for the libcurl ABI drop-in.
+#
+# Real libcurl exports its symbols under a TLS-backend-specific version node
+# (most commonly `CURL_OPENSSL_4` on Linux distros). A program dynamically
+# linked against such a libcurl references e.g. `curl_easy_init@CURL_OPENSSL_4`.
+# Exporting the same `curl_*` symbols under that node lets the dynamic linker
+# satisfy those references against this library.
+#
+# Caveat: distros that build libcurl against GnuTLS/NSS/etc. use a different
+# node name; pre-built binaries linked to those resolve only if their node name
+# matches. Programs recompiled against our header (or linked at build time) are
+# unaffected by the node name.
+CURL_OPENSSL_4 {
+    global:
+        curl_*;
+    local:
+        *;
+};
