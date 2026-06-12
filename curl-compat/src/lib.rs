@@ -21,6 +21,7 @@
 
 mod consts;
 mod easy;
+mod multi;
 mod version;
 
 pub use consts::*;

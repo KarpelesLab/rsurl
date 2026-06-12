@@ -300,6 +300,40 @@ CURLcode curl_easy_setopt(CURL *handle, CURLoption option, ...);
 CURLcode curl_easy_getinfo(CURL *handle, CURLINFO info, ...);
 CURLcode curl_easy_perform(CURL *handle);
 
+/* ===================== multi interface ===================== */
+
+typedef int CURLMSG;
+#define CURLMSG_NONE 0
+#define CURLMSG_DONE 1
+
+typedef struct CURLMsg {
+  CURLMSG msg;            /* what this message means */
+  CURL *easy_handle;      /* the handle it concerns */
+  union {
+    void *whatever;       /* (not used) */
+    CURLcode result;      /* return code for the transfer */
+  } data;
+} CURLMsg;
+
+/* Poll descriptor (programs may pass an array; this shim ignores extra fds). */
+struct curl_waitfd {
+  int fd;
+  short events;
+  short revents;
+};
+
+CURLM *curl_multi_init(void);
+CURLMcode curl_multi_cleanup(CURLM *multi);
+CURLMcode curl_multi_add_handle(CURLM *multi, CURL *easy);
+CURLMcode curl_multi_remove_handle(CURLM *multi, CURL *easy);
+CURLMcode curl_multi_perform(CURLM *multi, int *running_handles);
+CURLMcode curl_multi_poll(CURLM *multi, struct curl_waitfd *extra_fds,
+                          int extra_nfds, int timeout_ms, int *numfds);
+CURLMcode curl_multi_wait(CURLM *multi, struct curl_waitfd *extra_fds,
+                          int extra_nfds, int timeout_ms, int *numfds);
+CURLMsg *curl_multi_info_read(CURLM *multi, int *msgs_in_queue);
+CURLMcode curl_multi_setopt(CURLM *multi, int option, ...);
+
 #ifdef __cplusplus
 }
 #endif

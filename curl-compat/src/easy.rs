@@ -673,6 +673,25 @@ fn set_error_buffer(h: &EasyHandle, msg: &str) {
     }
 }
 
+/// Build the request for an easy handle given by raw pointer. Used by the
+/// multi interface to assemble the request on the caller's thread before
+/// handing it (which is `Send`) to a worker.
+pub(crate) fn build_request_ptr(handle: *mut CURL) -> Result<Request, CURLcode> {
+    match as_handle(handle) {
+        Some(h) => build_request(h),
+        None => Err(CURLE_FAILED_INIT),
+    }
+}
+
+/// Deliver a completed response to an easy handle given by raw pointer (runs
+/// on the caller's thread, e.g. inside `curl_multi_perform`).
+pub(crate) fn deliver_ptr(handle: *mut CURL, resp: Response) -> CURLcode {
+    match as_handle(handle) {
+        Some(h) => deliver(h, resp),
+        None => CURLE_FAILED_INIT,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn curl_easy_perform(handle: *mut CURL) -> CURLcode {
     ffi_guard(CURLE_FAILED_INIT, || {
