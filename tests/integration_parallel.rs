@@ -116,27 +116,44 @@ fn start(accept_ranges: bool) -> Server {
 
 static OUT_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-fn run_download(url: &str, segments: u32) -> (Vec<u8>, bool) {
+struct Run {
+    data: Vec<u8>,
+    stderr: String,
+    ok: bool,
+}
+
+/// Run `rsurl --parallel-segments[ n] [-#] -o tmp url`. `segments == None` omits
+/// the count (exercising the default of 4); `progress` adds `-#`.
+fn run_download_ex(url: &str, segments: Option<u32>, progress: bool) -> Run {
     let bin = env!("CARGO_BIN_EXE_rsurl");
-    // Unique per call so concurrently-run tests don't collide on the path.
     let uniq = OUT_SEQ.fetch_add(1, Ordering::SeqCst);
-    let out = std::env::temp_dir().join(format!(
-        "rsurl_par_{}_{}_{}",
-        std::process::id(),
-        segments,
-        uniq
-    ));
-    let status = Command::new(bin)
-        .arg("--parallel-segments")
-        .arg(segments.to_string())
+    let out = std::env::temp_dir().join(format!("rsurl_par_{}_{}", std::process::id(), uniq));
+    let mut cmd = Command::new(bin);
+    cmd.arg("--parallel-segments");
+    if let Some(n) = segments {
+        cmd.arg(n.to_string());
+    }
+    if progress {
+        cmd.arg("-#");
+    }
+    let output = cmd
         .arg("-o")
         .arg(&out)
         .arg(url)
-        .status()
+        .output()
         .expect("spawn rsurl");
     let data = std::fs::read(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
-    (data, status.success())
+    Run {
+        data,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        ok: output.status.success(),
+    }
+}
+
+fn run_download(url: &str, segments: u32) -> (Vec<u8>, bool) {
+    let r = run_download_ex(url, Some(segments), false);
+    (r.data, r.ok)
 }
 
 #[test]
@@ -151,6 +168,38 @@ fn parallel_segments_reassembles_file() {
         server.range_gets.load(Ordering::SeqCst) >= 2,
         "expected >=2 range GETs, saw {}",
         server.range_gets.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn bare_flag_defaults_to_four_segments() {
+    let server = start(true);
+    let url = format!("http://127.0.0.1:{}/big", server.port);
+    // No count given → defaults to 4 segments.
+    let r = run_download_ex(&url, None, false);
+    assert!(r.ok, "rsurl exited non-zero: {}", r.stderr);
+    assert_eq!(r.data, payload(), "downloaded file does not match");
+    assert_eq!(
+        server.range_gets.load(Ordering::SeqCst),
+        4,
+        "default should split into 4 segments, saw {}",
+        server.range_gets.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn progress_flag_renders_and_keeps_file_intact() {
+    let server = start(true);
+    let url = format!("http://127.0.0.1:{}/big", server.port);
+    let r = run_download_ex(&url, Some(4), true);
+    assert!(r.ok, "rsurl exited non-zero: {}", r.stderr);
+    assert_eq!(r.data, payload(), "progress mode corrupted the file");
+    // stderr (not a TTY here) carries the aggregate progress line; the file is
+    // unaffected by the display going to stderr.
+    assert!(
+        r.stderr.contains("rsurl:"),
+        "expected a progress line on stderr, got {:?}",
+        r.stderr
     );
 }
 

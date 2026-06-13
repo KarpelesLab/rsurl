@@ -54,6 +54,8 @@ use std::fs::File;
 use std::io::{self, IsTerminal, Read, Seek, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rsurl::{CookieJar, HttpVersionPref, Request, Response, Url};
@@ -2325,11 +2327,16 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 )
             }
             "--parallel-segments" => {
-                a.parallel_segments = Some(
-                    next_val(&mut it, arg)?
-                        .parse()
-                        .map_err(|_| "--parallel-segments requires a number".to_string())?,
-                )
+                // Optional count; defaults to 4. Only consume the next token if
+                // it parses as a number (otherwise it's the URL / next flag).
+                let n = match it.clone().next().and_then(|s| s.parse::<usize>().ok()) {
+                    Some(v) => {
+                        it.next();
+                        v
+                    }
+                    None => 4,
+                };
+                a.parallel_segments = Some(n);
             }
             "--tls-max" => {
                 let v = next_val(&mut it, arg)?;
@@ -3970,6 +3977,118 @@ const MIN_SEGMENT_BYTES: u64 = 1 << 20; // 1 MiB
 /// Hard cap on concurrent segments regardless of `--parallel-segments`.
 const MAX_SEGMENTS: usize = 16;
 
+/// A `Write` that tallies bytes into a shared counter — lets the progress
+/// render thread observe each segment's progress as it streams to the file.
+struct CountingWriter<W> {
+    inner: W,
+    counter: Arc<AtomicU64>,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.counter.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Format a byte count like `12.3 MiB`.
+fn human_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// A fixed-width `[████░░░░]` bar for `got`/`total`.
+fn progress_bar(got: u64, total: u64, width: usize) -> String {
+    let filled = if total == 0 {
+        width
+    } else {
+        ((got as u128 * width as u128 / total as u128) as usize).min(width)
+    };
+    let mut s = String::with_capacity(width + 2);
+    s.push('[');
+    for _ in 0..filled {
+        s.push('\u{2588}'); // █
+    }
+    for _ in filled..width {
+        s.push('\u{2591}'); // ░
+    }
+    s.push(']');
+    s
+}
+
+/// Draw the parallel-download progress. On a TTY: one line per segment plus an
+/// aggregate line, redrawn in place. Off a TTY: a single `\r` aggregate line.
+fn render_parallel(
+    lens: &[u64],
+    counters: &[Arc<AtomicU64>],
+    total: u64,
+    start: std::time::Instant,
+    tty: bool,
+    first: &mut bool,
+) {
+    const BAR_W: usize = 24;
+    let mut err = io::stderr().lock();
+    let done: u64 = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    let secs = start.elapsed().as_secs_f64();
+    let rate = if secs > 0.0 {
+        (done as f64 / secs) as u64
+    } else {
+        0
+    };
+
+    if tty {
+        let lines = lens.len() + 1; // per-segment lines + aggregate
+        if *first {
+            *first = false;
+        } else {
+            let _ = write!(err, "\x1b[{lines}A");
+        }
+        for (i, (len, ctr)) in lens.iter().zip(counters).enumerate() {
+            let got = ctr.load(Ordering::Relaxed);
+            let _ = writeln!(
+                err,
+                "\r\x1b[2K  seg {:>2}/{:<2} {} {}/{}",
+                i + 1,
+                lens.len(),
+                progress_bar(got, *len, BAR_W),
+                human_bytes(got),
+                human_bytes(*len),
+            );
+        }
+        let _ = writeln!(
+            err,
+            "\r\x1b[2K  total     {} {}/{}  {}/s",
+            progress_bar(done, total, BAR_W),
+            human_bytes(done),
+            human_bytes(total),
+            human_bytes(rate),
+        );
+    } else {
+        let _ = write!(
+            err,
+            "\rrsurl: {}/{} ({}/s)   ",
+            human_bytes(done),
+            human_bytes(total),
+            human_bytes(rate),
+        );
+    }
+    let _ = err.flush();
+}
+
 /// Download a single file over `n` concurrent HTTP range requests. Probes with
 /// HEAD; if the server doesn't support ranges, the size is unknown/small, or
 /// anything goes wrong, falls back to the normal single-stream download
@@ -4055,16 +4174,24 @@ fn run_parallel_download(
 
     let seg = size / n as u64;
     let now = std::time::Instant::now();
+
+    // Per-segment byte counters drive the live display without depending on any
+    // one segment's write cadence.
+    let counters: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let mut lens = Vec::with_capacity(n);
+
     let mut handles = Vec::with_capacity(n);
-    for i in 0..n {
+    for (i, counter_slot) in counters.iter().enumerate() {
         let start = i as u64 * seg;
         let end = if i == n - 1 {
             size - 1
         } else {
             (i as u64 + 1) * seg - 1
         };
+        lens.push(end - start + 1);
         let seg_req = req.clone().header("Range", &format!("bytes={start}-{end}"));
         let path = out_path.clone();
+        let counter = Arc::clone(counter_slot);
         handles.push(std::thread::spawn(move || -> Result<u64, String> {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -4072,9 +4199,11 @@ fn run_parallel_download(
                 .map_err(|e| e.to_string())?;
             f.seek(io::SeekFrom::Start(start))
                 .map_err(|e| e.to_string())?;
+            // Count bytes as they land so the render thread can show progress.
+            let mut w = CountingWriter { inner: f, counter };
             let mut trace = io::sink();
             let resp = seg_req
-                .send_download(&mut f, None, &mut trace)
+                .send_download(&mut w, None, &mut trace)
                 .map_err(|e| e.to_string())?;
             if resp.status != 206 {
                 return Err(format!(
@@ -4085,6 +4214,28 @@ fn run_parallel_download(
             Ok(end - start + 1)
         }));
     }
+
+    // Live progress display (with `-#`): a render thread redraws every ~120 ms.
+    let show_progress = args.progress_bar && !args.silent;
+    let render = if show_progress {
+        let lens = lens.clone();
+        let counters: Vec<Arc<AtomicU64>> = counters.iter().map(Arc::clone).collect();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_w = Arc::clone(&done);
+        let tty = io::stderr().is_terminal();
+        let handle = std::thread::spawn(move || {
+            let mut first = true;
+            while !done_w.load(Ordering::Relaxed) {
+                render_parallel(&lens, &counters, size, now, tty, &mut first);
+                std::thread::sleep(std::time::Duration::from_millis(120));
+            }
+            render_parallel(&lens, &counters, size, now, tty, &mut first);
+            eprintln!();
+        });
+        Some((done, handle))
+    } else {
+        None
+    };
 
     let mut total = 0u64;
     let mut failure: Option<String> = None;
@@ -4098,6 +4249,10 @@ fn run_parallel_download(
                 failure.get_or_insert_with(|| "segment thread panicked".to_string());
             }
         }
+    }
+    if let Some((done, handle)) = render {
+        done.store(true, Ordering::Relaxed);
+        let _ = handle.join();
     }
 
     if failure.is_none() && total == size {
@@ -4518,7 +4673,8 @@ Options:
   -g, --globoff            disable URL globbing ({{}} and [] taken literally)
   -Z, --parallel           run this invocation's transfers concurrently
       --parallel-max <n>   cap on concurrent transfers (default 50)
-      --parallel-segments <n>  fetch one -o/-O file via n concurrent ranges
+      --parallel-segments [n]  fetch one -o/-O file via n concurrent ranges
+                               (default 4; add -# for a live progress display)
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1
