@@ -51,7 +51,7 @@
 //!     -V, --version            print version
 
 use std::fs::File;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Seek, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -270,6 +270,9 @@ struct Args {
     parallel: bool,
     /// `--parallel-max <n>`: cap on concurrent transfers (default 50).
     parallel_max: Option<usize>,
+    /// `--parallel-segments <n>`: download a single `-o`/`-O` file over `n`
+    /// concurrent HTTP range requests (segmented download). rsurl extension.
+    parallel_segments: Option<usize>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -2024,6 +2027,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // no status-gated body suppression. This is the path that enforces
     // --limit-rate, -# progress, and an early --max-filesize abort.
     if streams_to_file(args) {
+        if parallel_segments_eligible(args) {
+            return run_parallel_download(req, &parsed_url, args, jar);
+        }
         return run_http_download(req, &parsed_url, args, jar);
     }
 
@@ -2316,6 +2322,13 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                     next_val(&mut it, arg)?
                         .parse()
                         .map_err(|_| "--parallel-max requires a number".to_string())?,
+                )
+            }
+            "--parallel-segments" => {
+                a.parallel_segments = Some(
+                    next_val(&mut it, arg)?
+                        .parse()
+                        .map_err(|_| "--parallel-segments requires a number".to_string())?,
                 )
             }
             "--tls-max" => {
@@ -3939,6 +3952,174 @@ impl Write for DownloadSink<'_> {
 
 /// Streaming HTTP download to a file: enforces `--limit-rate`/`-#`/
 /// `--max-filesize` and avoids buffering the whole body in memory.
+/// CLI-level gate for segmented parallel download (before any network probe).
+/// `--parallel-segments n>1` and none of the features that constrain the byte
+/// range or the write path (resume, user range, rate limits, upload).
+fn parallel_segments_eligible(args: &Args) -> bool {
+    args.parallel_segments.is_some_and(|n| n > 1)
+        && args.continue_at.is_none()
+        && args.range.is_none()
+        && args.limit_rate.is_none()
+        && args.speed_limit.is_none()
+        && args.speed_time.is_none()
+        && args.upload_file.is_none()
+}
+
+/// Smallest segment worth a separate connection (don't split tiny files).
+const MIN_SEGMENT_BYTES: u64 = 1 << 20; // 1 MiB
+/// Hard cap on concurrent segments regardless of `--parallel-segments`.
+const MAX_SEGMENTS: usize = 16;
+
+/// Download a single file over `n` concurrent HTTP range requests. Probes with
+/// HEAD; if the server doesn't support ranges, the size is unknown/small, or
+/// anything goes wrong, falls back to the normal single-stream download
+/// ([`run_http_download`]) so behavior is never worse than without the flag.
+fn run_parallel_download(
+    req: rsurl::Request,
+    url: &Url,
+    args: &Args,
+    jar: Option<&mut CookieJar>,
+) -> u8 {
+    // Cookies aren't shared across segment threads; keep cookie semantics by
+    // falling back to the single-stream path when a jar is in use.
+    if jar.is_some() {
+        return run_http_download(req, url, args, jar);
+    }
+
+    // HEAD probe carries the request's auth/headers/proxy and (if --location)
+    // follows redirects to the final resource.
+    let probe = match req.clone().method("HEAD").send() {
+        Ok(r) => r,
+        Err(_) => return run_http_download(req, url, args, None),
+    };
+    let size = probe
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let ranges_ok = probe
+        .header("accept-ranges")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
+    let (Some(size), true) = (size, ranges_ok && probe.status < 400) else {
+        return run_http_download(req, url, args, None);
+    };
+
+    if let Some(max) = args.max_filesize {
+        if size > max {
+            if show_errors(args) {
+                eprintln!("rsurl: Maximum file size exceeded");
+            }
+            return 63;
+        }
+    }
+
+    let requested = args.parallel_segments.unwrap_or(1).min(MAX_SEGMENTS);
+    let by_size = size.div_ceil(MIN_SEGMENT_BYTES).max(1) as usize;
+    let n = requested.min(by_size);
+    if n < 2 {
+        // Too small to benefit — one stream is just as good.
+        return run_http_download(req, url, args, None);
+    }
+
+    let name = if args.remote_name {
+        match remote_name_from_url(url) {
+            Ok(nm) => nm,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                return 23;
+            }
+        }
+    } else {
+        args.output.clone().unwrap_or_default()
+    };
+    let (file, out_path) = match create_output_file_tracked(&name, args) {
+        Ok(pair) => pair,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: open {name}: {e}");
+            }
+            return 23;
+        }
+    };
+    // Preallocate so each segment can seek to its offset and write in place.
+    if file.set_len(size).is_err() {
+        // Not a regular seekable file — fall back (recreates/truncates it).
+        drop(file);
+        return run_http_download(req, url, args, None);
+    }
+    drop(file);
+
+    if args.verbose {
+        eprintln!("* Parallel download: {n} segments, {size} bytes");
+    }
+
+    let seg = size / n as u64;
+    let now = std::time::Instant::now();
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = i as u64 * seg;
+        let end = if i == n - 1 {
+            size - 1
+        } else {
+            (i as u64 + 1) * seg - 1
+        };
+        let seg_req = req.clone().header("Range", &format!("bytes={start}-{end}"));
+        let path = out_path.clone();
+        handles.push(std::thread::spawn(move || -> Result<u64, String> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            f.seek(io::SeekFrom::Start(start))
+                .map_err(|e| e.to_string())?;
+            let mut trace = io::sink();
+            let resp = seg_req
+                .send_download(&mut f, None, &mut trace)
+                .map_err(|e| e.to_string())?;
+            if resp.status != 206 {
+                return Err(format!(
+                    "server did not honor Range (status {})",
+                    resp.status
+                ));
+            }
+            Ok(end - start + 1)
+        }));
+    }
+
+    let mut total = 0u64;
+    let mut failure: Option<String> = None;
+    for h in handles {
+        match h.join() {
+            Ok(Ok(written)) => total += written,
+            Ok(Err(e)) => {
+                failure.get_or_insert(e);
+            }
+            Err(_) => {
+                failure.get_or_insert_with(|| "segment thread panicked".to_string());
+            }
+        }
+    }
+
+    if failure.is_none() && total == size {
+        let elapsed = now.elapsed();
+        if args.remote_time {
+            set_remote_time(&probe, &name);
+        }
+        run_write_out(&probe, url, args, elapsed, size);
+        return 0;
+    }
+
+    // Something went wrong mid-stream — retry as a single stream, which
+    // recreates (truncates) the file via the normal path.
+    if args.verbose {
+        eprintln!(
+            "* Parallel download incomplete ({}); retrying as a single stream",
+            failure.as_deref().unwrap_or("size mismatch")
+        );
+    }
+    run_http_download(req, url, args, None)
+}
+
 fn run_http_download(
     req: rsurl::Request,
     url: &Url,
@@ -4337,6 +4518,7 @@ Options:
   -g, --globoff            disable URL globbing ({{}} and [] taken literally)
   -Z, --parallel           run this invocation's transfers concurrently
       --parallel-max <n>   cap on concurrent transfers (default 50)
+      --parallel-segments <n>  fetch one -o/-O file via n concurrent ranges
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1

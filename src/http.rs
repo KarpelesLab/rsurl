@@ -358,6 +358,14 @@ impl Request {
         Self::new("GET", url)
     }
 
+    /// Override the HTTP method (uppercased), keeping every other setting. Curl
+    /// `-X`. Useful to turn a configured request into a `HEAD` probe without
+    /// rebuilding it.
+    pub fn method(mut self, method: &str) -> Self {
+        self.method = method.to_ascii_uppercase();
+        self
+    }
+
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_string(), value.to_string()));
         self
@@ -2937,6 +2945,12 @@ mod tests {
         assert_eq!(v, "HTTP/1.1");
         assert_eq!(s, 200);
         assert_eq!(r, "OK");
+    }
+
+    #[test]
+    fn method_override_uppercases() {
+        let req = Request::get("http://example.com/").unwrap().method("head");
+        assert_eq!(req.method, "HEAD");
     }
 
     #[test]
