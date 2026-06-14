@@ -776,9 +776,13 @@ fn glob_expand(url: &str) -> Result<Vec<(String, Vec<String>)>, String> {
 /// would be eaten as glob escapes — or a magnet link, neither of which is a URL
 /// to expand. An `http(s)://` torrent URL still globs normally.
 fn glob_disabled(op: &Args, url: &str) -> bool {
+    // Any torrent-routing flag (matching process_url's dispatch) may take a
+    // local `.torrent` path rather than a URL.
+    let torrent_source =
+        op.torrent || op.bt_info || op.bt_save_torrent || op.bt_file.is_some() || op.bt_concat;
     op.globoff
         || url.starts_with("magnet:")
-        || (op.torrent && !url.starts_with("http://") && !url.starts_with("https://"))
+        || (torrent_source && !url.starts_with("http://") && !url.starts_with("https://"))
 }
 
 /// Substitute `#1`..`#9` in an output-name template with glob captures.

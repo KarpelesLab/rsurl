@@ -626,7 +626,11 @@ fn cli_bt_info_concat_and_file() {
         .arg(&torrent_path)
         .output()
         .expect("spawn");
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "--bt-info failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let json = String::from_utf8_lossy(&out.stdout);
     assert!(json.contains("\"total_length\": 20000"), "json: {json}");
     assert!(json.contains("\"path\": \"pack/b.bin\", \"length\": 8000, \"offset\": 12000"));
