@@ -217,6 +217,94 @@ fn downloads_pieces_with_many_blocks() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// A seeder that handshakes, advertises every piece, and unchokes — but never
+/// serves a single block. It stays connected (so it does not time out quickly),
+/// modelling a peer that grabs a piece and then stalls indefinitely.
+fn start_stalling_seeder(meta: Metainfo) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let num_pieces = meta.num_pieces();
+    let info_hash = meta.info_hash;
+
+    thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        s.set_read_timeout(Some(Duration::from_secs(60))).ok();
+        let hs = match peer::read_handshake(&mut s) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        if hs.info_hash != info_hash {
+            return;
+        }
+        let _ = peer::write_handshake(&mut s, &Handshake::new(info_hash, [0x66; 20]));
+        let mut bf = Bitfield::new(num_pieces);
+        for i in 0..num_pieces {
+            bf.set(i);
+        }
+        let _ = peer::write_message(&mut s, &Message::Bitfield(bf.as_bytes().to_vec()));
+        loop {
+            match peer::read_message(&mut s) {
+                Ok(Message::Interested) => {
+                    let _ = peer::write_message(&mut s, &Message::Unchoke);
+                }
+                // Requests are accepted but never answered — the stall.
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    });
+    port
+}
+
+/// Endgame: with a healthy seeder and a peer that grabs a piece then stalls
+/// forever, the download must still finish (the idle good peer re-requests the
+/// stalled piece) — and well within the per-peer read timeout, which is the
+/// only way the non-endgame engine could ever recover.
+#[test]
+fn endgame_completes_despite_a_stalling_peer() {
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let meta = make_torrent(&data, 4096, "endgame.bin");
+    assert!(meta.num_pieces() >= 8);
+
+    let good = start_seeder(data.clone(), meta.clone());
+    let bad = start_stalling_seeder(meta.clone());
+    let peers = vec![
+        format!("127.0.0.1:{good}").parse().unwrap(),
+        format!("127.0.0.1:{bad}").parse().unwrap(),
+    ];
+
+    let out = std::env::temp_dir().join(format!("rsurl_bt_eg_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let layout = vec![(out.clone(), data.len() as u64)];
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let meta2 = meta.clone();
+    thread::spawn(move || {
+        let r = download(
+            &meta2,
+            layout,
+            &peers,
+            &TorrentOptions::default(),
+            &mut |_| {},
+        );
+        let _ = tx.send(r.map(|s| s.downloaded));
+    });
+    // Generous, but far below the 30 s peer timeout the old engine would need.
+    let downloaded = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("download did not complete in time — endgame regressed?")
+        .expect("download");
+    assert_eq!(downloaded, data.len() as u64);
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        data,
+        "endgame output mismatch"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
 /// Build the raw bencoded `info` dictionary for a single-file torrent.
 fn make_info_bytes(data: &[u8], piece_len: usize, name: &str) -> Vec<u8> {
     let mut pieces = Vec::new();

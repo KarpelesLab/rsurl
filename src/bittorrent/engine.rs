@@ -10,7 +10,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{self, Sender};
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -77,16 +76,17 @@ pub fn run(
     let (tx, rx) = mpsc::channel::<ToEngine>();
     let num_pieces = meta.num_pieces();
 
-    // Spawn one worker per peer.
+    // Spawn one worker per peer. Workers are detached (not joined): a peer
+    // blocked mid-piece on a slow/stalled socket must not hold up a completed
+    // transfer — it exits on Stop when idle, or when its socket times out.
     let verbosity = opts.verbosity;
     let peer_verbose = verbosity >= 2; // per-peer lifecycle only at -vv
-    let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(peers.len());
     for (i, &addr) in peers.iter().enumerate() {
         let tx = tx.clone();
         let info_hash = meta.info_hash;
         let ct = opts.connect_timeout;
         let pt = opts.peer_timeout;
-        handles.push(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             peer_worker(
                 i,
                 addr,
@@ -98,7 +98,7 @@ pub fn run(
                 peer_verbose,
                 tx,
             );
-        }));
+        });
     }
     drop(tx); // engine holds no sender; rx ends once every peer thread exits.
 
@@ -107,6 +107,7 @@ pub fn run(
     let mut peer_cmd: HashMap<usize, Sender<ToPeer>> = HashMap::new();
     let mut assigned: HashSet<usize> = HashSet::new();
     let mut peer_piece: HashMap<usize, usize> = HashMap::new();
+    let mut endgame_announced = false;
 
     while !storage.is_complete() {
         let ev = match rx.recv_timeout(Duration::from_secs(2)) {
@@ -143,17 +144,31 @@ pub fn run(
                     &mut assigned,
                     &mut peer_piece,
                     &peer_cmd,
+                    verbosity,
+                    &mut endgame_announced,
                 );
             }
             ToEngine::PieceDone { peer, index, data } => {
-                assigned.remove(&index);
                 peer_piece.remove(&peer);
-                match storage.write_piece(index, &data) {
-                    Ok(true) => progress(&snapshot(storage, meta)),
-                    Ok(false) => { /* hash mismatch: leave unassigned to retry elsewhere */ }
-                    Err(e) => {
-                        stop_all(&peer_cmd, handles);
-                        return Err(e); // disk error is fatal
+                if storage.has(index) {
+                    // A duplicate copy (endgame) of a piece we already have.
+                } else {
+                    match storage.write_piece(index, &data) {
+                        Ok(true) => {
+                            assigned.remove(&index);
+                            progress(&snapshot(storage, meta));
+                        }
+                        // Bad data: free it for re-pick unless another peer is
+                        // still downloading the same piece (endgame).
+                        Ok(false) => {
+                            if !peer_piece.values().any(|&p| p == index) {
+                                assigned.remove(&index);
+                            }
+                        }
+                        Err(e) => {
+                            stop_all(&peer_cmd);
+                            return Err(e); // disk error is fatal
+                        }
                     }
                 }
                 try_assign(
@@ -164,13 +179,16 @@ pub fn run(
                     &mut assigned,
                     &mut peer_piece,
                     &peer_cmd,
+                    verbosity,
+                    &mut endgame_announced,
                 );
             }
             ToEngine::Failed { peer, index } => {
-                assigned.remove(&index);
                 peer_piece.remove(&peer);
-                // The peer also sends Gone; the freed piece is picked up by the
-                // next peer that finishes a piece.
+                // Free the piece only if no other peer is still on it (endgame).
+                if !peer_piece.values().any(|&p| p == index) {
+                    assigned.remove(&index);
+                }
             }
             ToEngine::Gone { peer } => {
                 if let Some(bf) = peer_bf.remove(&peer) {
@@ -178,13 +196,15 @@ pub fn run(
                 }
                 peer_cmd.remove(&peer);
                 if let Some(p) = peer_piece.remove(&peer) {
-                    assigned.remove(&p);
+                    if !peer_piece.values().any(|&x| x == p) {
+                        assigned.remove(&p);
+                    }
                 }
             }
         }
     }
 
-    stop_all(&peer_cmd, handles);
+    stop_all(&peer_cmd);
 
     if storage.is_complete() {
         Ok(Stats {
@@ -205,6 +225,8 @@ fn try_assign(
     assigned: &mut HashSet<usize>,
     peer_piece: &mut HashMap<usize, usize>,
     peer_cmd: &HashMap<usize, Sender<ToPeer>>,
+    verbosity: u8,
+    endgame_announced: &mut bool,
 ) {
     let (Some(bf), Some(cmd)) = (peer_bf.get(&peer), peer_cmd.get(&peer)) else {
         return;
@@ -213,21 +235,71 @@ fn try_assign(
         let _ = cmd.send(ToPeer::Stop);
         return;
     }
-    match picker.pick(storage.bitfield(), bf, assigned) {
+
+    // `fresh` means a not-yet-in-flight piece (added to `assigned` here); an
+    // endgame duplicate is already in `assigned` and owned by another peer too.
+    let (idx, fresh) = match picker.pick(storage.bitfield(), bf, assigned) {
         Some(idx) => {
             assigned.insert(idx);
+            (Some(idx), true)
+        }
+        None => {
+            // Endgame: once every still-missing piece is already in flight, an
+            // idle peer re-requests one it has so the tail isn't stuck behind a
+            // single slow peer. First valid copy wins; late copies are dropped.
+            let complete = storage.bitfield().count();
+            let unassigned = storage
+                .num_pieces()
+                .saturating_sub(complete + assigned.len());
+            if unassigned == 0 {
+                let dup = endgame_pick(storage, bf, peer_piece, assigned);
+                if dup.is_some() && verbosity >= 1 && !*endgame_announced {
+                    *endgame_announced = true;
+                    eprintln!("* endgame: re-requesting in-flight pieces from idle peers");
+                }
+                (dup, false)
+            } else {
+                (None, false)
+            }
+        }
+    };
+
+    match idx {
+        Some(idx) => {
             peer_piece.insert(peer, idx);
             let size = storage.piece_size(idx);
             if cmd.send(ToPeer::Assign { index: idx, size }).is_err() {
-                assigned.remove(&idx);
+                if fresh {
+                    assigned.remove(&idx);
+                }
                 peer_piece.remove(&peer);
             }
         }
-        // This peer has no piece we still need that isn't already in flight.
+        // Nothing this peer can usefully fetch.
         None => {
             let _ = cmd.send(ToPeer::Stop);
         }
     }
+}
+
+/// Pick an in-flight piece this peer has (and we still lack) to duplicate in
+/// endgame, preferring the one with the fewest peers currently on it so idle
+/// peers spread across the remaining pieces rather than piling on one.
+fn endgame_pick(
+    storage: &Storage,
+    bf: &Bitfield,
+    peer_piece: &HashMap<usize, usize>,
+    assigned: &HashSet<usize>,
+) -> Option<usize> {
+    let mut assignees: HashMap<usize, usize> = HashMap::new();
+    for &p in peer_piece.values() {
+        *assignees.entry(p).or_insert(0) += 1;
+    }
+    assigned
+        .iter()
+        .copied()
+        .filter(|&idx| bf.has(idx) && !storage.has(idx))
+        .min_by_key(|idx| assignees.get(idx).copied().unwrap_or(0))
 }
 
 fn snapshot(storage: &Storage, meta: &Metainfo) -> Progress {
@@ -240,12 +312,12 @@ fn snapshot(storage: &Storage, meta: &Metainfo) -> Progress {
     }
 }
 
-fn stop_all(peer_cmd: &HashMap<usize, Sender<ToPeer>>, handles: Vec<JoinHandle<()>>) {
+/// Ask every worker to stop. Workers are detached, so we do not join them —
+/// a peer blocked mid-piece would otherwise pin us for its full read timeout;
+/// it terminates on its own once the socket times out.
+fn stop_all(peer_cmd: &HashMap<usize, Sender<ToPeer>>) {
     for cmd in peer_cmd.values() {
         let _ = cmd.send(ToPeer::Stop);
-    }
-    for h in handles {
-        let _ = h.join();
     }
 }
 
@@ -419,4 +491,57 @@ fn download_piece<S: std::io::Read + std::io::Write>(
         }
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A storage of `num` pieces (piece length 4), none complete.
+    fn empty_storage(num: usize) -> Storage {
+        let hashes = vec![[0u8; 20]; num];
+        let path = std::env::temp_dir().join("rsurl_engine_test_unused");
+        Storage::create(vec![(path, (num * 4) as u64)], 4, hashes).unwrap()
+    }
+
+    #[test]
+    fn endgame_pick_prefers_fewest_assignees() {
+        let st = empty_storage(5);
+        let mut bf = Bitfield::new(5);
+        for i in 0..5 {
+            bf.set(i); // peer has every piece
+        }
+        let assigned: HashSet<usize> = [1, 2, 3].into_iter().collect();
+        // piece 1 has two assignees, pieces 2 and 3 one each.
+        let mut pp: HashMap<usize, usize> = HashMap::new();
+        pp.insert(10, 1);
+        pp.insert(11, 1);
+        pp.insert(12, 2);
+        pp.insert(13, 3);
+        // Should avoid the doubly-assigned piece 1.
+        assert!(matches!(
+            endgame_pick(&st, &bf, &pp, &assigned),
+            Some(2) | Some(3)
+        ));
+    }
+
+    #[test]
+    fn endgame_pick_skips_pieces_peer_lacks() {
+        let st = empty_storage(5);
+        let mut bf = Bitfield::new(5);
+        bf.set(2); // peer only has piece 2
+        let assigned: HashSet<usize> = [1, 2].into_iter().collect();
+        let pp: HashMap<usize, usize> = HashMap::new();
+        // Piece 1 is in flight but the peer lacks it; only 2 is eligible.
+        assert_eq!(endgame_pick(&st, &bf, &pp, &assigned), Some(2));
+    }
+
+    #[test]
+    fn endgame_pick_none_when_nothing_eligible() {
+        let st = empty_storage(3);
+        let bf = Bitfield::new(3); // peer has nothing
+        let assigned: HashSet<usize> = [0, 1, 2].into_iter().collect();
+        let pp: HashMap<usize, usize> = HashMap::new();
+        assert_eq!(endgame_pick(&st, &bf, &pp, &assigned), None);
+    }
 }
