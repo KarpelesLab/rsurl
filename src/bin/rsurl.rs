@@ -69,6 +69,9 @@ struct Args {
     include_headers: bool,
     head: bool,
     verbose: bool,
+    /// Count of `-v` flags: 1 = verbose, 2+ = extra (e.g. per-peer torrent
+    /// diagnostics). `verbose` stays `true` whenever this is ≥ 1.
+    verbosity: u8,
     silent: bool,
     method: Option<String>,
     headers: Vec<(String, String)>,
@@ -2211,7 +2214,10 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 a.head = true;
                 a.include_headers = true;
             }
-            "-v" | "--verbose" => a.verbose = true,
+            "-v" | "--verbose" => {
+                a.verbose = true;
+                a.verbosity = a.verbosity.saturating_add(1);
+            }
             "-s" | "--silent" => a.silent = true,
             "-X" | "--request" => a.method = Some(next_val(&mut it, arg)?),
             "-H" | "--header" => {
@@ -4462,7 +4468,7 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         peer_id,
         listen_port,
         seed,
-        verbose: args.verbose,
+        verbosity: args.verbosity,
         ..Default::default()
     };
 
@@ -4528,7 +4534,7 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
             // probe them concurrently, so fail fast and move on.
             Duration::from_secs(5),
             Duration::from_secs(10),
-            args.verbose,
+            args.verbosity >= 2,
         ) {
             Ok(m) => (m, magnet.trackers),
             Err(e) => {
@@ -4991,7 +4997,9 @@ Options:
   -O, --remote-name        save body as the URL's last path segment
   -i, --include            include response headers in the output
   -I, --head               issue HEAD instead of GET
-  -v, --verbose            print request/response headers to stderr
+  -v, --verbose            print request/response headers to stderr; for a
+                           torrent, -v shows a periodic swarm summary and -vv
+                           adds per-peer connect/unchoke/disconnect detail
   -s, --silent             suppress error messages
   -X, --request <method>   override HTTP method; for rtsp:// selects the
                            RTSP method (OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN)

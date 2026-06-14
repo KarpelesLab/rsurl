@@ -78,7 +78,8 @@ pub fn run(
     let num_pieces = meta.num_pieces();
 
     // Spawn one worker per peer.
-    let verbose = opts.verbose;
+    let verbosity = opts.verbosity;
+    let peer_verbose = verbosity >= 2; // per-peer lifecycle only at -vv
     let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(peers.len());
     for (i, &addr) in peers.iter().enumerate() {
         let tx = tx.clone();
@@ -86,7 +87,17 @@ pub fn run(
         let ct = opts.connect_timeout;
         let pt = opts.peer_timeout;
         handles.push(std::thread::spawn(move || {
-            peer_worker(i, addr, info_hash, peer_id, num_pieces, ct, pt, verbose, tx);
+            peer_worker(
+                i,
+                addr,
+                info_hash,
+                peer_id,
+                num_pieces,
+                ct,
+                pt,
+                peer_verbose,
+                tx,
+            );
         }));
     }
     drop(tx); // engine holds no sender; rx ends once every peer thread exits.
@@ -98,9 +109,22 @@ pub fn run(
     let mut peer_piece: HashMap<usize, usize> = HashMap::new();
 
     while !storage.is_complete() {
-        let ev = match rx.recv() {
+        let ev = match rx.recv_timeout(Duration::from_secs(2)) {
             Ok(e) => e,
-            Err(_) => break, // all peers gone
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // -v: a periodic swarm summary instead of per-peer spam.
+                if verbosity >= 1 {
+                    eprintln!(
+                        "* swarm: {} peers, {} pieces in flight, {}/{} complete",
+                        peer_cmd.len(),
+                        assigned.len(),
+                        storage.bitfield().count(),
+                        num_pieces,
+                    );
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // all peers gone
         };
         match ev {
             ToEngine::Joined {

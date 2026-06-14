@@ -38,8 +38,9 @@ pub struct TorrentOptions {
     pub peer_timeout: Duration,
     /// Whether to seed after completing (and for how long).
     pub seed: SeedMode,
-    /// Emit per-peer lifecycle diagnostics to stderr (driven by `-v`).
-    pub verbose: bool,
+    /// Diagnostic verbosity to stderr: 0 = quiet, 1 = periodic swarm summary,
+    /// 2+ = per-peer lifecycle. Driven by repeated `-v`.
+    pub verbosity: u8,
 }
 
 impl Default for TorrentOptions {
@@ -50,7 +51,7 @@ impl Default for TorrentOptions {
             connect_timeout: Duration::from_secs(10),
             peer_timeout: Duration::from_secs(30),
             seed: SeedMode::Off,
-            verbose: false,
+            verbosity: 0,
         }
     }
 }
