@@ -13,7 +13,9 @@ use purecrypto::hash::{Digest, Sha1};
 
 use rsurl::bittorrent::bencode::{encode, parse, Value};
 use rsurl::bittorrent::peer::{self, Handshake, Message};
-use rsurl::bittorrent::{download, file_layout, Bitfield, Metainfo, Storage, TorrentOptions};
+use rsurl::bittorrent::{
+    download, download_window, file_layout, Bitfield, Metainfo, Storage, TorrentOptions,
+};
 
 /// ut_metadata piece size (BEP 9).
 const METADATA_PIECE: usize = 16 * 1024;
@@ -500,8 +502,18 @@ fn recheck_corrects_a_lying_bitfield() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// Build a multi-file torrent (concatenated linear data + parsed Metainfo).
 fn make_multi_torrent(files: &[(&str, usize)], piece_len: usize, dir: &str) -> (Vec<u8>, Metainfo) {
+    let (data, _bytes, meta) = make_multi_torrent_bytes(files, piece_len, dir);
+    (data, meta)
+}
+
+/// Build a multi-file torrent: returns (concatenated data, .torrent bytes,
+/// parsed Metainfo).
+fn make_multi_torrent_bytes(
+    files: &[(&str, usize)],
+    piece_len: usize,
+    dir: &str,
+) -> (Vec<u8>, Vec<u8>, Metainfo) {
     let total: usize = files.iter().map(|(_, n)| *n).sum();
     let data: Vec<u8> = (0..total as u32)
         .map(|i| (i.wrapping_mul(17) % 251) as u8)
@@ -529,8 +541,9 @@ fn make_multi_torrent(files: &[(&str, usize)], piece_len: usize, dir: &str) -> (
     info.insert(b"pieces".to_vec(), Value::Bytes(pieces));
     let mut root = BTreeMap::new();
     root.insert(b"info".to_vec(), Value::Dict(info));
-    let meta = Metainfo::from_bytes(&encode(&Value::Dict(root))).unwrap();
-    (data, meta)
+    let bytes = encode(&Value::Dict(root));
+    let meta = Metainfo::from_bytes(&bytes).unwrap();
+    (data, bytes, meta)
 }
 
 /// A completed multi-file torrent writes its files in place and leaves no
@@ -562,6 +575,108 @@ fn multi_file_completes_and_removes_sidecar() {
         "sidecar should be removed"
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// download_window extracts only a byte range (here, the second file) into one
+/// output file, equal to that slice of the linear payload.
+#[test]
+fn download_window_extracts_one_file() {
+    let (data, meta) = make_multi_torrent(&[("a.bin", 12_000), ("b.bin", 8_000)], 4096, "pack");
+    let port = start_seeder(data.clone(), meta.clone());
+    let peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+
+    let out = std::env::temp_dir().join(format!("rsurl_win_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+
+    // Second file: global offset 12_000, length 8_000.
+    let stats = download_window(
+        &meta,
+        out.clone(),
+        &peers,
+        &TorrentOptions::default(),
+        12_000,
+        20_000,
+        &mut |_| {},
+    )
+    .expect("window download");
+    assert!(stats.downloaded > 0);
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        &data[12_000..],
+        "window mismatch"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+/// `--bt-info` prints decoded metadata as JSON; `--bt-concat` and `--bt-file`
+/// drive the binary end to end against the in-process seeder.
+#[test]
+fn cli_bt_info_concat_and_file() {
+    let (data, torrent_bytes, meta) =
+        make_multi_torrent_bytes(&[("a.bin", 12_000), ("b.bin", 8_000)], 4096, "pack");
+    let pid = std::process::id();
+    let tdir = std::env::temp_dir();
+    let torrent_path = tdir.join(format!("rsurl_bt3_{pid}.torrent"));
+    std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+    let bin = env!("CARGO_BIN_EXE_rsurl");
+
+    // --bt-info: JSON to stdout, no peers needed for a .torrent.
+    let out = std::process::Command::new(bin)
+        .arg("--bt-info")
+        .arg(&torrent_path)
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let json = String::from_utf8_lossy(&out.stdout);
+    assert!(json.contains("\"total_length\": 20000"), "json: {json}");
+    assert!(json.contains("\"path\": \"pack/b.bin\", \"length\": 8000, \"offset\": 12000"));
+
+    // --bt-concat: whole torrent as one file.
+    let port = start_seeder(data.clone(), meta.clone());
+    let concat = tdir.join(format!("rsurl_bt3_concat_{pid}.bin"));
+    let _ = std::fs::remove_file(&concat);
+    let s = std::process::Command::new(bin)
+        .args([
+            "--bt-peer",
+            &format!("127.0.0.1:{port}"),
+            "--bt-concat",
+            "-s",
+            "-o",
+        ])
+        .arg(&concat)
+        .arg(&torrent_path)
+        .status()
+        .expect("spawn");
+    assert!(s.success());
+    assert_eq!(std::fs::read(&concat).unwrap(), data, "concat mismatch");
+
+    // --bt-file 2: just the second file.
+    let port2 = start_seeder(data.clone(), meta.clone());
+    let one = tdir.join(format!("rsurl_bt3_file_{pid}.bin"));
+    let _ = std::fs::remove_file(&one);
+    let s = std::process::Command::new(bin)
+        .args([
+            "--bt-peer",
+            &format!("127.0.0.1:{port2}"),
+            "--bt-file",
+            "2",
+            "-s",
+            "-o",
+        ])
+        .arg(&one)
+        .arg(&torrent_path)
+        .status()
+        .expect("spawn");
+    assert!(s.success());
+    assert_eq!(
+        std::fs::read(&one).unwrap(),
+        &data[12_000..],
+        "bt-file mismatch"
+    );
+
+    let _ = std::fs::remove_file(&torrent_path);
+    let _ = std::fs::remove_file(&concat);
+    let _ = std::fs::remove_file(&one);
 }
 
 /// Build the raw bencoded `info` dictionary for a single-file torrent.

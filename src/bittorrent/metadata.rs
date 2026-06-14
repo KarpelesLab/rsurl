@@ -40,7 +40,9 @@ fn merr(msg: impl Into<String>) -> Error {
 /// Fetch the `info` dictionary for `info_hash` from `peers` and parse it into a
 /// [`Metainfo`]. Peers are probed concurrently (a bounded number at a
 /// time) and the first verified metadata wins; remaining attempts are
-/// abandoned. Returns the last error if no peer yields valid metadata.
+/// abandoned. Returns the parsed metadata together with the raw, verified
+/// `info` bytes (so the caller can write a `.torrent`), or the last error if no
+/// peer yields valid metadata.
 pub fn fetch_metainfo(
     info_hash: [u8; 20],
     peers: &[SocketAddr],
@@ -48,7 +50,7 @@ pub fn fetch_metainfo(
     connect_timeout: Duration,
     peer_timeout: Duration,
     verbose: bool,
-) -> Result<Metainfo> {
+) -> Result<(Metainfo, Vec<u8>)> {
     if peers.is_empty() {
         return Err(merr("no peers to fetch metadata from"));
     }
@@ -92,7 +94,7 @@ pub fn fetch_metainfo(
         match msg {
             Ok(info) => {
                 done.store(true, Ordering::Relaxed);
-                return Metainfo::from_info_dict(&info);
+                return Metainfo::from_info_dict(&info).map(|m| (m, info));
             }
             Err(e) => last = e,
         }

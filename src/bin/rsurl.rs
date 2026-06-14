@@ -298,6 +298,15 @@ struct Args {
     /// `--recheck`: on a torrent resume, re-hash on-disk data against the piece
     /// table instead of trusting the saved resume bitfield.
     recheck: bool,
+    /// `--bt-info`: print decoded torrent metadata as JSON to stdout, then exit.
+    bt_info: bool,
+    /// `--bt-save-torrent`: write a `.torrent` (to `-o`, else stdout), then exit.
+    bt_save_torrent: bool,
+    /// `--bt-file <N|path>`: download just one file of a multi-file torrent into
+    /// `-o` (1-based index, or a matching path).
+    bt_file: Option<String>,
+    /// `--bt-concat`: download a multi-file torrent as one concatenated file.
+    bt_concat: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1670,10 +1679,16 @@ fn assemble_form_body(parts: &[DataPart]) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
-    // BitTorrent: a magnet link, or any source under `--torrent`. Routed before
-    // URL parsing because the source may be a local `.torrent` path (not a URL)
-    // and magnet links have no `://` authority.
-    if args.torrent || url.starts_with("magnet:") {
+    // BitTorrent: a magnet link, `--torrent`, or any torrent-specific flag.
+    // Routed before URL parsing because the source may be a local `.torrent`
+    // path (not a URL) and magnet links have no `://` authority.
+    if args.torrent
+        || url.starts_with("magnet:")
+        || args.bt_info
+        || args.bt_save_torrent
+        || args.bt_file.is_some()
+        || args.bt_concat
+    {
         #[cfg(feature = "bittorrent")]
         {
             return run_bittorrent(url, args);
@@ -2413,6 +2428,10 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--no-dht" => a.no_dht = true,
             "--seed" => a.seed = true,
             "--recheck" => a.recheck = true,
+            "--bt-info" => a.bt_info = true,
+            "--bt-save-torrent" => a.bt_save_torrent = true,
+            "--bt-file" => a.bt_file = Some(next_val(&mut it, arg)?),
+            "--bt-concat" => a.bt_concat = true,
             "--share-ratio" => {
                 a.share_ratio = Some(
                     next_val(&mut it, arg)?
@@ -4697,6 +4716,156 @@ fn run_parallel_download(
     run_http_download(req, url, args, None)
 }
 
+/// Lower-hex encoding of bytes.
+#[cfg(feature = "bittorrent")]
+fn bytes_hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s
+}
+
+/// Escape a string for embedding in a JSON double-quoted value.
+#[cfg(feature = "bittorrent")]
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// Render torrent metadata as JSON, including each file's computed byte offset.
+#[cfg(feature = "bittorrent")]
+fn metadata_json(meta: &rsurl::bittorrent::Metainfo) -> String {
+    let mut o = String::new();
+    o.push_str("{\n");
+    o.push_str(&format!("  \"name\": \"{}\",\n", json_escape(&meta.name)));
+    o.push_str(&format!(
+        "  \"info_hash\": \"{}\",\n",
+        bytes_hex(&meta.info_hash)
+    ));
+    o.push_str(&format!("  \"piece_length\": {},\n", meta.piece_length));
+    o.push_str(&format!("  \"num_pieces\": {},\n", meta.num_pieces()));
+    o.push_str(&format!("  \"total_length\": {},\n", meta.total_length));
+    o.push_str(&format!("  \"private\": {},\n", meta.private));
+    o.push_str("  \"trackers\": [");
+    for (i, t) in meta.trackers.iter().enumerate() {
+        if i > 0 {
+            o.push_str(", ");
+        }
+        o.push_str(&format!("\"{}\"", json_escape(t)));
+    }
+    o.push_str("],\n");
+    o.push_str("  \"files\": [\n");
+    let mut off = 0u64;
+    for (i, f) in meta.files.iter().enumerate() {
+        if i > 0 {
+            o.push_str(",\n");
+        }
+        o.push_str(&format!(
+            "    {{\"path\": \"{}\", \"length\": {}, \"offset\": {}}}",
+            json_escape(&f.path.to_string_lossy()),
+            f.length,
+            off
+        ));
+        off += f.length;
+    }
+    o.push_str("\n  ]\n}\n");
+    o
+}
+
+/// Build a minimal `.torrent` from raw `info` bytes and the magnet's trackers,
+/// splicing the verified `info` bytes verbatim so the infohash is preserved.
+/// Keys are emitted in canonical bencode order (announce < announce-list < info).
+#[cfg(feature = "bittorrent")]
+fn build_torrent(info: &[u8], trackers: &[String]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(info.len() + 64);
+    out.push(b'd');
+    if let Some(first) = trackers.first() {
+        out.extend_from_slice(b"8:announce");
+        out.extend_from_slice(format!("{}:", first.len()).as_bytes());
+        out.extend_from_slice(first.as_bytes());
+    }
+    if !trackers.is_empty() {
+        out.extend_from_slice(b"13:announce-list");
+        out.push(b'l'); // tiers
+        for t in trackers {
+            out.push(b'l'); // one tracker per tier
+            out.extend_from_slice(format!("{}:", t.len()).as_bytes());
+            out.extend_from_slice(t.as_bytes());
+            out.push(b'e');
+        }
+        out.push(b'e');
+    }
+    out.extend_from_slice(b"4:info");
+    out.extend_from_slice(info);
+    out.push(b'e');
+    out
+}
+
+/// Write the `.torrent` bytes to `-o` (else stdout) for `--bt-save-torrent`.
+#[cfg(feature = "bittorrent")]
+fn bt_write_torrent(bytes: &[u8], args: &Args) -> u8 {
+    if let Some(o) = args.output.as_deref().filter(|p| *p != "-") {
+        let path = resolve_output_path(o, args);
+        match std::fs::write(&path, bytes) {
+            Ok(_) => 0,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: write {}: {e}", path.display());
+                }
+                23
+            }
+        }
+    } else {
+        match io::stdout().write_all(bytes) {
+            Ok(_) => 0,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                23
+            }
+        }
+    }
+}
+
+/// Resolve a `--bt-file <N|path>` selector to `(index, global_offset, length)`.
+/// Accepts a 1-based index, an exact path, a file name, or a path suffix.
+#[cfg(feature = "bittorrent")]
+fn bt_resolve_file(
+    meta: &rsurl::bittorrent::Metainfo,
+    sel: &str,
+) -> std::result::Result<(usize, u64, u64), String> {
+    let idx = match sel.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= meta.files.len() => Some(n - 1),
+        _ => meta.files.iter().position(|f| {
+            let p = f.path.to_string_lossy();
+            p == sel || f.path.file_name().and_then(|n| n.to_str()) == Some(sel) || p.ends_with(sel)
+        }),
+    };
+    match idx {
+        Some(i) => {
+            let offset: u64 = meta.files[..i].iter().map(|f| f.length).sum();
+            Ok((i, offset, meta.files[i].length))
+        }
+        None => Err(format!(
+            "--bt-file: no file matching {sel:?} (torrent has {} file(s); use --bt-info to list them)",
+            meta.files.len()
+        )),
+    }
+}
+
 /// Resolve the on-disk file layout for a torrent given the CLI output flags.
 /// Per rsurl policy, a download requires an explicit target.
 #[cfg(feature = "bittorrent")]
@@ -4705,6 +4874,14 @@ fn bt_layout(
     args: &Args,
 ) -> std::result::Result<Vec<(std::path::PathBuf, u64)>, String> {
     use std::path::Path;
+    // `--bt-concat`: the whole linear space as one file (a metadata-aware
+    // consumer seeks within it). This is just a single-file layout.
+    if args.bt_concat {
+        return match args.output.as_deref().filter(|p| *p != "-") {
+            Some(o) => Ok(vec![(resolve_output_path(o, args), meta.total_length)]),
+            None => Err("--bt-concat needs -o <file>".into()),
+        };
+    }
     if meta.files.len() == 1 {
         if let Some(o) = args.output.as_deref().filter(|p| *p != "-") {
             let p = resolve_output_path(o, args);
@@ -4852,8 +5029,9 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         }
     }
 
-    // 1) Obtain the metainfo and the tracker list.
-    let (meta, trackers) = if source.starts_with("magnet:") {
+    // 1) Obtain the metainfo, the tracker list, and the canonical `.torrent`
+    //    bytes (for --bt-save-torrent).
+    let (meta, trackers, torrent_bytes) = if source.starts_with("magnet:") {
         let magnet = match Magnet::parse(source) {
             Ok(m) => m,
             Err(e) => {
@@ -4903,7 +5081,10 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
             Duration::from_secs(10),
             args.verbosity >= 2,
         ) {
-            Ok(m) => (m, magnet.trackers),
+            Ok((m, info)) => {
+                let tb = build_torrent(&info, &magnet.trackers);
+                (m, magnet.trackers, tb)
+            }
             Err(e) => {
                 if show_errors(args) {
                     eprintln!("rsurl: magnet metadata: {e}");
@@ -4943,7 +5124,7 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         match Metainfo::from_bytes(&bytes) {
             Ok(m) => {
                 let trackers = m.trackers.clone();
-                (m, trackers)
+                (m, trackers, bytes) // the loaded file is already a .torrent
             }
             Err(e) => {
                 if show_errors(args) {
@@ -4954,14 +5135,50 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         }
     };
 
-    // 2) Output layout.
-    let layout = match bt_layout(&meta, args) {
-        Ok(l) => l,
-        Err(msg) => {
-            if show_errors(args) {
-                eprintln!("rsurl: {msg}");
+    // 1b) Metadata-only commands: emit and exit before any download setup.
+    if args.bt_info {
+        print!("{}", metadata_json(&meta));
+        let _ = io::stdout().flush();
+        return 0;
+    }
+    if args.bt_save_torrent {
+        return bt_write_torrent(&torrent_bytes, args);
+    }
+
+    // 2) Output target: a single-file byte window (`--bt-file`) or a normal
+    //    multi/single-file layout.
+    let window: Option<(std::path::PathBuf, u64, u64)> = if let Some(sel) = &args.bt_file {
+        match bt_resolve_file(&meta, sel) {
+            Ok((idx, off, len)) => {
+                let out = match args.output.as_deref().filter(|p| *p != "-") {
+                    Some(o) => resolve_output_path(o, args),
+                    None => std::path::PathBuf::from(
+                        meta.files[idx].path.file_name().unwrap_or_default(),
+                    ),
+                };
+                Some((out, off, off + len))
             }
-            return 2;
+            Err(msg) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {msg}");
+                }
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    let layout = if window.is_some() {
+        Vec::new()
+    } else {
+        match bt_layout(&meta, args) {
+            Ok(l) => l,
+            Err(msg) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {msg}");
+                }
+                return 2;
+            }
         }
     };
 
@@ -5011,7 +5228,10 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
 
     // 4) Download with throttled progress to stderr; once complete, the same
     //    callback renders the seeding (upload) status.
-    let total = meta.total_length;
+    let total = match &window {
+        Some((_, s, e)) => e - s, // windowed: progress over the selected range
+        None => meta.total_length,
+    };
     let show = !args.silent;
     let start = Instant::now();
     let mut last_tick = start;
@@ -5049,7 +5269,10 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
             last_tick = Instant::now();
         }
     };
-    let result = bittorrent::download(&meta, layout, &peers, &opts, &mut cb);
+    let result = match window {
+        Some((out, s, e)) => bittorrent::download_window(&meta, out, &peers, &opts, s, e, &mut cb),
+        None => bittorrent::download(&meta, layout, &peers, &opts, &mut cb),
+    };
     if show {
         eprintln!();
     }
@@ -5667,6 +5890,10 @@ Options:
       --share-ratio <r>    seed until uploaded/downloaded reaches r, then exit
       --recheck            on torrent resume, re-hash on-disk data instead of
                            trusting the saved .rsurlpart bitfield
+      --bt-info            print torrent metadata as JSON to stdout, then exit
+      --bt-save-torrent    write the .torrent (to -o, else stdout), then exit
+      --bt-file <N|path>   download just one file of a multi-file torrent to -o
+      --bt-concat          download a multi-file torrent as one concatenated -o
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1

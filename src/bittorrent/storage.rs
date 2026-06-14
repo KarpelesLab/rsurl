@@ -29,6 +29,11 @@ pub struct Storage {
     hashes: Vec<[u8; 20]>,
     files: Vec<FileSlot>,
     have: Bitfield,
+    /// For a windowed (single-file/offset) download: the global byte range we
+    /// actually want. Pieces outside it are pre-marked complete so the engine
+    /// fetches only the covering pieces, and progress is reported over the
+    /// window. `None` for a full download.
+    window: Option<(u64, u64)>,
 }
 
 impl Storage {
@@ -62,6 +67,53 @@ impl Storage {
             have: Bitfield::new(hashes.len()),
             hashes,
             files,
+            window: None,
+        })
+    }
+
+    /// A windowed store: a single output `out` holds the torrent's global byte
+    /// range `[start, end)` (so file selection / arbitrary offset extraction
+    /// write just those bytes). The full piece table and `total` are kept so
+    /// pieces still verify; pieces not overlapping the window are pre-marked
+    /// complete so only the covering pieces are fetched. A verified piece is
+    /// written via the same `rw` overlap logic, so only its in-window slice
+    /// lands in `out` (boundary pieces are fetched whole to verify, then
+    /// trimmed).
+    pub fn create_window(
+        out: PathBuf,
+        piece_length: u64,
+        hashes: Vec<[u8; 20]>,
+        total: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<Storage> {
+        if piece_length == 0 {
+            return Err(serr("zero piece length"));
+        }
+        let end = end.min(total);
+        let start = start.min(end);
+        let files = vec![FileSlot {
+            path: out,
+            length: end - start,
+            start,
+            handle: None,
+        }];
+        let mut have = Bitfield::new(hashes.len());
+        for i in 0..hashes.len() {
+            let ps = piece_length * i as u64;
+            let pe = (ps + piece_length).min(total);
+            let overlaps = ps < end && pe > start;
+            if !overlaps {
+                have.set(i); // pre-complete: never requested
+            }
+        }
+        Ok(Storage {
+            piece_length,
+            total,
+            hashes,
+            files,
+            have,
+            window: Some((start, end)),
         })
     }
 
@@ -102,11 +154,22 @@ impl Storage {
         }
     }
 
-    /// Bytes of verified, on-disk data.
+    /// Bytes of verified, on-disk data. For a windowed store this counts only
+    /// the in-window bytes of completed pieces (so progress runs 0→window_len
+    /// rather than being inflated by the pre-marked out-of-window pieces).
     pub fn bytes_complete(&self) -> u64 {
         (0..self.num_pieces())
             .filter(|&i| self.have.has(i))
-            .map(|i| self.piece_size(i))
+            .map(|i| match self.window {
+                Some((ws, we)) => {
+                    let ps = self.piece_length * i as u64;
+                    let pe = ps + self.piece_size(i);
+                    let ov_s = ps.max(ws);
+                    let ov_e = pe.min(we);
+                    ov_e.saturating_sub(ov_s)
+                }
+                None => self.piece_size(i),
+            })
             .sum()
     }
 
@@ -310,6 +373,32 @@ mod tests {
         }
         st2.recheck();
         assert!(!st2.has(0) && st2.has(2));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn windowed_storage_writes_only_in_range() {
+        // 10 bytes, piece length 4 → pieces 4,4,2. Window [5,9): pieces 1 and 2
+        // overlap; piece 0 is pre-marked complete.
+        let data: Vec<u8> = (0..10u8).collect();
+        let pieces: Vec<[u8; 20]> = (0..3)
+            .map(|i| sha1(&data[i * 4..(i * 4 + 4).min(10)]))
+            .collect();
+        let f = tmp("window.bin");
+        let _ = std::fs::remove_file(&f);
+        let mut st = Storage::create_window(f.clone(), 4, pieces, 10, 5, 9).unwrap();
+
+        assert!(st.has(0), "out-of-window piece pre-marked");
+        assert!(!st.has(1) && !st.has(2));
+        assert!(!st.is_complete());
+
+        assert!(st.write_piece(1, &data[4..8]).unwrap());
+        assert!(st.write_piece(2, &data[8..10]).unwrap());
+        assert!(st.is_complete());
+        assert_eq!(st.bytes_complete(), 4); // window length
+
+        // The output holds exactly data[5..9].
+        assert_eq!(std::fs::read(&f).unwrap(), data[5..9].to_vec());
         let _ = std::fs::remove_file(&f);
     }
 

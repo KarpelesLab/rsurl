@@ -188,6 +188,45 @@ pub fn download(
     }
 }
 
+/// Download only the torrent's global byte range `[start, end)` into the single
+/// file `out` (used for selecting one file of a multi-file torrent, or an
+/// arbitrary offset). Only the pieces overlapping the range are fetched and
+/// verified; just the in-range bytes are written. Writes directly to `out`
+/// (no resume container) and does not seed.
+pub fn download_window(
+    meta: &Metainfo,
+    out: PathBuf,
+    peers: &[SocketAddr],
+    opts: &TorrentOptions,
+    start: u64,
+    end: u64,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<Stats> {
+    let peer_id = if opts.peer_id == [0u8; 20] {
+        super::generate_peer_id()?
+    } else {
+        opts.peer_id
+    };
+    let mut storage = Storage::create_window(
+        out,
+        meta.piece_length,
+        meta.pieces.clone(),
+        meta.total_length,
+        start,
+        end,
+    )?;
+    let mut nosave = |_: &Bitfield| {};
+    engine::run(
+        meta,
+        &mut storage,
+        peers,
+        peer_id,
+        opts,
+        progress,
+        &mut nosave,
+    )
+}
+
 /// Serialise resume metadata for a torrent: infohash followed by the bitfield.
 fn encode_meta(info_hash: [u8; 20], bf: &Bitfield) -> Vec<u8> {
     let mut v = Vec::with_capacity(20 + bf.as_bytes().len());
