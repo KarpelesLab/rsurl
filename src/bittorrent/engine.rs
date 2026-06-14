@@ -21,6 +21,9 @@ use super::peer::{self, Handshake, Message, BLOCK_SIZE};
 use super::picker::{Bitfield, Picker};
 use super::storage::Storage;
 
+/// Number of block requests kept in flight per piece (sliding window).
+const PIPELINE_DEPTH: usize = 16;
+
 fn eerr(msg: impl Into<String>) -> Error {
     Error::BadResponse(format!("bittorrent: {}", msg.into()))
 }
@@ -328,32 +331,46 @@ fn download_piece<S: std::io::Read + std::io::Write>(
     let size = size as u32;
     let mut buf = vec![0u8; size as usize];
 
-    let mut begin = 0u32;
-    let mut outstanding: HashSet<u32> = HashSet::new();
-    while begin < size {
-        let length = BLOCK_SIZE.min(size - begin);
-        peer::write_message(
-            sock,
-            &Message::Request {
-                index,
-                begin,
-                length,
-            },
-        )?;
-        outstanding.insert(begin);
-        begin += length;
-    }
+    let num_blocks = (size as usize).div_ceil(BLOCK_SIZE as usize);
+    let mut filled = vec![false; num_blocks];
+    let mut next_block = 0usize; // next block index to request
+    let mut received = 0usize; // distinct blocks stored
+    let mut outstanding = 0usize;
 
-    while !outstanding.is_empty() {
+    // Pipeline a bounded window of block requests rather than flooding the
+    // whole piece at once: a 4 MiB piece is 256 blocks, and many peers cap
+    // their incoming request queue and silently drop the overflow, which would
+    // otherwise stall the piece forever.
+    while received < num_blocks {
+        while outstanding < PIPELINE_DEPTH && next_block < num_blocks {
+            let begin = next_block as u32 * BLOCK_SIZE;
+            let length = BLOCK_SIZE.min(size - begin);
+            peer::write_message(
+                sock,
+                &Message::Request {
+                    index,
+                    begin,
+                    length,
+                },
+            )?;
+            next_block += 1;
+            outstanding += 1;
+        }
         match peer::read_message(sock)? {
             Message::Piece {
                 index: pi,
                 begin: pb,
                 block,
             } if pi == index => {
+                outstanding = outstanding.saturating_sub(1);
                 let off = pb as usize;
-                if off + block.len() <= buf.len() && outstanding.remove(&pb) {
-                    buf[off..off + block.len()].copy_from_slice(&block);
+                if pb % BLOCK_SIZE == 0 {
+                    let bi = (pb / BLOCK_SIZE) as usize;
+                    if bi < num_blocks && !filled[bi] && off + block.len() <= buf.len() {
+                        buf[off..off + block.len()].copy_from_slice(&block);
+                        filled[bi] = true;
+                        received += 1;
+                    }
                 }
             }
             // Keep-alives, haves, (un)chokes, other-piece blocks: ignored; a

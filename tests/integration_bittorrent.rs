@@ -182,6 +182,41 @@ fn cli_downloads_torrent_to_output() {
     let _ = std::fs::remove_file(&torrent_path);
 }
 
+/// Multi-block pieces: a piece length far larger than the 16 KiB block size
+/// (and larger than the request pipeline window) so the sliding-window block
+/// pipeline in the engine is actually exercised. A single 16 KiB-block torrent
+/// never hits that path.
+#[test]
+fn downloads_pieces_with_many_blocks() {
+    // 700 KB, 320 KiB pieces => 20 blocks/piece (> the pipeline depth), with a
+    // short final piece.
+    let data: Vec<u8> = (0..700_000u32)
+        .map(|i| (i.wrapping_mul(31) % 253) as u8)
+        .collect();
+    let piece_len = 320 * 1024;
+    let meta = make_torrent(&data, piece_len, "multiblock.bin");
+    assert!(meta.piece_length as usize > 16 * 1024);
+
+    let port = start_seeder(data.clone(), meta.clone());
+    let peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+
+    let out = std::env::temp_dir().join(format!("rsurl_bt_mb_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let layout = vec![(out.clone(), data.len() as u64)];
+
+    let stats = download(
+        &meta,
+        layout,
+        &peers,
+        &TorrentOptions::default(),
+        &mut |_| {},
+    )
+    .expect("download");
+    assert_eq!(stats.downloaded, data.len() as u64);
+    assert_eq!(std::fs::read(&out).unwrap(), data, "multiblock mismatch");
+    let _ = std::fs::remove_file(&out);
+}
+
 /// Build the raw bencoded `info` dictionary for a single-file torrent.
 fn make_info_bytes(data: &[u8], piece_len: usize, name: &str) -> Vec<u8> {
     let mut pieces = Vec::new();
