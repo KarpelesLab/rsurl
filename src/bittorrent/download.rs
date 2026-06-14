@@ -12,18 +12,32 @@ use crate::error::Result;
 
 use super::engine;
 use super::metainfo::Metainfo;
+use super::seed;
 use super::storage::Storage;
+
+/// When (if ever) to keep seeding after the download completes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SeedMode {
+    /// Exit as soon as the download completes (the curl-like default).
+    Off,
+    /// Keep seeding until the process is terminated.
+    Forever,
+    /// Keep seeding until uploaded/downloaded reaches this ratio.
+    UntilRatio(f64),
+}
 
 /// Knobs for a torrent transfer.
 #[derive(Debug, Clone)]
 pub struct TorrentOptions {
     /// 20-byte peer id; if all-zero, [`download`] generates a random one.
     pub peer_id: [u8; 20],
-    /// Port we advertise to peers/trackers (the listen port when seeding).
+    /// Port we advertise to peers/trackers and listen on when seeding.
     pub listen_port: u16,
     pub connect_timeout: Duration,
     /// Per-read/write socket timeout for a peer connection.
     pub peer_timeout: Duration,
+    /// Whether to seed after completing (and for how long).
+    pub seed: SeedMode,
 }
 
 impl Default for TorrentOptions {
@@ -33,6 +47,7 @@ impl Default for TorrentOptions {
             listen_port: 6881,
             connect_timeout: Duration::from_secs(10),
             peer_timeout: Duration::from_secs(30),
+            seed: SeedMode::Off,
         }
     }
 }
@@ -44,6 +59,8 @@ pub struct Progress {
     pub total: u64,
     pub pieces_complete: usize,
     pub num_pieces: usize,
+    /// Bytes uploaded so far (non-zero only while seeding).
+    pub uploaded: u64,
 }
 
 /// Final transfer statistics.
@@ -69,5 +86,9 @@ pub fn download(
         opts.peer_id
     };
     let mut storage = Storage::create(layout, meta.piece_length, meta.pieces.clone())?;
-    engine::run(meta, &mut storage, peers, peer_id, opts, progress)
+    let stats = engine::run(meta, &mut storage, peers, peer_id, opts, progress)?;
+    if opts.seed == SeedMode::Off {
+        return Ok(stats);
+    }
+    seed::run(meta, storage, peer_id, opts, stats, progress)
 }

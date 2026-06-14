@@ -18,11 +18,12 @@ pub mod metadata;
 pub mod metainfo;
 pub mod peer;
 pub mod picker;
+pub mod seed;
 pub mod storage;
 pub mod tracker;
 
 pub use bencode::Value;
-pub use download::{download, Progress, Stats, TorrentOptions};
+pub use download::{download, Progress, SeedMode, Stats, TorrentOptions};
 pub use magnet::Magnet;
 pub use metadata::fetch_metainfo;
 pub use metainfo::{FileEntry, Metainfo};

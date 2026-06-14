@@ -208,6 +208,7 @@ fn snapshot(storage: &Storage, meta: &Metainfo) -> Progress {
         total: meta.total_length,
         pieces_complete: storage.bitfield().count(),
         num_pieces: meta.num_pieces(),
+        uploaded: 0,
     }
 }
 

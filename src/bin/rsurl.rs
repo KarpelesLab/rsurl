@@ -285,6 +285,11 @@ struct Args {
     bt_peers: Vec<String>,
     /// `--no-dht`: disable the DHT peer-discovery fallback for torrents.
     no_dht: bool,
+    /// `--seed`: after a torrent download completes, keep seeding.
+    seed: bool,
+    /// `--share-ratio <r>`: seed after completion until uploaded/downloaded
+    /// reaches `r`, then exit.
+    share_ratio: Option<f64>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -2375,6 +2380,14 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             }
             "--bt-peer" => a.bt_peers.push(next_val(&mut it, arg)?),
             "--no-dht" => a.no_dht = true,
+            "--seed" => a.seed = true,
+            "--share-ratio" => {
+                a.share_ratio = Some(
+                    next_val(&mut it, arg)?
+                        .parse()
+                        .map_err(|_| "--share-ratio requires a number".to_string())?,
+                )
+            }
             "--tls-max" => {
                 let v = next_val(&mut it, arg)?;
                 a.tls_max = Some(match v.as_str() {
@@ -4418,7 +4431,7 @@ fn bt_dht_peers(info_hash: [u8; 20], verbose: bool) -> Vec<std::net::SocketAddr>
 /// trackers + DHT), and fetch + verify the data. Exits when complete (curl-like).
 #[cfg(feature = "bittorrent")]
 fn run_bittorrent(source: &str, args: &Args) -> u8 {
-    use rsurl::bittorrent::{self, metadata, Magnet, Metainfo, TorrentOptions};
+    use rsurl::bittorrent::{self, metadata, Magnet, Metainfo, SeedMode, TorrentOptions};
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
@@ -4432,9 +4445,16 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         }
     };
     let listen_port = args.listen_port.unwrap_or(6881);
+    // --share-ratio implies seeding to that ratio; --seed alone seeds forever.
+    let seed = match (args.share_ratio, args.seed) {
+        (Some(r), _) => SeedMode::UntilRatio(r),
+        (None, true) => SeedMode::Forever,
+        (None, false) => SeedMode::Off,
+    };
     let opts = TorrentOptions {
         peer_id,
         listen_port,
+        seed,
         ..Default::default()
     };
 
@@ -4596,15 +4616,37 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
             meta.num_pieces(),
             peers.len()
         );
+        match seed {
+            SeedMode::Forever => eprintln!("* will seed after completion on port {listen_port}"),
+            SeedMode::UntilRatio(r) => {
+                eprintln!("* will seed to ratio {r:.2} on port {listen_port}")
+            }
+            SeedMode::Off => {}
+        }
     }
 
-    // 4) Download with throttled progress to stderr.
+    // 4) Download with throttled progress to stderr; once complete, the same
+    //    callback renders the seeding (upload) status.
     let total = meta.total_length;
     let show = !args.silent;
     let start = Instant::now();
     let mut last_tick = start;
     let mut cb = |p: &bittorrent::Progress| {
-        if show && (last_tick.elapsed() >= Duration::from_millis(120) || p.downloaded == total) {
+        if !show {
+            return;
+        }
+        let complete = p.num_pieces > 0 && p.pieces_complete == p.num_pieces;
+        if complete && p.uploaded > 0 {
+            // Seeding phase.
+            eprint!(
+                "\r* seeding: uploaded {} (ratio {:.2})   ",
+                human_bytes(p.uploaded),
+                p.uploaded as f64 / total.max(1) as f64,
+            );
+            let _ = io::stderr().flush();
+            return;
+        }
+        if last_tick.elapsed() >= Duration::from_millis(120) || p.downloaded == total {
             let secs = start.elapsed().as_secs_f64();
             let rate = if secs > 0.0 {
                 (p.downloaded as f64 / secs) as u64
@@ -5043,6 +5085,8 @@ Options:
       --listen-port <p>    port advertised to BitTorrent peers/trackers (6881)
       --bt-peer <ip:port>  add a torrent peer directly (repeatable)
       --no-dht             disable the DHT peer-discovery fallback
+      --seed               keep seeding after the torrent completes
+      --share-ratio <r>    seed until uploaded/downloaded reaches r, then exit
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1

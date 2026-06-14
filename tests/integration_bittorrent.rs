@@ -5,7 +5,7 @@
 #![cfg(feature = "bittorrent")]
 
 use std::collections::BTreeMap;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
@@ -369,4 +369,113 @@ fn cli_downloads_magnet() {
     );
 
     let _ = std::fs::remove_file(&out);
+}
+
+/// Grab a likely-free localhost port by binding then releasing it.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// `--share-ratio`: the binary downloads from a seeder, then seeds on its
+/// listen port; a test leecher drains the whole torrent (ratio 1.0), after
+/// which the binary must exit on its own.
+#[test]
+fn cli_seeds_until_share_ratio() {
+    use std::io::Read;
+
+    let data: Vec<u8> = (0..12_000u32).map(|i| (i % 251) as u8).collect();
+    let (torrent_bytes, meta) = make_torrent_bytes(&data, 4096, "seed.bin");
+    let piece_len = meta.piece_length as usize;
+    let info_hash = meta.info_hash;
+    let num_pieces = meta.num_pieces();
+
+    // Upstream seeder the binary downloads from.
+    let src_port = start_seeder(data.clone(), meta.clone());
+    let listen_port = free_port();
+
+    let pid = std::process::id();
+    let tdir = std::env::temp_dir();
+    let torrent_path = tdir.join(format!("rsurl_seed_{pid}.torrent"));
+    let out = tdir.join(format!("rsurl_seed_{pid}.bin"));
+    std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+    let _ = std::fs::remove_file(&out);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .arg("--torrent")
+        .arg("--bt-peer")
+        .arg(format!("127.0.0.1:{src_port}"))
+        .arg("--listen-port")
+        .arg(listen_port.to_string())
+        .arg("--share-ratio")
+        .arg("1.0")
+        .arg("-s")
+        .arg("-o")
+        .arg(&out)
+        .arg(&torrent_path)
+        .spawn()
+        .expect("spawn rsurl");
+
+    // Once the download finishes the binary starts listening; retry-connect.
+    let mut c = None;
+    for _ in 0..100 {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", listen_port)) {
+            c = Some(s);
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let mut c = c.expect("connect to seeding rsurl");
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    // Leech every piece to push the binary's upload ratio to 1.0.
+    peer::write_handshake(&mut c, &Handshake::new(info_hash, [1u8; 20])).unwrap();
+    let hs = peer::read_handshake(&mut c).unwrap();
+    assert_eq!(hs.info_hash, info_hash);
+    // First message is the seeder's bitfield.
+    assert!(matches!(
+        peer::read_message(&mut c).unwrap(),
+        Message::Bitfield(_)
+    ));
+    peer::write_message(&mut c, &Message::Interested).unwrap();
+    assert_eq!(peer::read_message(&mut c).unwrap(), Message::Unchoke);
+
+    let mut got = vec![0u8; data.len()];
+    for i in 0..num_pieces {
+        let off = i * piece_len;
+        let len = (piece_len).min(data.len() - off) as u32;
+        peer::write_message(
+            &mut c,
+            &Message::Request {
+                index: i as u32,
+                begin: 0,
+                length: len,
+            },
+        )
+        .unwrap();
+        match peer::read_message(&mut c).unwrap() {
+            Message::Piece { index, block, .. } => {
+                let o = index as usize * piece_len;
+                got[o..o + block.len()].copy_from_slice(&block);
+            }
+            other => panic!("expected piece, got {other:?}"),
+        }
+    }
+    assert_eq!(got, data, "leeched data mismatch");
+    // Let any trailing bytes drain, then drop the connection.
+    let _ = c.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut sink = [0u8; 64];
+    let _ = c.read(&mut sink);
+    drop(c);
+
+    // The binary should reach ratio 1.0 and exit cleanly on its own.
+    let status = child.wait().expect("wait rsurl");
+    assert!(status.success(), "rsurl seeding exit: {status}");
+    assert_eq!(std::fs::read(&out).unwrap(), data, "seed output mismatch");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&torrent_path);
 }
