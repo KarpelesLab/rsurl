@@ -50,8 +50,8 @@ pub use crate::cancel::CancelToken;
 pub use crate::cookie::{Cookie, CookieJar, SameSite};
 pub use crate::error::{Error, Result};
 pub use crate::http::{
-    send_multiplexed, send_multiplexed_traced, HttpVersionPref, ProxyConfig, Request, Response,
-    ResponseHead, Timing, TlsInfo,
+    send_multiplexed, send_multiplexed_traced, HttpVersionPref, Priority, ProxyConfig, Request,
+    Response, ResponseHead, Timing, TlsInfo,
 };
 pub use crate::multi::{EasyId, Multi};
 pub use crate::net::Client;

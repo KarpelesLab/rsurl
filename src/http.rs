@@ -157,6 +157,18 @@ pub struct Request {
     /// chain validation of its own and defers the trust decision to this
     /// callback (the browser model). See [`Request::tls_verify_callback`].
     pub(crate) tls_verify_callback: Option<crate::tls::VerifyCallback>,
+    /// DNS resolver for the direct dial path. Defaults to the system resolver;
+    /// override for caching / split-horizon / DoH via [`Request::resolver`].
+    pub(crate) resolver: Arc<dyn crate::net::Resolver>,
+    /// Optional connection-pool partition key (e.g. the top-level site). Keeps
+    /// connections and TLS sessions isolated per partition. See
+    /// [`Request::partition`].
+    pub(crate) partition_key: Option<String>,
+    /// Optional per-request proxy selector, consulted once for the request URL
+    /// when no explicit proxy/connector is set. See [`Request::proxy_resolver`].
+    pub(crate) proxy_resolver: Option<Arc<dyn crate::net::ProxyResolver>>,
+    /// Priority hint, applied as issuance order in [`send_multiplexed`].
+    pub(crate) priority: Priority,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -164,6 +176,29 @@ pub struct Request {
 pub enum IpFamily {
     V4,
     V6,
+}
+
+/// A request priority hint (à la `fetch`'s `priority`). Currently applied as the
+/// issuance order within [`send_multiplexed`] — higher-priority requests get
+/// their HEADERS on the wire first. HTTP/2 PRIORITY-frame weights and
+/// preconnect/pool-sizing controls are not yet wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority {
+    High,
+    #[default]
+    Normal,
+    Low,
+}
+
+impl Priority {
+    /// Sort rank: lower issues first (High = 0).
+    fn rank(self) -> u8 {
+        match self {
+            Priority::High => 0,
+            Priority::Normal => 1,
+            Priority::Low => 2,
+        }
+    }
 }
 
 /// Where to route HTTP(S) traffic through. Parsed from a curl-style proxy
@@ -261,7 +296,70 @@ impl Request {
             keep_method_case: false,
             jar_through_redirects: true,
             tls_verify_callback: None,
+            resolver: Arc::new(crate::net::StdResolver),
+            partition_key: None,
+            proxy_resolver: None,
+            priority: Priority::Normal,
         })
+    }
+
+    /// Set this request's [`Priority`] hint. In [`send_multiplexed`], higher
+    /// priority requests are issued (HEADERS on the wire) first.
+    pub fn priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Select the proxy dynamically per request via a
+    /// [`ProxyResolver`](crate::net::ProxyResolver) — a system/PAC/env policy.
+    /// Consulted once for the request URL only when no explicit
+    /// [`proxy`](Self::proxy)/[`connector`](Self::connector) is set. Use
+    /// [`rsurl::net::from_env`](crate::net::from_env) for environment proxies.
+    pub fn proxy_resolver(mut self, resolver: Arc<dyn crate::net::ProxyResolver>) -> Self {
+        self.proxy_resolver = Some(resolver);
+        self
+    }
+
+    /// Apply the proxy resolver (if any) for the current URL, unless an explicit
+    /// proxy or non-direct connector is already configured. Idempotent: once a
+    /// proxy/connector is installed, a re-call is a no-op.
+    fn apply_proxy_resolver(&mut self) -> Result<()> {
+        if self.proxy.is_some() || !self.connector.is_direct() {
+            return Ok(());
+        }
+        let Some(resolver) = self.proxy_resolver.clone() else {
+            return Ok(());
+        };
+        if let crate::net::ProxyChoice::Proxy(spec) = resolver.resolve(&self.url) {
+            // Reuse the same spec-application logic as the `proxy()` builder.
+            let is_http_proxy = match spec.split_once("://") {
+                Some((scheme, _)) => scheme.eq_ignore_ascii_case("http"),
+                None => true,
+            };
+            if is_http_proxy {
+                self.proxy = Some(ProxyConfig::parse(&spec)?);
+            } else {
+                self.connector = connector_from_proxy_url(&spec)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Override DNS resolution with a custom [`Resolver`](crate::net::Resolver)
+    /// (caching, split-horizon, DoH, …). Static `--resolve` pins set via
+    /// [`resolve_addr`](Self::resolve_addr) still take precedence.
+    pub fn resolver(mut self, resolver: Arc<dyn crate::net::Resolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Partition the connection pool and TLS-session cache by `key` (e.g. the
+    /// top-level site), so connections are not shared across partitions —
+    /// matching a browser's network-state partitioning. Requests with different
+    /// keys never reuse each other's pooled sockets.
+    pub fn partition(mut self, key: &str) -> Self {
+        self.partition_key = Some(key.to_string());
+        self
     }
 
     /// Install a certificate-validation hook that becomes the **sole** trust
@@ -797,18 +895,23 @@ impl Request {
         on_head: Option<HeadObserver>,
     ) -> Result<Response> {
         let cancel = self.cancel.clone();
-        let r = self.send_download_dispatch(sink, jar, trace, on_head);
+        let started = std::time::Instant::now();
+        let mut r = self.send_download_dispatch(sink, jar, trace, on_head);
+        if let Ok(resp) = &mut r {
+            resp.timing.total = Some(started.elapsed());
+        }
         map_cancelled(&cancel, r)
     }
 
     fn send_download_dispatch(
-        self,
+        mut self,
         sink: &mut dyn Write,
         mut jar: Option<&mut crate::cookie::CookieJar>,
         trace: &mut dyn Write,
         mut on_head: Option<HeadObserver>,
     ) -> Result<Response> {
         self.cancel_check()?;
+        self.apply_proxy_resolver()?;
         let direct = self.connector.is_direct() && self.proxy.is_none();
         // HTTP/1.1 streaming (plaintext, or `--http1.1`) — follows redirects and
         // manages cookies itself.
@@ -975,8 +1078,9 @@ impl Request {
             // Captured before the TLS stream is type-erased into `Box<dyn Rw>`.
             let mut tls_info: Option<TlsInfo> = None;
             let stream: Box<dyn Rw> = if req.url.scheme == "https" {
-                let (tcp, guard) = tcp_connect_cancellable(&req, trace)?;
+                let (tcp, guard, namelookup) = tcp_connect_cancellable(&req, trace)?;
                 _cancel_guard = guard;
+                timing.namelookup = namelookup;
                 timing.connect = Some(start.elapsed());
                 let opts = tls_opts_from(&req, &[])?;
                 let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
@@ -987,8 +1091,9 @@ impl Request {
                 tls_info = Some(tls_info_from(&tls));
                 Box::new(tls)
             } else {
-                let (tcp, guard) = tcp_connect_cancellable(&req, trace)?;
+                let (tcp, guard, namelookup) = tcp_connect_cancellable(&req, trace)?;
                 _cancel_guard = guard;
+                timing.namelookup = namelookup;
                 let connect = start.elapsed();
                 timing.connect = Some(connect);
                 timing.pretransfer = Some(connect);
@@ -1224,7 +1329,11 @@ impl Request {
         // socket shut down by `cancel()` (which surfaces as an I/O error) is
         // reported as a cancellation rather than a connection reset.
         let cancel = self.cancel.clone();
-        let r = self.send_to_inner(trace, jar);
+        let started = std::time::Instant::now();
+        let mut r = self.send_to_inner(trace, jar);
+        if let Ok(resp) = &mut r {
+            resp.timing.total = Some(started.elapsed());
+        }
         map_cancelled(&cancel, r)
     }
 
@@ -1238,6 +1347,8 @@ impl Request {
         // the `Host:` header, TLS SNI, and cookie matching all see the same
         // ASCII host. Redirect targets are normalised the same way below.
         req.url.set_idn(req.idn)?;
+        // Resolve the proxy for the request URL (once) before dispatching.
+        req.apply_proxy_resolver()?;
         // For Digest auth, withhold the Basic credentials so the first request
         // goes out unauthenticated; we answer the 401 challenge below.
         let digest_creds = if req.auth_digest {
@@ -1466,6 +1577,10 @@ pub struct Response {
 /// field renders as `0.000000`, matching curl's output for an unmeasured phase.
 #[derive(Debug, Clone, Default)]
 pub struct Timing {
+    /// Time until DNS name resolution completed (curl `%{time_namelookup}`).
+    /// Populated on the direct HTTP(S) paths; `None` when the address was
+    /// pre-resolved (`--resolve`) or on the pooled / h2 / h3 paths.
+    pub namelookup: Option<Duration>,
     /// Time until the TCP connection to the origin was established.
     pub connect: Option<Duration>,
     /// Time until the TLS handshake completed (HTTPS only).
@@ -1474,6 +1589,9 @@ pub struct Timing {
     pub pretransfer: Option<Duration>,
     /// Time until the full response head had been received (first-byte proxy).
     pub starttransfer: Option<Duration>,
+    /// Total wall-clock time for the operation, across redirects (curl
+    /// `%{time_total}`). Set on the public send entry points for every path.
+    pub total: Option<Duration>,
 }
 
 /// The status line + headers of a response, delivered *before* the body in the
@@ -1672,11 +1790,12 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
 
 fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
     let start = std::time::Instant::now();
-    let (stream, _cancel_guard) = tcp_connect_cancellable(&req, trace)?;
+    let (stream, _cancel_guard, namelookup) = tcp_connect_cancellable(&req, trace)?;
     let connect = start.elapsed();
     let mut bufrd = BufReader::new(stream);
     write_request(bufrd.get_mut(), &req, via_plain_http_proxy(&req), trace)?;
     let mut resp = read_response_timed(&mut bufrd, &req.method, Some(start), trace)?;
+    resp.timing.namelookup = namelookup;
     resp.timing.connect = Some(connect);
     resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
     finalize_plain(bufrd, &req, &resp, may_pool, trace);
@@ -1845,6 +1964,7 @@ pub(crate) fn pool_key_for(req: &Request) -> crate::pool::Key {
         host: u.host.clone(),
         port: u.port,
         effective_target: effective_dial_target(&req.connect_to, &req.resolve, &u.host, u.port),
+        partition: req.partition_key.clone(),
     }
 }
 
@@ -2129,7 +2249,25 @@ pub fn send_multiplexed_traced(
     for req in &mut reqs {
         let _ = req.url.set_idn(req.idn);
     }
-    crate::http2::send_multiplexed(reqs, trace)
+    // Apply the priority hint as issuance order: stable-sort indices by
+    // priority (High first), issue in that order, then restore the caller's
+    // input order in the returned results.
+    let mut idx: Vec<usize> = (0..reqs.len()).collect();
+    idx.sort_by_key(|&i| reqs[i].priority.rank());
+    let already_in_order = idx.iter().enumerate().all(|(k, &i)| k == i);
+    if already_in_order {
+        return crate::http2::send_multiplexed(reqs, trace);
+    }
+    let mut slots: Vec<Option<Request>> = reqs.into_iter().map(Some).collect();
+    let ordered: Vec<Request> = idx.iter().map(|&i| slots[i].take().unwrap()).collect();
+    let results = crate::http2::send_multiplexed(ordered, trace);
+    let mut out: Vec<Option<Result<Response>>> = (0..idx.len()).map(|_| None).collect();
+    for (k, r) in results.into_iter().enumerate() {
+        out[idx[k]] = Some(r);
+    }
+    out.into_iter()
+        .map(|o| o.expect("each slot filled"))
+        .collect()
 }
 
 fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
@@ -2224,7 +2362,7 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
 
 fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
     let start = std::time::Instant::now();
-    let (tcp, _cancel_guard) = tcp_connect_cancellable(&req, trace)?;
+    let (tcp, _cancel_guard, namelookup) = tcp_connect_cancellable(&req, trace)?;
     let connect = start.elapsed();
     // HTTPS via proxy means we have to ask the proxy to splice us through
     // to the origin before the TLS handshake — the proxy can't see the
@@ -2247,6 +2385,7 @@ fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     // the normal direct one.
     write_request(bufrd.get_mut(), &req, false, trace)?;
     let mut resp = read_response_timed(&mut bufrd, &req.method, Some(start), trace)?;
+    resp.timing.namelookup = namelookup;
     resp.timing.connect = Some(connect);
     resp.timing.appconnect = Some(appconnect);
     resp.timing.pretransfer = Some(appconnect); // request goes out right after TLS
@@ -2318,28 +2457,41 @@ fn apply_connect_to(rules: &[(String, u16, String, u16)], host: &str, port: u16)
 
 /// Resolve `host:port` to a single socket address, honoring `--resolve`
 /// overrides and the `-4`/`-6` address-family preference.
-fn resolve_target(host: &str, port: u16, req: &Request) -> Result<std::net::SocketAddr> {
-    // --resolve: a fixed address for this host:port wins.
+/// Resolve `host:port`, returning the chosen address and — when an actual DNS
+/// lookup ran — how long it took (for `Timing::namelookup`). A static
+/// `--resolve` pin reports `None` (no lookup happened).
+fn resolve_target(
+    host: &str,
+    port: u16,
+    req: &Request,
+) -> Result<(std::net::SocketAddr, Option<Duration>)> {
+    // --resolve: a fixed address for this host:port wins (no lookup).
     if let Some((_, _, ip)) = req
         .resolve
         .iter()
         .find(|(h, p, _)| *p == port && h.eq_ignore_ascii_case(host))
     {
-        return Ok(std::net::SocketAddr::new(*ip, port));
+        return Ok((std::net::SocketAddr::new(*ip, port), None));
     }
-    let addr = format!("{host}:{port}");
-    let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr)?;
-    match req.ip_family {
+    // Otherwise go through the (pluggable) resolver, timing the lookup.
+    let started = std::time::Instant::now();
+    let addrs = req.resolver.resolve(host, port)?;
+    let dns = started.elapsed();
+    let chosen = match req.ip_family {
         Some(IpFamily::V4) => addrs
+            .into_iter()
             .find(|a| a.is_ipv4())
             .ok_or_else(|| Error::InvalidUrl(format!("{host}: no IPv4 address"))),
         Some(IpFamily::V6) => addrs
+            .into_iter()
             .find(|a| a.is_ipv6())
             .ok_or_else(|| Error::InvalidUrl(format!("{host}: no IPv6 address"))),
         None => addrs
+            .into_iter()
             .next()
             .ok_or_else(|| Error::InvalidUrl(host.to_string())),
-    }
+    }?;
+    Ok((chosen, Some(dns)))
 }
 
 /// Dial a TCP connection for `req`. When the request carries a
@@ -2350,8 +2502,12 @@ fn resolve_target(host: &str, port: u16, req: &Request) -> Result<std::net::Sock
 pub(crate) fn tcp_connect_cancellable(
     req: &Request,
     trace: &mut dyn Write,
-) -> Result<(TcpStream, Option<crate::cancel::CancelGuard>)> {
-    let stream = tcp_connect_inner(req, trace)?;
+) -> Result<(
+    TcpStream,
+    Option<crate::cancel::CancelGuard>,
+    Option<Duration>,
+)> {
+    let (stream, namelookup) = tcp_connect_inner(req, trace)?;
     let guard = match &req.cancel {
         Some(token) => {
             if let Ok(shut) = stream.try_clone() {
@@ -2364,10 +2520,14 @@ pub(crate) fn tcp_connect_cancellable(
         }
         None => None,
     };
-    Ok((stream, guard))
+    Ok((stream, guard, namelookup))
 }
 
-fn tcp_connect_inner(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
+/// Returns the connected socket and, when a DNS lookup ran, its duration.
+fn tcp_connect_inner(
+    req: &Request,
+    trace: &mut dyn Write,
+) -> Result<(TcpStream, Option<Duration>)> {
     let proxy = req.proxy.as_ref().filter(|_| !proxy_bypassed(req));
     let (target_host, target_port, via_proxy_label) = match proxy {
         Some(p) => (p.host.as_str(), p.port, true),
@@ -2380,7 +2540,7 @@ fn tcp_connect_inner(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> 
     } else {
         apply_connect_to(&req.connect_to, target_host, target_port)
     };
-    let first = resolve_target(&target_host, target_port, req)?;
+    let (first, namelookup) = resolve_target(&target_host, target_port, req)?;
     let _ = writeln!(trace, "*   Trying {first}...");
     let stream = match req.connect_timeout {
         Some(t) => TcpStream::connect_timeout(&first, t)?,
@@ -2406,7 +2566,7 @@ fn tcp_connect_inner(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> 
     }
     stream.set_read_timeout(req.read_timeout)?;
     stream.set_write_timeout(req.read_timeout)?;
-    Ok(stream)
+    Ok((stream, namelookup))
 }
 
 /// Issue an HTTP/1.1 `CONNECT <host>:<port>` over an already-open TCP
@@ -3606,6 +3766,24 @@ mod tests {
 
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn partition_key_distinguishes_pool_keys() {
+        let a = Request::get("http://example.com/")
+            .unwrap()
+            .partition("siteA");
+        let b = Request::get("http://example.com/")
+            .unwrap()
+            .partition("siteB");
+        let bare = Request::get("http://example.com/").unwrap();
+        assert_ne!(pool_key_for(&a), pool_key_for(&b));
+        assert_ne!(pool_key_for(&a), pool_key_for(&bare));
+        // Same partition → same key (still pools together).
+        let a2 = Request::get("http://example.com/")
+            .unwrap()
+            .partition("siteA");
+        assert_eq!(pool_key_for(&a), pool_key_for(&a2));
     }
 
     #[test]

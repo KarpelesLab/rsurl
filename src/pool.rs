@@ -71,6 +71,11 @@ pub(crate) struct Key {
     /// Effective dial target after `--connect-to`/`--resolve`. `None` when no
     /// override applies to this (host,port).
     pub effective_target: Option<(String, u16)>,
+    /// Caller-supplied connection-pool partition key (e.g. the top-level site),
+    /// from [`crate::Request::partition`]. `None` for unpartitioned requests, so
+    /// default pooling is unchanged. Two requests with different partition keys
+    /// never share a pooled socket or TLS session.
+    pub partition: Option<String>,
 }
 
 /// Generic over the transport so the same code drives both the plain and
@@ -166,6 +171,7 @@ mod tests {
             host: host.into(),
             port,
             effective_target: None,
+            partition: None,
         }
     }
 

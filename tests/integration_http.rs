@@ -648,6 +648,130 @@ fn cookies_not_carried_across_redirects_when_disabled() {
     );
 }
 
+/// #9: a successful request reports total wall-clock and DNS-lookup timings.
+#[test]
+fn timing_total_and_namelookup_populated() {
+    let server = TestServer::start(|_req: SReq| SResp::ok("ok"));
+    let resp = Request::get(&server.url("/")).unwrap().send().unwrap();
+    assert!(resp.timing.total.is_some(), "total time should be set");
+    assert!(
+        resp.timing.namelookup.is_some(),
+        "DNS namelookup time should be set on a fresh dial"
+    );
+}
+
+/// #14: a custom `Resolver` is consulted for the dial address.
+#[test]
+fn custom_resolver_reaches_server() {
+    let server = TestServer::start(|_req: SReq| SResp::ok("via-resolver"));
+    let server_addr = server.addr;
+
+    #[derive(Debug)]
+    struct PinResolver(std::net::SocketAddr);
+    impl rsurl::net::Resolver for PinResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> rsurl::Result<Vec<std::net::SocketAddr>> {
+            Ok(vec![self.0])
+        }
+    }
+
+    // A host that does not resolve normally; the resolver pins it to the server.
+    let url = format!("http://made-up-host.invalid:{}/", server_addr.port());
+    let resp = Request::get(&url)
+        .unwrap()
+        .resolver(std::sync::Arc::new(PinResolver(server_addr)))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"via-resolver");
+}
+
+/// #15: two requests to the same authority with different partition keys must
+/// NOT share a pooled connection (two accepts), unlike the default (one).
+#[test]
+fn partition_key_isolates_pool() {
+    use std::sync::atomic::Ordering;
+    let server = TestServer::start_keepalive(|_req: SReq| SResp::ok("ok"));
+
+    let r1 = Request::get(&server.url("/a"))
+        .unwrap()
+        .partition("siteA")
+        .send()
+        .unwrap();
+    assert_eq!(r1.status, 200);
+    std::thread::sleep(Duration::from_millis(30));
+    let r2 = Request::get(&server.url("/b"))
+        .unwrap()
+        .partition("siteB")
+        .send()
+        .unwrap();
+    assert_eq!(r2.status, 200);
+
+    let accepted = server.accept_count.load(Ordering::SeqCst);
+    assert_eq!(
+        accepted, 2,
+        "different partition keys must not reuse the pooled connection, got {accepted}",
+    );
+}
+
+/// #12: a `ProxyResolver` returning `Direct` leaves the request on a direct dial.
+#[test]
+fn proxy_resolver_direct_connects_normally() {
+    let server = TestServer::start(|_req: SReq| SResp::ok("direct"));
+
+    #[derive(Debug)]
+    struct AlwaysDirect;
+    impl rsurl::net::ProxyResolver for AlwaysDirect {
+        fn resolve(&self, _url: &rsurl::Url) -> rsurl::net::ProxyChoice {
+            rsurl::net::ProxyChoice::Direct
+        }
+    }
+
+    let resp = Request::get(&server.url("/"))
+        .unwrap()
+        .proxy_resolver(std::sync::Arc::new(AlwaysDirect))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"direct");
+}
+
+/// #12: a `ProxyResolver` returning a proxy URL routes through it (the proxy
+/// sees an absolute-form request line for plain HTTP).
+#[test]
+fn proxy_resolver_routes_via_proxy() {
+    use std::sync::{Arc, Mutex};
+    let seen_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen_for_handler = Arc::clone(&seen_line);
+    // The "proxy" is just a TestServer that records the request line it saw.
+    let proxy = TestServer::start(move |req: SReq| {
+        *seen_for_handler.lock().unwrap() = Some(req.path.clone());
+        SResp::ok("via-proxy")
+    });
+    let proxy_addr = proxy.addr;
+
+    #[derive(Debug)]
+    struct ToProxy(String);
+    impl rsurl::net::ProxyResolver for ToProxy {
+        fn resolve(&self, _url: &rsurl::Url) -> rsurl::net::ProxyChoice {
+            rsurl::net::ProxyChoice::Proxy(self.0.clone())
+        }
+    }
+
+    let resp = Request::get("http://example.com/page")
+        .unwrap()
+        .proxy_resolver(Arc::new(ToProxy(format!("http://{proxy_addr}"))))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"via-proxy");
+    // Plain HTTP via proxy uses absolute-form: the proxy sees the full URL.
+    let line = seen_line.lock().unwrap().clone().unwrap_or_default();
+    assert!(
+        line.contains("http://example.com/page"),
+        "proxy should receive absolute-form target, got {line:?}"
+    );
+}
+
 /// `Response::final_url` reports the effective URL after a redirect (the value
 /// behind curl's `CURLINFO_EFFECTIVE_URL`); without a redirect it is the
 /// requested URL.

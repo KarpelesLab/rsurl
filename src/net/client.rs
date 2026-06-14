@@ -278,7 +278,22 @@ impl Client {
     /// [`Url::set_idn`]). Used by the CLI, which parses the URL once up front.
     pub fn websocket_url(&self, url: &Url) -> Result<crate::websocket::WebSocket> {
         let cfg = self.net_config_for(&url.host);
-        crate::websocket::WebSocket::open(url, &cfg, self.read_timeout)
+        crate::websocket::WebSocket::open(url, &cfg, self.read_timeout, &[])
+    }
+
+    /// Like [`Client::websocket`] but offers `subprotocols` in the
+    /// `Sec-WebSocket-Protocol` handshake header; the server's selection is
+    /// readable via [`WebSocket::subprotocol`](crate::websocket::WebSocket::subprotocol).
+    pub fn websocket_with_subprotocols(
+        &self,
+        url: &str,
+        subprotocols: &[&str],
+    ) -> Result<crate::websocket::WebSocket> {
+        let mut url = Url::parse(url)?;
+        url.set_idn(self.idn)?;
+        let cfg = self.net_config_for(&url.host);
+        let protos: Vec<String> = subprotocols.iter().map(|s| s.to_string()).collect();
+        crate::websocket::WebSocket::open(&url, &cfg, self.read_timeout, &protos)
     }
 
     /// Run the default operation for the URL's scheme and return its payload,

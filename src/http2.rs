@@ -3112,6 +3112,9 @@ pub(crate) struct PoolKey {
     scheme: String,
     host: String,
     port: u16,
+    /// Caller-supplied partition key (e.g. top-level site); isolates pooled h2
+    /// connections per partition. `None` for unpartitioned requests.
+    partition: Option<String>,
 }
 
 impl PoolKey {
@@ -3120,6 +3123,7 @@ impl PoolKey {
             scheme: req.url.scheme.clone(),
             host: req.url.host.clone(),
             port: req.url.port,
+            partition: req.partition_key.clone(),
         }
     }
 }
@@ -3209,7 +3213,7 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
     // trace lines and the actual socket come from the same code as HTTP/1.1.
     // The cancel guard (when a token is attached) shuts the socket down on a
     // concurrent `cancel()`; the caller keeps it alive for the request.
-    let (tcp, cancel_guard) = crate::http::tcp_connect_cancellable(req, trace)?;
+    let (tcp, cancel_guard, _namelookup) = crate::http::tcp_connect_cancellable(req, trace)?;
     // HTTPS-over-proxy: CONNECT to establish a transparent tunnel before
     // the TLS handshake. h2c (cleartext HTTP/2) over a proxy is rejected
     // higher up in `send()`, so by here we know scheme == "https".

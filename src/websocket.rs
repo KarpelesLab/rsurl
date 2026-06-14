@@ -225,13 +225,13 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     match url.scheme.as_str() {
         "ws" => {
             let mut sock = tcp_connect(url, cfg)?;
-            let mut pmd = handshake(&mut sock, url)?;
+            let (mut pmd, _proto) = handshake(&mut sock, url, &[])?;
             read_data_and_close(&mut sock, pmd.as_mut())
         }
         "wss" => {
             let tcp = tcp_connect(url, cfg)?;
             let mut tls = crate::tls::connect_over(tcp, &url.host)?;
-            let mut pmd = handshake(&mut tls, url)?;
+            let (mut pmd, _proto) = handshake(&mut tls, url, &[])?;
             read_data_and_close(&mut tls, pmd.as_mut())
         }
         other => Err(Error::UnsupportedScheme(other.to_string())),
@@ -431,6 +431,8 @@ pub struct WebSocket {
     /// them (curl's `CURLWS_NOAUTOPONG`). [`recv`](WebSocket::recv) always
     /// auto-pongs regardless, since it hides control frames.
     auto_pong: bool,
+    /// The negotiated subprotocol (`Sec-WebSocket-Protocol`), if any.
+    subprotocol: Option<String>,
 }
 
 impl WebSocket {
@@ -442,45 +444,54 @@ impl WebSocket {
         crate::net::Client::new().websocket(url)
     }
 
+    /// Open a WebSocket offering `subprotocols` in the handshake
+    /// `Sec-WebSocket-Protocol` header. Read the server's choice with
+    /// [`subprotocol`](Self::subprotocol).
+    pub fn connect_with_subprotocols(url: &str, subprotocols: &[&str]) -> Result<WebSocket> {
+        crate::net::Client::new().websocket_with_subprotocols(url, subprotocols)
+    }
+
     /// Open a connection using an already-built [`NetConfig`] and the caller's
     /// persistent read timeout. Used by [`Client::websocket`].
     pub(crate) fn open(
         url: &Url,
         cfg: &crate::net::NetConfig,
         read_timeout: Option<Duration>,
+        subprotocols: &[String],
     ) -> Result<WebSocket> {
-        let (stream, ctl, pmd): (Box<dyn ReadWrite>, _, _) = match url.scheme.as_str() {
-            "ws" => {
-                let mut data = cfg.connect(&url.host, url.port)?;
-                data.set_write_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                // Bound each handshake read; the wall-clock HANDSHAKE_DEADLINE
-                // inside `handshake` defeats a slow drip on top of this.
-                data.set_read_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                let ctl = data.try_clone_box().ok();
-                let pmd = handshake(&mut data, url)?;
-                (Box::new(data), ctl, pmd)
-            }
-            "wss" => {
-                let data = cfg.connect(&url.host, url.port)?;
-                data.set_write_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                data.set_read_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                // Clone the raw socket for timeout control *before* the TLS
-                // layer takes ownership of it.
-                let ctl = data.try_clone_box().ok();
-                // Honour the client's verification setting (`-k` => verify off);
-                // wss otherwise verifies against the system roots like `fetch`.
-                let mut opts = crate::tls::TlsOpts::verifying();
-                opts.verify = cfg.verify;
-                let mut tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
-                let pmd = handshake(&mut tls, url)?;
-                (Box::new(tls), ctl, pmd)
-            }
-            other => return Err(Error::UnsupportedScheme(other.to_string())),
-        };
+        let (stream, ctl, pmd, subprotocol): (Box<dyn ReadWrite>, _, _, _) =
+            match url.scheme.as_str() {
+                "ws" => {
+                    let mut data = cfg.connect(&url.host, url.port)?;
+                    data.set_write_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    // Bound each handshake read; the wall-clock HANDSHAKE_DEADLINE
+                    // inside `handshake` defeats a slow drip on top of this.
+                    data.set_read_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    let ctl = data.try_clone_box().ok();
+                    let (pmd, proto) = handshake(&mut data, url, subprotocols)?;
+                    (Box::new(data), ctl, pmd, proto)
+                }
+                "wss" => {
+                    let data = cfg.connect(&url.host, url.port)?;
+                    data.set_write_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    data.set_read_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    // Clone the raw socket for timeout control *before* the TLS
+                    // layer takes ownership of it.
+                    let ctl = data.try_clone_box().ok();
+                    // Honour the client's verification setting (`-k` => verify off);
+                    // wss otherwise verifies against the system roots like `fetch`.
+                    let mut opts = crate::tls::TlsOpts::verifying();
+                    opts.verify = cfg.verify;
+                    let mut tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
+                    let (pmd, proto) = handshake(&mut tls, url, subprotocols)?;
+                    (Box::new(tls), ctl, pmd, proto)
+                }
+                other => return Err(Error::UnsupportedScheme(other.to_string())),
+            };
 
         // The handshake is done; switch to the caller's persistent read timeout
         // (which may be `None` to block indefinitely on a quiet connection).
@@ -497,7 +508,14 @@ impl WebSocket {
             recv_closed: false,
             compression,
             auto_pong: true,
+            subprotocol,
         })
+    }
+
+    /// The subprotocol the server selected from the offered
+    /// `Sec-WebSocket-Protocol` list, or `None` if none was negotiated.
+    pub fn subprotocol(&self) -> Option<&str> {
+        self.subprotocol.as_deref()
     }
 
     /// Whether permessage-deflate (RFC 7692) was negotiated for this
@@ -837,7 +855,11 @@ impl WebSocket {
 /// Returns `Some(Pmd)` if the server agreed to permessage-deflate (RFC 7692),
 /// `None` otherwise (in which case the connection operates uncompressed,
 /// exactly as before).
-fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> {
+fn handshake<S: Read + Write>(
+    stream: &mut S,
+    url: &Url,
+    subprotocols: &[String],
+) -> Result<(Option<Pmd>, Option<String>)> {
     let key_bytes: [u8; 16] = random_16()?;
     let key_b64 = base64_encode(&key_bytes);
 
@@ -854,6 +876,13 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
         url.path.as_str()
     };
 
+    // Sec-WebSocket-Protocol: comma-separated subprotocols in preference order.
+    let proto_header = if subprotocols.is_empty() {
+        String::new()
+    } else {
+        format!("Sec-WebSocket-Protocol: {}\r\n", subprotocols.join(", "))
+    };
+
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_header}\r\n\
@@ -862,6 +891,7 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
          Sec-WebSocket-Key: {key_b64}\r\n\
          Sec-WebSocket-Version: 13\r\n\
          Sec-WebSocket-Extensions: {PMD_OFFER}\r\n\
+         {proto_header}\
          \r\n"
     );
     stream.write_all(req.as_bytes())?;
@@ -888,6 +918,7 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
     let mut connection_ok = false;
     let mut accept_value: Option<String> = None;
     let mut extensions_value: Option<String> = None;
+    let mut subprotocol_value: Option<String> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -909,6 +940,8 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
             }
         } else if k.eq_ignore_ascii_case("sec-websocket-accept") {
             accept_value = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("sec-websocket-protocol") {
+            subprotocol_value = Some(v.to_string());
         } else if k.eq_ignore_ascii_case("sec-websocket-extensions") {
             // A server may repeat the header; concatenate as the spec allows
             // a comma-joined list to be split across lines.
@@ -945,7 +978,7 @@ fn handshake<S: Read + Write>(stream: &mut S, url: &Url) -> Result<Option<Pmd>> 
     // uncompressed exactly as before.
     let pmd = extensions_value.as_deref().and_then(parse_pmd_response);
 
-    Ok(pmd)
+    Ok((pmd, subprotocol_value))
 }
 
 /// Read the HTTP/1.1 upgrade-handshake response header off `stream`, one byte
@@ -2116,7 +2149,7 @@ mod tests {
             response: Cursor::new(resp),
         };
         let url = Url::parse("ws://example.com/chat").expect("url");
-        let _ = handshake(&mut rec, &url); // Accept mismatch is fine here.
+        let _ = handshake(&mut rec, &url, &[]); // Accept mismatch is fine here.
         let req = String::from_utf8(rec.request).expect("utf8 request");
         assert!(
             req.contains("Sec-WebSocket-Extensions: permessage-deflate"),
@@ -2365,6 +2398,7 @@ mod tests {
             recv_closed: false,
             compression,
             auto_pong: true,
+            subprotocol: None,
         }
     }
 

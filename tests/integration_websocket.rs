@@ -193,6 +193,68 @@ fn library_round_trips_text_over_real_socket() {
     assert_eq!(ws.recv().expect("drain"), None);
 }
 
+/// #13: a server that selects a subprotocol from the offered list; the client
+/// must surface it via `WebSocket::subprotocol()`.
+#[test]
+fn subprotocol_is_negotiated() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while s.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 64 * 1024 {
+                return;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        let key = head
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"))
+            })
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        // Confirm the client offered the protocols, then pick the second.
+        let offered = head
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-protocol"))
+            })
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        assert!(offered.contains("chat.v1") && offered.contains("chat.v2"));
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Protocol: chat.v2\r\n\
+             Sec-WebSocket-Accept: {}\r\n\r\n",
+            accept_key(&key)
+        );
+        let _ = s.write_all(resp.as_bytes());
+        // Keep the socket open briefly so the client's close can land.
+        thread::sleep(Duration::from_millis(200));
+    });
+
+    let ws = WebSocket::connect_with_subprotocols(
+        &format!("ws://127.0.0.1:{port}/"),
+        &["chat.v1", "chat.v2"],
+    )
+    .expect("connect");
+    assert_eq!(ws.subprotocol(), Some("chat.v2"));
+}
+
 #[test]
 fn cli_sends_stdin_lines_and_prints_echoes() {
     use std::process::{Command, Stdio};

@@ -12,6 +12,8 @@
 
 mod client;
 mod connector;
+mod proxy_resolver;
+mod resolver;
 mod socks;
 mod stream;
 pub(crate) mod udp;
@@ -24,5 +26,7 @@ pub use connector::{
     connector_from_proxy_url, Connector, DirectConnector, HttpProxyConnector, HttpProxyIntent,
     HttpsProxyConnector, Socks4Connector, Socks5Connector,
 };
+pub use proxy_resolver::{from_env, EnvProxyResolver, ProxyChoice, ProxyResolver};
+pub use resolver::{Resolver, StdResolver};
 pub use stream::NetStream;
 pub use udp::UdpProxy;
