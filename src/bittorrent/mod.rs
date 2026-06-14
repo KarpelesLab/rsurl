@@ -11,6 +11,7 @@
 
 pub mod bencode;
 pub mod download;
+pub mod engine;
 pub mod magnet;
 pub mod metainfo;
 pub mod peer;

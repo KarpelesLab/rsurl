@@ -2,6 +2,7 @@
 //! payload over the real peer wire protocol, and `rsurl::bittorrent::download`
 //! fetches + verifies it. Exercises bencode/metainfo, the handshake, message
 //! framing, the piece picker, and storage together.
+#![cfg(feature = "bittorrent")]
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -22,9 +23,9 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     o
 }
 
-/// Build a single-file `.torrent` for `data` with the given piece length, plus
-/// the parsed `Metainfo`.
-fn make_torrent(data: &[u8], piece_len: usize, name: &str) -> Metainfo {
+/// Build a single-file `.torrent` for `data` with the given piece length.
+/// Returns the encoded `.torrent` bytes and the parsed `Metainfo`.
+fn make_torrent_bytes(data: &[u8], piece_len: usize, name: &str) -> (Vec<u8>, Metainfo) {
     let mut pieces = Vec::new();
     for chunk in data.chunks(piece_len) {
         pieces.extend_from_slice(&sha1(chunk));
@@ -37,7 +38,12 @@ fn make_torrent(data: &[u8], piece_len: usize, name: &str) -> Metainfo {
     let mut root = BTreeMap::new();
     root.insert(b"info".to_vec(), Value::Dict(info));
     let bytes = encode(&Value::Dict(root));
-    Metainfo::from_bytes(&bytes).unwrap()
+    let meta = Metainfo::from_bytes(&bytes).unwrap();
+    (bytes, meta)
+}
+
+fn make_torrent(data: &[u8], piece_len: usize, name: &str) -> Metainfo {
+    make_torrent_bytes(data, piece_len, name).1
 }
 
 /// Spawn a one-connection seeder that has the whole `data` and serves any
@@ -135,4 +141,40 @@ fn downloads_and_verifies_from_seeder() {
         "downloaded file mismatch"
     );
     let _ = std::fs::remove_file(&out);
+}
+
+/// Drive the actual `rsurl` binary: `--torrent --bt-peer <seeder> -o <file>`
+/// against a `.torrent` on disk and the in-process seeder.
+#[test]
+fn cli_downloads_torrent_to_output() {
+    let data: Vec<u8> = (0..18_000u32)
+        .map(|i| (i.wrapping_mul(7) % 251) as u8)
+        .collect();
+    let (torrent_bytes, meta) = make_torrent_bytes(&data, 4096, "cli.bin");
+
+    let port = start_seeder(data.clone(), meta.clone());
+
+    let pid = std::process::id();
+    let tdir = std::env::temp_dir();
+    let torrent_path = tdir.join(format!("rsurl_cli_{pid}.torrent"));
+    let out = tdir.join(format!("rsurl_cli_{pid}.bin"));
+    std::fs::write(&torrent_path, &torrent_bytes).unwrap();
+    let _ = std::fs::remove_file(&out);
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .arg("--torrent")
+        .arg("--bt-peer")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("-s")
+        .arg("-o")
+        .arg(&out)
+        .arg(&torrent_path)
+        .status()
+        .expect("spawn rsurl");
+
+    assert!(status.success(), "rsurl exited with {status}");
+    assert_eq!(std::fs::read(&out).unwrap(), data, "cli download mismatch");
+
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&torrent_path);
 }

@@ -275,6 +275,14 @@ struct Args {
     /// `--parallel-segments <n>`: download a single `-o`/`-O` file over `n`
     /// concurrent HTTP range requests (segmented download). rsurl extension.
     parallel_segments: Option<usize>,
+    /// `--torrent`: treat the source (a `.torrent` path/URL, or a magnet link)
+    /// as torrent metainfo and download its contents.
+    torrent: bool,
+    /// `--listen-port <p>`: port advertised to peers/trackers for BitTorrent.
+    listen_port: Option<u16>,
+    /// `--bt-peer <ip:port>` (repeatable): add a peer directly (besides those
+    /// from trackers).
+    bt_peers: Vec<String>,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -1636,6 +1644,23 @@ fn assemble_form_body(parts: &[DataPart]) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
+    // BitTorrent: a magnet link, or any source under `--torrent`. Routed before
+    // URL parsing because the source may be a local `.torrent` path (not a URL)
+    // and magnet links have no `://` authority.
+    if args.torrent || url.starts_with("magnet:") {
+        #[cfg(feature = "bittorrent")]
+        {
+            return run_bittorrent(url, args);
+        }
+        #[cfg(not(feature = "bittorrent"))]
+        {
+            if show_errors(args) {
+                eprintln!("rsurl: this build has no BitTorrent support");
+            }
+            return 2;
+        }
+    }
+
     // A URL given without a scheme defaults to --proto-default (or http),
     // matching curl's "curl example.com" behaviour.
     let scheme_defaulted;
@@ -2338,6 +2363,15 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 };
                 a.parallel_segments = Some(n);
             }
+            "--torrent" => a.torrent = true,
+            "--listen-port" => {
+                a.listen_port = Some(
+                    next_val(&mut it, arg)?
+                        .parse()
+                        .map_err(|_| "--listen-port requires a port number".to_string())?,
+                )
+            }
+            "--bt-peer" => a.bt_peers.push(next_val(&mut it, arg)?),
             "--tls-max" => {
                 let v = next_val(&mut it, arg)?;
                 a.tls_max = Some(match v.as_str() {
@@ -4275,6 +4309,210 @@ fn run_parallel_download(
     run_http_download(req, url, args, None)
 }
 
+/// Resolve the on-disk file layout for a torrent given the CLI output flags.
+/// Per rsurl policy, a download requires an explicit target.
+#[cfg(feature = "bittorrent")]
+fn bt_layout(
+    meta: &rsurl::bittorrent::Metainfo,
+    args: &Args,
+) -> std::result::Result<Vec<(std::path::PathBuf, u64)>, String> {
+    use std::path::Path;
+    if meta.files.len() == 1 {
+        if let Some(o) = args.output.as_deref().filter(|p| *p != "-") {
+            Ok(vec![(resolve_output_path(o, args), meta.files[0].length)])
+        } else if let Some(dir) = &args.output_dir {
+            Ok(rsurl::bittorrent::file_layout(meta, Path::new(dir)))
+        } else {
+            Err("torrent download needs -o <file> or --output-dir <dir>".into())
+        }
+    } else if let Some(dir) = &args.output_dir {
+        Ok(rsurl::bittorrent::file_layout(meta, Path::new(dir)))
+    } else {
+        Err("multi-file torrent needs --output-dir <dir>".into())
+    }
+}
+
+/// Download a torrent: load its metainfo (`.torrent` from a path/`file://`/
+/// `http(s)://`, or a magnet link), discover peers (manual `--bt-peer` +
+/// trackers), and fetch + verify the data. Exits when complete (curl-like).
+#[cfg(feature = "bittorrent")]
+fn run_bittorrent(source: &str, args: &Args) -> u8 {
+    use rsurl::bittorrent::{self, tracker, Metainfo, TorrentOptions};
+    use std::time::{Duration, Instant};
+
+    // 1) Load the metainfo.
+    let bytes = if source.starts_with("magnet:") {
+        if show_errors(args) {
+            eprintln!("rsurl: magnet links require peer metadata exchange (not in this build yet); use a .torrent");
+        }
+        return 2;
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        match rsurl::Request::get(source).and_then(|r| r.send()) {
+            Ok(resp) if resp.status == 200 => resp.body,
+            Ok(resp) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: fetching torrent: HTTP {}", resp.status);
+                }
+                return 1;
+            }
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: fetching torrent: {e}");
+                }
+                return transfer_exit_code(&e);
+            }
+        }
+    } else {
+        let path = source.strip_prefix("file://").unwrap_or(source);
+        match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: reading torrent {path}: {e}");
+                }
+                return 1;
+            }
+        }
+    };
+
+    let meta = match Metainfo::from_bytes(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            return 1;
+        }
+    };
+
+    // 2) Output layout.
+    let layout = match bt_layout(&meta, args) {
+        Ok(l) => l,
+        Err(msg) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {msg}");
+            }
+            return 2;
+        }
+    };
+
+    // 3) Peers: explicit --bt-peer, else announce to the torrent's trackers.
+    let peer_id = match bittorrent::generate_peer_id() {
+        Ok(p) => p,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            return 1;
+        }
+    };
+    let listen_port = args.listen_port.unwrap_or(6881);
+    let mut peers: Vec<std::net::SocketAddr> = Vec::new();
+    for p in &args.bt_peers {
+        match p.parse() {
+            Ok(a) => peers.push(a),
+            Err(_) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: bad --bt-peer {p}");
+                }
+            }
+        }
+    }
+    if args.bt_peers.is_empty() {
+        let params = tracker::AnnounceParams {
+            info_hash: meta.info_hash,
+            peer_id,
+            port: listen_port,
+            uploaded: 0,
+            downloaded: 0,
+            left: meta.total_length,
+            event: tracker::Event::Started,
+            num_want: 100,
+            key: 0,
+        };
+        for t in &meta.trackers {
+            match tracker::announce(t, &params, Duration::from_secs(10)) {
+                Ok(resp) => {
+                    if args.verbose {
+                        eprintln!("* tracker {t}: {} peers", resp.peers.len());
+                    }
+                    peers.extend(resp.peers);
+                }
+                Err(e) => {
+                    if args.verbose {
+                        eprintln!("* tracker {t}: {e}");
+                    }
+                }
+            }
+            if !peers.is_empty() {
+                break; // one responsive tracker is enough to start
+            }
+        }
+    }
+    peers.sort();
+    peers.dedup();
+    if peers.is_empty() {
+        if show_errors(args) {
+            eprintln!("rsurl: no peers found (no --bt-peer and trackers returned none)");
+        }
+        return 1;
+    }
+
+    if !args.silent {
+        eprintln!(
+            "* torrent: {} ({}, {} pieces, {} peers)",
+            meta.name,
+            human_bytes(meta.total_length),
+            meta.num_pieces(),
+            peers.len()
+        );
+    }
+
+    // 4) Download with throttled progress to stderr.
+    let opts = TorrentOptions {
+        peer_id,
+        listen_port,
+        ..Default::default()
+    };
+    let total = meta.total_length;
+    let show = !args.silent;
+    let start = Instant::now();
+    let mut last_tick = start;
+    let mut cb = |p: &bittorrent::Progress| {
+        if show && (last_tick.elapsed() >= Duration::from_millis(120) || p.downloaded == total) {
+            let secs = start.elapsed().as_secs_f64();
+            let rate = if secs > 0.0 {
+                (p.downloaded as f64 / secs) as u64
+            } else {
+                0
+            };
+            eprint!(
+                "\r* {}/{} pieces  {}/{}  {}/s   ",
+                p.pieces_complete,
+                p.num_pieces,
+                human_bytes(p.downloaded),
+                human_bytes(total),
+                human_bytes(rate),
+            );
+            let _ = io::stderr().flush();
+            last_tick = Instant::now();
+        }
+    };
+    let result = bittorrent::download(&meta, layout, &peers, &opts, &mut cb);
+    if show {
+        eprintln!();
+    }
+    match result {
+        Ok(_) => 0,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            transfer_exit_code(&e)
+        }
+    }
+}
+
 fn run_http_download(
     req: rsurl::Request,
     url: &Url,
@@ -4675,6 +4913,10 @@ Options:
       --parallel-max <n>   cap on concurrent transfers (default 50)
       --parallel-segments [n]  fetch one -o/-O file via n concurrent ranges
                                (default 4; add -# for a live progress display)
+      --torrent            treat the source (.torrent path/URL or magnet:) as a
+                           torrent; downloads its data to -o/--output-dir
+      --listen-port <p>    port advertised to BitTorrent peers/trackers (6881)
+      --bt-peer <ip:port>  add a torrent peer directly (repeatable)
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1
