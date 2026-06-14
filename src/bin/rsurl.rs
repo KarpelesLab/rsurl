@@ -26,7 +26,7 @@
 //!                              WRQ, MQTT PUBLISH, or SFTP/SCP write)
 //!         --key <file>         SSH private-key identity for sftp://, scp://
 //!                              public-key auth (repeatable; curl's --key)
-//!     -C, --continue-at <off>  resume at byte <off> (FTP sends REST before STOR)
+//!     -C, --continue-at <off>  resume at byte <off> (FTP REST; '-C -' resumes HTTP)
 //!     -a, --append             FTP/FTPS upload: append (APPE) instead of STOR
 //!     -A, --user-agent <ua>    set User-Agent
 //!     -e, --referer <ref>      set Referer
@@ -129,9 +129,11 @@ struct Args {
     /// default `Content-Type: application/octet-stream`.
     upload_file: Option<String>,
     /// `-C`/`--continue-at <offset>` — resume a transfer at byte `offset`.
-    /// For FTP uploads this sends `REST <offset>` before `STOR`. The curl
-    /// "automatic" form `-C -` is not supported and is rejected at parse time.
+    /// For FTP uploads this sends `REST <offset>` before `STOR`.
     continue_at: Option<u64>,
+    /// `-C -` — automatic resume: for an HTTP download, continue an existing
+    /// `<name>.rsurlpart` via a Range request and finalise it on completion.
+    continue_resume: bool,
     /// `-a`/`--append` — for FTP/FTPS uploads (`-T`), append to the remote file
     /// via `APPE` instead of replacing it via `STOR`. A no-op for non-FTP
     /// uploads, matching curl (whose `-a` only applies to FTP/FTPS/SFTP).
@@ -2286,15 +2288,13 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "-C" | "--continue-at" => {
                 let v = next_val(&mut it, arg)?;
                 if v == "-" {
-                    return Err(
-                        "-C -: automatic resume is not supported; pass an explicit byte offset"
-                            .into(),
+                    a.continue_resume = true;
+                } else {
+                    a.continue_at = Some(
+                        v.parse::<u64>()
+                            .map_err(|_| format!("-C/--continue-at: not a byte offset: {v:?}"))?,
                     );
                 }
-                a.continue_at = Some(
-                    v.parse::<u64>()
-                        .map_err(|_| format!("-C/--continue-at: not a byte offset: {v:?}"))?,
-                );
             }
             "-a" | "--append" => a.append = true,
             "--key" => {
@@ -3553,6 +3553,7 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
         progress: args.progress_bar,
         silent: args.silent,
         last_tick: now,
+        resume: None,
     };
     let result = client.transfer_url_to(url, &mut sink);
     let time_total = now.elapsed();
@@ -3972,6 +3973,77 @@ struct DownloadSink<'a> {
     progress: bool,
     silent: bool,
     last_tick: std::time::Instant,
+    /// `-C -` resume: periodically persist the partial state to `.rsurlpart`.
+    resume: Option<ResumeCtx>,
+}
+
+/// State for periodically rewriting a `.rsurlpart` trailer during a resumable
+/// HTTP download.
+struct ResumeCtx {
+    part: std::path::PathBuf,
+    total: u64,
+    /// Pre-encoded validator tail (url/etag/last-modified); the trailer meta is
+    /// `total + done` followed by this.
+    validators: Vec<u8>,
+    last_save: std::time::Instant,
+}
+
+/// Build the `http-stream` resume meta block: `[total][done] + validators`.
+fn http_resume_meta(total: u64, done: u64, validators: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16 + validators.len());
+    m.extend_from_slice(&total.to_le_bytes());
+    m.extend_from_slice(&done.to_le_bytes());
+    m.extend_from_slice(validators);
+    m
+}
+
+/// Encode the resume validators (final URL, ETag, Last-Modified) as
+/// length-prefixed strings.
+fn http_resume_validators(url: &str, etag: &str, last_modified: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    for s in [url, etag, last_modified] {
+        let b = s.as_bytes();
+        v.extend_from_slice(&(b.len() as u16).to_le_bytes());
+        v.extend_from_slice(b);
+    }
+    v
+}
+
+/// Parse an `http-stream` meta block, returning `done` only if the stored
+/// total/url/etag match the current resource (otherwise the partial is stale).
+fn http_resume_parse(meta: &[u8], total: u64, url: &str, etag: &str) -> Option<u64> {
+    if meta.len() < 16 {
+        return None;
+    }
+    let stored_total = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+    let done = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+    if stored_total != total {
+        return None;
+    }
+    let mut p = &meta[16..];
+    let mut take = || -> Option<String> {
+        if p.len() < 2 {
+            return None;
+        }
+        let n = u16::from_le_bytes([p[0], p[1]]) as usize;
+        if p.len() < 2 + n {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&p[2..2 + n]).into_owned();
+        p = &p[2 + n..];
+        Some(s)
+    };
+    let stored_url = take()?;
+    let stored_etag = take()?;
+    let _stored_lm = take()?;
+    if stored_url != url {
+        return None;
+    }
+    // If both sides have an ETag, they must agree (resource unchanged).
+    if !etag.is_empty() && !stored_etag.is_empty() && etag != stored_etag {
+        return None;
+    }
+    Some(done)
 }
 
 impl Write for DownloadSink<'_> {
@@ -4005,6 +4077,20 @@ impl Write for DownloadSink<'_> {
             eprint!("\rrsurl: {} bytes received", self.written);
             let _ = io::stderr().flush();
             self.last_tick = std::time::Instant::now();
+        }
+        // Persist resume state about once a second (bounded I/O).
+        let written = self.written;
+        if let Some(rc) = &mut self.resume {
+            if rc.last_save.elapsed() >= std::time::Duration::from_secs(1) {
+                let meta = http_resume_meta(rc.total, written, &rc.validators);
+                let _ = rsurl::resume::write_state(
+                    &rc.part,
+                    rc.total,
+                    rsurl::resume::Kind::HttpStream,
+                    &meta,
+                );
+                rc.last_save = std::time::Instant::now();
+            }
         }
         Ok(buf.len())
     }
@@ -4697,11 +4783,207 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
     }
 }
 
+/// Resolve `-Y` (minimum bytes/sec) and `-y` (window seconds). Per curl, `-y`
+/// alone implies `-Y 1` and `-Y` alone implies `-y 30`; neither disables the
+/// low-speed check.
+fn low_speed_params(args: &Args) -> (Option<u64>, u64) {
+    let lim = args
+        .speed_limit
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok());
+    let tim = args
+        .speed_time
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok());
+    match (lim, tim) {
+        (None, None) => (None, 30),
+        (l, t) => (Some(l.unwrap_or(1)), t.unwrap_or(30)),
+    }
+}
+
+/// `-C -` resume for a single HTTP stream. Probes with HEAD; if the server
+/// reports a size and `Accept-Ranges: bytes`, downloads into `<name>.rsurlpart`
+/// (continuing any valid prior partial via `Range: bytes=done-`), periodically
+/// persisting the resume trailer, and finalises (truncate + rename) on success.
+/// Returns `Some(exit_code)` when it handled the transfer, or `None` to fall
+/// back to a normal in-place download.
+fn http_resume(
+    req: &rsurl::Request,
+    url: &Url,
+    args: &Args,
+    name: &str,
+    mut jar: Option<&mut CookieJar>,
+) -> Option<u8> {
+    // HEAD probe for size + range support + validators.
+    let probe = req.clone().method("HEAD").send().ok()?;
+    if probe.status >= 400 {
+        return None;
+    }
+    let total = probe
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<u64>().ok())?;
+    if !probe
+        .header("accept-ranges")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
+    {
+        return None;
+    }
+    if let Some(max) = args.max_filesize {
+        if total > max {
+            if show_errors(args) {
+                eprintln!("rsurl: Maximum file size exceeded");
+            }
+            return Some(63);
+        }
+    }
+    let etag = probe.header("etag").unwrap_or("").to_string();
+    let last_mod = probe.header("last-modified").unwrap_or("").to_string();
+    // A stable per-resource validator string (deterministic across runs).
+    let url_s = format!("{}://{}:{}{}", url.scheme, url.host, url.port, url.path);
+
+    let final_path = resolve_output_path(name, args);
+    if args.create_dirs {
+        if let Some(p) = final_path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+    } else if let Some(dir) = &args.output_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let part = rsurl::resume::part_path(&final_path);
+
+    // Resume offset from any matching prior partial.
+    let mut done = match rsurl::resume::read_state(&part) {
+        Ok(Some(st)) if st.kind == rsurl::resume::Kind::HttpStream => {
+            http_resume_parse(&st.meta, total, &url_s, &etag).unwrap_or(0)
+        }
+        _ => 0,
+    };
+    if done > total {
+        done = 0;
+    }
+    if done == total {
+        if let Err(e) = rsurl::resume::finalize(&part, &final_path, total) {
+            if show_errors(args) {
+                eprintln!("rsurl: finalize {}: {e}", final_path.display());
+            }
+            return Some(23);
+        }
+        return Some(0);
+    }
+
+    let (speed_limit, speed_time) = low_speed_params(args);
+    let validators = http_resume_validators(&url_s, &etag, &last_mod);
+
+    // At most two attempts: if a ranged GET comes back 200 (range ignored), we
+    // restart once from offset 0.
+    for _ in 0..2 {
+        let from = done;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&part)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: open {}: {e}", part.display());
+                }
+                return Some(23);
+            }
+        };
+        // Size the data region to `total` (drops any stale trailer), then append
+        // from `from`.
+        if file.set_len(total).is_err() {
+            return None; // not a seekable regular file — fall back
+        }
+        let mut f = file;
+        if f.seek(io::SeekFrom::Start(from)).is_err() {
+            return None;
+        }
+
+        let now = std::time::Instant::now();
+        let mut sink = DownloadSink {
+            inner: Box::new(f),
+            written: from,
+            max: args.max_filesize,
+            rate: args.limit_rate.as_deref().and_then(parse_rate),
+            speed_limit,
+            speed_time,
+            started: now,
+            progress: args.progress_bar,
+            silent: args.silent,
+            last_tick: now,
+            resume: Some(ResumeCtx {
+                part: part.clone(),
+                total,
+                validators: validators.clone(),
+                last_save: now,
+            }),
+        };
+        let mut greq = req.clone();
+        if from > 0 {
+            greq = greq.header("Range", &format!("bytes={from}-"));
+        }
+        let result = if args.verbose {
+            let mut err = io::stderr().lock();
+            greq.send_download(&mut sink, jar.as_deref_mut(), &mut err)
+        } else {
+            greq.send_download(&mut sink, jar.as_deref_mut(), &mut io::sink())
+        };
+        if args.progress_bar && !args.silent {
+            eprintln!();
+        }
+        match result {
+            Ok(resp) => {
+                if from > 0 && resp.status == 200 {
+                    // Server ignored the Range — restart cleanly from scratch.
+                    if args.verbose {
+                        eprintln!("* server ignored Range; restarting from 0");
+                    }
+                    done = 0;
+                    continue;
+                }
+                drop(sink); // close the handle before renaming (Windows)
+                if let Err(e) = rsurl::resume::finalize(&part, &final_path, total) {
+                    if show_errors(args) {
+                        eprintln!("rsurl: finalize {}: {e}", final_path.display());
+                    }
+                    return Some(23);
+                }
+                if args.remote_time {
+                    set_remote_time(&resp, name);
+                }
+                run_write_out(&resp, url, args, now.elapsed(), total);
+                return Some(0);
+            }
+            Err(e) => {
+                // Persist the latest offset so a re-run can resume.
+                let written = sink.written;
+                drop(sink);
+                let meta = http_resume_meta(total, written, &validators);
+                let _ = rsurl::resume::write_state(
+                    &part,
+                    total,
+                    rsurl::resume::Kind::HttpStream,
+                    &meta,
+                );
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                return Some(transfer_exit_code(&e));
+            }
+        }
+    }
+    Some(0)
+}
+
 fn run_http_download(
     req: rsurl::Request,
     url: &Url,
     args: &Args,
-    jar: Option<&mut CookieJar>,
+    mut jar: Option<&mut CookieJar>,
 ) -> u8 {
     let name = if args.remote_name {
         match remote_name_from_url(url) {
@@ -4716,6 +4998,14 @@ fn run_http_download(
     } else {
         args.output.clone().unwrap_or_default()
     };
+    // `-C -`: resume into <name>.rsurlpart via a Range request when the server
+    // supports it. Returns None (fall through to a normal download) if the
+    // target isn't a concrete file or the server isn't range-capable.
+    if args.continue_resume && !name.is_empty() && name != "-" {
+        if let Some(code) = http_resume(&req, url, args, &name, jar.as_deref_mut()) {
+            return code;
+        }
+    }
     let (file, out_path) = match create_output_file_tracked(&name, args) {
         Ok(pair) => pair,
         Err(e) => {
@@ -4725,22 +5015,7 @@ fn run_http_download(
             return 23;
         }
     };
-    // -Y bytes/sec minimum; -y window seconds. curl: -y alone implies -Y 1,
-    // -Y alone implies -y 30. Neither → no low-speed check.
-    let (speed_limit, speed_time) = {
-        let lim = args
-            .speed_limit
-            .as_deref()
-            .and_then(|s| s.parse::<u64>().ok());
-        let tim = args
-            .speed_time
-            .as_deref()
-            .and_then(|s| s.parse::<u64>().ok());
-        match (lim, tim) {
-            (None, None) => (None, 30),
-            (l, t) => (Some(l.unwrap_or(1)), t.unwrap_or(30)),
-        }
-    };
+    let (speed_limit, speed_time) = low_speed_params(args);
     let now = std::time::Instant::now();
     let mut sink = DownloadSink {
         inner: Box::new(file),
@@ -4753,6 +5028,7 @@ fn run_http_download(
         progress: args.progress_bar,
         silent: args.silent,
         last_tick: now,
+        resume: None,
     };
     let result = if args.verbose {
         let mut err = io::stderr().lock();
@@ -5025,7 +5301,8 @@ Options:
                            public-key auth (repeatable). Without it, the
                            default ~/.ssh/id_ed25519|id_ecdsa|id_rsa are tried
   -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
-                           the automatic form '-C -' is not supported
+                           '-C -' auto-resumes an HTTP download via its
+                           <name>.rsurlpart (needs server Range support)
   -a, --append             FTP/FTPS upload: append (APPE) instead of replacing
                            (STOR). No-op for other protocols; overrides -C
   -A, --user-agent <ua>    set User-Agent

@@ -1157,10 +1157,11 @@ fn cli_append_with_continue_at_prefers_appe() {
     );
 }
 
-/// `-C -` (curl's automatic-resume form) is rejected at parse time with a
-/// clear usage error, since automatic resume isn't implemented.
+/// `-C -` (curl's automatic-resume form) is accepted. It drives HTTP-download
+/// resume; for an FTP upload it is a no-op, so the transfer simply proceeds and
+/// fails on the unreachable host rather than producing a usage error.
 #[test]
-fn cli_continue_at_dash_is_rejected() {
+fn cli_continue_at_dash_is_accepted() {
     use std::process::Command;
     let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
         .args([
@@ -1173,7 +1174,10 @@ fn cli_continue_at_dash_is_rejected() {
         .output()
         .expect("spawn rsurl");
     let code = out.status.code();
-    assert_eq!(code, Some(2), "expected usage error exit 2, got {code:?}");
+    assert!(
+        matches!(code, Some(6) | Some(7)),
+        "expected a transfer error (6/7), not a usage error, got {code:?}"
+    );
 }
 
 /// Combining `-F` and `-d` (or `-T` and either) must be rejected with a
