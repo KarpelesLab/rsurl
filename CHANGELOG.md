@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.6...rsurl-v0.0.7) - 2026-06-14
+
+### Other
+
+- don't glob-expand local .torrent paths (fixes Windows CI)
+- --recheck re-hashes on-disk data on resume
+- resumable parallel download with -C - --parallel-segments
+- resumable single-stream downloads with -C -
+- resume downloads from saved piece state
+- shared partial-file format for resumable downloads
+- gitignore downloaded media in repo root
+- endgame mode + detach workers so completion never blocks
+- verbosity levels for torrent diagnostics
+- per-peer diagnostics under -v
+- bound block-request pipeline per piece
+- probe peers concurrently for magnet metadata
+- fix seeding on macOS/BSD/Windows (blocking accepted sockets)
+- inbound seeding with --seed / --share-ratio
+- DHT peer discovery (BEP 5)
+- magnet metadata download (BEP 9 / BEP 10)
+- concurrent swarm engine + CLI download
+- phase 3 — peer wire protocol, picker, storage, verified download
+- phase 2 — HTTP and UDP tracker clients
+- phase 1 — bencode, .torrent metainfo, magnet (default feature)
+- default --parallel-segments to 4 + live progress display
+- add --parallel-segments for multi-connection single-file downloads
+- fix broken intra-doc link in Response.final_url doc
+- implement the multi interface on rsurl::Multi
+- implement the easy interface
+- optional libcurl-ABI drop-in crate (skeleton)
+- add Response.final_url (effective URL after redirects)
+- add a native concurrent multi-transfer driver (rsurl::Multi)
+- add a command-line client (curl never built one)
+- close lib feature gaps vs curl (control frames, raw mode, close code)
+- drop intra-doc link to the private ctl field (rustdoc warning)
+- document the persistent WebSocket entry point in the module header
+- add persistent WebSocket client API
+- honor --pinnedpubkey and SAN-required check over h3 (purecrypto#31)
+- detect TLS truncation on the purecrypto backend (TLS-1, purecrypto#30)
+- reject truncated EOF-delimited bodies over TLS (TLS-1)
+- POP3 STLS (RFC 2595) + --ssl-reqd require-TLS enforcement
+- add --ssl-reqd require-TLS mode for SMTP/IMAP
+- honor --capath/--crlfile/--ciphers over h3; guard --pinnedpubkey
+- fold effective dial target into HTTP/1.1 pool Key (HTTP1-5)
+- TLS-4 reject SAN-less server leaf on the purecrypto backend
+- TLS-5 zeroize client private-key material on drop
+- reject forbidden header octets (H23-2)
+- reject forbidden header octets (H23-1)
+- validate UTF-8 on reassembled TEXT messages (websocket-utf8)
+- fail closed on unknown algorithm; reject quoted-string breakout (AUTH-2/digest-algorithm)
+- write jar 0600 owner-only, atomically (AUTH-1)
+- validate SOCKS5 UDP relay source (NET-2)
+- bound per-line read in LineReader::read_line (MAIL-2)
+- bound per-line read in read_reply (MAIL-1)
+- --crlfile honours all PEM CRL blocks, not just the first (TLS-3)
+- make TlsOpts::default() verify certificates (TLS-2)
+- fix four robustness bugs (HTTP1-1..HTTP1-4)
+- terminate authority at first of / ? # (NET-1 authority confusion / SSRF)
+
 ## [0.0.6](https://github.com/KarpelesLab/rsurl/compare/v0.0.5...v0.0.6) - 2026-06-09
 
 ### Other
