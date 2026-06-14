@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.8...rsurl-v0.0.9) - 2026-06-14
+
+### Other
+
+- canonical forward-slash paths in metadata/selection (Windows)
+- disable URL globbing for all torrent-routing flags (Windows)
+- metadata inspection + selective/concatenated downloads
+
 ## [0.0.8](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.7...rsurl-v0.0.8) - 2026-06-14
 
 ### Other
