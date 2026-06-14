@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.7...rsurl-v0.0.8) - 2026-06-14
+
+### Other
+
+- fix rustdoc private-intra-doc-link after making the module public
+- HTTP/2 PRIORITY weights + runtime pool-size config
+- TlsInfo + per-phase Timing on h2, h3, and pooled HTTPS
+- timing, DNS/proxy resolvers, partitioning, WS subprotocols, priorities
+- caller-owned cert-validation hook + handshake introspection
+- SameSite/CHIPS surface + jar enumeration; opt-out redirect cookies
+- streaming callbacks, cancellation, and strict header control
+
 ## [0.0.7](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.6...rsurl-v0.0.7) - 2026-06-14
 
 ### Other
