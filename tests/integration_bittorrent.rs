@@ -13,7 +13,7 @@ use purecrypto::hash::{Digest, Sha1};
 
 use rsurl::bittorrent::bencode::{encode, parse, Value};
 use rsurl::bittorrent::peer::{self, Handshake, Message};
-use rsurl::bittorrent::{download, Bitfield, Metainfo, TorrentOptions};
+use rsurl::bittorrent::{download, file_layout, Bitfield, Metainfo, Storage, TorrentOptions};
 
 /// ut_metadata piece size (BEP 9).
 const METADATA_PIECE: usize = 16 * 1024;
@@ -303,6 +303,194 @@ fn endgame_completes_despite_a_stalling_peer() {
         "endgame output mismatch"
     );
     let _ = std::fs::remove_file(&out);
+}
+
+/// A seeder that only has (advertises and serves) pieces `[have_from, end)`.
+fn start_partial_seeder(data: Vec<u8>, meta: Metainfo, have_from: usize) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let piece_len = meta.piece_length as usize;
+    let num_pieces = meta.num_pieces();
+    let info_hash = meta.info_hash;
+
+    thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let hs = match peer::read_handshake(&mut s) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        if hs.info_hash != info_hash {
+            return;
+        }
+        let _ = peer::write_handshake(&mut s, &Handshake::new(info_hash, [0x55; 20]));
+        let mut bf = Bitfield::new(num_pieces);
+        for i in have_from..num_pieces {
+            bf.set(i);
+        }
+        let _ = peer::write_message(&mut s, &Message::Bitfield(bf.as_bytes().to_vec()));
+        loop {
+            let msg = match peer::read_message(&mut s) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            match msg {
+                Message::Interested => {
+                    let _ = peer::write_message(&mut s, &Message::Unchoke);
+                }
+                Message::Request {
+                    index,
+                    begin,
+                    length,
+                } if (index as usize) >= have_from => {
+                    let off = index as usize * piece_len + begin as usize;
+                    let end = (off + length as usize).min(data.len());
+                    if off <= end {
+                        let _ = peer::write_message(
+                            &mut s,
+                            &Message::Piece {
+                                index,
+                                begin,
+                                block: data[off..end].to_vec(),
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    port
+}
+
+/// Resume a single-file torrent: pre-seed the first half of the pieces into the
+/// `.rsurlpart` (with a valid resume trailer), point the swarm at a peer that
+/// only has the *second* half, and require the download to finish — which is
+/// only possible if the restored pieces are honoured. Also checks the partial
+/// is finalised (renamed) away.
+#[test]
+fn resumes_single_file_from_partial() {
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let meta = make_torrent(&data, 4096, "resume.bin");
+    let piece_len = meta.piece_length as usize;
+    let np = meta.num_pieces();
+    let half = np / 2;
+    assert!(half >= 2 && half < np);
+
+    let out = std::env::temp_dir().join(format!("rsurl_resume_{}.bin", std::process::id()));
+    let part = std::path::PathBuf::from(format!("{}.rsurlpart", out.display()));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&part);
+
+    // Pre-write the first half into the .rsurlpart and stamp the resume trailer.
+    {
+        let mut st = Storage::create(
+            vec![(part.clone(), data.len() as u64)],
+            meta.piece_length,
+            meta.pieces.clone(),
+        )
+        .unwrap();
+        let mut bits = Bitfield::new(np);
+        for i in 0..half {
+            let off = i * piece_len;
+            let end = (off + piece_len).min(data.len());
+            assert!(st.write_piece(i, &data[off..end]).unwrap());
+            bits.set(i);
+        }
+        let mut metab = meta.info_hash.to_vec();
+        metab.extend_from_slice(bits.as_bytes());
+        rsurl::resume::write_state(
+            &part,
+            data.len() as u64,
+            rsurl::resume::Kind::Torrent,
+            &metab,
+        )
+        .unwrap();
+    }
+
+    // Peer has ONLY the second half — completion proves the first half resumed.
+    let port = start_partial_seeder(data.clone(), meta.clone(), half);
+    let peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+
+    let stats = download(
+        &meta,
+        vec![(out.clone(), data.len() as u64)],
+        &peers,
+        &TorrentOptions::default(),
+        &mut |_| {},
+    )
+    .expect("resume download");
+
+    assert_eq!(stats.downloaded, data.len() as u64);
+    assert_eq!(std::fs::read(&out).unwrap(), data, "resumed file mismatch");
+    assert!(!part.exists(), ".rsurlpart should be finalized away");
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Build a multi-file torrent (concatenated linear data + parsed Metainfo).
+fn make_multi_torrent(files: &[(&str, usize)], piece_len: usize, dir: &str) -> (Vec<u8>, Metainfo) {
+    let total: usize = files.iter().map(|(_, n)| *n).sum();
+    let data: Vec<u8> = (0..total as u32)
+        .map(|i| (i.wrapping_mul(17) % 251) as u8)
+        .collect();
+    let mut pieces = Vec::new();
+    for chunk in data.chunks(piece_len) {
+        pieces.extend_from_slice(&sha1(chunk));
+    }
+    let file_list: Vec<Value> = files
+        .iter()
+        .map(|(name, len)| {
+            let mut f = BTreeMap::new();
+            f.insert(b"length".to_vec(), Value::Int(*len as i64));
+            f.insert(
+                b"path".to_vec(),
+                Value::List(vec![Value::Bytes(name.as_bytes().to_vec())]),
+            );
+            Value::Dict(f)
+        })
+        .collect();
+    let mut info = BTreeMap::new();
+    info.insert(b"name".to_vec(), Value::Bytes(dir.as_bytes().to_vec()));
+    info.insert(b"piece length".to_vec(), Value::Int(piece_len as i64));
+    info.insert(b"files".to_vec(), Value::List(file_list));
+    info.insert(b"pieces".to_vec(), Value::Bytes(pieces));
+    let mut root = BTreeMap::new();
+    root.insert(b"info".to_vec(), Value::Dict(info));
+    let meta = Metainfo::from_bytes(&encode(&Value::Dict(root))).unwrap();
+    (data, meta)
+}
+
+/// A completed multi-file torrent writes its files in place and leaves no
+/// `<topdir>/.rsurlpart` sidecar behind.
+#[test]
+fn multi_file_completes_and_removes_sidecar() {
+    let (data, meta) = make_multi_torrent(&[("a.bin", 12_000), ("b.bin", 8_000)], 4096, "pack");
+    let port = start_seeder(data.clone(), meta.clone());
+    let peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+
+    let base = std::env::temp_dir().join(format!("rsurl_multi_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let layout = file_layout(&meta, &base);
+
+    download(
+        &meta,
+        layout,
+        &peers,
+        &TorrentOptions::default(),
+        &mut |_| {},
+    )
+    .expect("download");
+
+    let top = base.join("pack");
+    assert_eq!(std::fs::read(top.join("a.bin")).unwrap(), &data[..12_000]);
+    assert_eq!(std::fs::read(top.join("b.bin")).unwrap(), &data[12_000..]);
+    assert!(
+        !top.join(".rsurlpart").exists(),
+        "sidecar should be removed"
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Build the raw bencoded `info` dictionary for a single-file torrent.

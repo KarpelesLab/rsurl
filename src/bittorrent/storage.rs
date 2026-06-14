@@ -90,6 +90,18 @@ impl Storage {
         &self.have
     }
 
+    /// Mark pieces already present on disk as complete, from a resume bitfield.
+    /// Bits outside the piece range are ignored. Trusted (no re-hash): pieces
+    /// were verified before being recorded, and files are opened without
+    /// truncation, so the on-disk data is intact.
+    pub fn restore_have(&mut self, bits: &Bitfield) {
+        for i in 0..self.num_pieces() {
+            if bits.has(i) {
+                self.have.set(i);
+            }
+        }
+    }
+
     /// Bytes of verified, on-disk data.
     pub fn bytes_complete(&self) -> u64 {
         (0..self.num_pieces())
@@ -234,5 +246,20 @@ mod tests {
 
         let _ = std::fs::remove_file(&f0);
         let _ = std::fs::remove_file(&f1);
+    }
+
+    #[test]
+    fn restore_have_marks_pieces() {
+        let f = tmp("restore.bin");
+        let _ = std::fs::remove_file(&f);
+        let mut st = Storage::create(vec![(f.clone(), 12)], 4, vec![[0u8; 20]; 3]).unwrap();
+        assert!(!st.has(0) && !st.is_complete());
+        let mut bits = Bitfield::new(3);
+        bits.set(0);
+        bits.set(2);
+        st.restore_have(&bits);
+        assert!(st.has(0) && st.has(2) && !st.has(1));
+        assert!(!st.is_complete());
+        let _ = std::fs::remove_file(&f);
     }
 }

@@ -62,6 +62,7 @@ pub fn run(
     peer_id: [u8; 20],
     opts: &TorrentOptions,
     progress: &mut dyn FnMut(&Progress),
+    save: &mut dyn FnMut(&Bitfield),
 ) -> Result<Stats> {
     if storage.is_complete() {
         return Ok(Stats {
@@ -123,6 +124,8 @@ pub fn run(
                         num_pieces,
                     );
                 }
+                // Persist resume state periodically (bounded I/O).
+                save(storage.bitfield());
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break, // all peers gone
