@@ -2066,6 +2066,17 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // no status-gated body suppression. This is the path that enforces
     // --limit-rate, -# progress, and an early --max-filesize abort.
     if streams_to_file(args) {
+        // `-C -`: resumable paths. A resumable parallel download is used when
+        // segments are requested and there's no cookie jar; otherwise (or if the
+        // server isn't range-capable) fall through to single-stream resume.
+        if args.continue_resume {
+            if parallel_segments_eligible(args) && jar.is_none() {
+                if let Some(code) = run_parallel_resume(&req, &parsed_url, args) {
+                    return code;
+                }
+            }
+            return run_http_download(req, &parsed_url, args, jar);
+        }
         if parallel_segments_eligible(args) {
             return run_parallel_download(req, &parsed_url, args, jar);
         }
@@ -4231,6 +4242,256 @@ fn render_parallel(
     let _ = err.flush();
 }
 
+/// Size of a resumable parallel download's fixed chunk (the bitmap unit).
+const RESUME_CHUNK: u64 = 4 * 1024 * 1024;
+
+fn bit_get(map: &[u8], i: usize) -> bool {
+    map[i / 8] & (1 << (i % 8)) != 0
+}
+fn bit_set(map: &mut [u8], i: usize) {
+    map[i / 8] |= 1 << (i % 8);
+}
+
+/// Encode an `http-ranged` resume meta block: `[chunk_size:u32][total:u64]`,
+/// the validator tail, then the chunk bitmap.
+fn http_ranged_meta(chunk: u32, total: u64, validators: &[u8], bitmap: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(12 + validators.len() + bitmap.len());
+    m.extend_from_slice(&chunk.to_le_bytes());
+    m.extend_from_slice(&total.to_le_bytes());
+    m.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+    m.extend_from_slice(validators);
+    m.extend_from_slice(bitmap);
+    m
+}
+
+/// Parse an `http-ranged` meta block, returning the chunk bitmap only if the
+/// chunk size / total / url / etag still match the current resource.
+fn http_ranged_parse(
+    meta: &[u8],
+    chunk: u32,
+    total: u64,
+    url: &str,
+    etag: &str,
+) -> Option<Vec<u8>> {
+    if meta.len() < 16 {
+        return None;
+    }
+    if u32::from_le_bytes(meta[0..4].try_into().unwrap()) != chunk {
+        return None;
+    }
+    if u64::from_le_bytes(meta[4..12].try_into().unwrap()) != total {
+        return None;
+    }
+    let vlen = u32::from_le_bytes(meta[12..16].try_into().unwrap()) as usize;
+    let rest = meta.get(16..)?;
+    let validators = rest.get(..vlen)?;
+    let bitmap = rest.get(vlen..)?.to_vec();
+    if !validators_match(validators, url, etag) {
+        return None;
+    }
+    Some(bitmap)
+}
+
+/// Compare stored validators against the current url/etag, ignoring the
+/// (possibly differing) Last-Modified field.
+fn validators_match(stored: &[u8], url: &str, etag: &str) -> bool {
+    // Decode the three length-prefixed strings.
+    let mut p = stored;
+    let mut take = || -> Option<String> {
+        if p.len() < 2 {
+            return None;
+        }
+        let n = u16::from_le_bytes([p[0], p[1]]) as usize;
+        let s = String::from_utf8_lossy(p.get(2..2 + n)?).into_owned();
+        p = &p[2 + n..];
+        Some(s)
+    };
+    let (Some(su), Some(se), Some(_lm)) = (take(), take(), take()) else {
+        return false;
+    };
+    su == url && (etag.is_empty() || se.is_empty() || se == etag)
+}
+
+/// `-C -` resumable parallel download: split the file into fixed chunks, fetch
+/// the not-yet-done ones concurrently via Range requests into `<name>.rsurlpart`
+/// (persisting a chunk bitmap), and finalise on completion. Returns `None` to
+/// fall back to single-stream resume (server not range-capable / not seekable /
+/// no concrete output file).
+fn run_parallel_resume(req: &rsurl::Request, url: &Url, args: &Args) -> Option<u8> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Mutex;
+
+    let name = if args.remote_name {
+        remote_name_from_url(url).ok()?
+    } else {
+        args.output.clone().unwrap_or_default()
+    };
+    if name.is_empty() || name == "-" {
+        return None;
+    }
+
+    let probe = req.clone().method("HEAD").send().ok()?;
+    if probe.status >= 400 {
+        return None;
+    }
+    let total = probe
+        .header("content-length")
+        .and_then(|v| v.trim().parse::<u64>().ok())?;
+    if total == 0
+        || !probe
+            .header("accept-ranges")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
+    {
+        return None;
+    }
+    if let Some(max) = args.max_filesize {
+        if total > max {
+            if show_errors(args) {
+                eprintln!("rsurl: Maximum file size exceeded");
+            }
+            return Some(63);
+        }
+    }
+    let etag = probe.header("etag").unwrap_or("").to_string();
+    let last_mod = probe.header("last-modified").unwrap_or("").to_string();
+    let url_s = format!("{}://{}:{}{}", url.scheme, url.host, url.port, url.path);
+
+    let final_path = resolve_output_path(&name, args);
+    if args.create_dirs {
+        if let Some(p) = final_path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+    } else if let Some(dir) = &args.output_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let part = rsurl::resume::part_path(&final_path);
+
+    let num_chunks = total.div_ceil(RESUME_CHUNK) as usize;
+    let map_len = num_chunks.div_ceil(8);
+    let validators = http_resume_validators(&url_s, &etag, &last_mod);
+    let mut bitmap = vec![0u8; map_len];
+    if let Ok(Some(st)) = rsurl::resume::read_state(&part) {
+        if st.kind == rsurl::resume::Kind::HttpRanged {
+            if let Some(bm) = http_ranged_parse(&st.meta, RESUME_CHUNK as u32, total, &url_s, &etag)
+            {
+                if bm.len() == map_len {
+                    bitmap = bm;
+                }
+            }
+        }
+    }
+
+    // Size the data region and stamp the initial state.
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&part)
+    {
+        Ok(f) => {
+            if f.set_len(total).is_err() {
+                return None; // not a seekable regular file
+            }
+        }
+        Err(_) => return None,
+    }
+    let _ = rsurl::resume::write_state(
+        &part,
+        total,
+        rsurl::resume::Kind::HttpRanged,
+        &http_ranged_meta(RESUME_CHUNK as u32, total, &validators, &bitmap),
+    );
+
+    let n_workers = args
+        .parallel_segments
+        .unwrap_or(1)
+        .min(MAX_SEGMENTS)
+        .min(num_chunks.max(1));
+    if args.verbose {
+        let done = (0..num_chunks).filter(|&i| bit_get(&bitmap, i)).count();
+        eprintln!(
+            "* resumable parallel: {num_chunks} chunks ({done} already done), {n_workers} workers"
+        );
+    }
+
+    let bitmap = Arc::new(Mutex::new(bitmap));
+    let next = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let req = req.clone();
+        let part = part.clone();
+        let bitmap = Arc::clone(&bitmap);
+        let next = Arc::clone(&next);
+        let failed = Arc::clone(&failed);
+        let validators = validators.clone();
+        handles.push(std::thread::spawn(move || {
+            while !failed.load(Ordering::Relaxed) {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= num_chunks {
+                    break;
+                }
+                if bit_get(&bitmap.lock().unwrap(), i) {
+                    continue; // already have this chunk
+                }
+                let start = i as u64 * RESUME_CHUNK;
+                let end = (start + RESUME_CHUNK).min(total) - 1;
+                let r = req.clone().header("Range", &format!("bytes={start}-{end}"));
+                let mut f = match std::fs::OpenOptions::new().write(true).open(&part) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+                if f.seek(io::SeekFrom::Start(start)).is_err() {
+                    failed.store(true, Ordering::Relaxed);
+                    break;
+                }
+                match r.send_download(&mut f, None, &mut io::sink()) {
+                    Ok(resp) if resp.status == 206 => {}
+                    _ => {
+                        failed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                // Mark done and persist the bitmap (serialised on the lock).
+                let mut bm = bitmap.lock().unwrap();
+                bit_set(&mut bm, i);
+                let _ = rsurl::resume::write_state(
+                    &part,
+                    total,
+                    rsurl::resume::Kind::HttpRanged,
+                    &http_ranged_meta(RESUME_CHUNK as u32, total, &validators, &bm),
+                );
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    if failed.load(Ordering::Relaxed) {
+        if show_errors(args) {
+            eprintln!("rsurl: parallel resume incomplete; re-run to continue");
+        }
+        return Some(18); // CURLE_PARTIAL_FILE
+    }
+
+    drop(bitmap);
+    if let Err(e) = rsurl::resume::finalize(&part, &final_path, total) {
+        if show_errors(args) {
+            eprintln!("rsurl: finalize {}: {e}", final_path.display());
+        }
+        return Some(23);
+    }
+    if args.remote_time {
+        set_remote_time(&probe, &name);
+    }
+    Some(0)
+}
+
 /// Download a single file over `n` concurrent HTTP range requests. Probes with
 /// HEAD; if the server doesn't support ranges, the size is unknown/small, or
 /// anything goes wrong, falls back to the normal single-stream download
@@ -5302,7 +5563,8 @@ Options:
                            default ~/.ssh/id_ed25519|id_ecdsa|id_rsa are tried
   -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
                            '-C -' auto-resumes an HTTP download via its
-                           <name>.rsurlpart (needs server Range support)
+                           <name>.rsurlpart (needs server Range support; with
+                           --parallel-segments, resumes per chunk)
   -a, --append             FTP/FTPS upload: append (APPE) instead of replacing
                            (STOR). No-op for other protocols; overrides -C
   -A, --user-agent <ua>    set User-Agent

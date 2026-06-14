@@ -25,12 +25,17 @@ struct Server {
     range_starts: Arc<Mutex<Vec<u64>>>,
 }
 
-/// Spawn an HTTP server. With `accept_ranges == false` it advertises no range
-/// support and always returns the full body, forcing the client to fall back.
 fn start(accept_ranges: bool) -> Server {
+    start_body(payload(), accept_ranges)
+}
+
+/// Spawn an HTTP server serving `body`. With `accept_ranges == false` it
+/// advertises no range support and always returns the full body, forcing the
+/// client to fall back.
+fn start_body(body: Vec<u8>, accept_ranges: bool) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let body = Arc::new(payload());
+    let body = Arc::new(body);
     let range_starts = Arc::new(Mutex::new(Vec::new()));
     let starts = Arc::clone(&range_starts);
 
@@ -196,6 +201,72 @@ fn fresh_resume_download_completes() {
     assert_eq!(std::fs::read(&out).unwrap(), data);
     assert!(!part.exists());
     let _ = std::fs::remove_file(&out);
+}
+
+/// Resumable parallel download (`-C - --parallel-segments N`): pre-mark the
+/// first 4 MiB chunk done in the bitmap, then require the remaining chunks to be
+/// fetched (never re-requesting the done one) and the file finalised.
+#[test]
+fn parallel_resume_skips_done_chunks() {
+    const CHUNK: u64 = 4 * 1024 * 1024;
+    let big: Vec<u8> = (0..(10 * 1024 * 1024u32))
+        .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+        .collect();
+    let total = big.len() as u64;
+    let srv = start_body(big.clone(), true);
+    let url = format!("http://127.0.0.1:{}/file", srv.port);
+
+    let out = out_path();
+    let part = std::path::PathBuf::from(format!("{}.rsurlpart", out.display()));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&part);
+
+    let num_chunks = total.div_ceil(CHUNK) as usize; // 3
+    assert!(num_chunks >= 3);
+    // Pre-write chunk 0 and a bitmap with bit 0 set.
+    std::fs::write(&part, &big[..CHUNK as usize]).unwrap();
+    let mut bitmap = vec![0u8; num_chunks.div_ceil(8)];
+    bitmap[0] |= 1;
+    let meta = ranged_meta(CHUNK as u32, total, &url, ETAG, "", &bitmap);
+    rsurl::resume::write_state(&part, total, rsurl::resume::Kind::HttpRanged, &meta).unwrap();
+
+    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .args(["-C", "-", "--parallel-segments", "3", "-s", "-o"])
+        .arg(&out)
+        .arg(&url)
+        .status()
+        .expect("spawn rsurl");
+    assert!(status.success(), "rsurl exit: {status}");
+
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        big,
+        "parallel resume mismatch"
+    );
+    assert!(!part.exists(), ".rsurlpart should be finalized away");
+    // Only the missing chunks (offsets CHUNK and 2*CHUNK) were fetched.
+    let mut starts = srv.range_starts.lock().unwrap().clone();
+    starts.sort_unstable();
+    assert_eq!(starts, vec![CHUNK, 2 * CHUNK], "done chunk must be skipped");
+
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Encode an `http-ranged` resume meta block matching the binary's layout.
+fn ranged_meta(chunk: u32, total: u64, url: &str, etag: &str, lm: &str, bitmap: &[u8]) -> Vec<u8> {
+    let mut validators = Vec::new();
+    for s in [url, etag, lm] {
+        let b = s.as_bytes();
+        validators.extend_from_slice(&(b.len() as u16).to_le_bytes());
+        validators.extend_from_slice(b);
+    }
+    let mut m = Vec::new();
+    m.extend_from_slice(&chunk.to_le_bytes());
+    m.extend_from_slice(&total.to_le_bytes());
+    m.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+    m.extend_from_slice(&validators);
+    m.extend_from_slice(bitmap);
+    m
 }
 
 #[test]

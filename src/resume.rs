@@ -256,8 +256,8 @@ mod tests {
     fn rewrite_shrinks_stale_meta() {
         let p = tmp("rewrite");
         let _ = std::fs::remove_file(&p);
-        write_state(&p, 0, Kind::Torrent, &vec![7u8; 100]).unwrap();
-        write_state(&p, 0, Kind::Torrent, &vec![9u8; 4]).unwrap();
+        write_state(&p, 0, Kind::Torrent, &[7u8; 100]).unwrap();
+        write_state(&p, 0, Kind::Torrent, &[9u8; 4]).unwrap();
         let st = read_state(&p).unwrap().expect("state");
         assert_eq!(st.meta, vec![9u8; 4]);
         // File is exactly meta + trailer (no stale tail).
