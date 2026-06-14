@@ -10,6 +10,7 @@
 //! infohash, and magnet parsing.
 
 pub mod bencode;
+pub mod dht;
 pub mod download;
 pub mod engine;
 pub mod magnet;

@@ -283,6 +283,8 @@ struct Args {
     /// `--bt-peer <ip:port>` (repeatable): add a peer directly (besides those
     /// from trackers).
     bt_peers: Vec<String>,
+    /// `--no-dht`: disable the DHT peer-discovery fallback for torrents.
+    no_dht: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -2372,6 +2374,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 )
             }
             "--bt-peer" => a.bt_peers.push(next_val(&mut it, arg)?),
+            "--no-dht" => a.no_dht = true,
             "--tls-max" => {
                 let v = next_val(&mut it, arg)?;
                 a.tls_max = Some(match v.as_str() {
@@ -4379,9 +4382,40 @@ fn bt_announce_peers(
     peers
 }
 
+/// Fall back to the DHT: resolve the built-in bootstrap nodes and run an
+/// iterative `get_peers` lookup for `info_hash`. Returns any peers found.
+#[cfg(feature = "bittorrent")]
+fn bt_dht_peers(info_hash: [u8; 20], verbose: bool) -> Vec<std::net::SocketAddr> {
+    use rsurl::bittorrent::dht;
+    use std::time::Duration;
+
+    let bootstrap = dht::default_bootstrap();
+    if bootstrap.is_empty() {
+        if verbose {
+            eprintln!("* dht: no bootstrap nodes resolved");
+        }
+        return Vec::new();
+    }
+    let node_id = dht::random_node_id();
+    match dht::find_peers(info_hash, &bootstrap, node_id, Duration::from_secs(20)) {
+        Ok(peers) => {
+            if verbose {
+                eprintln!("* dht: found {} peers", peers.len());
+            }
+            peers
+        }
+        Err(e) => {
+            if verbose {
+                eprintln!("* dht: {e}");
+            }
+            Vec::new()
+        }
+    }
+}
+
 /// Download a torrent: load its metainfo (`.torrent` from a path/`file://`/
 /// `http(s)://`, or a `magnet:` link), discover peers (manual `--bt-peer` +
-/// trackers), and fetch + verify the data. Exits when complete (curl-like).
+/// trackers + DHT), and fetch + verify the data. Exits when complete (curl-like).
 #[cfg(feature = "bittorrent")]
 fn run_bittorrent(source: &str, args: &Args) -> u8 {
     use rsurl::bittorrent::{self, metadata, Magnet, Metainfo, TorrentOptions};
@@ -4439,6 +4473,12 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
                 0,
                 args.verbose,
             );
+        }
+        if peers.is_empty() && !args.no_dht {
+            if !args.silent {
+                eprintln!("* no tracker peers; trying DHT");
+            }
+            peers = bt_dht_peers(magnet.info_hash, args.verbose);
         }
         peers.sort();
         peers.dedup();
@@ -4521,7 +4561,8 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         }
     };
 
-    // 3) If we still have no peers, announce the trackers for the download.
+    // 3) If we still have no peers, announce the trackers for the download,
+    //    then fall back to the DHT.
     if peers.is_empty() {
         peers = bt_announce_peers(
             &trackers,
@@ -4532,11 +4573,17 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
             args.verbose,
         );
     }
+    if peers.is_empty() && !args.no_dht {
+        if !args.silent {
+            eprintln!("* no tracker peers; trying DHT");
+        }
+        peers = bt_dht_peers(meta.info_hash, args.verbose);
+    }
     peers.sort();
     peers.dedup();
     if peers.is_empty() {
         if show_errors(args) {
-            eprintln!("rsurl: no peers found (no --bt-peer and trackers returned none)");
+            eprintln!("rsurl: no peers found (trackers and DHT returned none)");
         }
         return 1;
     }
@@ -4995,6 +5042,7 @@ Options:
                            torrent; downloads its data to -o/--output-dir
       --listen-port <p>    port advertised to BitTorrent peers/trackers (6881)
       --bt-peer <ip:port>  add a torrent peer directly (repeatable)
+      --no-dht             disable the DHT peer-discovery fallback
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1
