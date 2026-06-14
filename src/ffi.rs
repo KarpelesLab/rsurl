@@ -442,7 +442,11 @@ pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
                 RsurlCode::Ok
             }
             Err(crate::Error::UnsupportedScheme(_)) => RsurlCode::Unsupported,
-            Err(crate::Error::Io(_)) | Err(crate::Error::UnexpectedEof) => RsurlCode::Network,
+            // A cancelled transfer maps to the network class (the connection was
+            // torn down). The C ABI has no dedicated cancel code in this build.
+            Err(crate::Error::Io(_))
+            | Err(crate::Error::UnexpectedEof)
+            | Err(crate::Error::Cancelled) => RsurlCode::Network,
             Err(crate::Error::BadResponse(_))
             | Err(crate::Error::H2NotNegotiated)
             // `Ssh`, `Decode`, and `Status` cannot arise from this HTTP

@@ -1508,18 +1508,25 @@ impl Http3State {
 }
 
 pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
-    send_inner(req, None, trace)
+    send_inner(req, None, None, trace)
 }
 
 /// Stream an HTTP/3 response body straight to `sink` instead of buffering it.
-/// The returned [`Response`] carries an empty `body`.
-pub fn send_to(req: Request, sink: &mut dyn Write, trace: &mut dyn Write) -> Result<Response> {
-    send_inner(req, Some(sink), trace)
+/// The returned [`Response`] carries an empty `body`. `on_head`, when present,
+/// fires with the response head before any body byte reaches `sink`.
+pub fn send_to(
+    req: Request,
+    sink: &mut dyn Write,
+    on_head: Option<crate::http::HeadObserver<'_>>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
+    send_inner(req, Some(sink), on_head, trace)
 }
 
 fn send_inner(
     req: Request,
     sink: Option<&mut dyn Write>,
+    on_head: Option<crate::http::HeadObserver<'_>>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     if req.url.scheme != "https" {
@@ -1605,6 +1612,7 @@ fn send_inner(
         &req,
         &mut state,
         sink,
+        on_head,
         trace,
     )
 }
@@ -2020,7 +2028,7 @@ fn write_request(
         format!("{}:{}", req.url.host, req.url.port)
     };
     let mut fields: Vec<(String, String)> = Vec::with_capacity(req.headers.len() + 5);
-    fields.push((":method".into(), req.method.clone()));
+    fields.push((":method".into(), crate::http::effective_method(req)));
     fields.push((":scheme".into(), "https".into()));
     fields.push((":authority".into(), host_port));
     fields.push((":path".into(), req.url.path.clone()));
@@ -2050,16 +2058,19 @@ fn write_request(
         }
         fields.push((kl, v.clone()));
     }
-    if !have_ua {
-        fields.push((
-            "user-agent".into(),
-            format!("rsurl/{}", env!("CARGO_PKG_VERSION")),
-        ));
-    }
-    if !have_accept_enc {
-        // Match HTTP/1.1 + HTTP/2 default: we decode these on the way back
-        // in `finalize_response` via `crate::compress`.
-        fields.push(("accept-encoding".into(), "gzip, deflate".into()));
+    // Automatic headers, suppressed in strict mode (caller's set sent verbatim).
+    if !req.strict_headers {
+        if !have_ua {
+            fields.push((
+                "user-agent".into(),
+                format!("rsurl/{}", env!("CARGO_PKG_VERSION")),
+            ));
+        }
+        if !have_accept_enc {
+            // Match HTTP/1.1 + HTTP/2 default: we decode these on the way back
+            // in `finalize_response` via `crate::compress`.
+            fields.push(("accept-encoding".into(), "gzip, deflate".into()));
+        }
     }
     if !req.body.is_empty() {
         fields.push(("content-length".into(), req.body.len().to_string()));
@@ -2076,7 +2087,11 @@ fn write_request(
             .find(|(k, _)| k == ":path")
             .map(|(_, v)| v.as_str())
             .unwrap_or("/");
-        let _ = writeln!(trace, "> {} {path} HTTP/3", req.method);
+        let _ = writeln!(
+            trace,
+            "> {} {path} HTTP/3",
+            crate::http::effective_method(req)
+        );
         if let Some((_, authority)) = fields.iter().find(|(k, _)| k == ":authority") {
             let _ = writeln!(trace, "> Host: {authority}");
         }
@@ -2130,6 +2145,7 @@ fn read_response(
     req: &Request,
     state: &mut Http3State,
     mut sink: Option<&mut dyn Write>,
+    mut on_head: Option<crate::http::HeadObserver<'_>>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let mut streamed_len: u64 = 0;
@@ -2207,6 +2223,14 @@ fn read_response(
                 send_section_ack(conn, sid, state);
             }
             stream_buf.drain(..consumed);
+            // Fire the head callback as soon as the HEADERS block is decoded —
+            // DATA frames are consumed on later passes of this inner loop, so
+            // this runs before the first body byte reaches the sink.
+            if on_head.is_some() {
+                if let Some(fields) = headers.as_ref() {
+                    fire_h3_head(fields, &mut on_head);
+                }
+            }
             if stream_buf.is_empty() {
                 break;
             }
@@ -2335,6 +2359,32 @@ fn send_section_ack(conn: &mut QuicConnection, request_sid: StreamId, state: &Ht
         let mut out = Vec::with_capacity(4);
         encode_section_ack(request_sid.value(), &mut out);
         let _ = write_all(conn, dec, &out);
+    }
+}
+
+/// Invoke `on_head` once with the decoded response head, taking the observer so
+/// it can never fire twice. Interim 1xx responses are skipped (not the final
+/// head). Mirrors the `:status`/pseudo-header handling in [`finalize_response`].
+fn fire_h3_head(fields: &qpack::Fields, on_head: &mut Option<crate::http::HeadObserver<'_>>) {
+    let mut status: Option<u16> = None;
+    let mut hdrs: Vec<(String, String)> = Vec::with_capacity(fields.len());
+    for (k, v) in fields {
+        if k == ":status" {
+            status = v.parse::<u16>().ok();
+        } else if !k.starts_with(':') {
+            hdrs.push((k.clone(), v.clone()));
+        }
+    }
+    let Some(status) = status.filter(|s| *s >= 200) else {
+        return;
+    };
+    if let Some(obs) = on_head.take() {
+        obs(&crate::http::ResponseHead {
+            status,
+            reason: String::new(),
+            version: "HTTP/3".to_string(),
+            headers: hdrs,
+        });
     }
 }
 

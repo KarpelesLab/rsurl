@@ -1984,7 +1984,7 @@ impl<S: Read + Write> Connection<S> {
     /// Drive the connection's read side until `stream_id` reaches a terminal
     /// state, then remove that stream from the map and return it.
     fn drive_until_stream_done(&mut self, stream_id: u32) -> Result<Stream> {
-        self.drive_until_stream_done_to(stream_id, None)
+        self.drive_until_stream_done_to(stream_id, None, None)
     }
 
     /// As [`drive_until_stream_done`], but DATA payloads for `stream_id` are
@@ -1995,6 +1995,7 @@ impl<S: Read + Write> Connection<S> {
         &mut self,
         stream_id: u32,
         mut sink: Option<&mut dyn Write>,
+        mut on_head: Option<crate::http::HeadObserver<'_>>,
     ) -> Result<Stream> {
         loop {
             // Has the stream already completed in an earlier dispatch?
@@ -2003,6 +2004,7 @@ impl<S: Read + Write> Connection<S> {
                     && s.response_headers.is_some()
                     && s.end_stream_recv
                 {
+                    self.fire_head(stream_id, &mut on_head);
                     return Ok(self.streams.remove(&stream_id).unwrap());
                 }
             } else {
@@ -2015,7 +2017,13 @@ impl<S: Read + Write> Connection<S> {
                 Some(w) => Some(&mut **w),
                 None => None,
             };
-            match self.read_and_dispatch(reborrow)? {
+            let outcome = self.read_and_dispatch(reborrow)?;
+            // Fire the head callback the moment the response HEADERS for our
+            // stream are decoded — which, since DATA frames are distinct frames
+            // arriving after HEADERS, is guaranteed before the first body byte
+            // is written to `sink`.
+            self.fire_head(stream_id, &mut on_head);
+            match outcome {
                 DispatchOutcome::Continue => {}
                 DispatchOutcome::Done(done_id) if done_id == stream_id => {
                     return Ok(self.streams.remove(&stream_id).unwrap());
@@ -2024,6 +2032,42 @@ impl<S: Read + Write> Connection<S> {
                     // Some other stream finished; loop continues.
                 }
             }
+        }
+    }
+
+    /// Invoke `on_head` once, the first time `stream_id`'s response headers are
+    /// available. Takes the observer out of the `Option` so it never fires
+    /// twice (e.g. on a trailing HEADERS frame).
+    fn fire_head(&self, stream_id: u32, on_head: &mut Option<crate::http::HeadObserver<'_>>) {
+        if on_head.is_none() {
+            return;
+        }
+        let Some(s) = self.streams.get(&stream_id) else {
+            return;
+        };
+        let Some(headers) = s.response_headers.as_ref() else {
+            return;
+        };
+        let mut status: Option<u16> = None;
+        let mut clean: Vec<(String, String)> = Vec::with_capacity(headers.len());
+        for (k, v) in headers {
+            if k == ":status" {
+                status = v.parse::<u16>().ok();
+            } else if !k.starts_with(':') {
+                clean.push((k.clone(), v.clone()));
+            }
+        }
+        // Interim 1xx responses (e.g. 100/103) are not the final head; wait.
+        let Some(status) = status.filter(|s| *s >= 200) else {
+            return;
+        };
+        if let Some(obs) = on_head.take() {
+            obs(&crate::http::ResponseHead {
+                status,
+                reason: String::new(),
+                version: "HTTP/2".to_string(),
+                headers: clean,
+            });
         }
     }
 
@@ -3155,10 +3199,17 @@ fn global_pool() -> &'static Mutex<PoolInner<TlsStream<TcpStream>>> {
 /// Build a brand-new HTTP/2 connection: TCP → TLS (ALPN=h2) → preface.
 /// Used both by `send()` on a cold path and indirectly by anything that
 /// wants a fresh `Connection` (currently no other call sites).
-fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<Connection<TlsStream<TcpStream>>> {
+type DialedH2 = (
+    Connection<TlsStream<TcpStream>>,
+    Option<crate::cancel::CancelGuard>,
+);
+
+fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
     // Reuse the shared TCP dialer so the `*   Trying ...` / `* Connected to ...`
     // trace lines and the actual socket come from the same code as HTTP/1.1.
-    let tcp = crate::http::tcp_connect(req, trace)?;
+    // The cancel guard (when a token is attached) shuts the socket down on a
+    // concurrent `cancel()`; the caller keeps it alive for the request.
+    let (tcp, cancel_guard) = crate::http::tcp_connect_cancellable(req, trace)?;
     // HTTPS-over-proxy: CONNECT to establish a transparent tunnel before
     // the TLS handshake. h2c (cleartext HTTP/2) over a proxy is rejected
     // higher up in `send()`, so by here we know scheme == "https".
@@ -3179,7 +3230,7 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<Connection<TlsStream<
         return Err(Error::H2NotNegotiated);
     }
     let _ = writeln!(trace, "* using HTTP/2");
-    Connection::new(tls)
+    Ok((Connection::new(tls)?, cancel_guard))
 }
 
 /// True if `req`'s TLS options match what the pool can safely reuse. We
@@ -3273,7 +3324,7 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
     }
 
     // -------- Cold-dial path --------
-    let mut fresh = dial_h2(&req, trace)?;
+    let (mut fresh, _cancel_guard) = dial_h2(&req, trace)?;
     let resp = run_one_request(&mut fresh, &req, trace)?;
     if eligible && fresh.is_usable() {
         let arc = Arc::new(Mutex::new(fresh));
@@ -3440,12 +3491,13 @@ fn run_one_request_to<S: Read + Write>(
     conn: &mut Connection<S>,
     req: &Request,
     sink: &mut dyn Write,
+    on_head: Option<crate::http::HeadObserver<'_>>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let stream_id = conn.open_stream()?;
     trace_request(req, trace);
     conn.send_request_on(stream_id, req)?;
-    let stream = conn.drive_until_stream_done_to(stream_id, Some(sink))?;
+    let stream = conn.drive_until_stream_done_to(stream_id, Some(sink), on_head)?;
     conn.prune_completed_streams();
     build_response_from_stream_streaming(stream, sink, trace)
 }
@@ -3453,15 +3505,20 @@ fn run_one_request_to<S: Read + Write>(
 /// Stream an HTTP/2 response body straight to `sink` instead of buffering it.
 /// Always cold-dials (the streaming path does not pool) and closes the
 /// connection afterward; the returned [`Response`] carries an empty `body`.
-pub fn send_to(req: Request, sink: &mut dyn Write, trace: &mut dyn Write) -> Result<Response> {
+pub fn send_to(
+    req: Request,
+    sink: &mut dyn Write,
+    on_head: Option<crate::http::HeadObserver<'_>>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     if req.url.scheme != "https" {
         return Err(Error::UnsupportedScheme(format!(
             "http/2 over {} not supported",
             req.url.scheme
         )));
     }
-    let mut fresh = dial_h2(&req, trace)?;
-    let resp = run_one_request_to(&mut fresh, &req, sink, trace)?;
+    let (mut fresh, _cancel_guard) = dial_h2(&req, trace)?;
+    let resp = run_one_request_to(&mut fresh, &req, sink, on_head, trace)?;
     let _ = writeln!(trace, "* Connection closed");
     Ok(resp)
 }
@@ -3485,7 +3542,7 @@ fn request_header_fields(req: &Request) -> (RequestPseudo, Vec<(String, String)>
         format!("{}:{}", req.url.host, req.url.port)
     };
     let pseudo = RequestPseudo {
-        method: req.method.clone(),
+        method: crate::http::effective_method(req),
         scheme: req.url.scheme.clone(),
         authority,
         path: req.url.path.clone(),
@@ -3515,25 +3572,29 @@ fn request_header_fields(req: &Request) -> (RequestPseudo, Vec<(String, String)>
         }
         fields.push((lk, v.clone()));
     }
-    if !have_auth {
-        if let Some(creds) = crate::http::effective_basic_auth(req) {
-            fields.push(("authorization".to_string(), format!("Basic {creds}")));
+    // Automatic request headers, suppressed in strict mode (the caller's set is
+    // sent verbatim); see [`crate::Request::strict_headers`].
+    if !req.strict_headers {
+        if !have_auth {
+            if let Some(creds) = crate::http::effective_basic_auth(req) {
+                fields.push(("authorization".to_string(), format!("Basic {creds}")));
+            }
         }
-    }
-    if !have_ua {
-        fields.push((
-            "user-agent".to_string(),
-            concat!("rsurl/", env!("CARGO_PKG_VERSION")).to_string(),
-        ));
-    }
-    if !have_accept {
-        fields.push(("accept".to_string(), "*/*".to_string()));
-    }
-    if !have_accept_enc {
-        // Same default as the HTTP/1.1 writer — rsurl always decodes these
-        // on the way back (see `crate::compress`). The full value is HPACK
-        // static index 16, so this round-trips with minimum bytes on wire.
-        fields.push(("accept-encoding".to_string(), "gzip, deflate".to_string()));
+        if !have_ua {
+            fields.push((
+                "user-agent".to_string(),
+                concat!("rsurl/", env!("CARGO_PKG_VERSION")).to_string(),
+            ));
+        }
+        if !have_accept {
+            fields.push(("accept".to_string(), "*/*".to_string()));
+        }
+        if !have_accept_enc {
+            // Same default as the HTTP/1.1 writer — rsurl always decodes these
+            // on the way back (see `crate::compress`). The full value is HPACK
+            // static index 16, so this round-trips with minimum bytes on wire.
+            fields.push(("accept-encoding".to_string(), "gzip, deflate".to_string()));
+        }
     }
     if !req.body.is_empty() {
         fields.push(("content-length".to_string(), req.body.len().to_string()));
@@ -3641,6 +3702,7 @@ fn clone_error(e: &Error) -> Error {
             code: *code,
             reason: reason.clone(),
         },
+        Error::Cancelled => Error::Cancelled,
     }
 }
 
@@ -3737,7 +3799,7 @@ pub fn send_multiplexed(reqs: Vec<Request>, trace: &mut dyn Write) -> Vec<Result
     }
 
     // Cold-dial path.
-    let mut fresh = match dial_h2(first, trace) {
+    let (mut fresh, _cancel_guard) = match dial_h2(first, trace) {
         Ok(c) => c,
         Err(e) => {
             // The shared handshake failed (e.g. ALPN didn't select h2). Fall

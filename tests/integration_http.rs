@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::{BodyMode, Request as SReq, Response as SResp, TestServer};
 
-use rsurl::{CookieJar, Error, Request};
+use rsurl::{CancelToken, CookieJar, Error, Request, ResponseHead};
 
 /// 200 OK with a Content-Length-framed body — the cheapest possible
 /// round-trip.
@@ -321,6 +321,205 @@ fn deflate_response_is_decoded() {
 
     let resp = Request::get(&server.url("/")).unwrap().send().unwrap();
     assert_eq!(resp.body, plain);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming, cancellation, and strict-header control (Argus browser controls).
+// ---------------------------------------------------------------------------
+
+/// `send_streaming` must deliver the head once, before any body chunk, and the
+/// concatenated chunks must equal the body (requirements #1 and #3).
+#[test]
+fn streaming_delivers_head_before_body() {
+    let server = TestServer::start(|_req: SReq| SResp::ok("hello streaming world"));
+
+    #[derive(PartialEq, Debug)]
+    enum Ev {
+        Head(u16),
+        Chunk,
+    }
+    let events = std::cell::RefCell::new(Vec::new());
+    let body = std::cell::RefCell::new(Vec::new());
+    let resp = Request::get(&server.url("/"))
+        .unwrap()
+        .send_streaming(
+            |h: &ResponseHead| events.borrow_mut().push(Ev::Head(h.status)),
+            |chunk: &[u8]| {
+                events.borrow_mut().push(Ev::Chunk);
+                body.borrow_mut().extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+    let events = events.into_inner();
+    let body = body.into_inner();
+
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.is_empty(), "streamed body must not be buffered");
+    assert_eq!(body, b"hello streaming world");
+    // Head is the first event and appears exactly once, before any chunk.
+    assert_eq!(events[0], Ev::Head(200));
+    assert_eq!(
+        events.iter().filter(|e| matches!(e, Ev::Head(_))).count(),
+        1
+    );
+    let first_chunk = events.iter().position(|e| *e == Ev::Chunk);
+    if let Some(idx) = first_chunk {
+        assert!(idx > 0, "a chunk arrived before the head");
+    }
+}
+
+/// A streamed gzip body is decompressed incrementally: the chunk callback sees
+/// plaintext, and the head still precedes it.
+#[test]
+fn streaming_decodes_gzip_incrementally() {
+    let plain = b"the quick brown fox jumps over the lazy dog".repeat(50);
+    let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&plain).unwrap();
+    let gz_for_server = gz.clone();
+    let server = TestServer::start(move |_req: SReq| {
+        SResp::ok(gz_for_server.clone()).header("Content-Encoding", "gzip")
+    });
+
+    let got_head = std::cell::Cell::new(false);
+    let head_before_body = std::cell::Cell::new(true);
+    let body = std::cell::RefCell::new(Vec::new());
+    Request::get(&server.url("/"))
+        .unwrap()
+        .send_streaming(
+            |_h: &ResponseHead| got_head.set(true),
+            |chunk: &[u8]| {
+                if !got_head.get() {
+                    head_before_body.set(false);
+                }
+                body.borrow_mut().extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert!(got_head.get(), "head callback never fired");
+    assert!(head_before_body.get(), "body chunk arrived before the head");
+    assert_eq!(
+        body.into_inner(),
+        plain,
+        "streamed body should be decoded plaintext"
+    );
+}
+
+/// An error returned from the chunk callback aborts the transfer and surfaces.
+#[test]
+fn streaming_chunk_error_aborts() {
+    let server = TestServer::start(|_req: SReq| SResp::ok("abcdefgh"));
+    let err = Request::get(&server.url("/"))
+        .unwrap()
+        .send_streaming(
+            |_h: &ResponseHead| {},
+            |_chunk: &[u8]| Err(Error::BadResponse("stop".into())),
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::BadResponse(m) if m == "stop"));
+}
+
+/// `strict_headers` suppresses rsurl's automatic User-Agent / Accept /
+/// Accept-Encoding while sending the caller's headers verbatim (requirement #4).
+/// `Host` is still emitted for HTTP/1.1 correctness.
+#[test]
+fn strict_headers_suppress_auto_injection() {
+    let server = TestServer::start(|req: SReq| {
+        let mut body = Vec::new();
+        for (k, v) in &req.headers {
+            body.extend_from_slice(format!("{k}: {v}\n").as_bytes());
+        }
+        SResp::ok(body)
+    });
+    let resp = Request::get(&server.url("/"))
+        .unwrap()
+        .strict_headers(true)
+        .header("X-Custom", "yes")
+        .send()
+        .unwrap();
+    let text = String::from_utf8(resp.body).unwrap().to_ascii_lowercase();
+    assert!(
+        text.contains("x-custom: yes"),
+        "custom header missing: {text}"
+    );
+    assert!(text.contains("host: "), "Host must still be sent: {text}");
+    assert!(
+        !text.contains("user-agent:"),
+        "UA should be suppressed: {text}"
+    );
+    assert!(
+        !text.contains("accept:"),
+        "Accept should be suppressed: {text}"
+    );
+    assert!(
+        !text.contains("accept-encoding:"),
+        "Accept-Encoding should be suppressed: {text}"
+    );
+}
+
+/// `keep_method_case` sends the method verbatim; the default upper-cases it.
+#[test]
+fn keep_method_case_controls_wire_method() {
+    let server = TestServer::start(|req: SReq| SResp::ok(req.method.clone()));
+    let upper = Request::new("query", &server.url("/"))
+        .unwrap()
+        .send()
+        .unwrap();
+    assert_eq!(upper.body, b"QUERY", "default should upper-case the method");
+
+    let server2 = TestServer::start(|req: SReq| SResp::ok(req.method.clone()));
+    let exact = Request::new("query", &server2.url("/"))
+        .unwrap()
+        .keep_method_case(true)
+        .send()
+        .unwrap();
+    assert_eq!(
+        exact.body, b"query",
+        "keep_method_case should preserve case"
+    );
+}
+
+/// Cancelling a token from another thread tears down an in-flight streaming
+/// download and surfaces [`Error::Cancelled`] (requirement #2). The server
+/// sends the head plus a few body bytes, then stalls forever.
+#[test]
+fn cancel_token_aborts_streaming_download() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            // Drain the request head.
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            // Advertise a large body, send a little, then stall.
+            let _ =
+                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nstart-of-body");
+            let _ = sock.flush();
+            // Hold the connection open without finishing the body.
+            std::thread::sleep(Duration::from_secs(5));
+            drop(sock);
+        }
+    });
+
+    let token = CancelToken::new();
+    let canceller = token.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        canceller.cancel();
+    });
+
+    let url = format!("http://{addr}/");
+    let err = Request::get(&url)
+        .unwrap()
+        .cancel_token(token)
+        .send_streaming(|_h: &ResponseHead| {}, |_chunk: &[u8]| Ok(()))
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Cancelled),
+        "expected Error::Cancelled, got {err:?}"
+    );
+    let _ = server.join();
 }
 
 /// Sanity: a request to a closed port surfaces as an I/O error rather

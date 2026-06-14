@@ -153,12 +153,11 @@ fn start_echo_server() -> u16 {
                 return;
             };
             match opcode {
-                0x1 | 0x2 => {
-                    // Echo text/binary straight back.
-                    if s.write_all(&server_frame(opcode, &payload)).is_err() {
-                        return;
-                    }
+                // Echo text/binary straight back.
+                0x1 | 0x2 if s.write_all(&server_frame(opcode, &payload)).is_err() => {
+                    return;
                 }
+                0x1 | 0x2 => {}
                 0x8 => {
                     // Client close → echo a close and finish.
                     let _ = s.write_all(&server_frame(0x8, &[]));

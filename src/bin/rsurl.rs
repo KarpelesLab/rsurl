@@ -2680,6 +2680,9 @@ fn transfer_exit_code(e: &rsurl::Error) -> u8 {
             _ if io.to_string().contains("failed to lookup") => 6, // CURLE_COULDNT_RESOLVE_HOST
             _ => 7,                                                // CURLE_COULDNT_CONNECT
         },
+        // The CLI never attaches a cancel token, so this is unreachable in
+        // practice; map to curl's "aborted by callback" for completeness.
+        rsurl::Error::Cancelled => 42, // CURLE_ABORTED_BY_CALLBACK
     }
 }
 

@@ -134,6 +134,19 @@ pub struct Request {
     /// [`tls_opts_from`]. Honored by purecrypto-tls; the rustls backend errors.
     pub(crate) ciphers: Option<String>,
     pub(crate) tls13_ciphers: Option<String>,
+    /// Optional cancellation handle. When set and cancelled from another thread,
+    /// the transfer's socket is shut down and the result reported as
+    /// [`Error::Cancelled`]. See [`crate::CancelToken`].
+    pub(crate) cancel: Option<crate::CancelToken>,
+    /// Suppress rsurl's automatic request headers (`User-Agent`, `Accept`,
+    /// `Accept-Encoding`, `Connection`, and `Authorization` from `basic_auth`)
+    /// so the caller's header set is sent verbatim. `Host` and `Content-Length`
+    /// are still emitted when absent for HTTP/1.1 wire correctness. Set by
+    /// [`Request::strict_headers`]; a browser owns its own header policy.
+    pub(crate) strict_headers: bool,
+    /// Send the method exactly as given rather than upper-casing it
+    /// ([`Request::keep_method_case`]).
+    pub(crate) keep_method_case: bool,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -195,7 +208,9 @@ impl ProxyConfig {
 impl Request {
     pub fn new(method: &str, url: &str) -> Result<Self> {
         Ok(Request {
-            method: method.to_ascii_uppercase(),
+            // Stored verbatim; normalised to upper-case at wire-build time
+            // unless `keep_method_case` is set (see `effective_method`).
+            method: method.to_string(),
             url: Url::parse(url)?,
             headers: Vec::new(),
             body: Vec::new(),
@@ -231,7 +246,44 @@ impl Request {
             crl_file: None,
             ciphers: None,
             tls13_ciphers: None,
+            cancel: None,
+            strict_headers: false,
+            keep_method_case: false,
         })
+    }
+
+    /// Send only the headers the caller set — suppress rsurl's automatic
+    /// `User-Agent`, `Accept`, `Accept-Encoding`, `Connection`, and the
+    /// `Authorization` derived from basic-auth credentials. `Host` and
+    /// `Content-Length` are still added when absent (HTTP/1.1 requires them). A
+    /// browser uses this to control the exact request, owning forbidden-header
+    /// policy itself. rsurl never reorders or de-duplicates caller headers.
+    pub fn strict_headers(mut self, on: bool) -> Self {
+        self.strict_headers = on;
+        self
+    }
+
+    /// Send the request method exactly as given instead of upper-casing it.
+    pub fn keep_method_case(mut self, on: bool) -> Self {
+        self.keep_method_case = on;
+        self
+    }
+
+    /// Attach a [`crate::CancelToken`]. Cancelling it from another thread tears
+    /// down this transfer's connection and makes the call return
+    /// [`Error::Cancelled`]. One token may be shared across several requests
+    /// (like a `fetch` `AbortSignal`).
+    pub fn cancel_token(mut self, token: crate::CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// `Err(Error::Cancelled)` if a cancel token is attached and cancelled.
+    fn cancel_check(&self) -> Result<()> {
+        match &self.cancel {
+            Some(t) if t.is_cancelled() => Err(Error::Cancelled),
+            _ => Ok(()),
+        }
     }
 
     /// Authenticate with HTTP Digest using the `-u` credentials (curl
@@ -358,11 +410,12 @@ impl Request {
         Self::new("GET", url)
     }
 
-    /// Override the HTTP method (uppercased), keeping every other setting. Curl
-    /// `-X`. Useful to turn a configured request into a `HEAD` probe without
-    /// rebuilding it.
+    /// Override the HTTP method, keeping every other setting. Curl `-X`. Useful
+    /// to turn a configured request into a `HEAD` probe without rebuilding it.
+    /// Upper-cased on the wire unless [`keep_method_case`](Self::keep_method_case)
+    /// is set.
     pub fn method(mut self, method: &str) -> Self {
-        self.method = method.to_ascii_uppercase();
+        self.method = method.to_string();
         self
     }
 
@@ -643,6 +696,43 @@ impl Request {
         self.send_to(trace, Some(jar))
     }
 
+    /// Stream the response with two callbacks: `on_head` fires once with the
+    /// final response head (status + headers) *before* any body byte, then
+    /// `on_chunk` is called with each body chunk as it arrives. Returning `Err`
+    /// from `on_chunk` aborts the transfer and surfaces that error.
+    ///
+    /// Body bytes are delivered as the wire (and any `Content-Encoding`) yields
+    /// them — gzip/deflate/br/zstd are decompressed incrementally where the
+    /// transport allows, so a parser can consume plaintext as it streams.
+    /// Backpressure is the caller's: `on_chunk` blocks the read loop until it
+    /// returns. The returned [`Response`] carries the final status/headers; its
+    /// `body` is empty (the bytes went to `on_chunk`).
+    ///
+    /// This is the browser-facing entry point for requirement #1 (incremental
+    /// bodies) and #3 (head before body).
+    pub fn send_streaming(
+        self,
+        on_head: impl FnMut(&ResponseHead),
+        on_chunk: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<Response> {
+        self.send_streaming_with(None, on_head, on_chunk)
+    }
+
+    /// [`send_streaming`](Self::send_streaming) with an optional cookie jar
+    /// (consulted before, and updated after, like [`send_with_jar`](Self::send_with_jar)).
+    pub fn send_streaming_with(
+        self,
+        jar: Option<&mut crate::cookie::CookieJar>,
+        mut on_head: impl FnMut(&ResponseHead),
+        mut on_chunk: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<Response> {
+        let mut head_obs = |h: &ResponseHead| on_head(h);
+        let mut sink = ChunkSink::new(&mut on_chunk);
+        let r = self.send_download_observed(&mut sink, jar, &mut io::sink(), Some(&mut head_obs));
+        // Surface a chunk-callback error in place of the generic I/O abort.
+        sink.into_result(r)
+    }
+
     /// Stream the response body straight to `sink` instead of buffering it,
     /// so the CLI can apply progress / rate-limit / size-cap per chunk and not
     /// hold large downloads in memory.
@@ -656,9 +746,36 @@ impl Request {
     pub fn send_download(
         self,
         sink: &mut dyn Write,
-        mut jar: Option<&mut crate::cookie::CookieJar>,
+        jar: Option<&mut crate::cookie::CookieJar>,
         trace: &mut dyn Write,
     ) -> Result<Response> {
+        self.send_download_observed(sink, jar, trace, None)
+    }
+
+    /// The engine behind [`send_download`](Self::send_download) and
+    /// [`send_streaming`](Self::send_streaming). `on_head`, when present, is
+    /// invoked once with the final response head before any body byte is written
+    /// to `sink`.
+    fn send_download_observed(
+        self,
+        sink: &mut dyn Write,
+        jar: Option<&mut crate::cookie::CookieJar>,
+        trace: &mut dyn Write,
+        on_head: Option<HeadObserver>,
+    ) -> Result<Response> {
+        let cancel = self.cancel.clone();
+        let r = self.send_download_dispatch(sink, jar, trace, on_head);
+        map_cancelled(&cancel, r)
+    }
+
+    fn send_download_dispatch(
+        self,
+        sink: &mut dyn Write,
+        mut jar: Option<&mut crate::cookie::CookieJar>,
+        trace: &mut dyn Write,
+        mut on_head: Option<HeadObserver>,
+    ) -> Result<Response> {
+        self.cancel_check()?;
         let direct = self.connector.is_direct() && self.proxy.is_none();
         // HTTP/1.1 streaming (plaintext, or `--http1.1`) — follows redirects and
         // manages cookies itself.
@@ -666,7 +783,7 @@ impl Request {
             && (self.url.scheme == "http"
                 || matches!(self.http_version_pref, HttpVersionPref::Http11Only));
         if h1_streamable {
-            return self.stream_h1(sink, jar, trace);
+            return self.stream_h1(sink, jar, trace, on_head);
         }
         // HTTP/2 streaming for a direct https GET when h2 is allowed and we are
         // not following redirects (the buffered path handles cross-protocol
@@ -698,7 +815,11 @@ impl Request {
                 fb.http_version_pref = HttpVersionPref::Http11Only;
                 fb
             });
-            match crate::http2::send_to(req, sink, trace) {
+            let head_reborrow: Option<HeadObserver> = match &mut on_head {
+                Some(f) => Some(&mut **f),
+                None => None,
+            };
+            match crate::http2::send_to(req, sink, head_reborrow, trace) {
                 Ok(resp) => {
                     if let Some(j) = jar {
                         j.ingest_response(&url, &resp.headers);
@@ -707,10 +828,11 @@ impl Request {
                 }
                 // Auto: server didn't select h2 — retry the same request forced
                 // to HTTP/1.1, which streams via `stream_h1` (it's now https +
-                // Http11Only). The jar is re-applied there.
+                // Http11Only). The jar is re-applied there. `on_head` was not
+                // fired (no h2 response), so it carries through to the fallback.
                 Err(Error::H2NotNegotiated) => {
                     if let Some(fb) = fallback {
-                        return fb.send_download(sink, jar, trace);
+                        return fb.send_download_observed(sink, jar, trace, on_head);
                     }
                     return Err(Error::H2NotNegotiated);
                 }
@@ -745,7 +867,11 @@ impl Request {
                 fb.http_version_pref = HttpVersionPref::Auto;
                 fb
             });
-            match crate::http3::send_to(req, sink, trace) {
+            let head_reborrow: Option<HeadObserver> = match &mut on_head {
+                Some(f) => Some(&mut **f),
+                None => None,
+            };
+            match crate::http3::send_to(req, sink, head_reborrow, trace) {
                 Ok(resp) => {
                     if let Some(j) = jar {
                         j.ingest_response(&url, &resp.headers);
@@ -754,12 +880,14 @@ impl Request {
                 }
                 Err(e) if fallback.is_some() && h3_should_fall_back(&e) => {
                     let _ = writeln!(trace, "* HTTP/3 failed ({e}); falling back");
-                    return fallback.unwrap().send_download(sink, jar, trace);
+                    return fallback
+                        .unwrap()
+                        .send_download_observed(sink, jar, trace, on_head);
                 }
                 Err(e) => return Err(e),
             }
         }
-        self.send_download_buffered(sink, jar, trace)
+        self.send_download_buffered(sink, jar, trace, on_head)
     }
 
     /// Buffered download fallback: perform the request normally (following
@@ -770,8 +898,19 @@ impl Request {
         sink: &mut dyn Write,
         jar: Option<&mut crate::cookie::CookieJar>,
         trace: &mut dyn Write,
+        on_head: Option<HeadObserver>,
     ) -> Result<Response> {
         let resp = self.send_to(trace, jar)?;
+        // Head before body: the bytes were already received internally, but the
+        // caller still sees the head before the first chunk.
+        if let Some(obs) = on_head {
+            obs(&ResponseHead {
+                status: resp.status,
+                reason: resp.reason.clone(),
+                version: resp.version.clone(),
+                headers: resp.headers.clone(),
+            });
+        }
         sink.write_all(&resp.body)?;
         Ok(Response {
             body: Vec::new(),
@@ -786,15 +925,21 @@ impl Request {
         sink: &mut dyn Write,
         mut jar: Option<&mut crate::cookie::CookieJar>,
         trace: &mut dyn Write,
+        mut on_head: Option<HeadObserver>,
     ) -> Result<Response> {
         let mut req = self;
         req.url.set_idn(req.idn)?;
         let mut hops_left = req.max_redirs;
         loop {
+            req.cancel_check()?;
             let start = std::time::Instant::now();
             let mut timing = Timing::default();
+            // Held for this hop's connection so a `cancel()` can shut the socket
+            // down mid-read; dropped (deregistered) when the loop rebinds it.
+            let _cancel_guard;
             let stream: Box<dyn Rw> = if req.url.scheme == "https" {
-                let tcp = tcp_connect(&req, trace)?;
+                let (tcp, guard) = tcp_connect_cancellable(&req, trace)?;
+                _cancel_guard = guard;
                 timing.connect = Some(start.elapsed());
                 let opts = tls_opts_from(&req, &[])?;
                 let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
@@ -804,7 +949,8 @@ impl Request {
                 write_tls_info(&tls, trace);
                 Box::new(tls)
             } else {
-                let tcp = tcp_connect(&req, trace)?;
+                let (tcp, guard) = tcp_connect_cancellable(&req, trace)?;
+                _cancel_guard = guard;
                 let connect = start.elapsed();
                 timing.connect = Some(connect);
                 timing.pretransfer = Some(connect);
@@ -917,6 +1063,17 @@ impl Request {
                 // 3xx without Location — treat as the final response.
             }
 
+            // Final response: surface the head before any body byte reaches the
+            // sink (the streaming API's head-before-body contract).
+            if let Some(obs) = on_head.take() {
+                obs(&ResponseHead {
+                    status: head.status,
+                    reason: head.reason.clone(),
+                    version: head.version.clone(),
+                    headers: head.headers.clone(),
+                });
+            }
+
             // Final response. A `Content-Encoding` means we must decode.
             let content_encoding = head
                 .headers
@@ -1019,6 +1176,19 @@ impl Request {
     fn send_to(
         self,
         trace: &mut dyn Write,
+        jar: Option<&mut crate::cookie::CookieJar>,
+    ) -> Result<Response> {
+        // Map any failure of a cancelled transfer to `Error::Cancelled`, so a
+        // socket shut down by `cancel()` (which surfaces as an I/O error) is
+        // reported as a cancellation rather than a connection reset.
+        let cancel = self.cancel.clone();
+        let r = self.send_to_inner(trace, jar);
+        map_cancelled(&cancel, r)
+    }
+
+    fn send_to_inner(
+        self,
+        trace: &mut dyn Write,
         mut jar: Option<&mut crate::cookie::CookieJar>,
     ) -> Result<Response> {
         let mut req = self;
@@ -1037,6 +1207,7 @@ impl Request {
         let deadline = req.max_time.map(|d| std::time::Instant::now() + d);
         let mut hops_left = req.max_redirs;
         loop {
+            req.cancel_check()?;
             // Honour --max-time before each hop (the per-socket timeout
             // already handles the in-flight case).
             if let Some(end) = deadline {
@@ -1178,6 +1349,17 @@ fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
+/// If `cancel` is set and cancelled, report `r` as [`Error::Cancelled`]
+/// regardless of the underlying error (a socket shut down by `cancel()` surfaces
+/// as a connection reset). A successful result is left untouched even if a
+/// cancel raced in after completion.
+fn map_cancelled(cancel: &Option<crate::CancelToken>, r: Result<Response>) -> Result<Response> {
+    match (cancel, &r) {
+        (Some(t), Err(_)) if t.is_cancelled() => Err(Error::Cancelled),
+        _ => r,
+    }
+}
+
 fn url_to_string(u: &Url) -> String {
     let default = matches!((u.scheme.as_str(), u.port), ("http", 80) | ("https", 443));
     if default {
@@ -1224,6 +1406,75 @@ pub struct Timing {
     pub pretransfer: Option<Duration>,
     /// Time until the full response head had been received (first-byte proxy).
     pub starttransfer: Option<Duration>,
+}
+
+/// The status line + headers of a response, delivered *before* the body in the
+/// streaming API ([`Request::send_streaming`]). A browser uses this to apply
+/// policy and choose a parser before any body byte arrives.
+#[derive(Debug, Clone)]
+pub struct ResponseHead {
+    pub status: u16,
+    /// HTTP/1.1 reason phrase; empty for HTTP/2 and HTTP/3 (no reason phrase).
+    pub reason: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl ResponseHead {
+    /// First value of a header, case-insensitive.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A callback invoked once, with the final response head, before any body byte
+/// is delivered to the chunk sink. Threaded through the streaming download path.
+pub(crate) type HeadObserver<'a> = &'a mut dyn FnMut(&ResponseHead);
+
+/// Adapts a `FnMut(&[u8]) -> Result<()>` chunk callback into an [`io::Write`] so
+/// the streaming download machinery (which writes body bytes to a `&mut dyn
+/// Write` sink) can drive a caller's chunk callback. A callback error is stashed
+/// and surfaced by [`ChunkSink::into_result`]; meanwhile `write` returns an
+/// `io::Error` so the transfer unwinds promptly.
+struct ChunkSink<'a> {
+    on_chunk: &'a mut dyn FnMut(&[u8]) -> Result<()>,
+    err: Option<Error>,
+}
+
+impl<'a> ChunkSink<'a> {
+    fn new(on_chunk: &'a mut dyn FnMut(&[u8]) -> Result<()>) -> Self {
+        ChunkSink {
+            on_chunk,
+            err: None,
+        }
+    }
+
+    /// Replace a generic "aborted" I/O error from the sink with the original
+    /// callback error, if one was captured.
+    fn into_result(self, r: Result<Response>) -> Result<Response> {
+        match (self.err, r) {
+            (Some(e), _) => Err(e),
+            (None, r) => r,
+        }
+    }
+}
+
+impl Write for ChunkSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match (self.on_chunk)(buf) {
+            Ok(()) => Ok(buf.len()),
+            Err(e) => {
+                self.err = Some(e);
+                Err(io::Error::other("chunk callback aborted the transfer"))
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Response {
@@ -1353,7 +1604,7 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
 
 fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
     let start = std::time::Instant::now();
-    let stream = tcp_connect(&req, trace)?;
+    let (stream, _cancel_guard) = tcp_connect_cancellable(&req, trace)?;
     let connect = start.elapsed();
     let mut bufrd = BufReader::new(stream);
     write_request(bufrd.get_mut(), &req, via_plain_http_proxy(&req), trace)?;
@@ -1638,6 +1889,16 @@ pub(crate) fn proxy_bypassed(req: &Request) -> bool {
     })
 }
 
+/// The method to put on the wire: the caller's verbatim string when
+/// [`Request::keep_method_case`] is set, else upper-cased (the default).
+pub(crate) fn effective_method(req: &Request) -> String {
+    if req.keep_method_case {
+        req.method.clone()
+    } else {
+        req.method.to_ascii_uppercase()
+    }
+}
+
 /// Compute the base64 token to send in `Authorization: Basic <token>`,
 /// preferring the explicit credentials set via [`Request::basic_auth`] over
 /// any `user:pass@` userinfo in the URL (RFC 7617). Returns `None` if
@@ -1893,7 +2154,7 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
 
 fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
     let start = std::time::Instant::now();
-    let tcp = tcp_connect(&req, trace)?;
+    let (tcp, _cancel_guard) = tcp_connect_cancellable(&req, trace)?;
     let connect = start.elapsed();
     // HTTPS via proxy means we have to ask the proxy to splice us through
     // to the origin before the TLS handshake — the proxy can't see the
@@ -2009,7 +2270,32 @@ fn resolve_target(host: &str, port: u16, req: &Request) -> Result<std::net::Sock
     }
 }
 
-pub(crate) fn tcp_connect(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
+/// Dial a TCP connection for `req`. When the request carries a
+/// [`crate::CancelToken`], also registers a shutdown hook on it (a cloned socket
+/// handle) so a concurrent `cancel()` can unblock a thread parked in a read. The
+/// returned guard deregisters the hook when dropped — keep it alive for the
+/// socket's lifetime.
+pub(crate) fn tcp_connect_cancellable(
+    req: &Request,
+    trace: &mut dyn Write,
+) -> Result<(TcpStream, Option<crate::cancel::CancelGuard>)> {
+    let stream = tcp_connect_inner(req, trace)?;
+    let guard = match &req.cancel {
+        Some(token) => {
+            if let Ok(shut) = stream.try_clone() {
+                Some(token.register(Box::new(move || {
+                    let _ = shut.shutdown(std::net::Shutdown::Both);
+                })))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    Ok((stream, guard))
+}
+
+fn tcp_connect_inner(req: &Request, trace: &mut dyn Write) -> Result<TcpStream> {
     let proxy = req.proxy.as_ref().filter(|_| !proxy_bypassed(req));
     let (target_host, target_port, via_proxy_label) = match proxy {
         Some(p) => (p.host.as_str(), p.port, true),
@@ -2265,7 +2551,8 @@ fn write_request<W: Write>(
 ) -> Result<()> {
     // Validate everything that lands on the request line / header block before
     // emitting a single byte, so nothing carrying CR/LF can reach the socket.
-    validate_method(&req.method)?;
+    let method = effective_method(req);
+    validate_method(&method)?;
     for (k, v) in &req.headers {
         validate_header(k, v)?;
     }
@@ -2277,6 +2564,12 @@ fn write_request<W: Write>(
     } else {
         format!("{}:{}", req.url.host, req.url.port)
     };
+    // In strict mode, only emit the URL-derived Host when the caller didn't set
+    // their own — the browser owns the exact header set.
+    let caller_set_host = req
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("host"));
 
     let mut buf = Vec::with_capacity(256);
     // Absolute-form per RFC 9112 §3.2.2: required when sending to a proxy
@@ -2296,11 +2589,13 @@ fn write_request<W: Write>(
                 req.url.scheme, req.url.host, req.url.port, req.url.path
             )
         };
-        write!(&mut buf, "{} {target} HTTP/1.1\r\n", req.method)?;
+        write!(&mut buf, "{method} {target} HTTP/1.1\r\n")?;
     } else {
-        write!(&mut buf, "{} {} HTTP/1.1\r\n", req.method, req.url.path)?;
+        write!(&mut buf, "{method} {} HTTP/1.1\r\n", req.url.path)?;
     }
-    write!(&mut buf, "Host: {host_header}\r\n")?;
+    if !(req.strict_headers && caller_set_host) {
+        write!(&mut buf, "Host: {host_header}\r\n")?;
+    }
     // Proxy-Authorization: Basic ... rides with every request to a plain
     // HTTP proxy. (For HTTPS the credentials went on the CONNECT, not
     // here — origin servers must not see them.)
@@ -2337,21 +2632,25 @@ fn write_request<W: Write>(
         }
         write!(&mut buf, "{k}: {v}\r\n")?;
     }
-    if !have_auth {
-        if let Some(creds) = effective_basic_auth(req) {
-            write!(&mut buf, "Authorization: Basic {creds}\r\n")?;
+    // Automatic headers — suppressed in strict mode so the caller's set is sent
+    // verbatim. `Content-Length` below is always emitted (wire correctness).
+    if !req.strict_headers {
+        if !have_auth {
+            if let Some(creds) = effective_basic_auth(req) {
+                write!(&mut buf, "Authorization: Basic {creds}\r\n")?;
+            }
         }
-    }
-    if !have_ua {
-        write!(&mut buf, "User-Agent: {DEFAULT_USER_AGENT}\r\n")?;
-    }
-    if !have_accept {
-        write!(&mut buf, "Accept: */*\r\n")?;
-    }
-    if !have_accept_enc {
-        // Default-on equivalent of curl's `--compressed`: we always know
-        // how to decode these on the way back (see `crate::compress`).
-        write!(&mut buf, "Accept-Encoding: gzip, deflate\r\n")?;
+        if !have_ua {
+            write!(&mut buf, "User-Agent: {DEFAULT_USER_AGENT}\r\n")?;
+        }
+        if !have_accept {
+            write!(&mut buf, "Accept: */*\r\n")?;
+        }
+        if !have_accept_enc {
+            // Default-on equivalent of curl's `--compressed`: we always know
+            // how to decode these on the way back (see `crate::compress`).
+            write!(&mut buf, "Accept-Encoding: gzip, deflate\r\n")?;
+        }
     }
     if !req.body.is_empty() && !have_clen {
         write!(&mut buf, "Content-Length: {}\r\n", req.body.len())?;
@@ -2949,8 +3248,15 @@ mod tests {
 
     #[test]
     fn method_override_uppercases() {
+        // The method is stored verbatim but upper-cased on the wire by default.
         let req = Request::get("http://example.com/").unwrap().method("head");
-        assert_eq!(req.method, "HEAD");
+        assert_eq!(effective_method(&req), "HEAD");
+        // keep_method_case sends it exactly as given.
+        let raw = Request::get("http://example.com/")
+            .unwrap()
+            .method("head")
+            .keep_method_case(true);
+        assert_eq!(effective_method(&raw), "head");
     }
 
     #[test]

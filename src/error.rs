@@ -33,6 +33,9 @@ pub enum Error {
     /// [`crate::Response::error_for_status`] was called on a response whose
     /// HTTP status was an error (>= 400). Carries the status and reason phrase.
     Status { code: u16, reason: String },
+    /// The transfer was cancelled via its [`crate::CancelToken`] (a navigation
+    /// cancel, `fetch` abort, or stop button). The connection is torn down.
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -53,6 +56,7 @@ impl fmt::Display for Error {
                     write!(f, "HTTP status {code} {reason}")
                 }
             }
+            Error::Cancelled => write!(f, "transfer cancelled"),
         }
     }
 }
