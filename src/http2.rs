@@ -1687,6 +1687,14 @@ struct Connection<S: Read + Write> {
     /// WINDOW_UPDATE that raised a send window). `process_frame` reads and
     /// clears it after each dispatch to drive the no-progress counter.
     made_progress: bool,
+    /// Negotiated TLS parameters of this connection, captured at dial time.
+    /// Carried so every response on the connection (including pooled reuse) can
+    /// report [`crate::Response::tls`]. `None` for non-TLS test connections.
+    tls_info: Option<crate::http::TlsInfo>,
+    /// Per-phase dial timing (namelookup/connect/appconnect), captured at dial.
+    /// Applied to a response only on the fresh-dial path (pooled reuse leaves
+    /// these phases unset, matching curl's reuse semantics).
+    dial_timing: crate::http::Timing,
 }
 
 /// Per-connection budget counters that bound hostile-peer frame floods. See the
@@ -1812,6 +1820,8 @@ impl<S: Read + Write> Connection<S> {
             expecting_continuation: None,
             budget: FloodBudget::default(),
             made_progress: false,
+            tls_info: None,
+            dial_timing: crate::http::Timing::default(),
         })
     }
 
@@ -2330,11 +2340,12 @@ impl<S: Read + Write> Connection<S> {
                         .streams
                         .remove(&done_id)
                         .expect("Done stream must still be registered");
-                    results[idx] = Some(build_response_from_stream_labelled(
-                        stream,
-                        Some(done_id),
-                        trace,
-                    ));
+                    let mut built =
+                        build_response_from_stream_labelled(stream, Some(done_id), trace);
+                    if let Ok(resp) = &mut built {
+                        resp.tls = self.tls_info.clone();
+                    }
+                    results[idx] = Some(built);
                     // A slot freed up — start the next queued request.
                     self.start_queued(&mut queue, &mut id_to_idx, &mut results, reqs, trace);
                 }
@@ -3213,7 +3224,9 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
     // trace lines and the actual socket come from the same code as HTTP/1.1.
     // The cancel guard (when a token is attached) shuts the socket down on a
     // concurrent `cancel()`; the caller keeps it alive for the request.
-    let (tcp, cancel_guard, _namelookup) = crate::http::tcp_connect_cancellable(req, trace)?;
+    let start = std::time::Instant::now();
+    let (tcp, cancel_guard, namelookup) = crate::http::tcp_connect_cancellable(req, trace)?;
+    let connect = start.elapsed();
     // HTTPS-over-proxy: CONNECT to establish a transparent tunnel before
     // the TLS handshake. h2c (cleartext HTTP/2) over a proxy is rejected
     // higher up in `send()`, so by here we know scheme == "https".
@@ -3226,6 +3239,7 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
     }
     let opts = crate::http::tls_opts_from(req, &[b"h2"])?;
     let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+    let appconnect = start.elapsed();
     crate::http::write_tls_info(&tls, trace);
     let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
     if !negotiated_h2 {
@@ -3234,7 +3248,17 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
         return Err(Error::H2NotNegotiated);
     }
     let _ = writeln!(trace, "* using HTTP/2");
-    Ok((Connection::new(tls)?, cancel_guard))
+    let tls_info = crate::http::tls_info_from(&tls);
+    let mut conn = Connection::new(tls)?;
+    conn.tls_info = Some(tls_info);
+    conn.dial_timing = crate::http::Timing {
+        namelookup,
+        connect: Some(connect),
+        appconnect: Some(appconnect),
+        pretransfer: Some(appconnect),
+        ..Default::default()
+    };
+    Ok((conn, cancel_guard))
 }
 
 /// True if `req`'s TLS options match what the pool can safely reuse. We
@@ -3329,7 +3353,8 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
 
     // -------- Cold-dial path --------
     let (mut fresh, _cancel_guard) = dial_h2(&req, trace)?;
-    let resp = run_one_request(&mut fresh, &req, trace)?;
+    let mut resp = run_one_request(&mut fresh, &req, trace)?;
+    apply_dial_timing(&mut resp, &fresh);
     if eligible && fresh.is_usable() {
         let arc = Arc::new(Mutex::new(fresh));
         let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
@@ -3360,7 +3385,11 @@ fn run_one_request<S: Read + Write>(
     // Reap any other streams that completed while we were driving this one, so
     // a pooled connection's `streams` map doesn't grow across reuses.
     conn.prune_completed_streams();
-    build_response_from_stream(stream, trace)
+    let mut resp = build_response_from_stream(stream, trace)?;
+    // Surface the connection's negotiated TLS parameters (a property of the
+    // live connection — reported on pooled reuse too).
+    resp.tls = conn.tls_info.clone();
+    Ok(resp)
 }
 
 /// Translate a fully-received `Stream` into the public `Response` type.
@@ -3505,7 +3534,9 @@ fn run_one_request_to<S: Read + Write>(
     conn.send_request_on(stream_id, req)?;
     let stream = conn.drive_until_stream_done_to(stream_id, Some(sink), on_head)?;
     conn.prune_completed_streams();
-    build_response_from_stream_streaming(stream, sink, trace)
+    let mut resp = build_response_from_stream_streaming(stream, sink, trace)?;
+    resp.tls = conn.tls_info.clone();
+    Ok(resp)
 }
 
 /// Stream an HTTP/2 response body straight to `sink` instead of buffering it.
@@ -3524,9 +3555,19 @@ pub fn send_to(
         )));
     }
     let (mut fresh, _cancel_guard) = dial_h2(&req, trace)?;
-    let resp = run_one_request_to(&mut fresh, &req, sink, on_head, trace)?;
+    let mut resp = run_one_request_to(&mut fresh, &req, sink, on_head, trace)?;
+    apply_dial_timing(&mut resp, &fresh);
     let _ = writeln!(trace, "* Connection closed");
     Ok(resp)
+}
+
+/// Copy a freshly-dialed connection's per-phase timing onto its first response.
+/// (Pooled reuse leaves these phases unset, matching curl's reuse semantics.)
+fn apply_dial_timing<S: Read + Write>(resp: &mut Response, conn: &Connection<S>) {
+    resp.timing.namelookup = conn.dial_timing.namelookup;
+    resp.timing.connect = conn.dial_timing.connect;
+    resp.timing.appconnect = conn.dial_timing.appconnect;
+    resp.timing.pretransfer = conn.dial_timing.pretransfer;
 }
 
 /// Build the HPACK-encoded header block for the request: pseudo-headers in the
@@ -5034,7 +5075,37 @@ mod tests {
             expecting_continuation: None,
             budget: FloodBudget::default(),
             made_progress: false,
+            tls_info: None,
+            dial_timing: crate::http::Timing::default(),
         }
+    }
+
+    #[test]
+    fn apply_dial_timing_copies_phases() {
+        use std::time::Duration;
+        let mut conn = fake_conn();
+        conn.dial_timing = crate::http::Timing {
+            namelookup: Some(Duration::from_millis(1)),
+            connect: Some(Duration::from_millis(2)),
+            appconnect: Some(Duration::from_millis(3)),
+            pretransfer: Some(Duration::from_millis(3)),
+            ..Default::default()
+        };
+        let mut resp = crate::http::Response {
+            status: 200,
+            reason: String::new(),
+            version: "HTTP/2".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            timing: crate::http::Timing::default(),
+            final_url: String::new(),
+            tls: None,
+        };
+        apply_dial_timing(&mut resp, &conn);
+        assert_eq!(resp.timing.namelookup, Some(Duration::from_millis(1)));
+        assert_eq!(resp.timing.connect, Some(Duration::from_millis(2)));
+        assert_eq!(resp.timing.appconnect, Some(Duration::from_millis(3)));
+        assert_eq!(resp.timing.pretransfer, Some(Duration::from_millis(3)));
     }
 
     #[test]

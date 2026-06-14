@@ -1546,10 +1546,13 @@ fn send_inner(
         None => Vec::new(),
     };
 
+    let dial_start = Instant::now();
     let mut conn = build_client(&req)?;
     let (sock, peer) = open_udp(&req)?;
+    let connect = dial_start.elapsed();
     let _ = writeln!(trace, "*   Trying {peer} (UDP)...");
     handshake(&mut conn, &*sock, peer, req.read_timeout)?;
+    let appconnect = dial_start.elapsed();
     // Post-handshake certificate policy, identical to the TCP TLS path now
     // that purecrypto surfaces the QUIC peer chain (purecrypto#31): a
     // SAN-required hostname check (TLS-4) and public-key pinning.
@@ -1598,13 +1601,21 @@ fn send_inner(
         .open_bidi()
         .map_err(|e| Error::BadResponse(format!("http3: open_bidi failed: {e:?}")))?;
 
+    // Negotiated TLS parameters for `Response::tls`. QUIC always runs TLS 1.3.
+    let tls_info = crate::http::TlsInfo {
+        version: Some(crate::tls::ProtocolVersion::TLSv1_3),
+        cipher_suite: conn.negotiated_cipher_suite(),
+        alpn: conn.alpn_protocol().map(|p| p.to_vec()),
+        peer_certificates: conn.peer_certificates().to_vec(),
+    };
+
     write_request(&mut conn, request_stream, &req, trace)?;
     if !req.body.is_empty() {
         let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
     }
     pump(&mut conn, &*sock, peer, req.read_timeout)?;
 
-    read_response(
+    let mut resp = read_response(
         &mut conn,
         &*sock,
         peer,
@@ -1614,7 +1625,12 @@ fn send_inner(
         sink,
         on_head,
         trace,
-    )
+    )?;
+    resp.tls = Some(tls_info);
+    resp.timing.connect = Some(connect);
+    resp.timing.appconnect = Some(appconnect);
+    resp.timing.pretransfer = Some(appconnect);
+    Ok(resp)
 }
 
 /// Read all readable server-initiated unidirectional streams, classify each

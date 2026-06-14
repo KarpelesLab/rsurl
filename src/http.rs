@@ -2402,10 +2402,12 @@ fn perform_on_pooled_tls(
     if let Err(e) = write_request(bufrd.get_mut(), req, false, trace) {
         return Err(stale_or_hard(e));
     }
-    let resp = match read_response(&mut bufrd, &req.method, trace) {
+    let mut resp = match read_response(&mut bufrd, &req.method, trace) {
         Ok(r) => r,
         Err(e) => return Err(stale_or_hard(e)),
     };
+    // TLS parameters are a property of the (reused) connection — report them.
+    resp.tls = Some(tls_info_from(bufrd.get_ref()));
     finalize_tls(bufrd, req, &resp, true, trace);
     Ok(resp)
 }
