@@ -153,6 +153,10 @@ pub struct Request {
     /// per-hop cookie policy isn't second-guessed. See
     /// [`Request::cookies_through_redirects`].
     pub(crate) jar_through_redirects: bool,
+    /// Caller-owned TLS certificate-validation hook. When set, rsurl performs no
+    /// chain validation of its own and defers the trust decision to this
+    /// callback (the browser model). See [`Request::tls_verify_callback`].
+    pub(crate) tls_verify_callback: Option<crate::tls::VerifyCallback>,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -256,7 +260,19 @@ impl Request {
             strict_headers: false,
             keep_method_case: false,
             jar_through_redirects: true,
+            tls_verify_callback: None,
         })
+    }
+
+    /// Install a certificate-validation hook that becomes the **sole** trust
+    /// authority for HTTPS connections: rsurl performs the TLS handshake without
+    /// its own chain validation and calls `cb` with the peer chain (leaf-first
+    /// DER) and SNI, honouring its [`CertVerdict`](crate::tls::CertVerdict).
+    /// This lets a security layer own trust decisions (custom roots, error
+    /// override UX). Mutually exclusive in effect with rsurl's own verification.
+    pub fn tls_verify_callback(mut self, cb: crate::tls::VerifyCallback) -> Self {
+        self.tls_verify_callback = Some(cb);
+        self
     }
 
     /// Whether the cookie jar (when one is supplied) is applied and updated on
@@ -956,6 +972,8 @@ impl Request {
             // Held for this hop's connection so a `cancel()` can shut the socket
             // down mid-read; dropped (deregistered) when the loop rebinds it.
             let _cancel_guard;
+            // Captured before the TLS stream is type-erased into `Box<dyn Rw>`.
+            let mut tls_info: Option<TlsInfo> = None;
             let stream: Box<dyn Rw> = if req.url.scheme == "https" {
                 let (tcp, guard) = tcp_connect_cancellable(&req, trace)?;
                 _cancel_guard = guard;
@@ -966,6 +984,7 @@ impl Request {
                 timing.appconnect = Some(appconnect);
                 timing.pretransfer = Some(appconnect);
                 write_tls_info(&tls, trace);
+                tls_info = Some(tls_info_from(&tls));
                 Box::new(tls)
             } else {
                 let (tcp, guard) = tcp_connect_cancellable(&req, trace)?;
@@ -1136,6 +1155,7 @@ impl Request {
                             body: Vec::new(),
                             timing,
                             final_url: url_to_string(&req.url),
+                            tls: tls_info.clone(),
                         });
                     }
                 }
@@ -1157,6 +1177,7 @@ impl Request {
                     body: Vec::new(),
                     timing,
                     final_url: url_to_string(&req.url),
+                    tls: tls_info.clone(),
                 });
             }
             let n = stream_body(&mut bufrd, sink, &head.headers, head.status, &req.method)?;
@@ -1169,6 +1190,7 @@ impl Request {
                 body: Vec::new(),
                 timing,
                 final_url: url_to_string(&req.url),
+                tls: tls_info.clone(),
             });
         }
     }
@@ -1394,6 +1416,25 @@ fn url_to_string(u: &Url) -> String {
     }
 }
 
+/// Negotiated TLS parameters for an HTTPS response — what `argus-security`
+/// needs for the security indicator and headless CDP `SecurityDetails`.
+///
+/// Populated on the direct (fresh-handshake) HTTPS paths. It is `None` for
+/// plaintext `http://`, for connections served from the pool (no fresh
+/// handshake), and on the HTTP/2 / HTTP/3 backends in this milestone — mirroring
+/// how [`Timing`] is populated.
+#[derive(Debug, Clone)]
+pub struct TlsInfo {
+    /// Negotiated protocol version (e.g. TLS 1.3).
+    pub version: Option<crate::tls::ProtocolVersion>,
+    /// Negotiated cipher suite (IANA id).
+    pub cipher_suite: Option<u16>,
+    /// Server-selected ALPN protocol (e.g. `b"h2"`), if any.
+    pub alpn: Option<Vec<u8>>,
+    /// Peer certificate chain, leaf first, each entry DER-encoded.
+    pub peer_certificates: Vec<Vec<u8>>,
+}
+
 /// A complete HTTP response.
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -1402,6 +1443,8 @@ pub struct Response {
     pub version: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Negotiated TLS parameters, on the direct HTTPS paths (see [`TlsInfo`]).
+    pub tls: Option<TlsInfo>,
     /// Per-phase timings for `--write-out` `%{time_*}` variables. Populated on
     /// the direct HTTP/1.1 + HTTPS paths; left empty on reused (pooled)
     /// connections and the HTTP/2 / HTTP/3 backends (see [`Timing`]).
@@ -1992,6 +2035,8 @@ pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls:
         opts.cipher_suites
             .extend(crate::tls::cipher_names_to_ids(spec)?);
     }
+    // Caller-owned certificate validation hook (browser trust model).
+    opts.verify_callback = req.tls_verify_callback.clone();
     Ok(opts)
 }
 
@@ -2195,6 +2240,7 @@ fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
     let appconnect = start.elapsed();
     write_tls_info(&tls, trace);
+    let tls_info = tls_info_from(&tls);
     let mut bufrd = BufReader::new(tls);
     // Always origin-form here: even with a proxy in play we've already
     // tunnelled past it via CONNECT, so the request the origin sees is
@@ -2204,6 +2250,7 @@ fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     resp.timing.connect = Some(connect);
     resp.timing.appconnect = Some(appconnect);
     resp.timing.pretransfer = Some(appconnect); // request goes out right after TLS
+    resp.tls = Some(tls_info);
     finalize_tls(bufrd, &req, &resp, may_pool, trace);
     Ok(resp)
 }
@@ -2458,6 +2505,17 @@ pub(crate) fn connect_tunnel<S: Read + Write>(
     }
     let _ = writeln!(trace, "* CONNECT tunnel established to {host_port}");
     Ok(())
+}
+
+/// Snapshot the negotiated TLS parameters of a freshly handshaked stream for
+/// [`Response::tls`].
+pub(crate) fn tls_info_from<S: Read + Write>(tls: &crate::tls::TlsStream<S>) -> TlsInfo {
+    TlsInfo {
+        version: tls.negotiated_version(),
+        cipher_suite: tls.negotiated_cipher_suite(),
+        alpn: tls.alpn_selected().map(|p| p.to_vec()),
+        peer_certificates: tls.peer_certificates().to_vec(),
+    }
 }
 
 pub(crate) fn write_tls_info<S: Read + Write>(
@@ -2851,6 +2909,9 @@ where
         // The redirect-following `send_to` overwrites this with the effective
         // URL; this low-level path has no URL of its own.
         final_url: String::new(),
+        // Filled in by the HTTPS dial path (which has the TlsStream) after this
+        // low-level reader returns.
+        tls: None,
     })
 }
 
@@ -3547,6 +3608,19 @@ mod tests {
         let _ = std::fs::remove_file(&key_path);
     }
 
+    #[test]
+    fn tls_opts_from_carries_verify_callback() {
+        use crate::tls::{CertVerdict, VerifyCallback};
+        let req = Request::get("https://example.com/")
+            .unwrap()
+            .tls_verify_callback(VerifyCallback::new(|_| CertVerdict::Accept));
+        let opts = tls_opts_from(&req, &[]).expect("build TlsOpts");
+        assert!(
+            opts.verify_callback.is_some(),
+            "verify callback should reach TlsOpts"
+        );
+    }
+
     /// Base64-encode a 32-byte hash into curl's `sha256//BASE64` pin form.
     fn pin_to_sha256_spec(hash: &[u8; 32]) -> String {
         format!("sha256//{}", crate::websocket::base64_encode(hash))
@@ -3591,6 +3665,7 @@ mod tests {
             body: body.to_vec(),
             timing: Timing::default(),
             final_url: String::new(),
+            tls: None,
         }
     }
 

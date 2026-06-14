@@ -3605,6 +3605,7 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
                     body: Vec::new(),
                     timing: rsurl::Timing::default(),
                     final_url: String::new(),
+                    tls: None,
                 };
                 run_write_out(&resp, url, args, time_total, written);
             }

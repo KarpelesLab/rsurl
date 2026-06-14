@@ -3426,6 +3426,7 @@ fn build_response_from_stream_labelled(
         // Set by the buffered `send_to` redirect loop; empty on the raw
         // multiplexed path, where callers fall back to the request URL.
         final_url: String::new(),
+        tls: None,
     })
 }
 
@@ -3481,6 +3482,7 @@ fn build_response_from_stream_streaming(
         body: Vec::new(),
         timing: crate::http::Timing::default(),
         final_url: String::new(),
+        tls: None,
     })
 }
 

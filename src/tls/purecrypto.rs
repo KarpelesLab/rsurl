@@ -59,6 +59,9 @@ pub struct TlsOpts {
     /// IANA cipher-suite IDs to offer, in preference order (curl `--ciphers` /
     /// `--tls13-ciphers`). Empty leaves purecrypto's full default set.
     pub cipher_suites: Vec<u16>,
+    /// Caller-owned certificate-validation hook. When `Some`, rsurl skips its
+    /// own chain verification and the callback is the sole trust authority.
+    pub verify_callback: Option<super::common::VerifyCallback>,
 }
 
 impl TlsOpts {
@@ -79,6 +82,7 @@ impl TlsOpts {
             pinned_spki_sha256: Vec::new(),
             crl_pem: None,
             cipher_suites: Vec::new(),
+            verify_callback: None,
         }
     }
 }
@@ -196,11 +200,14 @@ pub fn connect_over_tls<S: Read + Write>(
         Some(r) => r,
         None => load_system_roots()?,
     };
+    // A verify callback is the sole trust authority: run the handshake without
+    // our own chain validation, then defer accept/reject to the callback.
+    let effective_verify = opts.verify && opts.verify_callback.is_none();
     let mut builder = Config::builder()
         .tls_only()
         .roots(roots)
         .server_name(sni.to_string())
-        .verify_certificates(opts.verify);
+        .verify_certificates(effective_verify);
     if !opts.alpn.is_empty() {
         builder = builder.alpn(std::mem::take(&mut opts.alpn));
     }
@@ -263,12 +270,27 @@ pub fn connect_over_tls<S: Read + Write>(
         seen_eof: false,
     };
     s.run_handshake()?;
+    // Caller-owned verification (the browser model): hand the full peer chain to
+    // the callback and honour its verdict. rsurl did no validation of its own.
+    if let Some(cb) = &opts.verify_callback {
+        let chain = s.peer_certificates().to_vec();
+        let verdict = cb.call(&super::common::CertVerify {
+            server_name: sni,
+            chain_der: &chain,
+        });
+        if verdict == super::common::CertVerdict::Reject {
+            return Err(Error::BadResponse(
+                "server certificate rejected by verify callback".into(),
+            ));
+        }
+        return Ok(s);
+    }
     // TLS-4: reject a server leaf with no Subject Alternative Name. purecrypto's
     // hostname check falls back to Common Name when the leaf has no SAN; CN
     // matching is deprecated and rejected by webpki/browsers and the rustls
     // backend, so align the default backend with modern standards. Only meaningful
     // when we actually verified the chain (`-k` skips hostname verification too).
-    if opts.verify {
+    if effective_verify {
         if let Some(der) = s.peer_certificates().first() {
             if !client_auth::leaf_has_san(der) {
                 return Err(Error::BadResponse(
@@ -354,6 +376,11 @@ impl<S: Read + Write> TlsStream<S> {
     /// ALPN protocol the server selected, or `None` if ALPN was not negotiated.
     pub fn alpn_selected(&self) -> Option<&[u8]> {
         self.conn.alpn_selected()
+    }
+
+    /// The negotiated cipher suite (IANA id), if the handshake completed.
+    pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        self.conn.negotiated_cipher_suite()
     }
 
     /// Peer certificate chain in wire order (leaf first), each entry DER-encoded.

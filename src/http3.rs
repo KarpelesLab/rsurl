@@ -2444,6 +2444,7 @@ fn finalize_response(
             body: Vec::new(),
             timing: crate::http::Timing::default(),
             final_url: String::new(),
+            tls: None,
         });
     }
     Ok(Response {
@@ -2455,6 +2456,7 @@ fn finalize_response(
         body,
         timing: crate::http::Timing::default(),
         final_url: String::new(),
+        tls: None,
     })
 }
 

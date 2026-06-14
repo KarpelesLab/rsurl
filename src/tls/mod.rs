@@ -21,7 +21,7 @@
 //! itself built on `purecrypto::tls`.
 
 mod common;
-pub use common::ProtocolVersion;
+pub use common::{CertVerdict, CertVerify, ProtocolVersion, VerifyCallback};
 
 // Purecrypto-flavoured root-store loaders, always compiled because HTTP/3
 // is bound to purecrypto's QUIC stack regardless of which TLS backend is

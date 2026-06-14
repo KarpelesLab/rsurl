@@ -69,6 +69,9 @@ pub struct TlsOpts {
     /// IANA cipher-suite IDs (curl `--ciphers`/`--tls13-ciphers`). The rustls
     /// backend does not wire suite restriction; a non-empty value errors.
     pub cipher_suites: Vec<u16>,
+    /// Caller-owned certificate-validation hook. When `Some`, rsurl skips its
+    /// own chain verification and the callback is the sole trust authority.
+    pub verify_callback: Option<super::common::VerifyCallback>,
 }
 
 impl TlsOpts {
@@ -87,6 +90,7 @@ impl TlsOpts {
             pinned_spki_sha256: Vec::new(),
             crl_pem: None,
             cipher_suites: Vec::new(),
+            verify_callback: None,
         }
     }
 }
@@ -207,6 +211,8 @@ pub struct TlsStream<S: Read + Write> {
     version: Option<ProtocolVersion>,
     /// Snapshot of the server-selected ALPN protocol, for the same reason.
     alpn: Option<Vec<u8>>,
+    /// Snapshot of the negotiated cipher suite (IANA id).
+    cipher_suite: Option<u16>,
     /// Snapshot of the peer certificate chain, leaf first, each DER-encoded.
     /// Owned so [`TlsStream::peer_certificates`] can return a borrow into it.
     peer_certs_der: Vec<Vec<u8>>,
@@ -313,11 +319,15 @@ pub fn connect_over_tls<S: Read + Write>(
     } else {
         None
     };
+    // A verify callback is the sole trust authority: use the no-verify verifier
+    // so the handshake reaches the point where we have the chain, then defer to
+    // the callback below.
+    let effective_verify = opts.verify && opts.verify_callback.is_none();
     let verified = builder.with_root_certificates(roots);
     let dangerous = ClientConfig::builder_with_protocol_versions(&versions)
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify::new()));
-    let mut config = match (opts.verify, identity) {
+    let mut config = match (effective_verify, identity) {
         (true, Some((chain, key))) => verified
             .with_client_auth_cert(chain, key)
             .map_err(rustls_err)?,
@@ -338,11 +348,27 @@ pub fn connect_over_tls<S: Read + Write>(
         sock: transport,
         version: None,
         alpn: None,
+        cipher_suite: None,
         peer_certs_der: Vec::new(),
         dirty_eof: false,
     };
     s.run_handshake()?;
     s.snapshot_post_handshake();
+    // Caller-owned verification (the browser model): hand the full peer chain to
+    // the callback and honour its verdict. rsurl did no validation of its own.
+    if let Some(cb) = &opts.verify_callback {
+        let chain = s.peer_certificates().to_vec();
+        let verdict = cb.call(&super::common::CertVerify {
+            server_name: sni,
+            chain_der: &chain,
+        });
+        if verdict == super::common::CertVerdict::Reject {
+            return Err(Error::BadResponse(
+                "server certificate rejected by verify callback".into(),
+            ));
+        }
+        return Ok(s);
+    }
     // TLS-4: no SAN-less-leaf check is needed here. webpki (used by the rustls
     // verifier) already rejects a leaf that has no Subject Alternative Name —
     // it does not fall back to Common Name matching — so a SAN-less server cert
@@ -446,6 +472,11 @@ impl<S: Read + Write> TlsStream<S> {
         self.alpn.as_deref()
     }
 
+    /// The negotiated cipher suite (IANA id), if the handshake completed.
+    pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        self.cipher_suite
+    }
+
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.peer_certs_der
     }
@@ -492,6 +523,10 @@ impl<S: Read + Write> TlsStream<S> {
     fn snapshot_post_handshake(&mut self) {
         self.version = self.conn.protocol_version().map(map_rustls_version);
         self.alpn = self.conn.alpn_protocol().map(|p| p.to_vec());
+        self.cipher_suite = self
+            .conn
+            .negotiated_cipher_suite()
+            .map(|cs| u16::from(cs.suite()));
         self.peer_certs_der = self
             .conn
             .peer_certificates()
