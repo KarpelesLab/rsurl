@@ -4332,56 +4332,181 @@ fn bt_layout(
     }
 }
 
+/// Announce to the given trackers (stopping at the first that yields peers)
+/// and return the peer addresses found.
+#[cfg(feature = "bittorrent")]
+fn bt_announce_peers(
+    trackers: &[String],
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    port: u16,
+    left: u64,
+    verbose: bool,
+) -> Vec<std::net::SocketAddr> {
+    use rsurl::bittorrent::tracker::{self, AnnounceParams, Event};
+    use std::time::Duration;
+
+    let params = AnnounceParams {
+        info_hash,
+        peer_id,
+        port,
+        uploaded: 0,
+        downloaded: 0,
+        left,
+        event: Event::Started,
+        num_want: 100,
+        key: 0,
+    };
+    let mut peers = Vec::new();
+    for t in trackers {
+        match tracker::announce(t, &params, Duration::from_secs(10)) {
+            Ok(resp) => {
+                if verbose {
+                    eprintln!("* tracker {t}: {} peers", resp.peers.len());
+                }
+                peers.extend(resp.peers);
+            }
+            Err(e) => {
+                if verbose {
+                    eprintln!("* tracker {t}: {e}");
+                }
+            }
+        }
+        if !peers.is_empty() {
+            break; // one responsive tracker is enough to start
+        }
+    }
+    peers
+}
+
 /// Download a torrent: load its metainfo (`.torrent` from a path/`file://`/
-/// `http(s)://`, or a magnet link), discover peers (manual `--bt-peer` +
+/// `http(s)://`, or a `magnet:` link), discover peers (manual `--bt-peer` +
 /// trackers), and fetch + verify the data. Exits when complete (curl-like).
 #[cfg(feature = "bittorrent")]
 fn run_bittorrent(source: &str, args: &Args) -> u8 {
-    use rsurl::bittorrent::{self, tracker, Metainfo, TorrentOptions};
+    use rsurl::bittorrent::{self, metadata, Magnet, Metainfo, TorrentOptions};
+    use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
-    // 1) Load the metainfo.
-    let bytes = if source.starts_with("magnet:") {
-        if show_errors(args) {
-            eprintln!("rsurl: magnet links require peer metadata exchange (not in this build yet); use a .torrent");
-        }
-        return 2;
-    } else if source.starts_with("http://") || source.starts_with("https://") {
-        match rsurl::Request::get(source).and_then(|r| r.send()) {
-            Ok(resp) if resp.status == 200 => resp.body,
-            Ok(resp) => {
-                if show_errors(args) {
-                    eprintln!("rsurl: fetching torrent: HTTP {}", resp.status);
-                }
-                return 1;
-            }
-            Err(e) => {
-                if show_errors(args) {
-                    eprintln!("rsurl: fetching torrent: {e}");
-                }
-                return transfer_exit_code(&e);
-            }
-        }
-    } else {
-        let path = source.strip_prefix("file://").unwrap_or(source);
-        match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                if show_errors(args) {
-                    eprintln!("rsurl: reading torrent {path}: {e}");
-                }
-                return 1;
-            }
-        }
-    };
-
-    let meta = match Metainfo::from_bytes(&bytes) {
-        Ok(m) => m,
+    let peer_id = match bittorrent::generate_peer_id() {
+        Ok(p) => p,
         Err(e) => {
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
             return 1;
+        }
+    };
+    let listen_port = args.listen_port.unwrap_or(6881);
+    let opts = TorrentOptions {
+        peer_id,
+        listen_port,
+        ..Default::default()
+    };
+
+    // Explicit peers from --bt-peer.
+    let mut peers: Vec<SocketAddr> = Vec::new();
+    for p in &args.bt_peers {
+        match p.parse() {
+            Ok(a) => peers.push(a),
+            Err(_) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: bad --bt-peer {p}");
+                }
+            }
+        }
+    }
+
+    // 1) Obtain the metainfo and the tracker list.
+    let (meta, trackers) = if source.starts_with("magnet:") {
+        let magnet = match Magnet::parse(source) {
+            Ok(m) => m,
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                return 2;
+            }
+        };
+        peers.extend(magnet.peers.iter().copied());
+        // Need at least one peer to fetch the info dictionary.
+        if peers.is_empty() {
+            peers = bt_announce_peers(
+                &magnet.trackers,
+                magnet.info_hash,
+                peer_id,
+                listen_port,
+                0,
+                args.verbose,
+            );
+        }
+        peers.sort();
+        peers.dedup();
+        if peers.is_empty() {
+            if show_errors(args) {
+                eprintln!("rsurl: no peers to fetch magnet metadata from");
+            }
+            return 1;
+        }
+        if !args.silent {
+            let label = magnet.display_name.as_deref().unwrap_or("magnet");
+            eprintln!("* fetching metadata for {label} from {} peers", peers.len());
+        }
+        match metadata::fetch_metainfo(
+            magnet.info_hash,
+            &peers,
+            peer_id,
+            opts.connect_timeout,
+            opts.peer_timeout,
+        ) {
+            Ok(m) => (m, magnet.trackers),
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: magnet metadata: {e}");
+                }
+                return 1;
+            }
+        }
+    } else {
+        let bytes = if source.starts_with("http://") || source.starts_with("https://") {
+            match rsurl::Request::get(source).and_then(|r| r.send()) {
+                Ok(resp) if resp.status == 200 => resp.body,
+                Ok(resp) => {
+                    if show_errors(args) {
+                        eprintln!("rsurl: fetching torrent: HTTP {}", resp.status);
+                    }
+                    return 1;
+                }
+                Err(e) => {
+                    if show_errors(args) {
+                        eprintln!("rsurl: fetching torrent: {e}");
+                    }
+                    return transfer_exit_code(&e);
+                }
+            }
+        } else {
+            let path = source.strip_prefix("file://").unwrap_or(source);
+            match std::fs::read(path) {
+                Ok(b) => b,
+                Err(e) => {
+                    if show_errors(args) {
+                        eprintln!("rsurl: reading torrent {path}: {e}");
+                    }
+                    return 1;
+                }
+            }
+        };
+        match Metainfo::from_bytes(&bytes) {
+            Ok(m) => {
+                let trackers = m.trackers.clone();
+                (m, trackers)
+            }
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: {e}");
+                }
+                return 1;
+            }
         }
     };
 
@@ -4396,58 +4521,16 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         }
     };
 
-    // 3) Peers: explicit --bt-peer, else announce to the torrent's trackers.
-    let peer_id = match bittorrent::generate_peer_id() {
-        Ok(p) => p,
-        Err(e) => {
-            if show_errors(args) {
-                eprintln!("rsurl: {e}");
-            }
-            return 1;
-        }
-    };
-    let listen_port = args.listen_port.unwrap_or(6881);
-    let mut peers: Vec<std::net::SocketAddr> = Vec::new();
-    for p in &args.bt_peers {
-        match p.parse() {
-            Ok(a) => peers.push(a),
-            Err(_) => {
-                if show_errors(args) {
-                    eprintln!("rsurl: bad --bt-peer {p}");
-                }
-            }
-        }
-    }
-    if args.bt_peers.is_empty() {
-        let params = tracker::AnnounceParams {
-            info_hash: meta.info_hash,
+    // 3) If we still have no peers, announce the trackers for the download.
+    if peers.is_empty() {
+        peers = bt_announce_peers(
+            &trackers,
+            meta.info_hash,
             peer_id,
-            port: listen_port,
-            uploaded: 0,
-            downloaded: 0,
-            left: meta.total_length,
-            event: tracker::Event::Started,
-            num_want: 100,
-            key: 0,
-        };
-        for t in &meta.trackers {
-            match tracker::announce(t, &params, Duration::from_secs(10)) {
-                Ok(resp) => {
-                    if args.verbose {
-                        eprintln!("* tracker {t}: {} peers", resp.peers.len());
-                    }
-                    peers.extend(resp.peers);
-                }
-                Err(e) => {
-                    if args.verbose {
-                        eprintln!("* tracker {t}: {e}");
-                    }
-                }
-            }
-            if !peers.is_empty() {
-                break; // one responsive tracker is enough to start
-            }
-        }
+            listen_port,
+            meta.total_length,
+            args.verbose,
+        );
     }
     peers.sort();
     peers.dedup();
@@ -4469,11 +4552,6 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
     }
 
     // 4) Download with throttled progress to stderr.
-    let opts = TorrentOptions {
-        peer_id,
-        listen_port,
-        ..Default::default()
-    };
     let total = meta.total_length;
     let show = !args.silent;
     let start = Instant::now();

@@ -186,6 +186,20 @@ impl Metainfo {
         })
     }
 
+    /// Build a `Metainfo` from just the raw bencoded `info` dictionary, as
+    /// obtained from a peer via `ut_metadata` for a `magnet:` link. The result
+    /// carries no trackers (those come from the magnet itself).
+    pub fn from_info_dict(info: &[u8]) -> Result<Metainfo> {
+        // Wrap as `{ "info": <info> }` so the shared parser — and its
+        // span-based infohash over the original `info` bytes — applies
+        // unchanged.
+        let mut torrent = Vec::with_capacity(info.len() + 8);
+        torrent.extend_from_slice(b"d4:info");
+        torrent.extend_from_slice(info);
+        torrent.push(b'e');
+        Metainfo::from_bytes(&torrent)
+    }
+
     pub fn num_pieces(&self) -> usize {
         self.pieces.len()
     }

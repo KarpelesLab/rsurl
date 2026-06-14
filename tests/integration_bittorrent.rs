@@ -11,9 +11,12 @@ use std::time::Duration;
 
 use purecrypto::hash::{Digest, Sha1};
 
-use rsurl::bittorrent::bencode::{encode, Value};
+use rsurl::bittorrent::bencode::{encode, parse, Value};
 use rsurl::bittorrent::peer::{self, Handshake, Message};
 use rsurl::bittorrent::{download, Bitfield, Metainfo, TorrentOptions};
+
+/// ut_metadata piece size (BEP 9).
+const METADATA_PIECE: usize = 16 * 1024;
 
 fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h = Sha1::new();
@@ -177,4 +180,193 @@ fn cli_downloads_torrent_to_output() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&torrent_path);
+}
+
+/// Build the raw bencoded `info` dictionary for a single-file torrent.
+fn make_info_bytes(data: &[u8], piece_len: usize, name: &str) -> Vec<u8> {
+    let mut pieces = Vec::new();
+    for chunk in data.chunks(piece_len) {
+        pieces.extend_from_slice(&sha1(chunk));
+    }
+    let mut info = BTreeMap::new();
+    info.insert(b"name".to_vec(), Value::Bytes(name.as_bytes().to_vec()));
+    info.insert(b"piece length".to_vec(), Value::Int(piece_len as i64));
+    info.insert(b"length".to_vec(), Value::Int(data.len() as i64));
+    info.insert(b"pieces".to_vec(), Value::Bytes(pieces));
+    encode(&Value::Dict(info))
+}
+
+fn to_hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+fn meta_ext_handshake(ut_id: i64, size: usize) -> Message {
+    let mut m = BTreeMap::new();
+    m.insert(b"ut_metadata".to_vec(), Value::Int(ut_id));
+    let mut d = BTreeMap::new();
+    d.insert(b"m".to_vec(), Value::Dict(m));
+    d.insert(b"metadata_size".to_vec(), Value::Int(size as i64));
+    Message::Extended {
+        ext_id: 0,
+        payload: encode(&Value::Dict(d)),
+    }
+}
+
+fn meta_data_msg(to_id: u8, piece: usize, total: usize, chunk: &[u8]) -> Message {
+    let mut d = BTreeMap::new();
+    d.insert(b"msg_type".to_vec(), Value::Int(1));
+    d.insert(b"piece".to_vec(), Value::Int(piece as i64));
+    d.insert(b"total_size".to_vec(), Value::Int(total as i64));
+    let mut payload = encode(&Value::Dict(d));
+    payload.extend_from_slice(chunk);
+    Message::Extended {
+        ext_id: to_id,
+        payload,
+    }
+}
+
+/// A seeder that both serves the BEP 9 metadata (ut_metadata) and the actual
+/// pieces, over as many connections as are opened. Returns its port.
+fn start_meta_seeder(data: Vec<u8>, info_bytes: Vec<u8>) -> u16 {
+    let info_hash = sha1(&info_bytes);
+    let meta = Metainfo::from_info_dict(&info_bytes).unwrap();
+    let piece_len = meta.piece_length as usize;
+    let num_pieces = meta.num_pieces();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else {
+                return;
+            };
+            let data = data.clone();
+            let info_bytes = info_bytes.clone();
+            thread::spawn(move || {
+                s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+                let hs = match peer::read_handshake(&mut s) {
+                    Ok(h) => h,
+                    Err(_) => return,
+                };
+                if hs.info_hash != info_hash {
+                    return;
+                }
+                let _ = peer::write_handshake(&mut s, &Handshake::new(info_hash, [0x55; 20]));
+
+                let mut bf = Bitfield::new(num_pieces);
+                for i in 0..num_pieces {
+                    bf.set(i);
+                }
+                let _ = peer::write_message(&mut s, &Message::Bitfield(bf.as_bytes().to_vec()));
+                // Advertise ut_metadata (our id 2) + the metadata size.
+                let _ = peer::write_message(&mut s, &meta_ext_handshake(2, info_bytes.len()));
+
+                let mut client_ut_id: u8 = 1;
+                loop {
+                    let msg = match peer::read_message(&mut s) {
+                        Ok(m) => m,
+                        Err(_) => return,
+                    };
+                    match msg {
+                        Message::Interested => {
+                            let _ = peer::write_message(&mut s, &Message::Unchoke);
+                        }
+                        Message::Request {
+                            index,
+                            begin,
+                            length,
+                        } => {
+                            let off = index as usize * piece_len + begin as usize;
+                            let end = (off + length as usize).min(data.len());
+                            if off <= end {
+                                let _ = peer::write_message(
+                                    &mut s,
+                                    &Message::Piece {
+                                        index,
+                                        begin,
+                                        block: data[off..end].to_vec(),
+                                    },
+                                );
+                            }
+                        }
+                        Message::Extended { ext_id: 0, payload } => {
+                            // Learn the client's ut_metadata id for our replies.
+                            if let Ok(v) = parse(&payload) {
+                                if let Some(id) = v
+                                    .get(b"m")
+                                    .and_then(|m| m.get(b"ut_metadata"))
+                                    .and_then(Value::as_int)
+                                {
+                                    client_ut_id = id as u8;
+                                }
+                            }
+                        }
+                        Message::Extended { payload, .. } => {
+                            // A ut_metadata request addressed to our id (2).
+                            let piece = parse(&payload)
+                                .ok()
+                                .and_then(|v| v.get(b"piece").and_then(Value::as_int))
+                                .unwrap_or(0) as usize;
+                            let start = piece * METADATA_PIECE;
+                            let end = (start + METADATA_PIECE).min(info_bytes.len());
+                            let _ = peer::write_message(
+                                &mut s,
+                                &meta_data_msg(
+                                    client_ut_id,
+                                    piece,
+                                    info_bytes.len(),
+                                    &info_bytes[start..end],
+                                ),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Full magnet flow through the binary: fetch the info dict via ut_metadata,
+/// then download + verify the data — all from one in-process seeder.
+#[test]
+fn cli_downloads_magnet() {
+    let data: Vec<u8> = (0..30_000u32)
+        .map(|i| (i.wrapping_mul(13) % 247) as u8)
+        .collect();
+    let info_bytes = make_info_bytes(&data, 4096, "magnet.bin");
+    let info_hash = sha1(&info_bytes);
+
+    let port = start_meta_seeder(data.clone(), info_bytes);
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&dn=magnet.bin&x.pe=127.0.0.1:{port}",
+        to_hex(&info_hash)
+    );
+
+    let pid = std::process::id();
+    let out = std::env::temp_dir().join(format!("rsurl_magnet_{pid}.bin"));
+    let _ = std::fs::remove_file(&out);
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"))
+        .arg("-s")
+        .arg("-o")
+        .arg(&out)
+        .arg(&magnet)
+        .status()
+        .expect("spawn rsurl");
+
+    assert!(status.success(), "rsurl exited with {status}");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        data,
+        "magnet download mismatch"
+    );
+
+    let _ = std::fs::remove_file(&out);
 }
