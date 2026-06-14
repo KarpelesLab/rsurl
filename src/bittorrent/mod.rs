@@ -12,10 +12,12 @@
 pub mod bencode;
 pub mod magnet;
 pub mod metainfo;
+pub mod tracker;
 
 pub use bencode::Value;
 pub use magnet::Magnet;
 pub use metainfo::{FileEntry, Metainfo};
+pub use tracker::{announce, AnnounceParams, AnnounceResponse, Event};
 
 use purecrypto::rng::{OsRng, RngCore};
 
