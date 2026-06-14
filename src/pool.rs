@@ -40,15 +40,44 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::tls::TlsStream;
 
-/// Per-authority cap. Matches the HTTP/2 pool's `POOL_PER_KEY_CAP`.
-const POOL_PER_KEY_CAP: usize = 4;
+/// Default per-authority cap.
+const DEFAULT_PER_KEY_CAP: usize = 4;
+/// Default total live pooled conns across all keys.
+const DEFAULT_GLOBAL_CAP: usize = 32;
 
-/// Live pooled conns across all keys.
-const POOL_GLOBAL_CAP: usize = 32;
+/// Runtime-tunable caps, shared by the HTTP/1.1 pool here and the HTTP/2 pool in
+/// `http2.rs`. Adjust with [`configure`].
+static PER_KEY_CAP: AtomicUsize = AtomicUsize::new(DEFAULT_PER_KEY_CAP);
+static GLOBAL_CAP: AtomicUsize = AtomicUsize::new(DEFAULT_GLOBAL_CAP);
+
+/// Set the connection-pool size limits at runtime (applies to both the HTTP/1.1
+/// and HTTP/2 pools): at most `per_key` idle connections per origin and `total`
+/// idle connections overall. Each is clamped to a minimum of 1. Takes effect on
+/// subsequent connection releases; already-pooled connections are unaffected.
+pub fn configure(per_key: usize, total: usize) {
+    PER_KEY_CAP.store(per_key.max(1), Ordering::Relaxed);
+    GLOBAL_CAP.store(total.max(1), Ordering::Relaxed);
+}
+
+/// Current per-authority cap.
+pub(crate) fn per_key_cap() -> usize {
+    PER_KEY_CAP.load(Ordering::Relaxed)
+}
+
+/// Current global cap.
+pub(crate) fn global_cap() -> usize {
+    GLOBAL_CAP.load(Ordering::Relaxed)
+}
+
+/// Serializes tests that read or mutate the process-global pool caps (here and
+/// in `http2.rs`), so a concurrent [`configure`] can't perturb their counts.
+#[cfg(test)]
+pub(crate) static CAP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Identity of a connection's destination authority.
 ///
@@ -110,11 +139,11 @@ impl<S: Read + Write> Pool<S> {
     /// used once is at least as likely to survive as a fresh arrival.)
     pub(crate) fn release(&mut self, key: Key, conn: BufReader<S>) {
         let total: usize = self.entries.values().map(Vec::len).sum();
-        if total >= POOL_GLOBAL_CAP {
+        if total >= global_cap() {
             return;
         }
         let bucket = self.entries.entry(key).or_default();
-        if bucket.len() >= POOL_PER_KEY_CAP {
+        if bucket.len() >= per_key_cap() {
             return;
         }
         bucket.push(conn);
@@ -187,23 +216,45 @@ mod tests {
         assert_eq!(p.total_len(), 0);
     }
 
+    use super::CAP_TEST_LOCK as CAP_LOCK;
+
     #[test]
     fn per_key_cap_enforced() {
+        let _g = CAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure(DEFAULT_PER_KEY_CAP, DEFAULT_GLOBAL_CAP);
+        let cap = per_key_cap();
         let mut p: Pool<Stub> = Pool::new();
-        for _ in 0..(POOL_PER_KEY_CAP + 2) {
+        for _ in 0..(cap + 2) {
             p.release(k("h", 80), BufReader::new(Stub));
         }
-        assert_eq!(p.total_len(), POOL_PER_KEY_CAP);
+        assert_eq!(p.total_len(), cap);
     }
 
     #[test]
     fn global_cap_enforced_across_keys() {
+        let _g = CAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure(DEFAULT_PER_KEY_CAP, DEFAULT_GLOBAL_CAP);
+        let cap = global_cap();
         let mut p: Pool<Stub> = Pool::new();
-        for i in 0..(POOL_GLOBAL_CAP + 5) {
-            // Each key has at most POOL_PER_KEY_CAP entries — so spread
-            // releases across many keys to actually exercise the global cap.
+        for i in 0..(cap + 5) {
+            // Each key has at most per_key_cap entries — so spread releases
+            // across many keys to actually exercise the global cap.
             p.release(k("h", i as u16), BufReader::new(Stub));
         }
-        assert_eq!(p.total_len(), POOL_GLOBAL_CAP);
+        assert_eq!(p.total_len(), cap);
+    }
+
+    #[test]
+    fn configure_sets_and_clamps_caps() {
+        let _g = CAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure(2, 5);
+        assert_eq!(per_key_cap(), 2);
+        assert_eq!(global_cap(), 5);
+        // Clamped to a minimum of 1.
+        configure(0, 0);
+        assert_eq!(per_key_cap(), 1);
+        assert_eq!(global_cap(), 1);
+        // Restore defaults for any later-running test.
+        configure(DEFAULT_PER_KEY_CAP, DEFAULT_GLOBAL_CAP);
     }
 }

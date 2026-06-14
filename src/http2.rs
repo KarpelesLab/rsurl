@@ -528,6 +528,17 @@ fn write_frame<W: Write>(w: &mut W, f: &Frame) -> io::Result<()> {
     Ok(())
 }
 
+/// Map a request [`Priority`](crate::http::Priority) to the PRIORITY frame's
+/// 1-byte weight field (on-wire weight = value + 1). `Normal` returns `None`,
+/// meaning "send no PRIORITY frame" — the peer uses the default weight (16).
+fn priority_weight_byte(priority: crate::http::Priority) -> Option<u8> {
+    match priority {
+        crate::http::Priority::High => Some(255), // weight 256 (max)
+        crate::http::Priority::Normal => None,    // default weight 16
+        crate::http::Priority::Low => Some(0),    // weight 1 (min)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HPACK integer codec (RFC 7541 §5.1).
 // ---------------------------------------------------------------------------
@@ -1908,11 +1919,38 @@ impl<S: Read + Write> Connection<S> {
         Ok(id)
     }
 
+    /// Emit a PRIORITY frame (RFC 9113 §6.3) carrying the request's priority
+    /// weight, before its HEADERS. Only for a non-default hint — `Normal` uses
+    /// the protocol default weight (16) and sends nothing. Priority-aware peers
+    /// honour the weight; others ignore it (it is a harmless standalone frame).
+    fn send_priority_hint(
+        &mut self,
+        stream_id: u32,
+        priority: crate::http::Priority,
+    ) -> Result<()> {
+        let Some(weight) = priority_weight_byte(priority) else {
+            return Ok(());
+        };
+        // Payload: 4-byte stream dependency (exclusive=0, dep=0) + 1-byte weight.
+        let payload = vec![0, 0, 0, 0, weight];
+        write_frame(
+            &mut self.tls,
+            &Frame {
+                typ: F_PRIORITY,
+                flags: 0,
+                stream_id,
+                payload,
+            },
+        )?;
+        Ok(())
+    }
+
     /// Build and write the HEADERS + CONTINUATION + DATA frames for `req` on
     /// `stream_id`. Blocks on flow control by reading inbound frames in-place
     /// when the send window is depleted. The stream's `state` is advanced
     /// for each outbound transition.
     fn send_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
+        self.send_priority_hint(stream_id, req.priority)?;
         let header_block = build_header_block(&mut self.encoder, req);
         let has_body = !req.body.is_empty();
         let max_frame_size = self.peer.max_frame_size as usize;
@@ -2103,6 +2141,7 @@ impl<S: Read + Write> Connection<S> {
     /// `send_request_on` is the verb name; this is `stage_request_on` because
     /// it only commits the request headers, deferring the body.
     fn stage_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
+        self.send_priority_hint(stream_id, req.priority)?;
         let header_block = build_header_block(&mut self.encoder, req);
         let has_body = !req.body.is_empty();
         let max_frame_size = self.peer.max_frame_size as usize;
@@ -3139,12 +3178,9 @@ impl PoolKey {
     }
 }
 
-/// Per-authority cap. With h2 multiplexing the steady-state need is small;
-/// keep this modest to bound memory under bursty traffic.
-const POOL_PER_KEY_CAP: usize = 4;
-
-/// Total live pooled conns across all keys.
-const POOL_GLOBAL_CAP: usize = 32;
+// The HTTP/2 pool shares the runtime-tunable size limits with the HTTP/1.1
+// pool; see [`crate::pool::configure`] and `crate::pool::{per_key_cap,
+// global_cap}`.
 
 /// One pooled connection's transport type. We only pool the production
 /// transport — `TlsStream<TcpStream>` over `connect_over_tls`. Test fakes do
@@ -3185,11 +3221,11 @@ impl<S: Read + Write> PoolInner<S> {
         // Global cap takes precedence: even if this bucket has room, we
         // refuse to grow the pool past the global ceiling.
         let total: usize = self.entries.values().map(Vec::len).sum();
-        if total >= POOL_GLOBAL_CAP {
+        if total >= crate::pool::global_cap() {
             return;
         }
         let bucket = self.entries.entry(key).or_default();
-        if bucket.len() >= POOL_PER_KEY_CAP {
+        if bucket.len() >= crate::pool::per_key_cap() {
             return;
         }
         bucket.push(conn);
@@ -5081,6 +5117,33 @@ mod tests {
     }
 
     #[test]
+    fn priority_weight_byte_maps_hints() {
+        use crate::http::Priority;
+        assert_eq!(priority_weight_byte(Priority::High), Some(255));
+        assert_eq!(priority_weight_byte(Priority::Normal), None);
+        assert_eq!(priority_weight_byte(Priority::Low), Some(0));
+    }
+
+    #[test]
+    fn priority_hint_emits_priority_frame() {
+        use crate::http::Priority;
+        let mut conn = fake_conn();
+        conn.send_priority_hint(1, Priority::High).unwrap();
+        let out = &conn.tls.wire_out;
+        // 9-byte frame header + 5-byte PRIORITY payload.
+        assert_eq!(out.len(), 14, "expected one PRIORITY frame");
+        assert_eq!(out[3], F_PRIORITY, "frame type should be PRIORITY");
+        assert_eq!(out[13], 255, "weight byte should be max for High");
+        // Normal priority emits no frame (default weight).
+        let mut c2 = fake_conn();
+        c2.send_priority_hint(3, Priority::Normal).unwrap();
+        assert!(
+            c2.tls.wire_out.is_empty(),
+            "Normal should send no PRIORITY frame"
+        );
+    }
+
+    #[test]
     fn apply_dial_timing_copies_phases() {
         use std::time::Duration;
         let mut conn = fake_conn();
@@ -5723,39 +5786,48 @@ mod tests {
 
     #[test]
     fn pool_per_key_cap_drops_overflow() {
-        // Release POOL_PER_KEY_CAP + 2 conns to a single key; only CAP
-        // survive. Pop them all and count.
+        // Release per_key_cap + 2 conns to a single key; only CAP survive.
+        // Serialized with the other cap tests; defaults restored first.
+        let _g = crate::pool::CAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::pool::configure(4, 32);
+        let cap = crate::pool::per_key_cap();
         let mut pool: PoolInner<FakeTls> = PoolInner::new();
         let k = url_key("https://example.com/");
-        for _ in 0..(POOL_PER_KEY_CAP + 2) {
+        for _ in 0..(cap + 2) {
             pool.release(k.clone(), fake_arc_conn());
         }
         let mut popped = 0;
         while pool.checkout(&k).is_some() {
             popped += 1;
         }
-        assert_eq!(popped, POOL_PER_KEY_CAP);
+        assert_eq!(popped, cap);
     }
 
     #[test]
     fn pool_global_cap_drops_overflow() {
         // Spread releases across many distinct keys so the per-key cap
-        // never bites — only the global cap can. Push double the global cap
-        // and assert the pool's total length never exceeds it.
+        // never bites — only the global cap can.
+        let _g = crate::pool::CAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::pool::configure(4, 32);
+        let cap = crate::pool::global_cap();
         let mut pool: PoolInner<FakeTls> = PoolInner::new();
-        for i in 0..(POOL_GLOBAL_CAP * 2) {
+        for i in 0..(cap * 2) {
             let k = url_key(&format!("https://h{i}.example/"));
             pool.release(k, fake_arc_conn());
         }
         assert!(
-            pool.total_len() <= POOL_GLOBAL_CAP,
+            pool.total_len() <= cap,
             "pool grew past global cap: {} > {}",
             pool.total_len(),
-            POOL_GLOBAL_CAP
+            cap
         );
         // And we should be exactly at the cap (we never evict, so we should
-        // have stopped accepting at POOL_GLOBAL_CAP).
-        assert_eq!(pool.total_len(), POOL_GLOBAL_CAP);
+        // have stopped accepting at the global cap).
+        assert_eq!(pool.total_len(), cap);
     }
 
     #[test]

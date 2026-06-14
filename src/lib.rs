@@ -15,7 +15,7 @@ mod error;
 mod http;
 mod idn;
 pub mod multi;
-mod pool;
+pub mod pool;
 pub mod resume;
 mod sigv4;
 mod smtp;
