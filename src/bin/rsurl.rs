@@ -4335,7 +4335,14 @@ fn bt_layout(
     use std::path::Path;
     if meta.files.len() == 1 {
         if let Some(o) = args.output.as_deref().filter(|p| *p != "-") {
-            Ok(vec![(resolve_output_path(o, args), meta.files[0].length)])
+            let p = resolve_output_path(o, args);
+            // `-o <dir>` (e.g. `-o .`): place the file inside the directory
+            // rather than treating the directory itself as the target file.
+            if p.is_dir() {
+                Ok(rsurl::bittorrent::file_layout(meta, &p))
+            } else {
+                Ok(vec![(p, meta.files[0].length)])
+            }
         } else if let Some(dir) = &args.output_dir {
             Ok(rsurl::bittorrent::file_layout(meta, Path::new(dir)))
         } else {
@@ -4516,8 +4523,10 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
             magnet.info_hash,
             &peers,
             peer_id,
-            opts.connect_timeout,
-            opts.peer_timeout,
+            // Short per-peer caps: many swarm peers are unreachable, and we
+            // probe them concurrently, so fail fast and move on.
+            Duration::from_secs(5),
+            Duration::from_secs(10),
         ) {
             Ok(m) => (m, magnet.trackers),
             Err(e) => {

@@ -11,6 +11,8 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -18,6 +20,9 @@ use crate::error::{Error, Result};
 use super::bencode::{self, Value};
 use super::metainfo::{sha1, Metainfo};
 use super::peer::{self, Handshake, Message};
+
+/// How many peers to probe for metadata at once.
+const MAX_PARALLEL: usize = 30;
 
 /// `ut_metadata` transfers the info dict in 16 KiB pieces (BEP 9).
 const METADATA_PIECE: usize = 16 * 1024;
@@ -32,9 +37,10 @@ fn merr(msg: impl Into<String>) -> Error {
     Error::BadResponse(format!("bt metadata: {}", msg.into()))
 }
 
-/// Fetch the `info` dictionary for `info_hash` directly from `peers`, trying
-/// each in turn, and parse it into a [`Metainfo`]. Returns the last error if
-/// no peer yields valid, verified metadata.
+/// Fetch the `info` dictionary for `info_hash` from `peers` and parse it into a
+/// [`Metainfo`]. Peers are probed concurrently (a bounded number at a
+/// time) and the first verified metadata wins; remaining attempts are
+/// abandoned. Returns the last error if no peer yields valid metadata.
 pub fn fetch_metainfo(
     info_hash: [u8; 20],
     peers: &[SocketAddr],
@@ -42,10 +48,44 @@ pub fn fetch_metainfo(
     connect_timeout: Duration,
     peer_timeout: Duration,
 ) -> Result<Metainfo> {
-    let mut last = merr("no peers to fetch metadata from");
-    for &addr in peers {
-        match fetch_info(addr, info_hash, peer_id, connect_timeout, peer_timeout) {
-            Ok(info) => return Metainfo::from_info_dict(&info),
+    if peers.is_empty() {
+        return Err(merr("no peers to fetch metadata from"));
+    }
+
+    let peers: Arc<Vec<SocketAddr>> = Arc::new(peers.to_vec());
+    let next = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<Result<Vec<u8>>>();
+
+    let workers = MAX_PARALLEL.min(peers.len());
+    for _ in 0..workers {
+        let tx = tx.clone();
+        let peers = Arc::clone(&peers);
+        let next = Arc::clone(&next);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= peers.len() {
+                    break;
+                }
+                let r = fetch_info(peers[i], info_hash, peer_id, connect_timeout, peer_timeout);
+                let ok = r.is_ok();
+                if tx.send(r).is_err() || ok {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx); // so rx closes once every worker exits
+
+    let mut last = merr("no peer served metadata");
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Ok(info) => {
+                done.store(true, Ordering::Relaxed);
+                return Metainfo::from_info_dict(&info);
+            }
             Err(e) => last = e,
         }
     }
