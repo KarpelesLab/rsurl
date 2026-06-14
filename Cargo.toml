@@ -30,8 +30,13 @@ path = "src/bin/rsurl.rs"
 
 [features]
 # Default keeps the historical behaviour: a single TLS backend layered on
-# purecrypto, no extra C-free guarantees lost.
-default = ["purecrypto-tls", "idn"]
+# purecrypto, no extra C-free guarantees lost. `bittorrent` is on by default
+# but can be dropped with `--no-default-features`.
+default = ["purecrypto-tls", "idn", "bittorrent"]
+# BitTorrent client (`.torrent` / `magnet:`): bencode, trackers, DHT, peer wire
+# protocol, seeding. Pure Rust on `purecrypto` + std — adds no new dependency,
+# so the feature is purely organizational (lets it be compiled out).
+bittorrent = []
 # Use purecrypto's TLS stack (purecrypto::tls). No additional deps.
 purecrypto-tls = []
 # Use rustls 0.23 + ring instead. Enable with

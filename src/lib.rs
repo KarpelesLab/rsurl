@@ -25,6 +25,8 @@ pub mod net;
 pub mod tls;
 
 // Protocol backends — each one owns a single URL scheme family.
+#[cfg(feature = "bittorrent")]
+pub mod bittorrent;
 pub mod dict;
 pub mod file;
 pub mod ftp;
