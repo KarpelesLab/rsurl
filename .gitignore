@@ -3,3 +3,13 @@ Cargo.lock
 *.swp
 .DS_Store
 /.claude/
+
+# Files downloaded while testing rsurl in-tree (it is a download tool, so guard
+# against accidentally committing fetched media/archives from the repo root).
+/*.mkv
+/*.mp4
+/*.avi
+/*.mp3
+/*.iso
+/*.zip
+/*.torrent
