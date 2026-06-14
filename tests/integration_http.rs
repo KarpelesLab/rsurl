@@ -610,6 +610,44 @@ fn cookie_traverses_redirect_chain() {
     );
 }
 
+/// `cookies_through_redirects(false)` confines jar use to the first request:
+/// a cookie set on the redirecting hop is NOT replayed on the followed hop,
+/// so a browser can drive its own per-hop cookie policy (requirement #5).
+#[test]
+fn cookies_not_carried_across_redirects_when_disabled() {
+    use std::sync::{Arc, Mutex};
+    let observed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let obs_for_handler = Arc::clone(&observed);
+    let server = TestServer::start(move |req: SReq| {
+        if req.path == "/start" {
+            SResp::status(302)
+                .header("Set-Cookie", "sid=abc; Path=/")
+                .header("Location", "/home")
+        } else {
+            *obs_for_handler.lock().unwrap() = req
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                .map(|(_, v)| v.clone());
+            SResp::ok("welcome")
+        }
+    });
+
+    let mut jar = CookieJar::new();
+    let resp = Request::get(&server.url("/start"))
+        .unwrap()
+        .follow_redirects(true)
+        .cookies_through_redirects(false)
+        .send_with_jar(&mut jar)
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        observed.lock().unwrap().clone(),
+        None,
+        "no cookie should be sent on the redirected hop when disabled"
+    );
+}
+
 /// `Response::final_url` reports the effective URL after a redirect (the value
 /// behind curl's `CURLINFO_EFFECTIVE_URL`); without a redirect it is the
 /// requested URL.

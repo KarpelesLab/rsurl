@@ -147,6 +147,12 @@ pub struct Request {
     /// Send the method exactly as given rather than upper-casing it
     /// ([`Request::keep_method_case`]).
     pub(crate) keep_method_case: bool,
+    /// Whether the cookie jar is consulted and updated on *redirect hops* (not
+    /// just the first request). `true` (default) is curl's behaviour. `false`
+    /// confines jar use to the initial request, so a browser following its own
+    /// per-hop cookie policy isn't second-guessed. See
+    /// [`Request::cookies_through_redirects`].
+    pub(crate) jar_through_redirects: bool,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -249,7 +255,18 @@ impl Request {
             cancel: None,
             strict_headers: false,
             keep_method_case: false,
+            jar_through_redirects: true,
         })
+    }
+
+    /// Whether the cookie jar (when one is supplied) is applied and updated on
+    /// redirect hops, not just the first request. Default `true` (curl's
+    /// behaviour). Set `false` so a browser can drive cookie policy per hop —
+    /// combined with [`follow_redirects(false)`](Self::follow_redirects), which
+    /// hands each 3xx back to the caller, this gives full per-hop control.
+    pub fn cookies_through_redirects(mut self, on: bool) -> Self {
+        self.jar_through_redirects = on;
+        self
     }
 
     /// Send only the headers the caller set — suppress rsurl's automatic
@@ -930,8 +947,10 @@ impl Request {
         let mut req = self;
         req.url.set_idn(req.idn)?;
         let mut hops_left = req.max_redirs;
+        let mut first_hop = true;
         loop {
             req.cancel_check()?;
+            let use_jar = req.jar_through_redirects || first_hop;
             let start = std::time::Instant::now();
             let mut timing = Timing::default();
             // Held for this hop's connection so a `cancel()` can shut the socket
@@ -960,7 +979,7 @@ impl Request {
 
             // Attach a jar-managed Cookie header to a snapshot of the request.
             let mut snapshot = req.clone();
-            if let Some(j) = jar.as_deref_mut() {
+            if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
                 j.purge_expired();
                 snapshot
                     .headers
@@ -977,7 +996,7 @@ impl Request {
             )?;
             let head = read_head(&mut bufrd, trace)?;
             timing.starttransfer = Some(start.elapsed());
-            if let Some(j) = jar.as_deref_mut() {
+            if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
                 j.ingest_response(&req.url, &head.headers);
             }
 
@@ -1058,6 +1077,7 @@ impl Request {
                     }
                     hops_left -= 1;
                     req = next;
+                    first_hop = false;
                     continue;
                 }
                 // 3xx without Location — treat as the final response.
@@ -1206,8 +1226,12 @@ impl Request {
         let mut digest_tried = false;
         let deadline = req.max_time.map(|d| std::time::Instant::now() + d);
         let mut hops_left = req.max_redirs;
+        let mut first_hop = true;
         loop {
             req.cancel_check()?;
+            // Confine jar use to the first request when the caller opted out of
+            // carrying cookies across redirect hops.
+            let use_jar = req.jar_through_redirects || first_hop;
             // Honour --max-time before each hop (the per-socket timeout
             // already handles the in-flight case).
             if let Some(end) = deadline {
@@ -1220,7 +1244,7 @@ impl Request {
             // entries from the snapshot before re-injecting from the jar,
             // because the previous hop's cookie line is stale once the URL
             // (and thus the matching set) has changed.
-            if let Some(j) = jar.as_deref_mut() {
+            if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
                 j.purge_expired();
                 snapshot
                     .headers
@@ -1230,7 +1254,7 @@ impl Request {
                 }
             }
             let mut resp = snapshot.send_once(trace)?;
-            if let Some(j) = jar.as_deref_mut() {
+            if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
                 j.ingest_response(&req.url, &resp.headers);
             }
             // Digest auth: answer a 401 Digest challenge once, then resend.
@@ -1341,6 +1365,7 @@ impl Request {
             }
             hops_left -= 1;
             req = next;
+            first_hop = false;
         }
     }
 }

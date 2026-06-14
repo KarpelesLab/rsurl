@@ -33,6 +33,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 
+/// The `SameSite` attribute of a cookie (RFC 6265bis §5.2). rsurl parses and
+/// exposes it but does **not** enforce it — same-site is a browser policy the
+/// caller (e.g. Argus) applies, not a CLI transfer concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SameSite {
+    /// No `SameSite` attribute was present.
+    #[default]
+    Unspecified,
+    Lax,
+    Strict,
+    None,
+}
+
 /// One parsed cookie. `expires` is a Unix epoch second; `None` means a
 /// session cookie (lives only for this rsurl invocation, never persisted).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +64,16 @@ pub struct Cookie {
     /// `true` when the cookie was set without an explicit `Domain=` —
     /// matches only the exact host. `false` means subdomain-match.
     pub host_only: bool,
+    /// The `SameSite` attribute, parsed but not enforced (browser policy).
+    pub same_site: SameSite,
+    /// `true` when the `Set-Cookie` carried the `Partitioned` attribute (CHIPS,
+    /// RFC 6265bis). The actual partition key is assigned by the embedder from
+    /// the top-level site — see [`Cookie::partition_key`].
+    pub partitioned: bool,
+    /// The partition key (CHIPS) the embedder associates with this cookie, e.g.
+    /// the top-level site. `None` until set by the caller; rsurl does not derive
+    /// it (it has no notion of a top-level browsing context).
+    pub partition_key: Option<String>,
 }
 
 /// Bag of cookies. Cheap to clone in tests; threaded by `&mut` through the
@@ -254,9 +277,45 @@ impl CookieJar {
             secure: false,
             http_only: false,
             host_only: true,
+            same_site: SameSite::Unspecified,
+            partitioned: false,
+            partition_key: None,
         };
         self.remove_matching(&cookie);
         self.cookies.push(cookie);
+    }
+
+    /// Iterate over the stored cookies (browser/embedder introspection).
+    pub fn iter(&self) -> impl Iterator<Item = &Cookie> {
+        self.cookies.iter()
+    }
+
+    /// All stored cookies as a slice.
+    pub fn cookies(&self) -> &[Cookie] {
+        &self.cookies
+    }
+
+    /// Insert a fully-formed cookie, replacing any existing one with the same
+    /// (name, domain, path). Lets the embedder restore cookies it persisted
+    /// itself (with `SameSite` / partition key intact).
+    pub fn insert(&mut self, cookie: Cookie) {
+        self.remove_matching(&cookie);
+        self.cookies.push(cookie);
+    }
+
+    /// Remove the cookie with the given (name, domain, path); returns whether
+    /// one was removed. Case-insensitive on domain, like RFC 6265 matching.
+    pub fn remove(&mut self, name: &str, domain: &str, path: &str) -> bool {
+        let before = self.cookies.len();
+        self.cookies.retain(|c| {
+            !(c.name == name && c.domain.eq_ignore_ascii_case(domain) && c.path == path)
+        });
+        self.cookies.len() != before
+    }
+
+    /// Remove every cookie.
+    pub fn clear(&mut self) {
+        self.cookies.clear();
     }
 }
 
@@ -356,6 +415,8 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
     let mut max_age: Option<i64> = None;
     let mut secure = false;
     let mut http_only = false;
+    let mut same_site = SameSite::Unspecified;
+    let mut partitioned = false;
 
     for attr in parts {
         let attr = attr.trim();
@@ -424,8 +485,20 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
             secure = true;
         } else if k.eq_ignore_ascii_case("httponly") {
             http_only = true;
+        } else if k.eq_ignore_ascii_case("samesite") {
+            // Parsed and exposed, but not enforced (browser policy).
+            same_site = match v.map(|s| s.trim()) {
+                Some(s) if s.eq_ignore_ascii_case("lax") => SameSite::Lax,
+                Some(s) if s.eq_ignore_ascii_case("strict") => SameSite::Strict,
+                Some(s) if s.eq_ignore_ascii_case("none") => SameSite::None,
+                _ => SameSite::Unspecified,
+            };
+        } else if k.eq_ignore_ascii_case("partitioned") {
+            // CHIPS boolean attribute; the partition key is assigned by the
+            // embedder, not derived here.
+            partitioned = true;
         }
-        // Anything else (SameSite, Priority, ...) is silently ignored.
+        // Anything else (Priority, ...) is silently ignored.
     }
 
     // Max-Age takes precedence over Expires (RFC 6265 §5.3 step 3).
@@ -446,6 +519,9 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
         secure,
         http_only,
         host_only,
+        same_site,
+        partitioned,
+        partition_key: None,
     })
 }
 
@@ -779,6 +855,11 @@ fn parse_netscape_line(line: &str) -> LineOutcome {
         secure,
         http_only,
         host_only,
+        // The Netscape cookies.txt format has no SameSite / Partitioned columns;
+        // these default and round-trip only through the in-memory jar API.
+        same_site: SameSite::Unspecified,
+        partitioned: false,
+        partition_key: None,
     }))
 }
 
@@ -789,6 +870,52 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn parses_samesite_and_partitioned() {
+        let mut j = CookieJar::new();
+        j.add_set_cookie(&url("https://example.com/"), "a=1; Path=/; SameSite=Lax", 0);
+        j.add_set_cookie(
+            &url("https://example.com/"),
+            "b=2; Path=/; Secure; SameSite=None; Partitioned",
+            0,
+        );
+        j.add_set_cookie(&url("https://example.com/"), "c=3; Path=/", 0);
+        let by = |name: &str| j.iter().find(|c| c.name == name).unwrap().clone();
+        assert_eq!(by("a").same_site, SameSite::Lax);
+        assert!(!by("a").partitioned);
+        assert_eq!(by("b").same_site, SameSite::None);
+        assert!(by("b").partitioned);
+        assert_eq!(by("c").same_site, SameSite::Unspecified);
+    }
+
+    #[test]
+    fn jar_enumeration_and_mutation() {
+        let mut j = CookieJar::new();
+        j.add_set_cookie(&url("https://example.com/"), "a=1; Path=/", 0);
+        assert_eq!(j.iter().count(), 1);
+        assert_eq!(j.cookies().len(), 1);
+
+        // Insert a cookie carrying a caller-assigned CHIPS partition key.
+        let mut c = j.cookies()[0].clone();
+        c.name = "p".into();
+        c.partition_key = Some("https://top.example".into());
+        j.insert(c);
+        let p = j.iter().find(|c| c.name == "p").unwrap();
+        assert_eq!(p.partition_key.as_deref(), Some("https://top.example"));
+
+        // insert() replaces a same (name,domain,path) cookie rather than dup.
+        let mut dup = p.clone();
+        dup.value = "v2".into();
+        j.insert(dup);
+        assert_eq!(j.iter().filter(|c| c.name == "p").count(), 1);
+        assert_eq!(j.iter().find(|c| c.name == "p").unwrap().value, "v2");
+
+        assert!(j.remove("a", "example.com", "/"));
+        assert!(!j.remove("missing", "example.com", "/"));
+        j.clear();
+        assert!(j.is_empty());
     }
 
     #[cfg(unix)]
@@ -931,6 +1058,9 @@ mod tests {
             secure: true,
             http_only: true,
             host_only: false,
+            same_site: SameSite::Unspecified,
+            partitioned: false,
+            partition_key: None,
         });
         let tmp = std::env::temp_dir().join("rsurl_cookie_test.txt");
         let path = tmp.to_str().unwrap();
@@ -1109,6 +1239,9 @@ mod tests {
             secure: false,
             http_only: false,
             host_only: true,
+            same_site: SameSite::Unspecified,
+            partitioned: false,
+            partition_key: None,
         });
         let tmp = std::env::temp_dir().join("rsurl_cookie_sep_test.txt");
         let path = tmp.to_str().unwrap();
