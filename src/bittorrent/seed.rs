@@ -60,6 +60,10 @@ pub fn run(
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                // A socket from accept() inherits the listener's non-blocking
+                // flag on macOS/BSD and Windows (but not Linux); force blocking
+                // so serve()'s timeout-based reads behave consistently.
+                let _ = stream.set_nonblocking(false);
                 let storage = Arc::clone(&storage);
                 let uploaded = Arc::clone(&uploaded);
                 let bf = complete_bf.clone();
