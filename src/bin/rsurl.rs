@@ -295,6 +295,9 @@ struct Args {
     /// `--share-ratio <r>`: seed after completion until uploaded/downloaded
     /// reaches `r`, then exit.
     share_ratio: Option<f64>,
+    /// `--recheck`: on a torrent resume, re-hash on-disk data against the piece
+    /// table instead of trusting the saved resume bitfield.
+    recheck: bool,
 }
 
 /// One body chunk supplied on the command line via `-d` and friends.
@@ -2398,6 +2401,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--bt-peer" => a.bt_peers.push(next_val(&mut it, arg)?),
             "--no-dht" => a.no_dht = true,
             "--seed" => a.seed = true,
+            "--recheck" => a.recheck = true,
             "--share-ratio" => {
                 a.share_ratio = Some(
                     next_val(&mut it, arg)?
@@ -4816,6 +4820,7 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         listen_port,
         seed,
         verbosity: args.verbosity,
+        recheck: args.recheck,
         ..Default::default()
     };
 
@@ -5645,6 +5650,8 @@ Options:
       --no-dht             disable the DHT peer-discovery fallback
       --seed               keep seeding after the torrent completes
       --share-ratio <r>    seed until uploaded/downloaded reaches r, then exit
+      --recheck            on torrent resume, re-hash on-disk data instead of
+                           trusting the saved .rsurlpart bitfield
       --location-trusted   keep credentials across cross-host redirects
       --post301/302/303    keep POST (don't downgrade to GET) on that redirect
       --connect-to <spec>  dial HOST2:PORT2 for requests to HOST1:PORT1

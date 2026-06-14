@@ -133,6 +133,35 @@ impl Storage {
         Ok(true)
     }
 
+    /// Re-hash every piece against the on-disk data, rebuilding the completion
+    /// bitfield from scratch. Used by `--recheck` so a resumed download trusts
+    /// the bytes themselves rather than a saved bitfield. Pieces whose data is
+    /// missing, short, or mismatched are left incomplete.
+    pub fn recheck(&mut self) {
+        let mut have = Bitfield::new(self.num_pieces());
+        for i in 0..self.num_pieces() {
+            let size = self.piece_size(i);
+            let offset = self.piece_length * i as u64;
+            if let Ok(buf) = self.read_at(offset, size) {
+                if sha1(&buf) == self.hashes[i] {
+                    have.set(i);
+                }
+            }
+        }
+        self.have = have;
+    }
+
+    /// Read `len` bytes from global offset `offset`, across the covering files.
+    /// Errors if any covering file is missing or shorter than required.
+    fn read_at(&mut self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; len as usize];
+        self.rw(offset, len, |file, file_off, span| {
+            file.seek(SeekFrom::Start(file_off)).map_err(Error::Io)?;
+            file.read_exact(&mut out[span.clone()]).map_err(Error::Io)
+        })?;
+        Ok(out)
+    }
+
     /// Read `length` bytes of (already-complete) piece `index` starting at
     /// `begin`. Used to serve `request`s when seeding.
     pub fn read_block(&mut self, index: usize, begin: u32, length: u32) -> Result<Vec<u8>> {
@@ -246,6 +275,42 @@ mod tests {
 
         let _ = std::fs::remove_file(&f0);
         let _ = std::fs::remove_file(&f1);
+    }
+
+    #[test]
+    fn recheck_rebuilds_bitfield_from_disk() {
+        // 10 bytes, piece length 4 → pieces of 4,4,2.
+        let data: Vec<u8> = (0..10u8).collect();
+        let pieces: Vec<[u8; 20]> = (0..3)
+            .map(|i| {
+                let s = i * 4;
+                sha1(&data[s..(s + 4).min(10)])
+            })
+            .collect();
+        let f = tmp("recheck.bin");
+        let _ = std::fs::remove_file(&f);
+        let mut st = Storage::create(vec![(f.clone(), 10)], 4, pieces.clone()).unwrap();
+        // Write pieces 0 and 2 only.
+        assert!(st.write_piece(0, &data[0..4]).unwrap());
+        assert!(st.write_piece(2, &data[8..10]).unwrap());
+
+        // A fresh Storage over the same file has no bits until recheck.
+        let mut st2 = Storage::create(vec![(f.clone(), 10)], 4, pieces).unwrap();
+        assert!(!st2.has(0));
+        st2.recheck();
+        assert!(st2.has(0) && st2.has(2) && !st2.has(1));
+        assert_eq!(st2.bytes_complete(), 4 + 2);
+
+        // Corrupting piece 0 on disk drops it on the next recheck.
+        {
+            use std::io::Write as _;
+            let mut h = OpenOptions::new().write(true).open(&f).unwrap();
+            h.seek(SeekFrom::Start(0)).unwrap();
+            h.write_all(&[0xff; 4]).unwrap();
+        }
+        st2.recheck();
+        assert!(!st2.has(0) && st2.has(2));
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]

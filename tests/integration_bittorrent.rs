@@ -429,6 +429,77 @@ fn resumes_single_file_from_partial() {
     let _ = std::fs::remove_file(&out);
 }
 
+/// `--recheck`: a `.rsurlpart` whose saved bitfield lies (claims every piece is
+/// complete) but only half the data is actually on disk. With recheck, the
+/// on-disk data is re-hashed, the lie is corrected, and the missing half is
+/// fetched — yielding a correct file.
+#[test]
+fn recheck_corrects_a_lying_bitfield() {
+    let data: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(5) % 251) as u8)
+        .collect();
+    let meta = make_torrent(&data, 4096, "recheck.bin");
+    let piece_len = meta.piece_length as usize;
+    let np = meta.num_pieces();
+    let half = np / 2;
+
+    let out = std::env::temp_dir().join(format!("rsurl_recheck_{}.bin", std::process::id()));
+    let part = std::path::PathBuf::from(format!("{}.rsurlpart", out.display()));
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&part);
+
+    // Only the first half is real on disk, but the saved bitfield claims all.
+    {
+        let mut st = Storage::create(
+            vec![(part.clone(), data.len() as u64)],
+            meta.piece_length,
+            meta.pieces.clone(),
+        )
+        .unwrap();
+        for i in 0..half {
+            let off = i * piece_len;
+            let end = (off + piece_len).min(data.len());
+            assert!(st.write_piece(i, &data[off..end]).unwrap());
+        }
+        let mut all = Bitfield::new(np);
+        for i in 0..np {
+            all.set(i); // the lie
+        }
+        let mut metab = meta.info_hash.to_vec();
+        metab.extend_from_slice(all.as_bytes());
+        rsurl::resume::write_state(
+            &part,
+            data.len() as u64,
+            rsurl::resume::Kind::Torrent,
+            &metab,
+        )
+        .unwrap();
+    }
+
+    let port = start_seeder(data.clone(), meta.clone());
+    let peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+    let opts = TorrentOptions {
+        recheck: true,
+        ..Default::default()
+    };
+    let stats = download(
+        &meta,
+        vec![(out.clone(), data.len() as u64)],
+        &peers,
+        &opts,
+        &mut |_| {},
+    )
+    .expect("recheck download");
+
+    assert_eq!(stats.downloaded, data.len() as u64);
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        data,
+        "recheck output mismatch"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
 /// Build a multi-file torrent (concatenated linear data + parsed Metainfo).
 fn make_multi_torrent(files: &[(&str, usize)], piece_len: usize, dir: &str) -> (Vec<u8>, Metainfo) {
     let total: usize = files.iter().map(|(_, n)| *n).sum();

@@ -47,6 +47,9 @@ pub struct TorrentOptions {
     /// Diagnostic verbosity to stderr: 0 = quiet, 1 = periodic swarm summary,
     /// 2+ = per-peer lifecycle. Driven by repeated `-v`.
     pub verbosity: u8,
+    /// Re-hash on-disk data against the piece table on start (`--recheck`)
+    /// instead of trusting the saved resume bitfield.
+    pub recheck: bool,
 }
 
 impl Default for TorrentOptions {
@@ -58,6 +61,7 @@ impl Default for TorrentOptions {
             peer_timeout: Duration::from_secs(30),
             seed: SeedMode::Off,
             verbosity: 0,
+            recheck: false,
         }
     }
 }
@@ -116,8 +120,14 @@ pub fn download(
 
     let mut storage = Storage::create(storage_layout, meta.piece_length, meta.pieces.clone())?;
 
-    // Resume: restore the verified-piece bitfield if a matching partial exists.
-    if let Ok(Some(st)) = resume::read_state(&state_path) {
+    // Resume: rebuild the completion bitfield. `--recheck` re-hashes the
+    // on-disk data; otherwise we trust a matching saved bitfield.
+    if opts.recheck {
+        if opts.verbosity >= 1 {
+            eprintln!("* rechecking on-disk data ({num_pieces} pieces)…");
+        }
+        storage.recheck();
+    } else if let Ok(Some(st)) = resume::read_state(&state_path) {
         if st.kind == resume::Kind::Torrent {
             if let Some(bits) = parse_meta(&st.meta, meta.info_hash, num_pieces) {
                 storage.restore_have(&bits);
