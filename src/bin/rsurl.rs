@@ -445,7 +445,7 @@ fn main() -> ExitCode {
     let mut last_failure: u8 = 0;
     for op in &ops {
         for url in &op.urls {
-            let expansions = if op.globoff {
+            let expansions = if glob_disabled(op, url) {
                 vec![(url.clone(), Vec::new())]
             } else {
                 match glob_expand(url) {
@@ -761,6 +761,17 @@ fn glob_expand(url: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     Ok(results)
 }
 
+/// Whether URL globbing must be skipped for this operation's source. Globbing
+/// (`{a,b}`/`[1-9]`, with `\` as the escape char) is a URL feature; a BitTorrent
+/// source may instead be a local `.torrent` path — on Windows its backslashes
+/// would be eaten as glob escapes — or a magnet link, neither of which is a URL
+/// to expand. An `http(s)://` torrent URL still globs normally.
+fn glob_disabled(op: &Args, url: &str) -> bool {
+    op.globoff
+        || url.starts_with("magnet:")
+        || (op.torrent && !url.starts_with("http://") && !url.starts_with("https://"))
+}
+
 /// Substitute `#1`..`#9` in an output-name template with glob captures.
 fn apply_glob_output(template: &str, caps: &[String]) -> String {
     if caps.is_empty() || !template.contains('#') {
@@ -799,7 +810,7 @@ fn run_parallel(ops: &[Args]) -> u8 {
     let mut items: Vec<Item> = Vec::new();
     for op in ops {
         for url in &op.urls {
-            let expansions = if op.globoff {
+            let expansions = if glob_disabled(op, url) {
                 vec![(url.clone(), Vec::new())]
             } else {
                 match glob_expand(url) {
@@ -5788,6 +5799,35 @@ mod tests {
                 "http://h/b/3",
             ]
         );
+    }
+
+    #[test]
+    fn glob_disabled_skips_torrent_paths_and_magnets() {
+        // A local `.torrent` path must never be glob-expanded: on Windows its
+        // backslashes would be eaten as glob escapes (`C:\a\b` -> `C:ab`), and
+        // `[`/`]` in a path would be misread as a range. (Regression: CLI
+        // torrent downloads failing on windows-latest.)
+        let torrent = Args {
+            torrent: true,
+            ..Default::default()
+        };
+        assert!(glob_disabled(
+            &torrent,
+            r"C:\Users\me\AppData\Local\Temp\x.torrent"
+        ));
+        assert!(glob_disabled(&torrent, "/tmp/x.torrent"));
+        // Magnet links are skipped regardless of `--torrent`.
+        assert!(glob_disabled(&Args::default(), "magnet:?xt=urn:btih:abc"));
+        // But an http(s) torrent URL still globs normally.
+        assert!(!glob_disabled(&torrent, "http://h/file[1-3].torrent"));
+        // And a plain URL without `--torrent` is unaffected.
+        assert!(!glob_disabled(&Args::default(), "http://h/{a,b}"));
+        // `-g/--globoff` disables it for everything.
+        let off = Args {
+            globoff: true,
+            ..Default::default()
+        };
+        assert!(glob_disabled(&off, "http://h/{a,b}"));
     }
 
     #[test]
