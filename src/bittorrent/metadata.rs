@@ -47,6 +47,7 @@ pub fn fetch_metainfo(
     peer_id: [u8; 20],
     connect_timeout: Duration,
     peer_timeout: Duration,
+    verbose: bool,
 ) -> Result<Metainfo> {
     if peers.is_empty() {
         return Err(merr("no peers to fetch metadata from"));
@@ -69,8 +70,15 @@ pub fn fetch_metainfo(
                 if i >= peers.len() {
                     break;
                 }
-                let r = fetch_info(peers[i], info_hash, peer_id, connect_timeout, peer_timeout);
+                let addr = peers[i];
+                let r = fetch_info(addr, info_hash, peer_id, connect_timeout, peer_timeout);
                 let ok = r.is_ok();
+                if verbose {
+                    match &r {
+                        Ok(info) => eprintln!("* metadata peer {addr}: got {} bytes", info.len()),
+                        Err(e) => eprintln!("* metadata peer {addr}: {e}"),
+                    }
+                }
                 if tx.send(r).is_err() || ok {
                     break;
                 }

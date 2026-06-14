@@ -78,6 +78,7 @@ pub fn run(
     let num_pieces = meta.num_pieces();
 
     // Spawn one worker per peer.
+    let verbose = opts.verbose;
     let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(peers.len());
     for (i, &addr) in peers.iter().enumerate() {
         let tx = tx.clone();
@@ -85,7 +86,7 @@ pub fn run(
         let ct = opts.connect_timeout;
         let pt = opts.peer_timeout;
         handles.push(std::thread::spawn(move || {
-            peer_worker(i, addr, info_hash, peer_id, num_pieces, ct, pt, tx);
+            peer_worker(i, addr, info_hash, peer_id, num_pieces, ct, pt, verbose, tx);
         }));
     }
     drop(tx); // engine holds no sender; rx ends once every peer thread exits.
@@ -235,9 +236,10 @@ fn peer_worker(
     num_pieces: usize,
     connect_timeout: Duration,
     peer_timeout: Duration,
+    verbose: bool,
     tx: Sender<ToEngine>,
 ) {
-    let _ = run_peer(
+    let r = run_peer(
         peer,
         addr,
         info_hash,
@@ -245,8 +247,15 @@ fn peer_worker(
         num_pieces,
         connect_timeout,
         peer_timeout,
+        verbose,
         &tx,
     );
+    if verbose {
+        match &r {
+            Ok(()) => eprintln!("* peer {addr}: disconnected"),
+            Err(e) => eprintln!("* peer {addr}: {e}"),
+        }
+    }
     let _ = tx.send(ToEngine::Gone { peer });
 }
 
@@ -259,6 +268,7 @@ fn run_peer(
     num_pieces: usize,
     connect_timeout: Duration,
     peer_timeout: Duration,
+    verbose: bool,
     tx: &Sender<ToEngine>,
 ) -> Result<()> {
     let mut sock = TcpStream::connect_timeout(&addr, connect_timeout).map_err(Error::Io)?;
@@ -266,6 +276,9 @@ fn run_peer(
         .map_err(Error::Io)?;
     sock.set_write_timeout(Some(peer_timeout))
         .map_err(Error::Io)?;
+    if verbose {
+        eprintln!("* peer {addr}: connected");
+    }
 
     peer::write_handshake(&mut sock, &Handshake::new(info_hash, peer_id))?;
     let hs = peer::read_handshake(&mut sock)?;
@@ -285,6 +298,9 @@ fn run_peer(
             Message::Have(i) => bf.set(i as usize),
             _ => {}
         }
+    }
+    if verbose {
+        eprintln!("* peer {addr}: unchoked ({} pieces available)", bf.count());
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ToPeer>();

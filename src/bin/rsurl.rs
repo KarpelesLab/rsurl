@@ -4462,6 +4462,7 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         peer_id,
         listen_port,
         seed,
+        verbose: args.verbose,
         ..Default::default()
     };
 
@@ -4527,6 +4528,7 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
             // probe them concurrently, so fail fast and move on.
             Duration::from_secs(5),
             Duration::from_secs(10),
+            args.verbose,
         ) {
             Ok(m) => (m, magnet.trackers),
             Err(e) => {
