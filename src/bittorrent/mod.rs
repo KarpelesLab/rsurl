@@ -10,18 +10,36 @@
 //! infohash, and magnet parsing.
 
 pub mod bencode;
+pub mod download;
 pub mod magnet;
 pub mod metainfo;
+pub mod peer;
+pub mod picker;
+pub mod storage;
 pub mod tracker;
 
 pub use bencode::Value;
+pub use download::{download, Progress, Stats, TorrentOptions};
 pub use magnet::Magnet;
 pub use metainfo::{FileEntry, Metainfo};
+pub use picker::{Bitfield, Picker};
+pub use storage::Storage;
 pub use tracker::{announce, AnnounceParams, AnnounceResponse, Event};
+
+use std::path::{Path, PathBuf};
 
 use purecrypto::rng::{OsRng, RngCore};
 
 use crate::error::{Error, Result};
+
+/// Resolve each file in `meta` to an absolute path under `base` (the file
+/// `path`s already carry the torrent's top directory for multi-file torrents).
+pub fn file_layout(meta: &Metainfo, base: &Path) -> Vec<(PathBuf, u64)> {
+    meta.files
+        .iter()
+        .map(|f| (base.join(&f.path), f.length))
+        .collect()
+}
 
 /// Generate a 20-byte BitTorrent peer id with the Azureus-style prefix
 /// `-RS` + version, the rest random. Fails closed if no OS entropy is
