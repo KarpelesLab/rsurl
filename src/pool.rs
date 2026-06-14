@@ -20,7 +20,7 @@
 //!   other authority even if DNS happens to point at the same address.
 //! * One global pool per transport type: plain `TcpStream` and the TLS-wrapped
 //!   variant `TlsStream<TcpStream>`. Both go through the same generic
-//!   [`Pool<S>`] code; only the static slot differs.
+//!   `Pool<S>` code; only the static slot differs.
 //! * **Stored shape is `BufReader<S>`**, not bare `S`. We carry the buffer
 //!   into the pool so any bytes we may have prefetched while reading headers
 //!   stay with the connection. (In practice the buffer is empty at hand-off
@@ -29,9 +29,10 @@
 //!   ever does send data while we're not looking.)
 //! * **LIFO checkout** — most-recently-used first, same as the HTTP/2 pool.
 //!   The most recent connection is also the most likely still alive.
-//! * **Two caps**: per-key (4) and global (32). Same constants as `http2.rs`.
-//!   Returns past the cap drop the connection on the floor; eviction would
-//!   be no more correct and would complicate the lock-hold time.
+//! * **Two caps**: per-key and global, defaulting to 4 and 32 and tunable at
+//!   runtime via [`configure`] (shared with the `http2.rs` pool). Returns past
+//!   the cap drop the connection on the floor; eviction would be no more
+//!   correct and would complicate the lock-hold time.
 //! * **No idle timeout**. Stale connections are detected at checkout time
 //!   by the caller — they retry on a fresh socket once if the pooled one
 //!   was killed by the peer. Polling for liveness with a timer would just
