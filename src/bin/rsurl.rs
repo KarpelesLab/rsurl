@@ -4778,7 +4778,8 @@ fn metadata_json(meta: &rsurl::bittorrent::Metainfo) -> String {
         }
         o.push_str(&format!(
             "    {{\"path\": \"{}\", \"length\": {}, \"offset\": {}}}",
-            json_escape(&f.path.to_string_lossy()),
+            // Canonical forward-slash path regardless of OS separator.
+            json_escape(&f.path.to_string_lossy().replace('\\', "/")),
             f.length,
             off
         ));
@@ -4853,10 +4854,15 @@ fn bt_resolve_file(
 ) -> std::result::Result<(usize, u64, u64), String> {
     let idx = match sel.parse::<usize>() {
         Ok(n) if n >= 1 && n <= meta.files.len() => Some(n - 1),
-        _ => meta.files.iter().position(|f| {
-            let p = f.path.to_string_lossy();
-            p == sel || f.path.file_name().and_then(|n| n.to_str()) == Some(sel) || p.ends_with(sel)
-        }),
+        _ => {
+            let sel = sel.replace('\\', "/"); // canonical, cross-platform
+            meta.files.iter().position(|f| {
+                let p = f.path.to_string_lossy().replace('\\', "/");
+                p == sel
+                    || f.path.file_name().and_then(|n| n.to_str()) == Some(sel.as_str())
+                    || p.ends_with(&sel)
+            })
+        }
     };
     match idx {
         Some(i) => {
