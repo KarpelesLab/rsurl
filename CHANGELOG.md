@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.10...rsurl-v0.0.11) - 2026-06-15
+
+### Added
+
+- *(ffi)* add RSURLOPT_HTTP_CONTENT_DECODING to disable decompression
+
+### Other
+
+- WebSocket::split() into concurrent WsReader + WsWriter
+- cover send_reader fallback+redirects, add http-only CI lane
+
 ## [0.0.10](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.9...rsurl-v0.0.10) - 2026-06-15
 
 ### Added
