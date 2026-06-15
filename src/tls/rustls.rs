@@ -608,6 +608,128 @@ impl<S: Read + Write> Read for TlsStream<S> {
     }
 }
 
+/// A concurrent TLS connection (rustls backend): the state machine runs behind
+/// a mutex while the blocking socket *read* happens outside it, so one thread
+/// can block in [`TlsConn::read`] while others [`TlsConn::write`]. Writes are
+/// serialized by the engine lock; reads run concurrently. Mirrors the
+/// purecrypto backend's `TlsConn`. Built via [`TlsStream::into_concurrent`].
+pub struct TlsConn {
+    engine: std::sync::Mutex<RsEngine>,
+    read_sock: std::sync::Mutex<Box<dyn crate::net::NetStream>>,
+}
+
+struct RsEngine {
+    conn: ClientConnection,
+    write_sock: Box<dyn crate::net::NetStream>,
+    dirty_eof: bool,
+}
+
+impl TlsStream<Box<dyn crate::net::NetStream>> {
+    /// Convert a handshaken blocking stream into a [`TlsConn`]. `read_sock` is a
+    /// clone of the same fd used for inbound bytes; the original socket becomes
+    /// the write side.
+    pub fn into_concurrent(self, read_sock: Box<dyn crate::net::NetStream>) -> TlsConn {
+        TlsConn {
+            engine: std::sync::Mutex::new(RsEngine {
+                conn: self.conn,
+                write_sock: self.sock,
+                dirty_eof: self.dirty_eof,
+            }),
+            read_sock: std::sync::Mutex::new(read_sock),
+        }
+    }
+}
+
+impl TlsConn {
+    /// Read decrypted application bytes, blocking on the socket outside the
+    /// engine lock so a concurrent [`write`](Self::write) is never blocked.
+    pub fn read(&self, dst: &mut [u8]) -> io::Result<usize> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            // Serve buffered plaintext + flush pending output, under the lock.
+            let wants_read = {
+                let mut e = self.engine.lock().unwrap();
+                match e.conn.reader().read(dst) {
+                    Ok(0) => return Ok(0),
+                    Ok(n) => return Ok(n),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                        e.dirty_eof = true;
+                        return Ok(0);
+                    }
+                    Err(err) => return Err(err),
+                }
+                let RsEngine {
+                    conn, write_sock, ..
+                } = &mut *e;
+                while conn.wants_write() {
+                    conn.write_tls(write_sock)?;
+                }
+                conn.wants_read()
+            };
+            if !wants_read {
+                return Ok(0);
+            }
+            // Blocking read with NO engine lock held.
+            let mut buf = [0u8; 16 * 1024];
+            let n = self.read_sock.lock().unwrap().read(&mut buf)?;
+            let mut e = self.engine.lock().unwrap();
+            if n == 0 {
+                return match e.conn.reader().read(dst) {
+                    Ok(n) => Ok(n),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                        e.dirty_eof = true;
+                        Ok(0)
+                    }
+                    Err(err) => Err(err),
+                };
+            }
+            let mut src: &[u8] = &buf[..n];
+            let RsEngine { conn, .. } = &mut *e;
+            while !src.is_empty() {
+                let used = conn.read_tls(&mut src)?;
+                if used == 0 {
+                    break;
+                }
+                conn.process_new_packets()
+                    .map_err(|e| io::Error::other(format!("tls: {e}")))?;
+            }
+        }
+    }
+
+    /// Encrypt and send `data`. Serialized against other writes by the lock.
+    pub fn write(&self, data: &[u8]) -> io::Result<()> {
+        let mut e = self.engine.lock().unwrap();
+        let RsEngine {
+            conn, write_sock, ..
+        } = &mut *e;
+        conn.writer().write_all(data)?;
+        while conn.wants_write() {
+            conn.write_tls(write_sock)?;
+        }
+        Ok(())
+    }
+
+    pub fn flush(&self) -> io::Result<()> {
+        let mut e = self.engine.lock().unwrap();
+        let RsEngine {
+            conn, write_sock, ..
+        } = &mut *e;
+        while conn.wants_write() {
+            conn.write_tls(write_sock)?;
+        }
+        write_sock.flush()
+    }
+
+    /// Set the inbound read timeout (affects the blocking read in `read`).
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        self.read_sock.lock().unwrap().set_read_timeout(dur)
+    }
+}
+
 /// `ServerCertVerifier` that returns success for any chain. Cryptographic
 /// signature verification on the handshake itself is still performed via the
 /// ring `CryptoProvider`, so a real TLS handshake (just not one that proves

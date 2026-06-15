@@ -420,45 +420,56 @@ impl<S: Read + Write> TlsStream<S> {
     }
 
     fn drain_outgoing(&mut self) -> io::Result<()> {
-        loop {
-            let out = self.conn.pop().map_err(io_tls)?;
-            if out.is_empty() {
-                return Ok(());
-            }
-            self.sock.write_all(&out)?;
-        }
+        pc_drain_outgoing(&mut self.conn, &mut self.sock)
     }
 
     /// Feed `wire` into the state machine, looping until everything has been
     /// consumed (the API only promises to consume a prefix per call).
     fn feed_all(&mut self, wire: &[u8]) -> io::Result<()> {
-        if !self.pending_wire.is_empty() {
-            self.pending_wire.extend_from_slice(wire);
-            let mut taken = 0;
-            while taken < self.pending_wire.len() {
-                let n = self
-                    .conn
-                    .feed(&self.pending_wire[taken..])
-                    .map_err(io_tls)?;
-                if n == 0 {
-                    break;
-                }
-                taken += n;
-            }
-            self.pending_wire.drain(..taken);
+        pc_feed_all(&mut self.conn, &mut self.pending_wire, wire)
+    }
+}
+
+/// Drain every outgoing wire record the state machine has queued, writing each
+/// to `sock`. Shared by the blocking [`TlsStream`] and the concurrent
+/// [`TlsConn`].
+fn pc_drain_outgoing(conn: &mut Connection, sock: &mut dyn Write) -> io::Result<()> {
+    loop {
+        let out = conn.pop().map_err(io_tls)?;
+        if out.is_empty() {
             return Ok(());
         }
+        sock.write_all(&out)?;
+    }
+}
+
+/// Feed `wire` into the state machine, looping until everything is consumed
+/// (each `feed` only promises to take a prefix); leftovers are buffered in
+/// `pending`. Shared by [`TlsStream`] and [`TlsConn`].
+fn pc_feed_all(conn: &mut Connection, pending: &mut Vec<u8>, wire: &[u8]) -> io::Result<()> {
+    if !pending.is_empty() {
+        pending.extend_from_slice(wire);
         let mut taken = 0;
-        while taken < wire.len() {
-            let n = self.conn.feed(&wire[taken..]).map_err(io_tls)?;
+        while taken < pending.len() {
+            let n = conn.feed(&pending[taken..]).map_err(io_tls)?;
             if n == 0 {
-                self.pending_wire.extend_from_slice(&wire[taken..]);
-                return Ok(());
+                break;
             }
             taken += n;
         }
-        Ok(())
+        pending.drain(..taken);
+        return Ok(());
     }
+    let mut taken = 0;
+    while taken < wire.len() {
+        let n = conn.feed(&wire[taken..]).map_err(io_tls)?;
+        if n == 0 {
+            pending.extend_from_slice(&wire[taken..]);
+            return Ok(());
+        }
+        taken += n;
+    }
+    Ok(())
 }
 
 impl<S: Read + Write> Write for TlsStream<S> {
@@ -512,6 +523,137 @@ impl<S: Read + Write> Read for TlsStream<S> {
         dst[..take].copy_from_slice(&self.plaintext[..take]);
         self.plaintext.drain(..take);
         Ok(take)
+    }
+}
+
+/// A concurrent TLS connection: the TLS state machine runs behind a mutex while
+/// the blocking socket *read* happens outside it, so one thread can block in
+/// [`TlsConn::read`] while others [`TlsConn::write`]. Writes are serialized by
+/// the engine lock (TLS records must not interleave on the wire); reads run
+/// concurrently. Built from a handshaken [`TlsStream`] via
+/// [`TlsStream::into_concurrent`].
+pub struct TlsConn {
+    engine: std::sync::Mutex<PcEngine>,
+    /// A second handle to the same fd, used only for inbound bytes so the
+    /// reader never holds the engine lock while blocked in a socket read.
+    read_sock: std::sync::Mutex<Box<dyn crate::net::NetStream>>,
+}
+
+struct PcEngine {
+    conn: Connection,
+    write_sock: Box<dyn crate::net::NetStream>,
+    pending_wire: Vec<u8>,
+    /// Decrypted bytes not yet handed to a `read` caller.
+    plaintext: Vec<u8>,
+    seen_eof: bool,
+}
+
+impl TlsStream<Box<dyn crate::net::NetStream>> {
+    /// Convert a handshaken blocking stream into a [`TlsConn`]. `read_sock` is a
+    /// clone of the same fd (e.g. via `try_clone_box`) used for inbound bytes;
+    /// the original socket becomes the write side. Any wire/plaintext buffered
+    /// during the handshake is carried over.
+    pub fn into_concurrent(self, read_sock: Box<dyn crate::net::NetStream>) -> TlsConn {
+        TlsConn {
+            engine: std::sync::Mutex::new(PcEngine {
+                conn: self.conn,
+                write_sock: self.sock,
+                pending_wire: self.pending_wire,
+                plaintext: self.plaintext,
+                seen_eof: self.seen_eof,
+            }),
+            read_sock: std::sync::Mutex::new(read_sock),
+        }
+    }
+}
+
+impl TlsConn {
+    /// Read decrypted application bytes. Blocks on the socket outside the engine
+    /// lock, so a concurrent [`write`](Self::write) is never blocked by a reader
+    /// parked here.
+    pub fn read(&self, dst: &mut [u8]) -> io::Result<usize> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            // Hand back anything already decrypted, or decrypt a parked record,
+            // without touching the socket.
+            {
+                let mut e = self.engine.lock().unwrap();
+                if let Some(n) = e.take_plaintext(dst) {
+                    return Ok(n);
+                }
+                let app = e.conn.recv().map_err(io_tls)?;
+                if !app.is_empty() {
+                    e.plaintext = app;
+                    return Ok(e.take_plaintext(dst).unwrap());
+                }
+                if e.seen_eof {
+                    return Ok(0);
+                }
+            }
+            // Blocking read with NO engine lock held.
+            let mut buf = [0u8; READ_CHUNK];
+            let n = self.read_sock.lock().unwrap().read(&mut buf)?;
+            let mut e = self.engine.lock().unwrap();
+            if n == 0 {
+                e.seen_eof = true;
+                let app = e.conn.recv().map_err(io_tls)?;
+                if app.is_empty() {
+                    return Ok(0);
+                }
+                e.plaintext = app;
+                return Ok(e.take_plaintext(dst).unwrap());
+            }
+            let PcEngine {
+                conn,
+                write_sock,
+                pending_wire,
+                ..
+            } = &mut *e;
+            pc_feed_all(conn, pending_wire, &buf[..n])?;
+            // Post-handshake records the SM wants to send (e.g. key update).
+            pc_drain_outgoing(conn, write_sock)?;
+        }
+    }
+
+    /// Encrypt and send `data`. Serialized against other writes by the lock.
+    pub fn write(&self, data: &[u8]) -> io::Result<()> {
+        let mut e = self.engine.lock().unwrap();
+        e.conn.send(data).map_err(io_tls)?;
+        let PcEngine {
+            conn, write_sock, ..
+        } = &mut *e;
+        pc_drain_outgoing(conn, write_sock)
+    }
+
+    pub fn flush(&self) -> io::Result<()> {
+        let mut e = self.engine.lock().unwrap();
+        let PcEngine {
+            conn, write_sock, ..
+        } = &mut *e;
+        pc_drain_outgoing(conn, write_sock)?;
+        write_sock.flush()
+    }
+
+    /// Set the inbound read timeout (affects the blocking read in
+    /// [`read`](Self::read)).
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+        self.read_sock.lock().unwrap().set_read_timeout(dur)
+    }
+}
+
+impl PcEngine {
+    /// Move up to `dst.len()` buffered plaintext bytes into `dst`; `None` if the
+    /// buffer is empty.
+    fn take_plaintext(&mut self, dst: &mut [u8]) -> Option<usize> {
+        if self.plaintext.is_empty() {
+            return None;
+        }
+        let n = dst.len().min(self.plaintext.len());
+        dst[..n].copy_from_slice(&self.plaintext[..n]);
+        self.plaintext.drain(..n);
+        Some(n)
     }
 }
 

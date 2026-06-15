@@ -45,7 +45,8 @@
 //!   * Ping *intervals* / timer-driven keepalive; we react to peer pings but
 //!     do not proactively send our own on a schedule.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use compcol::deflate::Deflate;
@@ -381,6 +382,78 @@ pub struct WsFrame {
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send + ?Sized> ReadWrite for T {}
 
+/// The connection underneath a [`WebSocket`], shared (`Arc`) by both halves of
+/// a [`split`](WebSocket::split). Reads run concurrently with writes; writes are
+/// serialized so a reader's auto-pong and a writer's frames never interleave on
+/// the wire.
+///
+///  * `Plain` — `ws://`: two clones of the same socket fd; reads block on one
+///    (reader-only) lock, writes serialize on the other. Full-duplex TCP.
+///  * `Tls` — `wss://`: a [`crate::tls::TlsConn`] that blocks the socket read
+///    outside its engine lock and serializes writes under it.
+///  * `Shared` — a single stream behind one lock (used by the in-process test
+///    mock; not concurrency-capable).
+enum WsTransport {
+    Plain {
+        read: Mutex<Box<dyn crate::net::NetStream>>,
+        write: Mutex<Box<dyn crate::net::NetStream>>,
+    },
+    // Boxed: the TLS state machine is large (esp. the rustls backend); boxing
+    // keeps the enum compact.
+    Tls(Box<crate::tls::TlsConn>),
+    Shared(Mutex<Box<dyn ReadWrite>>),
+}
+
+impl WsTransport {
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            WsTransport::Plain { read, .. } => read.lock().unwrap().read(buf),
+            WsTransport::Tls(c) => c.read(buf),
+            WsTransport::Shared(s) => s.lock().unwrap().read(buf),
+        }
+    }
+    fn write_all(&self, data: &[u8]) -> io::Result<()> {
+        match self {
+            WsTransport::Plain { write, .. } => write.lock().unwrap().write_all(data),
+            WsTransport::Tls(c) => c.write(data),
+            WsTransport::Shared(s) => s.lock().unwrap().write_all(data),
+        }
+    }
+    fn flush(&self) -> io::Result<()> {
+        match self {
+            WsTransport::Plain { write, .. } => write.lock().unwrap().flush(),
+            WsTransport::Tls(c) => c.flush(),
+            WsTransport::Shared(s) => s.lock().unwrap().flush(),
+        }
+    }
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self {
+            WsTransport::Plain { read, .. } => read.lock().unwrap().set_read_timeout(dur),
+            WsTransport::Tls(c) => c.set_read_timeout(dur),
+            WsTransport::Shared(_) => Ok(()), // mock: no real timeout
+        }
+    }
+}
+
+/// `Read`+`Write` adapter so the frame reader / handshake (which want
+/// `&mut impl Read`/`Write`) can drive a `&WsTransport` whose own methods take
+/// `&self`.
+struct TransportIo<'a>(&'a WsTransport);
+impl Read for TransportIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+impl Write for TransportIo<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0.write_all(data)?;
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 /// A live, persistent WebSocket connection (RFC 6455).
 ///
 /// Open one with [`WebSocket::connect`] for the common case, or
@@ -411,17 +484,14 @@ impl<T: Read + Write + Send + ?Sized> ReadWrite for T {}
 /// is `Send`, so you may move the whole connection between threads; just don't
 /// call it from two at once.)
 pub struct WebSocket {
-    stream: Box<dyn ReadWrite>,
+    /// The connection, shared with the split halves. Reads run concurrently
+    /// with (serialized) writes — see [`WsTransport`].
+    transport: Arc<WsTransport>,
     /// Bytes read off the transport but not yet consumed into a delivered
     /// frame. Frame parsing only drains this once a whole frame is assembled,
     /// so a read error mid-frame (e.g. a read timeout) is resumable instead of
     /// desyncing the stream.
     rxbuf: Vec<u8>,
-    /// A cloned handle to the underlying socket (same OS fd) kept only to
-    /// adjust the read timeout — the data path may be TLS-wrapped and own the
-    /// socket, so this side-channel reaches it. `None` if the transport does
-    /// not support cloning (e.g. some custom connectors).
-    ctl: Option<Box<dyn crate::net::NetStream>>,
     pmd: Option<Pmd>,
     /// We have sent a close frame; no more data frames may be sent. We may
     /// still `recv` to drain the peer's replies and its own close (RFC 6455
@@ -464,51 +534,65 @@ impl WebSocket {
         read_timeout: Option<Duration>,
         subprotocols: &[String],
     ) -> Result<WebSocket> {
-        let (stream, ctl, pmd, subprotocol): (Box<dyn ReadWrite>, _, _, _) =
-            match url.scheme.as_str() {
-                "ws" => {
-                    let mut data = cfg.connect(&url.host, url.port)?;
-                    data.set_write_timeout(Some(SEND_TIMEOUT))
-                        .map_err(Error::Io)?;
-                    // Bound each handshake read; the wall-clock HANDSHAKE_DEADLINE
-                    // inside `handshake` defeats a slow drip on top of this.
-                    data.set_read_timeout(Some(SEND_TIMEOUT))
-                        .map_err(Error::Io)?;
-                    let ctl = data.try_clone_box().ok();
-                    let (pmd, proto) = handshake(&mut data, url, subprotocols)?;
-                    (Box::new(data), ctl, pmd, proto)
+        // Build the (concurrency-capable) transport, then run the HTTP upgrade
+        // handshake over it. Each handshake read is bounded by SEND_TIMEOUT; the
+        // wall-clock HANDSHAKE_DEADLINE inside `handshake` defeats a slow drip.
+        let transport: Arc<WsTransport> = match url.scheme.as_str() {
+            "ws" => {
+                let data = cfg.connect(&url.host, url.port)?;
+                data.set_write_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                data.set_read_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                // Two clones of the same fd give independent read/write halves;
+                // if cloning is unsupported, fall back to a single shared stream
+                // (no concurrent split, but the connection still works).
+                match data.try_clone_box() {
+                    Ok(read) => {
+                        read.set_read_timeout(Some(SEND_TIMEOUT))
+                            .map_err(Error::Io)?;
+                        Arc::new(WsTransport::Plain {
+                            read: Mutex::new(read),
+                            write: Mutex::new(data),
+                        })
+                    }
+                    Err(_) => Arc::new(WsTransport::Shared(Mutex::new(Box::new(data)))),
                 }
-                "wss" => {
-                    let data = cfg.connect(&url.host, url.port)?;
-                    data.set_write_timeout(Some(SEND_TIMEOUT))
-                        .map_err(Error::Io)?;
-                    data.set_read_timeout(Some(SEND_TIMEOUT))
-                        .map_err(Error::Io)?;
-                    // Clone the raw socket for timeout control *before* the TLS
-                    // layer takes ownership of it.
-                    let ctl = data.try_clone_box().ok();
-                    // Honour the client's verification setting (`-k` => verify off);
-                    // wss otherwise verifies against the system roots like `fetch`.
-                    let mut opts = crate::tls::TlsOpts::verifying();
-                    opts.verify = cfg.verify;
-                    let mut tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
-                    let (pmd, proto) = handshake(&mut tls, url, subprotocols)?;
-                    (Box::new(tls), ctl, pmd, proto)
+            }
+            "wss" => {
+                let data = cfg.connect(&url.host, url.port)?;
+                data.set_write_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                data.set_read_timeout(Some(SEND_TIMEOUT))
+                    .map_err(Error::Io)?;
+                // A raw-socket clone for the concurrent read side, taken before
+                // TLS owns the socket.
+                let read_clone = data.try_clone_box().ok();
+                let mut opts = crate::tls::TlsOpts::verifying();
+                opts.verify = cfg.verify;
+                let tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
+                match read_clone {
+                    Some(read) => {
+                        read.set_read_timeout(Some(SEND_TIMEOUT))
+                            .map_err(Error::Io)?;
+                        Arc::new(WsTransport::Tls(Box::new(tls.into_concurrent(read))))
+                    }
+                    None => Arc::new(WsTransport::Shared(Mutex::new(Box::new(tls)))),
                 }
-                other => return Err(Error::UnsupportedScheme(other.to_string())),
-            };
+            }
+            other => return Err(Error::UnsupportedScheme(other.to_string())),
+        };
+
+        let (pmd, subprotocol) = handshake(&mut TransportIo(&transport), url, subprotocols)?;
 
         // The handshake is done; switch to the caller's persistent read timeout
         // (which may be `None` to block indefinitely on a quiet connection).
-        if let Some(c) = &ctl {
-            let _ = c.set_read_timeout(read_timeout);
-        }
+        let _ = transport.set_read_timeout(read_timeout);
 
         let compression = pmd.is_some();
         Ok(WebSocket {
-            stream,
+            transport,
             rxbuf: Vec::new(),
-            ctl,
             pmd,
             send_closed: false,
             recv_closed: false,
@@ -542,19 +626,14 @@ impl WebSocket {
     /// server pushes). Errors if the transport does not support a cloned socket
     /// control handle (e.g. some custom connectors).
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
-        match &self.ctl {
-            Some(c) => c.set_read_timeout(dur).map_err(Error::Io),
-            None => Err(Error::BadResponse(
-                "websocket: this transport does not support changing the read timeout".into(),
-            )),
-        }
+        self.transport.set_read_timeout(dur).map_err(Error::Io)
     }
 
     /// Send a UTF-8 text message (opcode 0x1).
     pub fn send_text(&mut self, text: &str) -> Result<()> {
         self.ensure_open()?;
         send_message(
-            &mut self.stream,
+            &mut TransportIo(self.transport.as_ref()),
             OPCODE_TEXT,
             text.as_bytes(),
             self.pmd.as_mut(),
@@ -564,7 +643,12 @@ impl WebSocket {
     /// Send a binary message (opcode 0x2).
     pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
         self.ensure_open()?;
-        send_message(&mut self.stream, OPCODE_BINARY, data, self.pmd.as_mut())
+        send_message(
+            &mut TransportIo(self.transport.as_ref()),
+            OPCODE_BINARY,
+            data,
+            self.pmd.as_mut(),
+        )
     }
 
     /// Send a [`WsMessage`].
@@ -586,8 +670,8 @@ impl WebSocket {
             )));
         }
         let frame = build_client_frame(OPCODE_PING, payload)?;
-        self.stream.write_all(&frame).map_err(Error::Io)?;
-        self.stream.flush().map_err(Error::Io)?;
+        self.transport.write_all(&frame).map_err(Error::Io)?;
+        self.transport.flush().map_err(Error::Io)?;
         Ok(())
     }
 
@@ -636,7 +720,7 @@ impl WebSocket {
         let mut buf: Vec<u8> = Vec::new();
 
         loop {
-            let frame = read_frame(&mut self.stream, &mut self.rxbuf)?;
+            let frame = read_frame(&mut TransportIo(self.transport.as_ref()), &mut self.rxbuf)?;
 
             if frame.opcode >= 0x8 {
                 validate_control_frame(&frame)?;
@@ -645,8 +729,8 @@ impl WebSocket {
                     OPCODE_PING => {
                         if self.auto_pong {
                             let pong = build_client_frame(OPCODE_PONG, &frame.payload)?;
-                            self.stream.write_all(&pong).map_err(Error::Io)?;
-                            self.stream.flush().map_err(Error::Io)?;
+                            self.transport.write_all(&pong).map_err(Error::Io)?;
+                            self.transport.flush().map_err(Error::Io)?;
                         }
                         // Don't break a half-reassembled message: only surface a
                         // ping that arrived between messages.
@@ -666,8 +750,8 @@ impl WebSocket {
                         // sent one — then this frame is the peer's echo of ours.
                         if !self.send_closed {
                             if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
-                                let _ = self.stream.write_all(&close);
-                                let _ = self.stream.flush();
+                                let _ = self.transport.write_all(&close);
+                                let _ = self.transport.flush();
                             }
                             self.send_closed = true;
                         }
@@ -775,8 +859,8 @@ impl WebSocket {
             }
         }
         let frame = build_client_frame_inner(fin, opcode.to_u8(), payload, false)?;
-        self.stream.write_all(&frame).map_err(Error::Io)?;
-        self.stream.flush().map_err(Error::Io)?;
+        self.transport.write_all(&frame).map_err(Error::Io)?;
+        self.transport.flush().map_err(Error::Io)?;
         Ok(())
     }
 
@@ -785,7 +869,7 @@ impl WebSocket {
     /// [`recv`](Self::recv) or [`recv_event`](Self::recv_event); use this only
     /// to drive the framing yourself.
     pub fn recv_frame(&mut self) -> Result<WsFrame> {
-        let frame = read_frame(&mut self.stream, &mut self.rxbuf)?;
+        let frame = read_frame(&mut TransportIo(self.transport.as_ref()), &mut self.rxbuf)?;
         Ok(WsFrame {
             fin: frame.fin,
             opcode: WsOpcode::from_u8(frame.opcode)?,
@@ -801,8 +885,8 @@ impl WebSocket {
             )));
         }
         let frame = build_client_frame(opcode, payload)?;
-        self.stream.write_all(&frame).map_err(Error::Io)?;
-        self.stream.flush().map_err(Error::Io)?;
+        self.transport.write_all(&frame).map_err(Error::Io)?;
+        self.transport.flush().map_err(Error::Io)?;
         Ok(())
     }
 
@@ -815,8 +899,8 @@ impl WebSocket {
         }
         self.send_closed = true;
         let frame = build_client_frame(OPCODE_CLOSE, &[])?;
-        self.stream.write_all(&frame).map_err(Error::Io)?;
-        self.stream.flush().map_err(Error::Io)?;
+        self.transport.write_all(&frame).map_err(Error::Io)?;
+        self.transport.flush().map_err(Error::Io)?;
         Ok(())
     }
 
@@ -840,8 +924,8 @@ impl WebSocket {
         }
         self.send_closed = true;
         let frame = build_client_frame(OPCODE_CLOSE, &payload)?;
-        self.stream.write_all(&frame).map_err(Error::Io)?;
-        self.stream.flush().map_err(Error::Io)?;
+        self.transport.write_all(&frame).map_err(Error::Io)?;
+        self.transport.flush().map_err(Error::Io)?;
         Ok(())
     }
 
@@ -2453,9 +2537,8 @@ mod tests {
     fn ws_over(mock: SharedMock, pmd: Option<Pmd>) -> WebSocket {
         let compression = pmd.is_some();
         WebSocket {
-            stream: Box::new(mock),
+            transport: Arc::new(WsTransport::Shared(Mutex::new(Box::new(mock)))),
             rxbuf: Vec::new(),
-            ctl: None,
             pmd,
             send_closed: false,
             recv_closed: false,
