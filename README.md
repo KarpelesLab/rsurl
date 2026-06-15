@@ -5,11 +5,14 @@
 [![Docs.rs](https://docs.rs/rsurl/badge.svg)](https://docs.rs/rsurl)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A pure-Rust implementation of curl, built on top of [purecrypto](https://crates.io/crates/purecrypto)
-for TLS and [puressh](https://crates.io/crates/puressh) for SSH (SFTP/SCP) —
-no OpenSSL, no system libcurl, no C dependencies. (The SSH stack pulls only
-`libc`/`nix` on unix, which are pure-Rust FFI *bindings* — no compiled C, no
-`*-sys`/cmake/bindgen in the default build.)
+A pure-Rust implementation of curl, built on [purecrypto](https://crates.io/crates/purecrypto)
+for TLS — no OpenSSL, no system libcurl, no C dependencies. Optional first-party
+pure-Rust stacks, on by default, add SSH ([puressh](https://crates.io/crates/puressh),
+the `ssh` feature) and BitTorrent (the `bittorrent` feature); IDN host
+normalization uses [intl](https://crates.io/crates/intl). An HTTP-only build
+drops the lot with `--no-default-features`. Even with everything enabled the
+only extra is `libc`/`nix` on unix — pure-Rust FFI *bindings*, no compiled C and
+no `*-sys`/cmake/bindgen.
 
 `rsurl` ships in three forms:
 
