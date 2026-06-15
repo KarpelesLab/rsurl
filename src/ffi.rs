@@ -91,6 +91,11 @@ pub enum RsurlOpt {
     /// const char* — `Accept-Encoding` value; empty string requests every codec
     /// rsurl can decode, like curl `--compressed` (`CURLOPT_ACCEPT_ENCODING`).
     AcceptEncoding = 18,
+    /// long — transparently decode a compressed response body. Non-zero
+    /// (default) on; 0 leaves the body as raw wire bytes with `Content-Encoding`
+    /// intact (curl `CURLOPT_HTTP_CONTENT_DECODING`). Mirrors
+    /// [`Request::decompress`](crate::Request::decompress).
+    HttpContentDecoding = 19,
 }
 
 /// Status codes returned by the API.
@@ -120,6 +125,8 @@ struct Handle {
     timeout_secs: Option<u64>,
     /// Convert international (IDN) hostnames to punycode. On by default.
     idn: bool,
+    /// Transparently decode a compressed response body. On by default.
+    decompress: bool,
     follow_location: bool,
     max_redirs: Option<u32>,
     basic_auth: Option<(String, String)>,
@@ -147,6 +154,7 @@ impl Handle {
             connect_timeout_secs: None,
             timeout_secs: None,
             idn: true,
+            decompress: true,
             follow_location: false,
             max_redirs: None,
             basic_auth: None,
@@ -285,6 +293,7 @@ pub unsafe extern "C" fn rsurl_easy_setopt_str(
             RsurlOpt::ConnectTimeout
             | RsurlOpt::Timeout
             | RsurlOpt::Idn
+            | RsurlOpt::HttpContentDecoding
             | RsurlOpt::FollowLocation
             | RsurlOpt::MaxRedirs
             | RsurlOpt::SslVerifyPeer => return RsurlCode::InvalidArg,
@@ -312,6 +321,7 @@ pub extern "C" fn rsurl_easy_setopt_long(
             RsurlOpt::ConnectTimeout => h.connect_timeout_secs = secs,
             RsurlOpt::Timeout => h.timeout_secs = secs,
             RsurlOpt::Idn => h.idn = value != 0,
+            RsurlOpt::HttpContentDecoding => h.decompress = value != 0,
             RsurlOpt::FollowLocation => h.follow_location = value != 0,
             RsurlOpt::MaxRedirs => {
                 h.max_redirs = if value < 0 {
@@ -347,6 +357,7 @@ fn opt_from_int(v: c_int) -> Option<RsurlOpt> {
         16 => RsurlOpt::Cookie,
         17 => RsurlOpt::Bearer,
         18 => RsurlOpt::AcceptEncoding,
+        19 => RsurlOpt::HttpContentDecoding,
         _ => return None,
     })
 }
@@ -375,7 +386,10 @@ pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
             Err(crate::Error::UnsupportedScheme(_)) => return RsurlCode::Unsupported,
             Err(_) => return RsurlCode::InvalidArg,
         };
-        req = req.idn(h.idn).verify_tls(h.verify_peer);
+        req = req
+            .idn(h.idn)
+            .verify_tls(h.verify_peer)
+            .decompress(h.decompress);
         if h.follow_location {
             req = req.follow_redirects(true);
             if let Some(n) = h.max_redirs {

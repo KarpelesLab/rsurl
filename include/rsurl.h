@@ -47,7 +47,9 @@ typedef enum {
     RSURLOPT_RANGE            = 15, /* const char* byte range, e.g. "0-1023" */
     RSURLOPT_COOKIE           = 16, /* const char* Cookie request header */
     RSURLOPT_XOAUTH2_BEARER   = 17, /* const char* OAuth2 bearer token */
-    RSURLOPT_ACCEPT_ENCODING  = 18  /* const char*; "" = all codecs (--compressed) */
+    RSURLOPT_ACCEPT_ENCODING  = 18, /* const char*; "" = all codecs (--compressed) */
+    RSURLOPT_HTTP_CONTENT_DECODING = 19 /* long: decode compressed bodies (default
+                                           1); 0 = raw bytes, Content-Encoding kept */
 } rsurl_option_t;
 
 /* Status codes returned by API functions. */
