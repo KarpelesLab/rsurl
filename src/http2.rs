@@ -2379,8 +2379,12 @@ impl<S: Read + Write> Connection<S> {
                         .streams
                         .remove(&done_id)
                         .expect("Done stream must still be registered");
-                    let mut built =
-                        build_response_from_stream_labelled(stream, Some(done_id), trace);
+                    let mut built = build_response_from_stream_labelled(
+                        stream,
+                        Some(done_id),
+                        reqs[idx].decompress,
+                        trace,
+                    );
                     if let Ok(resp) = &mut built {
                         resp.tls = self.tls_info.clone();
                     }
@@ -3421,7 +3425,7 @@ fn run_one_request<S: Read + Write>(
     // Reap any other streams that completed while we were driving this one, so
     // a pooled connection's `streams` map doesn't grow across reuses.
     conn.prune_completed_streams();
-    let mut resp = build_response_from_stream(stream, trace)?;
+    let mut resp = build_response_from_stream(stream, req.decompress, trace)?;
     // Surface the connection's negotiated TLS parameters (a property of the
     // live connection — reported on pooled reuse too).
     resp.tls = conn.tls_info.clone();
@@ -3433,8 +3437,12 @@ fn run_one_request<S: Read + Write>(
 /// (none are defined for responses but be conservative), and inherits the
 /// accumulated body. The `<` trace lines are unlabelled (single-stream path);
 /// the multiplexed driver uses [`build_response_from_stream_labelled`].
-fn build_response_from_stream(stream: Stream, trace: &mut dyn Write) -> Result<Response> {
-    build_response_from_stream_labelled(stream, None, trace)
+fn build_response_from_stream(
+    stream: Stream,
+    decompress: bool,
+    trace: &mut dyn Write,
+) -> Result<Response> {
+    build_response_from_stream_labelled(stream, None, decompress, trace)
 }
 
 /// Like [`build_response_from_stream`] but prefixes every `<` / `*` trace line
@@ -3443,6 +3451,7 @@ fn build_response_from_stream(stream: Stream, trace: &mut dyn Write) -> Result<R
 fn build_response_from_stream_labelled(
     stream: Stream,
     label_id: Option<u32>,
+    decompress: bool,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let headers = stream
@@ -3483,7 +3492,8 @@ fn build_response_from_stream_labelled(
 
     // Shared with HTTP/1.1 and HTTP/3: peel off any `Content-Encoding`
     // layer rsurl knows how to decode (gzip / deflate / x-gzip / identity).
-    let (clean_headers, body) = crate::http::maybe_decode_body(clean_headers, stream.body, trace)?;
+    let (clean_headers, body) =
+        crate::http::maybe_decode_body(clean_headers, stream.body, decompress, trace)?;
 
     Ok(Response {
         status,
@@ -3508,6 +3518,7 @@ fn build_response_from_stream_labelled(
 fn build_response_from_stream_streaming(
     stream: Stream,
     sink: &mut dyn Write,
+    decompress: bool,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let headers = stream
@@ -3538,7 +3549,8 @@ fn build_response_from_stream_streaming(
 
     // `stream.body` is non-empty only on the buffered fallback (content-encoded
     // response): decode it and write the plaintext through to the sink.
-    let (clean_headers, body) = crate::http::maybe_decode_body(clean_headers, stream.body, trace)?;
+    let (clean_headers, body) =
+        crate::http::maybe_decode_body(clean_headers, stream.body, decompress, trace)?;
     if !body.is_empty() {
         sink.write_all(&body)?;
     }
@@ -3570,7 +3582,7 @@ fn run_one_request_to<S: Read + Write>(
     conn.send_request_on(stream_id, req)?;
     let stream = conn.drive_until_stream_done_to(stream_id, Some(sink), on_head)?;
     conn.prune_completed_streams();
-    let mut resp = build_response_from_stream_streaming(stream, sink, trace)?;
+    let mut resp = build_response_from_stream_streaming(stream, sink, req.decompress, trace)?;
     resp.tls = conn.tls_info.clone();
     Ok(resp)
 }

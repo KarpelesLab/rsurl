@@ -319,6 +319,7 @@ pub(crate) fn strip_after_decode(headers: Vec<(String, String)>) -> Vec<(String,
 mod tests {
     use super::*;
     use compcol::vec::compress_to_vec;
+    use std::io;
 
     fn gz(data: &[u8]) -> Vec<u8> {
         compress_to_vec::<Gzip>(data).expect("gzip encode")
@@ -679,5 +680,40 @@ mod tests {
         let mut out = Vec::new();
         let err = stream_decode(blob.as_slice(), StreamCodec::Gzip, &mut out, 4);
         assert!(err.is_err(), "decode past budget must fail");
+    }
+
+    #[test]
+    fn maybe_decode_body_honors_decompress_flag() {
+        let plain = b"hello world";
+        let wire = gz(plain);
+        let headers = vec![
+            ("Content-Type".to_string(), "text/plain".to_string()),
+            ("Content-Encoding".to_string(), "gzip".to_string()),
+            ("Content-Length".to_string(), wire.len().to_string()),
+        ];
+
+        // decompress = true (curl default): body decoded, stale headers stripped.
+        let (h, body) =
+            crate::http::maybe_decode_body(headers.clone(), wire.clone(), true, &mut io::sink())
+                .unwrap();
+        assert_eq!(body, plain);
+        assert!(
+            !h.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")),
+            "Content-Encoding must be stripped after decode"
+        );
+
+        // decompress = false: raw wire bytes and Content-Encoding left intact.
+        let (h, body) =
+            crate::http::maybe_decode_body(headers.clone(), wire.clone(), false, &mut io::sink())
+                .unwrap();
+        assert_eq!(body, wire, "body must be the undecoded wire bytes");
+        assert_eq!(
+            h.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                .map(|(_, v)| v.as_str()),
+            Some("gzip"),
+            "Content-Encoding must be preserved when decompression is off"
+        );
     }
 }

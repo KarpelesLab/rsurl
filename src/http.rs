@@ -169,6 +169,15 @@ pub struct Request {
     pub(crate) proxy_resolver: Option<Arc<dyn crate::net::ProxyResolver>>,
     /// Priority hint, applied as issuance order in [`send_multiplexed`].
     pub(crate) priority: Priority,
+    /// Transparently decode a compressed response body (`Content-Encoding:
+    /// gzip|deflate|br|zstd|...`). `true` (the default) matches curl: the body
+    /// is decompressed and the now-stale `Content-Encoding`/`Content-Length`
+    /// headers are stripped. `false` (curl has no exact analogue; closest is
+    /// not sending `Accept-Encoding` and refusing to decode) leaves the body as
+    /// the raw wire bytes and the `Content-Encoding` header intact, so a caller
+    /// that wants to run its own content-coding policy sees exactly what the
+    /// server sent. See [`Request::decompress`].
+    pub(crate) decompress: bool,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -300,6 +309,7 @@ impl Request {
             partition_key: None,
             proxy_resolver: None,
             priority: Priority::Normal,
+            decompress: true,
         })
     }
 
@@ -633,6 +643,28 @@ impl Request {
     /// built without the `idn` feature.
     pub fn idn(mut self, on: bool) -> Self {
         self.idn = on;
+        self
+    }
+
+    /// Toggle transparent decompression of the response body. On by default
+    /// (curl's behaviour): a `Content-Encoding: gzip|deflate|br|zstd|...` body
+    /// is decoded and the stale `Content-Encoding`/`Content-Length` headers are
+    /// stripped before the [`Response`] is returned.
+    ///
+    /// Pass `false` to disable it: the body is returned as the raw wire bytes
+    /// and the `Content-Encoding` header is left intact, so a caller can run its
+    /// own content-coding handling (and, e.g., a strict RFC 9110 §8.4 reject of
+    /// codings it didn't ask for). rsurl still advertises `Accept-Encoding`
+    /// unless you also clear it (e.g. via [`Request::strict_headers`] or by
+    /// setting your own `Accept-Encoding` header), so a server may still encode;
+    /// with decompression off those bytes reach you undecoded.
+    ///
+    /// This applies to the buffered send path ([`send`](Self::send) and the
+    /// other `send*` entry points that return a body); on the streaming
+    /// download paths it likewise suppresses on-the-wire decoding so raw bytes
+    /// reach the sink / reader.
+    pub fn decompress(mut self, on: bool) -> Self {
+        self.decompress = on;
         self
     }
 
@@ -1218,12 +1250,16 @@ impl Request {
                 });
             }
 
-            // Final response. A `Content-Encoding` means we must decode.
+            // Final response. A `Content-Encoding` means we must decode —
+            // unless the caller turned decompression off, in which case we skip
+            // the decode block entirely and stream the raw bytes through below,
+            // leaving the `Content-Encoding` header intact.
             let content_encoding = head
                 .headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-                .map(|(_, v)| v.clone());
+                .map(|(_, v)| v.clone())
+                .filter(|_| req.decompress);
             if let Some(ce) = content_encoding {
                 // Fast path: a single gzip/zstd/br layer over a Content-Length
                 // body decodes straight off the wire (bounded by the decoder's
@@ -1272,7 +1308,7 @@ impl Request {
                     head.status,
                     &req.method,
                 )?;
-                let (headers, body) = maybe_decode_body(head.headers, body, trace)?;
+                let (headers, body) = maybe_decode_body(head.headers, body, req.decompress, trace)?;
                 sink.write_all(&body)?;
                 return Ok(Response {
                     status: head.status,
@@ -1794,7 +1830,8 @@ fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     let connect = start.elapsed();
     let mut bufrd = BufReader::new(stream);
     write_request(bufrd.get_mut(), &req, via_plain_http_proxy(&req), trace)?;
-    let mut resp = read_response_timed(&mut bufrd, &req.method, Some(start), trace)?;
+    let mut resp =
+        read_response_timed(&mut bufrd, &req.method, req.decompress, Some(start), trace)?;
     resp.timing.namelookup = namelookup;
     resp.timing.connect = Some(connect);
     resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
@@ -1825,7 +1862,7 @@ fn send_plain_via_connector(req: Request, trace: &mut dyn Write) -> Result<Respo
     let stream = connector_connect(&req, trace)?;
     let mut bufrd = BufReader::new(stream);
     write_request(bufrd.get_mut(), &req, false, trace)?;
-    let resp = read_response(&mut bufrd, &req.method, trace)?;
+    let resp = read_response(&mut bufrd, &req.method, req.decompress, trace)?;
     Ok(resp)
 }
 
@@ -1855,7 +1892,7 @@ fn send_https_via_connector(req: Request, trace: &mut dyn Write) -> Result<Respo
     write_tls_info(&tls, trace);
     let mut bufrd = BufReader::new(tls);
     write_request(bufrd.get_mut(), &req, false, trace)?;
-    let resp = read_response(&mut bufrd, &req.method, trace)?;
+    let resp = read_response(&mut bufrd, &req.method, req.decompress, trace)?;
     Ok(resp)
 }
 
@@ -1867,7 +1904,7 @@ fn perform_on_pooled_plain(
     if let Err(e) = write_request(bufrd.get_mut(), req, via_plain_http_proxy(req), trace) {
         return Err(stale_or_hard(e));
     }
-    let resp = match read_response(&mut bufrd, &req.method, trace) {
+    let resp = match read_response(&mut bufrd, &req.method, req.decompress, trace) {
         Ok(r) => r,
         Err(e) => return Err(stale_or_hard(e)),
     };
@@ -2384,7 +2421,8 @@ fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     // tunnelled past it via CONNECT, so the request the origin sees is
     // the normal direct one.
     write_request(bufrd.get_mut(), &req, false, trace)?;
-    let mut resp = read_response_timed(&mut bufrd, &req.method, Some(start), trace)?;
+    let mut resp =
+        read_response_timed(&mut bufrd, &req.method, req.decompress, Some(start), trace)?;
     resp.timing.namelookup = namelookup;
     resp.timing.connect = Some(connect);
     resp.timing.appconnect = Some(appconnect);
@@ -2402,7 +2440,7 @@ fn perform_on_pooled_tls(
     if let Err(e) = write_request(bufrd.get_mut(), req, false, trace) {
         return Err(stale_or_hard(e));
     }
-    let mut resp = match read_response(&mut bufrd, &req.method, trace) {
+    let mut resp = match read_response(&mut bufrd, &req.method, req.decompress, trace) {
         Ok(r) => r,
         Err(e) => return Err(stale_or_hard(e)),
     };
@@ -3026,12 +3064,13 @@ fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Hea
 fn read_response<R: Read>(
     r: &mut BufReader<R>,
     method: &str,
+    decompress: bool,
     trace: &mut dyn Write,
 ) -> Result<Response>
 where
     BufReader<R>: TruncationAware,
 {
-    read_response_timed(r, method, None, trace)
+    read_response_timed(r, method, decompress, None, trace)
 }
 
 /// As [`read_response`], but stamps `Response::timing.starttransfer` from
@@ -3039,6 +3078,7 @@ where
 fn read_response_timed<R: Read>(
     r: &mut BufReader<R>,
     method: &str,
+    decompress: bool,
     start: Option<std::time::Instant>,
     trace: &mut dyn Write,
 ) -> Result<Response>
@@ -3056,7 +3096,7 @@ where
     let body = read_body(r, &headers, &version, status, method)?;
     let wire_len = body.len();
     let _ = writeln!(trace, "* Received {wire_len} body bytes");
-    let (headers, body) = maybe_decode_body(headers, body, trace)?;
+    let (headers, body) = maybe_decode_body(headers, body, decompress, trace)?;
 
     Ok(Response {
         status,
@@ -3090,11 +3130,19 @@ pub(crate) type HeadersAndBody = (Vec<(String, String)>, Vec<u8>);
 ///
 /// Shared by HTTP/1.1, HTTP/2, and HTTP/3 — they all assemble a `(headers,
 /// body)` pair and need identical post-processing.
+///
+/// When `decompress` is `false` (the caller set [`Request::decompress(false)`]),
+/// this is a no-op: the headers and body are returned untouched, so the
+/// `Content-Encoding` header stays intact and the body is the raw wire bytes.
 pub(crate) fn maybe_decode_body(
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    decompress: bool,
     trace: &mut dyn Write,
 ) -> Result<HeadersAndBody> {
+    if !decompress {
+        return Ok((headers, body));
+    }
     let Some(enc) = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
@@ -4111,7 +4159,7 @@ mod tests {
         let huge = vec![b'X'; MAX_HEADER_BYTES + 4096];
         let mut r = BufReader::new(Cursor::new(huge));
         let mut trace = Vec::new();
-        let err = read_response(&mut r, "GET", &mut trace).unwrap_err();
+        let err = read_response(&mut r, "GET", true, &mut trace).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
     }
 
@@ -4123,7 +4171,7 @@ mod tests {
         bytes.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES + 4096));
         let mut r = BufReader::new(Cursor::new(bytes));
         let mut trace = Vec::new();
-        let err = read_response(&mut r, "GET", &mut trace).unwrap_err();
+        let err = read_response(&mut r, "GET", true, &mut trace).unwrap_err();
         assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
     }
 

@@ -308,6 +308,39 @@ fn gzip_response_is_decoded() {
     );
 }
 
+/// `Request::decompress(false)` must leave the body as the raw wire bytes and
+/// keep the `Content-Encoding` header intact, so a caller can run its own
+/// content-coding policy on exactly what the server sent.
+#[test]
+fn gzip_response_not_decoded_when_decompress_off() {
+    let plain = b"hello compressed world".to_vec();
+    let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&plain).unwrap();
+
+    let gz_for_server = gz.clone();
+    let server = TestServer::start(move |_req: SReq| {
+        SResp::ok(gz_for_server.clone()).header("Content-Encoding", "gzip")
+    });
+
+    let resp = Request::get(&server.url("/"))
+        .unwrap()
+        .decompress(false)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.body, gz,
+        "body should be the undecoded gzip wire bytes"
+    );
+    assert_eq!(
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+            .map(|(_, v)| v.as_str()),
+        Some("gzip"),
+        "Content-Encoding must be preserved when decompression is off",
+    );
+}
+
 /// Same wire shape but with `deflate` (zlib-wrapped, RFC 9110 form).
 #[test]
 fn deflate_response_is_decoded() {

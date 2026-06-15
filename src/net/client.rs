@@ -103,6 +103,7 @@ pub struct Client {
     ftp_create_dirs: bool,
     ftp_active: bool,
     require_tls: bool,
+    decompress: bool,
 }
 
 impl Default for Client {
@@ -118,6 +119,7 @@ impl Default for Client {
             ftp_create_dirs: false,
             ftp_active: false,
             require_tls: false,
+            decompress: true,
         }
     }
 }
@@ -165,6 +167,16 @@ impl Client {
     /// Normalize IDN hostnames to punycode (default `true`).
     pub fn idn(mut self, on: bool) -> Self {
         self.idn = on;
+        self
+    }
+
+    /// Transparently decompress `Content-Encoding` response bodies for the HTTP
+    /// requests this client builds (default `true`, matching curl). Pass `false`
+    /// to leave compressed bodies as raw wire bytes with the `Content-Encoding`
+    /// header intact, so the caller can apply its own content-coding policy.
+    /// See [`Request::decompress`](crate::Request::decompress).
+    pub fn decompress(mut self, on: bool) -> Self {
+        self.decompress = on;
         self
     }
 
@@ -246,7 +258,8 @@ impl Client {
     pub fn request(&self, method: &str, url: &str) -> Result<crate::Request> {
         let mut r = crate::Request::new(method, url)?
             .verify_tls(self.verify)
-            .idn(self.idn);
+            .idn(self.idn)
+            .decompress(self.decompress);
         let host = r.url().host.clone();
         r = r
             .connector(self.effective_connector(&host))

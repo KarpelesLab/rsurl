@@ -2207,12 +2207,15 @@ fn read_response(
         // Try to peel frames off the buffer.
         loop {
             // Stream DATA to the sink only when the response is not
-            // content-encoded (encoded bodies must be buffered to decode).
-            // Recomputed each frame because HEADERS may have just arrived.
-            let encoded = headers.as_ref().is_some_and(|f| {
-                f.iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-            });
+            // content-encoded (encoded bodies must be buffered to decode) — but
+            // when the caller turned decompression off, there's nothing to
+            // decode, so even an encoded body streams straight through as raw
+            // bytes. Recomputed each frame because HEADERS may have just arrived.
+            let encoded = req.decompress
+                && headers.as_ref().is_some_and(|f| {
+                    f.iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                });
             let frame_sink: Option<&mut dyn Write> = if encoded {
                 None
             } else {
@@ -2266,7 +2269,7 @@ fn read_response(
     }
 
     let fields = headers.ok_or_else(|| Error::BadResponse("http3: no HEADERS frame".into()))?;
-    finalize_response(fields, body, streamed_len, sink, trace)
+    finalize_response(fields, body, streamed_len, req.decompress, sink, trace)
 }
 
 enum FrameOutcome {
@@ -2408,6 +2411,7 @@ fn finalize_response(
     fields: qpack::Fields,
     body: Vec<u8>,
     streamed_len: u64,
+    decompress: bool,
     sink: Option<&mut dyn Write>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
@@ -2445,7 +2449,7 @@ fn finalize_response(
 
     // Shared with HTTP/1.1 and HTTP/2: strip any Content-Encoding layer we
     // recognise (gzip / deflate / x-gzip / identity).
-    let (hdrs, body) = crate::http::maybe_decode_body(hdrs, body, trace)?;
+    let (hdrs, body) = crate::http::maybe_decode_body(hdrs, body, decompress, trace)?;
     // Streaming path: the un-encoded body already went to the sink; only the
     // buffered (content-encoded) fallback still has bytes here to flush.
     if let Some(w) = sink {
