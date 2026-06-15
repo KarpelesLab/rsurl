@@ -19,42 +19,46 @@ no OpenSSL, no system libcurl, no C dependencies. (The SSH stack pulls only
 
 ## Status
 
-Functional across a broad protocol surface — HTTP/1.1, HTTP/2, HTTP/3, FTP(S),
-SSH (SFTP/SCP), the mail and messaging protocols, BitTorrent, and more all work
-(see the table below). Still in active development: APIs may shift before 1.0,
-and a few areas have documented caveats (notably HTTP/3, which works against
-several major servers but is not yet universal).
+Functional across a broad protocol surface, in active development (APIs may
+shift before 1.0). What works today:
 
-| Capability | Status | Notes |
-|---|---|---|
-| HTTP/1.1 (all methods) | working | Content-Length, chunked, read-to-EOF body modes |
-| Connection reuse | working | process-wide keep-alive pool for HTTP/1.1 (plain & TLS) and HTTP/2 (post-handshake conns keyed on scheme/host/port, reused across requests) |
-| Response compression | working | `gzip` / `deflate` / `x-gzip` / `zstd` / `br` / `compress` / `x-compress` (Unix `.Z` LZW) decoded transparently by default; `Request::decompress(false)` / `Client::decompress(false)` returns the raw wire bytes with `Content-Encoding` intact |
-| Cookies (`-b` / `-c`) | working | RFC 6265 jar; Netscape `cookies.txt` I/O, curl-compatible |
-| Proxies (`-x`) | working | HTTP (absolute-form / `CONNECT`), HTTPS-to-proxy, and SOCKS4/4a/5/5h — including SOCKS5 UDP ASSOCIATE for HTTP/3 & TFTP. Basic/`Proxy-Authorization` + SOCKS5 user/pass auth, `--noproxy` / `*_PROXY` env vars. Honoured across every scheme, not just HTTP |
-| Custom transport | working | implement `rsurl::net::Connector` (or `UdpProxy`) and pass it via `Client::connector` / `Request::connector` to supply your own sockets, pool, or test double |
-| HTTPS via purecrypto | working | TLS 1.2/1.3, system roots, full cert verification |
-| HTTP/2 (RFC 9113) | working* | ALPN h2, HPACK + Huffman decoder; connection- and stream-level flow control (WINDOW_UPDATE, INITIAL_WINDOW_SIZE deltas); process-wide connection pool reuses a warm conn across requests, advancing stream ids 1/3/5 (sequential reuse). True concurrent multiplexing — many in-flight streams on one connection, interleaved frame I/O, non-blocking body sends with no head-of-line stall, queueing at `SETTINGS_MAX_CONCURRENT_STREAMS`, per-stream RST + GOAWAY demux — is available as the `rsurl::send_multiplexed` library API (see below); the CLI still issues one request at a time |
-| HTTP/3 over QUIC (RFC 9114) | working\*\* | reachable via `--http3` (try h3, fall back to HTTP/2/1.1 on a QUIC transport failure) and `--http3-only` (force h3, no fallback). QUIC + frame layer + QPACK static/dynamic tables and Huffman decoder; advertises a non-zero `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (blocked-streams 0), applies the peer's encoder-stream inserts and resolves dynamic / post-base field-line refs, acks sections on the decoder stream; the request encoder still emits literals only; honors `--cacert`/`-k` |
-| FTP / FTPS (RFC 959, 4217) | working | RETR + LIST, STOR upload (`-T`) with REST resume (`-C`) or APPE append (`-a`), EPSV with PASV fallback, implicit FTPS |
-| FILE (RFC 8089) | working | rejects non-local hosts |
-| DICT (RFC 2229) | working | DEFINE, MATCH, SHOW DATABASES |
-| GOPHER / GOPHERS (RFC 1436) | working | reads to EOF; item-type 7 search via `?<words>` (sends `selector\t<words>`) |
-| IMAP / IMAPS (RFC 9051) | working | CAPABILITY probe, STARTTLS upgrade (RFC 2595), SASL AUTHENTICATE PLAIN/LOGIN with LOGIN-command fallback (honors LOGINDISABLED); LIST / SELECT+FETCH / UID FETCH BODY[] |
-| LDAP / LDAPS (RFC 4511) | working | simple bind + search → LDIF; filter syntax: equality, presence, substring (`cn=foo*bar*`), extensible match (`cn:dn:caseIgnoreMatch:=foo`), and `& \| !` |
-| MQTT / MQTTS (v3.1.1) | working | CONNECT; SUBSCRIBE + receive one PUBLISH (QoS 0); PUBLISH via `-d`/`-T` at QoS 0 (default, matches curl) or QoS 1 (PUBLISH→PUBACK) in the protocol layer |
-| POP3 / POP3S (RFC 1939) | working | LIST or RETR, USER/PASS auth |
-| RTSP (RFC 7826) | working | OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN via `-X` with CSeq + Session tracking (interleaved transport); RTP media reception not implemented |
-| TFTP (RFC 1350) | working | read (RRQ) and write/upload (`-T`, WRQ) with timeout/retry, 256 MiB cap |
-| SFTP (SSH) | working | download + upload (`-T`) over the SFTP subsystem (`open`/`read`/`write`/`close`); password (`-u`/userinfo) and public-key (`--key` or `~/.ssh/id_*`) auth; host-key verification via `~/.ssh/known_hosts` (TOFU: accept+persist unknown, reject changed; `-k` ⇒ accept-any). Via the pure-Rust `puressh` crate |
-| SCP (SSH) | working | download + upload (`-T`) driving the remote `scp -f`/`scp -t` helper, bridged through a temp file; same auth + known_hosts TOFU as SFTP. Via `puressh` |
-| WS / WSS (RFC 6455) | working | send + receive data frames, fragmented message reassembly, ping/pong/close handling; permessage-deflate (RFC 7692) negotiated in the upgrade — per-message inflate/deflate with RSV1, `client/server_no_context_takeover`, inflated-size cap against compression bombs |
-| BitTorrent (`.torrent` / `magnet:`) | working | pure-Rust bencode, HTTP/UDP trackers, DHT, peer wire protocol, and seeding; metadata inspection and selective / concatenated downloads. Behind the default-on `bittorrent` feature (pulls no extra dependency) |
+- **HTTP/1.1** — all methods; Content-Length, chunked, and read-to-EOF bodies; a
+  process-wide keep-alive connection pool (plain & TLS).
+- **HTTP/2** and **HTTP/3 over QUIC** — see the dedicated sections below.
+- **HTTPS** via purecrypto — TLS 1.2/1.3, system roots, full cert verification.
+- **FTP/FTPS**, **FILE**, **DICT**, **GOPHER(S)**, **IMAP(S)**, **LDAP(S)**,
+  **MQTT(S)**, **POP3(S)**, **RTSP**, **TFTP**, **WS/WSS** — uploads (`-T`),
+  resume, STARTTLS, and the usual per-protocol verbs.
+- **SSH** — SFTP and SCP download/upload, key + password auth, known_hosts TOFU
+  (optional `ssh` feature).
+- **BitTorrent** — `.torrent` / `magnet:`, trackers, DHT, peer wire, seeding,
+  metadata inspection, selective / concatenated downloads (optional
+  `bittorrent` feature).
+- **Proxies** — HTTP `CONNECT`, HTTPS-to-proxy, SOCKS4/4a/5/5h (incl. SOCKS5 UDP
+  for HTTP/3 & TFTP), honoured across every scheme; `--noproxy` / `*_PROXY`.
+- **Custom transport** — supply your own sockets via `rsurl::net::Connector`.
+- **Response compression** — `gzip`/`deflate`/`zstd`/`br`/`compress` decoded
+  transparently by default, or `decompress(false)` for the raw wire bytes.
+- **Cookies** — RFC 6265 jar with curl-compatible Netscape `cookies.txt` I/O.
 
-\* HTTP/2 verified live against nghttp2.org and cloudflare.com from the implementation
-worktree. Available via `--http2` (force) or auto-negotiated via ALPN.
+Per-protocol detail lives in the [CLI examples](#cli-usage) below and on
+[docs.rs](https://docs.rs/rsurl).
 
-### HTTP/2 concurrent multiplexing (`send_multiplexed`)
+## HTTP/2
+
+ALPN `h2`, HPACK + Huffman decoder; connection- and stream-level flow control
+(WINDOW_UPDATE, INITIAL_WINDOW_SIZE deltas). A process-wide connection pool
+reuses a warm conn across requests, advancing stream ids 1/3/5 (sequential
+reuse). Available via `--http2` (force) or auto-negotiated over ALPN. Verified
+live against nghttp2.org and cloudflare.com.
+
+True concurrent multiplexing — many in-flight streams on one connection,
+interleaved frame I/O, non-blocking body sends with no head-of-line stall,
+queueing at `SETTINGS_MAX_CONCURRENT_STREAMS`, per-stream RST + GOAWAY demux —
+is exposed as the `rsurl::send_multiplexed` library API (below); the CLI still
+issues one request at a time.
+
+### Concurrent multiplexing (`send_multiplexed`)
 
 `rsurl::send_multiplexed(reqs: Vec<Request>, trace) -> Vec<Result<Response>>`
 fans out a batch of requests to **one** `https://` origin concurrently over a
@@ -94,17 +98,24 @@ URLs one at a time so the shared cookie jar, per-URL output ordering, and
 per-URL exit codes stay exactly curl-compatible. Concurrent multiplexing is
 exposed as the library API above rather than forced into the CLI loop.
 
-\*\* HTTP/3 verified live end-to-end against `quic.nginx.org` and `www.google.com`
-(QUIC handshake completed, request sent, real `HTTP/3 200` + headers + body
-returned). Cloudflare's QUIC endpoints (`cloudflare-quic.com`,
-`www.cloudflare.com`) currently fail at the QUIC packet-decode step
-(`http3: feed: Decode`) against purecrypto's QUIC stack — under `--http3` this
-triggers the documented fallback to HTTP/2; under `--http3-only` it is a hard
-error. So h3 works against some major servers but is not yet universal.
+## HTTP/3 over QUIC (RFC 9114)
 
-System CA bundle paths searched, in order: `/etc/ssl/certs/ca-certificates.crt`,
-`/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem`,
-`/etc/ca-certificates/extracted/tls-ca-bundle.pem`.
+Reachable via `--http3` (try h3, fall back to HTTP/2/1.1 on a QUIC transport
+failure) and `--http3-only` (force h3, no fallback). QUIC + frame layer + QPACK
+static/dynamic tables and Huffman decoder; advertises a non-zero
+`SETTINGS_QPACK_MAX_TABLE_CAPACITY` (blocked-streams 0), applies the peer's
+encoder-stream inserts and resolves dynamic / post-base field-line refs, and
+acks sections on the decoder stream; the request encoder still emits literals
+only. Honors `--cacert` / `-k`. HTTP/3 always uses purecrypto's TLS (the QUIC
+stack is bound to it), regardless of the selected TLS backend.
+
+Verified live end-to-end against `quic.nginx.org` and `www.google.com` (QUIC
+handshake completed, request sent, real `HTTP/3 200` + headers + body returned).
+Cloudflare's QUIC endpoints (`cloudflare-quic.com`, `www.cloudflare.com`)
+currently fail at the QUIC packet-decode step (`http3: feed: Decode`) against
+purecrypto's QUIC stack — under `--http3` this triggers the documented fallback
+to HTTP/2; under `--http3-only` it is a hard error. So h3 works against several
+major servers but is not yet universal.
 
 ## Rust usage
 
@@ -288,6 +299,11 @@ rustls 0.23 + `ring` instead. The public API across `rsurl::tls` is
 identical between backends, so consumer code does not change. HTTP/3
 always uses purecrypto's TLS regardless of this feature, because the QUIC
 stack it sits on is part of `purecrypto`.
+
+System CA bundle paths are searched, in order:
+`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+`/etc/ssl/cert.pem`, `/etc/ssl/ca-bundle.pem`,
+`/etc/ca-certificates/extracted/tls-ca-bundle.pem`.
 
 ### Internationalized domain names (IDN)
 
