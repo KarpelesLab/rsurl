@@ -418,6 +418,77 @@ fn send_reader_errors_on_truncated_length_body() {
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
 }
 
+/// `send_reader` over a non-direct transport (here a custom connector) can't
+/// stream off the socket, so it takes the buffered fallback — which still
+/// returns the raw, undecoded body (decompression forced off on that path too).
+#[test]
+fn send_reader_buffers_via_custom_connector() {
+    use rsurl::net::{Connector, NetStream};
+    use std::io::Read;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let plain = b"buffered fallback body".to_vec();
+    let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&plain).unwrap();
+    let gz_for_server = gz.clone();
+    let server = TestServer::start(move |_req: SReq| {
+        SResp::ok(gz_for_server.clone()).header("Content-Encoding", "gzip")
+    });
+
+    // A custom connector is non-direct, which forces send_reader's buffered path.
+    #[derive(Debug)]
+    struct DirectDial;
+    impl Connector for DirectDial {
+        fn connect(
+            &self,
+            host: &str,
+            port: u16,
+            _t: Option<Duration>,
+        ) -> rsurl::Result<Box<dyn NetStream>> {
+            Ok(Box::new(std::net::TcpStream::connect((host, port))?))
+        }
+    }
+
+    let mut reader = Request::get(&server.url("/"))
+        .unwrap()
+        .connector(Arc::new(DirectDial))
+        .send_reader()
+        .unwrap();
+    assert_eq!(reader.status(), 200);
+    assert_eq!(reader.header("content-encoding"), Some("gzip"));
+    let mut got = Vec::new();
+    reader.read_to_end(&mut got).unwrap();
+    assert_eq!(
+        got, gz,
+        "buffered fallback must still hand back raw undecoded bytes",
+    );
+}
+
+/// `send_reader` follows a 3xx redirect when `follow_redirects` is set, draining
+/// the intermediate body and streaming the final response.
+#[test]
+fn send_reader_follows_redirect() {
+    use std::io::Read;
+
+    let server = TestServer::start(|req: SReq| {
+        if req.path == "/start" {
+            SResp::status(302).header("Location", "/dest")
+        } else {
+            SResp::ok("final body")
+        }
+    });
+
+    let mut reader = Request::get(&server.url("/start"))
+        .unwrap()
+        .follow_redirects(true)
+        .send_reader()
+        .unwrap();
+    assert_eq!(reader.status(), 200);
+    let mut got = String::new();
+    reader.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "final body");
+}
+
 /// `Response::into_reader` yields a `Read` + `Seek` cursor over the body; with
 /// `decompress(false)` those are the raw undecoded wire bytes.
 #[test]

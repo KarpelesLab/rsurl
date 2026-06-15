@@ -28,6 +28,12 @@ jobs:
             flags: --all-features
           - name: rustls
             flags: --no-default-features --features rustls-tls
+          # HTTP-only: no SSH, no BitTorrent (so no `puressh` dependency) — the
+          # minimal surface an HTTP source driver builds against. Guards the
+          # feature gating so an ungated `ssh`/`bittorrent` reference can't
+          # sneak back in unnoticed.
+          - name: http-only
+            flags: --no-default-features --features purecrypto-tls,idn
     steps:
       - uses: actions/checkout@v6
 

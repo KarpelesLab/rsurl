@@ -289,8 +289,10 @@ cargo build --release
 # C header:     include/rsurl.h
 ```
 
-Minimum supported Rust version (MSRV): **1.95** (raised from 1.74 when the
-`puressh`-backed SSH support landed; `puressh` requires 1.95).
+Minimum supported Rust version (MSRV): **1.95**, for every feature
+combination (it is pinned in `Cargo.toml`). The floor was originally raised
+from 1.74 by the `puressh`-backed SSH stack; dropping the `ssh` feature does
+not lower it.
 
 ### TLS backend
 
