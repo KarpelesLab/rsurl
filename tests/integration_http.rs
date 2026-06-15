@@ -341,6 +341,113 @@ fn gzip_response_not_decoded_when_decompress_off() {
     );
 }
 
+/// `send_reader` streams a `Content-Length` body straight off the socket and
+/// returns the raw, undecoded bytes (here a gzip body) with the head — and
+/// `Content-Encoding` — available up front.
+#[test]
+fn send_reader_streams_raw_content_length_body() {
+    use std::io::Read;
+
+    let plain = b"streamed raw body content".to_vec();
+    let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&plain).unwrap();
+    let gz_for_server = gz.clone();
+    let server = TestServer::start(move |_req: SReq| {
+        SResp::ok(gz_for_server.clone()).header("Content-Encoding", "gzip")
+    });
+
+    let mut reader = Request::get(&server.url("/"))
+        .unwrap()
+        .send_reader()
+        .unwrap();
+    assert_eq!(reader.status(), 200);
+    assert_eq!(
+        reader.header("content-encoding"),
+        Some("gzip"),
+        "Content-Encoding must be visible and preserved on the streaming reader",
+    );
+
+    let mut got = Vec::new();
+    reader.read_to_end(&mut got).unwrap();
+    assert_eq!(got, gz, "streamed bytes must be the raw undecoded body");
+}
+
+/// `send_reader` over a chunked body buffers and de-chunks (transfer framing is
+/// removed) but still leaves the content bytes raw.
+#[test]
+fn send_reader_handles_chunked_body() {
+    use std::io::Read;
+
+    let server = TestServer::start(|_req: SReq| {
+        SResp::ok(Vec::new())
+            .body(b"hello world".to_vec())
+            .mode(BodyMode::Chunked {
+                chunks: vec![b"hello ".to_vec(), b"world".to_vec()],
+                trailers: Vec::new(),
+            })
+    });
+
+    let mut reader = Request::get(&server.url("/"))
+        .unwrap()
+        .send_reader()
+        .unwrap();
+    assert_eq!(reader.status(), 200);
+    let mut got = String::new();
+    reader.read_to_string(&mut got).unwrap();
+    assert_eq!(got, "hello world");
+}
+
+/// A premature close before the declared `Content-Length` surfaces as an I/O
+/// error from the streaming reader rather than a silent short read.
+#[test]
+fn send_reader_errors_on_truncated_length_body() {
+    use std::io::Read;
+
+    let server = TestServer::start(|_req: SReq| {
+        SResp::ok(vec![b'x'; 100]).mode(BodyMode::ContentLengthShort {
+            declared: 100,
+            actual_len: 10,
+        })
+    });
+
+    let mut reader = Request::get(&server.url("/"))
+        .unwrap()
+        .send_reader()
+        .unwrap();
+    let mut got = Vec::new();
+    let err = reader.read_to_end(&mut got).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+}
+
+/// `Response::into_reader` yields a `Read` + `Seek` cursor over the body; with
+/// `decompress(false)` those are the raw undecoded wire bytes.
+#[test]
+fn into_reader_is_read_and_seek() {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let plain = b"abcdefghij".to_vec();
+    let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(&plain).unwrap();
+    let gz_for_server = gz.clone();
+    let server = TestServer::start(move |_req: SReq| {
+        SResp::ok(gz_for_server.clone()).header("Content-Encoding", "gzip")
+    });
+
+    let resp = Request::get(&server.url("/"))
+        .unwrap()
+        .decompress(false)
+        .send()
+        .unwrap();
+    let mut reader = resp.into_reader();
+    let mut got = Vec::new();
+    reader.read_to_end(&mut got).unwrap();
+    assert_eq!(got, gz, "cursor must yield the raw undecoded bytes");
+
+    // Seekable: rewind and re-read the first byte.
+    reader.seek(SeekFrom::Start(0)).unwrap();
+    let mut first = [0u8; 1];
+    reader.read_exact(&mut first).unwrap();
+    assert_eq!(first[0], gz[0]);
+}
+
 /// Same wire shape but with `deflate` (zlib-wrapped, RFC 9110 form).
 #[test]
 fn deflate_response_is_decoded() {

@@ -915,6 +915,90 @@ impl Request {
         self.send_download_observed(sink, jar, trace, None)
     }
 
+    /// Send the request and return a [`BodyReader`] — a [`std::io::Read`] over
+    /// the **undecoded** response body. The head (status + headers) is available
+    /// immediately; body bytes are pulled lazily as the reader is read.
+    ///
+    /// This is the `Read`-shaped counterpart to [`send`](Self::send) (buffered
+    /// `Vec`, decoded) and [`send_download`](Self::send_download) (raw bytes to a
+    /// `Write` sink): it hands back a reader of raw wire bytes, which makes a
+    /// media/source driver that consumes a `Read` a drop-in.
+    ///
+    /// Body bytes are returned exactly as the wire delivered them — any
+    /// `Content-Encoding` is left in place and the header is preserved (this
+    /// method does not decompress regardless of [`decompress`](Self::decompress),
+    /// since its whole purpose is the raw body). Transfer framing (`chunked` /
+    /// `Content-Length`) is still removed.
+    ///
+    /// On a direct HTTP/1.1 connection the body streams straight off the socket
+    /// (over HTTP/1.1 for both `http://` and `https://`, ALPN unset). A chunked
+    /// body is buffered once (its incremental decode is not exposed) and a
+    /// non-HTTP/1.1 transport (custom/SOCKS/HTTPS-proxy connector, or a forced
+    /// `--http2`/`--http3` preference) is buffered via the normal send path; the
+    /// `Read` is identical either way. Redirects are followed when
+    /// [`follow_redirects`](Self::follow_redirects) is set; cookie jars and
+    /// Digest auth are not applied on this low-level path.
+    pub fn send_reader(self) -> Result<BodyReader> {
+        self.send_reader_traced(&mut io::sink())
+    }
+
+    /// Like [`send_reader`](Self::send_reader) but writes a curl-style `-v`
+    /// trace of the connection / request / head to `trace`.
+    pub fn send_reader_traced(self, trace: &mut dyn Write) -> Result<BodyReader> {
+        let mut req = self;
+        req.url.set_idn(req.idn)?;
+        req.apply_proxy_resolver()?;
+        // Only a direct connection with no forced HTTP/2/3 streams off the
+        // socket; everything else buffers the raw body and reads it back.
+        let streamable = req.connector.is_direct()
+            && req.proxy.is_none()
+            && !matches!(
+                req.http_version_pref,
+                HttpVersionPref::Http2Only | HttpVersionPref::Http3Only
+            )
+            && (req.url.scheme == "http" || req.url.scheme == "https");
+        if !streamable {
+            return buffered_body_reader(req, trace);
+        }
+        req.cancel_check()?;
+        let mut hops_left = req.max_redirs;
+        loop {
+            let (head, mut bufrd, cancel) = open_h1_for_reader(&req, trace)?;
+
+            // Follow a 3xx with a Location when redirects are enabled, draining
+            // the (small) intermediate body first so the socket can be dropped.
+            if req.follow_redirects && is_redirect_status(head.status) {
+                if let Some(loc) = head
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+                    .map(|(_, v)| v.clone())
+                {
+                    let _ = read_body(
+                        &mut bufrd,
+                        &head.headers,
+                        &head.version,
+                        head.status,
+                        &req.method,
+                    )?;
+                    drop(bufrd);
+                    drop(cancel);
+                    if hops_left == 0 {
+                        return Err(Error::BadResponse(format!(
+                            "maximum ({}) redirects followed",
+                            req.max_redirs
+                        )));
+                    }
+                    hops_left -= 1;
+                    req = redirect_request(req, &head, &loc)?;
+                    continue;
+                }
+            }
+
+            return build_body_reader(&req, head, bufrd, cancel);
+        }
+    }
+
     /// The engine behind [`send_download`](Self::send_download) and
     /// [`send_streaming`](Self::send_streaming). `on_head`, when present, is
     /// invoked once with the final response head before any body byte is written
@@ -1760,6 +1844,24 @@ impl Response {
         serde_json::from_slice(&self.body).map_err(|e| Error::Decode(format!("json: {e}")))
     }
 
+    /// Consume the response and return a reader over its body.
+    ///
+    /// The reader is a [`std::io::Cursor`] over the body bytes, so it is both
+    /// [`Read`] and [`std::io::Seek`] — handy for handing a buffered payload to
+    /// an API that wants a `Read` (e.g. a media/source driver) without copying
+    /// the `Vec` again, and for seeking within it.
+    ///
+    /// The body has already gone through rsurl's normal post-processing: with
+    /// the default transparent decompression it is the decoded plaintext; pair
+    /// this with [`Request::decompress(false)`](Request::decompress) (or
+    /// [`Client::decompress(false)`](crate::Client::decompress)) to get a reader
+    /// over the raw, undecoded wire bytes with `Content-Encoding` left intact.
+    /// For a body that streams off the socket without being buffered first, see
+    /// [`Request::send_reader`].
+    pub fn into_reader(self) -> io::Cursor<Vec<u8>> {
+        io::Cursor::new(self.body)
+    }
+
     /// Consume the response, returning it unchanged for a 1xx–3xx status or
     /// [`Error::Status`] for a 4xx/5xx one — the reqwest-style "turn an HTTP
     /// error status into a `Result` error" convenience.
@@ -1777,6 +1879,293 @@ impl Response {
             Ok(self)
         }
     }
+}
+
+/// A streaming reader over an HTTP response body, returned by
+/// [`Request::send_reader`]. Implements [`std::io::Read`]; the head (status +
+/// headers) is available up front via [`BodyReader::head`] and the accessor
+/// methods.
+///
+/// The bytes are the **undecoded** body: any `Content-Encoding` is left in
+/// place (the matching header stays in the head), so this is the raw-wire
+/// counterpart to the buffered [`Response::body`]. Transfer framing (chunked /
+/// `Content-Length`) is still removed — that's hop-by-hop framing, not content
+/// coding.
+///
+/// On a direct HTTP/1.1 connection with a `Content-Length` or
+/// connection-close-delimited body, the bytes stream straight off the socket
+/// and are never all held in memory at once. A chunked body, an empty-body
+/// status, and any non-HTTP/1.1 transport (a custom/SOCKS/HTTPS-proxy
+/// connector, or a forced HTTP/2/3 preference) are buffered once and then read
+/// back from memory — the `Read` interface is identical either way.
+pub struct BodyReader {
+    head: ResponseHead,
+    inner: BodyInner,
+    /// Keeps the cancellation socket-shutdown registration alive while the body
+    /// streams; dropped (deregistered) with the reader. `None` when the request
+    /// carried no [`CancelToken`](crate::CancelToken) or on the buffered paths.
+    _cancel: Option<crate::cancel::CancelGuard>,
+}
+
+enum BodyInner {
+    /// Whole body already in memory (chunked, empty status, or a non-HTTP/1.1
+    /// transport that doesn't expose an incremental socket reader).
+    Buffered(io::Cursor<Vec<u8>>),
+    /// A `Content-Length`-bounded raw byte stream straight off the socket.
+    Length(LengthBody),
+    /// A connection-close-delimited stream, capped at [`MAX_BODY_BYTES`].
+    Eof(io::Take<BufReader<Box<dyn Rw>>>),
+}
+
+impl BodyReader {
+    /// The response head (status, reason, version, headers) — populated before
+    /// any body byte is read, like the streaming callback API's head-first
+    /// contract.
+    pub fn head(&self) -> &ResponseHead {
+        &self.head
+    }
+
+    /// The response status code.
+    pub fn status(&self) -> u16 {
+        self.head.status
+    }
+
+    /// First value of a response header, case-insensitive.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.head.header(name)
+    }
+}
+
+impl Read for BodyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.inner {
+            BodyInner::Buffered(c) => c.read(buf),
+            BodyInner::Length(l) => l.read(buf),
+            BodyInner::Eof(t) => t.read(buf),
+        }
+    }
+}
+
+/// A `Content-Length`-bounded body reader. Unlike a bare [`io::Take`], it
+/// surfaces a premature EOF (the peer closed before delivering the promised
+/// length) as an [`io::ErrorKind::UnexpectedEof`] rather than a silent short
+/// read, mirroring the buffered path's truncation rejection.
+struct LengthBody {
+    src: BufReader<Box<dyn Rw>>,
+    remaining: u64,
+}
+
+impl Read for LengthBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = self.remaining.min(buf.len() as u64) as usize;
+        let n = self.src.read(&mut buf[..cap])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "response body truncated before Content-Length",
+            ));
+        }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// A read head, the connection it arrived on (body still unread), and the
+/// cancellation guard to keep alive while the body streams — what
+/// [`open_h1_for_reader`] hands back to [`Request::send_reader`].
+type OpenedBody = (
+    Head,
+    BufReader<Box<dyn Rw>>,
+    Option<crate::cancel::CancelGuard>,
+);
+
+/// Connect (HTTP/1.1, ALPN unset), write the request, and read the response
+/// head, leaving the body unread in the returned [`BufReader`]. The cancel
+/// guard (if any) is returned so the caller can keep it alive for the body's
+/// lifetime. Direct, no-proxy use only — the streaming [`Request::send_reader`]
+/// path; everything else buffers via [`buffered_body_reader`].
+fn open_h1_for_reader(req: &Request, trace: &mut dyn Write) -> Result<OpenedBody> {
+    let (tcp, guard, _namelookup) = tcp_connect_cancellable(req, trace)?;
+    let stream: Box<dyn Rw> = if req.url.scheme == "https" {
+        let opts = tls_opts_from(req, &[])?;
+        let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
+        write_tls_info(&tls, trace);
+        Box::new(tls)
+    } else {
+        Box::new(tcp)
+    };
+    let mut bufrd = BufReader::new(stream);
+    write_request(bufrd.get_mut(), req, via_plain_http_proxy(req), trace)?;
+    let head = read_head(&mut bufrd, trace)?;
+    Ok((head, bufrd, guard))
+}
+
+/// Turn a read head + its connection into a [`BodyReader`], choosing the body
+/// framing the same way [`read_body`] does: an empty-body status yields nothing,
+/// a chunked body is de-chunked into memory (its incremental decode isn't
+/// exposed), a `Content-Length` body streams off the socket bounded by the
+/// length, and anything else streams until connection close. `Content-Encoding`
+/// is never touched — the bytes stay raw.
+fn build_body_reader(
+    req: &Request,
+    head: Head,
+    mut bufrd: BufReader<Box<dyn Rw>>,
+    cancel: Option<crate::cancel::CancelGuard>,
+) -> Result<BodyReader> {
+    let rhead = ResponseHead {
+        status: head.status,
+        reason: head.reason.clone(),
+        version: head.version.clone(),
+        headers: head.headers.clone(),
+    };
+
+    // RFC 9110: HEAD and these statuses never carry a body.
+    let has_body = !(req.method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&head.status)
+        || head.status == 204
+        || head.status == 304);
+    if !has_body {
+        return Ok(BodyReader {
+            head: rhead,
+            inner: BodyInner::Buffered(io::Cursor::new(Vec::new())),
+            _cancel: None,
+        });
+    }
+
+    // RFC 9112 §6.1: Transfer-Encoding + Content-Length together is a smuggling
+    // vector — reject rather than pick a framing.
+    let has_te = head
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+    let has_cl = head
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    if has_te && has_cl {
+        return Err(Error::BadResponse(
+            "both Transfer-Encoding and Content-Length present".into(),
+        ));
+    }
+
+    let chunked = head.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
+    });
+    if chunked {
+        // De-chunking incrementally as a `Read` isn't exposed; buffer the
+        // de-chunked (still content-encoded) bytes and read them back.
+        let body = read_body(
+            &mut bufrd,
+            &head.headers,
+            &head.version,
+            head.status,
+            &req.method,
+        )?;
+        return Ok(BodyReader {
+            head: rhead,
+            inner: BodyInner::Buffered(io::Cursor::new(body)),
+            _cancel: None,
+        });
+    }
+
+    match parse_content_length(&head.headers)? {
+        Some(len) => {
+            if len > MAX_BODY_BYTES as u64 {
+                return Err(Error::BadResponse(format!("body too large: {len}")));
+            }
+            Ok(BodyReader {
+                head: rhead,
+                inner: BodyInner::Length(LengthBody {
+                    src: bufrd,
+                    remaining: len,
+                }),
+                _cancel: cancel,
+            })
+        }
+        // No Content-Length, not chunked — connection-close-delimited.
+        None => Ok(BodyReader {
+            head: rhead,
+            inner: BodyInner::Eof(bufrd.take(MAX_BODY_BYTES as u64)),
+            _cancel: cancel,
+        }),
+    }
+}
+
+/// Buffered fallback for [`Request::send_reader`] on transports that don't
+/// expose an incremental socket reader (custom/SOCKS/HTTPS-proxy connector or a
+/// forced HTTP/2/3 preference): run the normal send path with decompression
+/// forced off, then serve the raw body from memory. Redirects, cookies (none
+/// here), and HTTP/2/3 are all handled by `send_to`.
+fn buffered_body_reader(mut req: Request, trace: &mut dyn Write) -> Result<BodyReader> {
+    req.decompress = false;
+    let resp = req.send_to(trace, None)?;
+    let head = ResponseHead {
+        status: resp.status,
+        reason: resp.reason.clone(),
+        version: resp.version.clone(),
+        headers: resp.headers.clone(),
+    };
+    Ok(BodyReader {
+        head,
+        inner: BodyInner::Buffered(io::Cursor::new(resp.body)),
+        _cancel: None,
+    })
+}
+
+/// Transform `req` into the next-hop request for a `3xx Location`, applying the
+/// same rules as the buffered redirect loop: resolve + IDN-normalise the target,
+/// reject non-HTTP(S) schemes, drop `Authorization`/`Cookie` (and Basic creds)
+/// on a cross-host hop unless `--location-trusted`, set `Referer` for
+/// `-e ;auto`, and downgrade POST→GET (dropping the body + framing headers) on
+/// 301/302/303 except where `--post30x` opts out.
+fn redirect_request(req: Request, head: &Head, location: &str) -> Result<Request> {
+    let mut next_url = crate::url::resolve(&req.url, location)?;
+    if next_url.scheme != "http" && next_url.scheme != "https" {
+        return Err(Error::UnsupportedScheme(next_url.scheme.clone()));
+    }
+    next_url.set_idn(req.idn)?;
+    let host_changed = next_url.host != req.url.host
+        || next_url.port != req.url.port
+        || next_url.scheme != req.url.scheme;
+    let prev_method = req.method.clone();
+    let prev_url = url_to_string(&req.url);
+    let status = head.status;
+
+    let mut next = req;
+    next.url = next_url;
+    if next.auto_referer {
+        next.headers
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("referer"));
+        next.headers.push(("Referer".to_string(), prev_url));
+    }
+    if host_changed && !next.redirect_trusted {
+        next.headers.retain(|(k, _)| {
+            !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie")
+        });
+        next.basic_auth = None;
+    }
+    let keep_post = if (301..=303).contains(&status) {
+        next.keep_post[(status - 301) as usize]
+    } else {
+        false
+    };
+    if (301..=303).contains(&status)
+        && !keep_post
+        && !prev_method.eq_ignore_ascii_case("GET")
+        && !prev_method.eq_ignore_ascii_case("HEAD")
+    {
+        next.method = "GET".to_string();
+        next.body = Vec::new();
+        next.headers.retain(|(k, _)| {
+            !k.eq_ignore_ascii_case("content-type")
+                && !k.eq_ignore_ascii_case("content-length")
+                && !k.eq_ignore_ascii_case("transfer-encoding")
+        });
+    }
+    Ok(next)
 }
 
 fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
