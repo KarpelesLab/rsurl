@@ -412,6 +412,11 @@ impl<T: Read + Write + Send + ?Sized> ReadWrite for T {}
 /// call it from two at once.)
 pub struct WebSocket {
     stream: Box<dyn ReadWrite>,
+    /// Bytes read off the transport but not yet consumed into a delivered
+    /// frame. Frame parsing only drains this once a whole frame is assembled,
+    /// so a read error mid-frame (e.g. a read timeout) is resumable instead of
+    /// desyncing the stream.
+    rxbuf: Vec<u8>,
     /// A cloned handle to the underlying socket (same OS fd) kept only to
     /// adjust the read timeout — the data path may be TLS-wrapped and own the
     /// socket, so this side-channel reaches it. `None` if the transport does
@@ -502,6 +507,7 @@ impl WebSocket {
         let compression = pmd.is_some();
         Ok(WebSocket {
             stream,
+            rxbuf: Vec::new(),
             ctl,
             pmd,
             send_closed: false,
@@ -630,7 +636,7 @@ impl WebSocket {
         let mut buf: Vec<u8> = Vec::new();
 
         loop {
-            let frame = read_frame(&mut self.stream)?;
+            let frame = read_frame(&mut self.stream, &mut self.rxbuf)?;
 
             if frame.opcode >= 0x8 {
                 validate_control_frame(&frame)?;
@@ -779,7 +785,7 @@ impl WebSocket {
     /// [`recv`](Self::recv) or [`recv_event`](Self::recv_event); use this only
     /// to drive the framing yourself.
     pub fn recv_frame(&mut self) -> Result<WsFrame> {
-        let frame = read_frame(&mut self.stream)?;
+        let frame = read_frame(&mut self.stream, &mut self.rxbuf)?;
         Ok(WsFrame {
             fin: frame.fin,
             opcode: WsOpcode::from_u8(frame.opcode)?,
@@ -1102,9 +1108,10 @@ fn read_message<S: Read + Write>(stream: &mut S, mut pmd: Option<&mut Pmd>) -> R
     // was set on its first frame).
     let mut compressed = false;
     let mut buf: Vec<u8> = Vec::new();
+    let mut rx: Vec<u8> = Vec::new();
 
     loop {
-        let frame = read_frame(stream)?;
+        let frame = read_frame(stream, &mut rx)?;
 
         // Control frames (opcode >= 0x8) may be interleaved between fragments
         // but MUST NOT themselves be fragmented and MUST have payload <= 125.
@@ -1348,36 +1355,42 @@ struct Frame {
 /// negotiated). RSV1 is surfaced via [`Frame::rsv1`]; whether it is legal
 /// depends on context (permessage-deflate negotiation + frame type), which is
 /// enforced by the caller in `read_message`.
-fn read_frame<S: Read>(stream: &mut S) -> Result<Frame> {
-    let mut header = [0u8; 2];
-    read_exact(stream, &mut header)?;
-    let fin = (header[0] & 0x80) != 0;
-    let rsv1 = (header[0] & 0x40) != 0;
+fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
+    // All wire bytes land in `rx` first and are only drained once a full frame
+    // is parsed, so a read error part-way through a frame leaves `rx` intact and
+    // the next call resumes from the same offset (no desync on a read timeout).
+    fill_to(stream, rx, 2)?;
+    let h0 = rx[0];
+    let h1 = rx[1];
+    let fin = (h0 & 0x80) != 0;
+    let rsv1 = (h0 & 0x40) != 0;
     // RSV2/RSV3 must always be zero — no extension using them is negotiated.
-    if (header[0] & 0x30) != 0 {
+    if (h0 & 0x30) != 0 {
         return Err(Error::BadResponse(
             "non-zero RSV2/RSV3 bits on incoming WS frame".into(),
         ));
     }
-    let opcode = header[0] & 0x0F;
-    let masked = (header[1] & 0x80) != 0;
-    if masked {
+    let opcode = h0 & 0x0F;
+    if (h1 & 0x80) != 0 {
         return Err(Error::BadResponse(
             "server-to-client frame is masked".into(),
         ));
     }
-    let len7 = header[1] & 0x7F;
+    let len7 = h1 & 0x7F;
+    let mut pos = 2usize;
     let payload_len: u64 = match len7 {
         0..=125 => len7 as u64,
         126 => {
-            let mut ext = [0u8; 2];
-            read_exact(stream, &mut ext)?;
-            u16::from_be_bytes(ext) as u64
+            fill_to(stream, rx, pos + 2)?;
+            let v = u16::from_be_bytes([rx[pos], rx[pos + 1]]) as u64;
+            pos += 2;
+            v
         }
         127 => {
-            let mut ext = [0u8; 8];
-            read_exact(stream, &mut ext)?;
-            u64::from_be_bytes(ext)
+            fill_to(stream, rx, pos + 8)?;
+            let v = u64::from_be_bytes(rx[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            v
         }
         _ => unreachable!(),
     };
@@ -1386,16 +1399,32 @@ fn read_frame<S: Read>(stream: &mut S) -> Result<Frame> {
             "WS payload too large: {payload_len} bytes"
         )));
     }
-    let mut payload = vec![0u8; payload_len as usize];
-    if payload_len > 0 {
-        read_exact(stream, &mut payload)?;
-    }
+    let plen = payload_len as usize;
+    fill_to(stream, rx, pos + plen)?;
+    let payload = rx[pos..pos + plen].to_vec();
+    pos += plen;
+    rx.drain(..pos); // consume only now that the whole frame is in hand
     Ok(Frame {
         fin,
         rsv1,
         opcode,
         payload,
     })
+}
+
+/// Read from `stream` into `rx` until it holds at least `need` bytes. On a read
+/// error (e.g. a timeout) `rx` keeps everything read so far, so a retry resumes
+/// without losing already-consumed wire bytes.
+fn fill_to<S: Read>(stream: &mut S, rx: &mut Vec<u8>, need: usize) -> Result<()> {
+    let mut tmp = [0u8; 16 * 1024];
+    while rx.len() < need {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            return Err(Error::UnexpectedEof);
+        }
+        rx.extend_from_slice(&tmp[..n]);
+    }
+    Ok(())
 }
 
 /// Build an unfragmented client-to-server frame with the given opcode and
@@ -1442,18 +1471,6 @@ fn build_client_frame_inner(fin: bool, opcode: u8, payload: &[u8], rsv1: bool) -
         *b ^= mask[i & 3];
     }
     Ok(out)
-}
-
-fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
-    let mut got = 0;
-    while got < buf.len() {
-        let n = r.read(&mut buf[got..])?;
-        if n == 0 {
-            return Err(Error::UnexpectedEof);
-        }
-        got += n;
-    }
-    Ok(())
 }
 
 /// `base64(sha1(key + WS_GUID))`. Used by both sides of the handshake to
@@ -1737,7 +1754,7 @@ mod tests {
         // 0x81 = FIN + opcode 1 (text), 0x05 = unmasked length 5, "hello"
         let bytes = [0x81, 0x05, b'h', b'e', b'l', b'l', b'o'];
         let mut cur = Cursor::new(&bytes[..]);
-        let f = read_frame(&mut cur).expect("frame parses");
+        let f = read_frame(&mut cur, &mut Vec::new()).expect("frame parses");
         assert!(f.fin);
         assert_eq!(f.opcode, OPCODE_TEXT);
         assert_eq!(f.payload, b"hello");
@@ -1749,10 +1766,54 @@ mod tests {
         let mut bytes: Vec<u8> = vec![0x82, 126, 0x00, 200];
         bytes.extend(std::iter::repeat_n(b'A', 200));
         let mut cur = Cursor::new(bytes);
-        let f = read_frame(&mut cur).expect("frame parses");
+        let f = read_frame(&mut cur, &mut Vec::new()).expect("frame parses");
         assert_eq!(f.opcode, OPCODE_BINARY);
         assert_eq!(f.payload.len(), 200);
         assert!(f.payload.iter().all(|&b| b == b'A'));
+    }
+
+    #[test]
+    fn read_frame_resumes_after_midframe_error() {
+        // A reader that hands out one byte per call and injects a WouldBlock
+        // once, mid-frame. With the persistent rx buffer, the retry resumes
+        // exactly where it left off rather than desyncing.
+        struct Flaky {
+            data: Vec<u8>,
+            pos: usize,
+            fail_at: usize,
+            failed: bool,
+        }
+        impl Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.failed && self.pos >= self.fail_at {
+                    self.failed = true;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "timeout",
+                    ));
+                }
+                if self.pos >= self.data.len() {
+                    return Ok(0);
+                }
+                buf[0] = self.data[self.pos];
+                self.pos += 1;
+                Ok(1)
+            }
+        }
+        let mut r = Flaky {
+            data: vec![0x81, 0x05, b'h', b'e', b'l', b'l', b'o'],
+            pos: 0,
+            fail_at: 3, // error after the header + first payload byte are read
+            failed: false,
+        };
+        let mut rx = Vec::new();
+        // First attempt errors part-way through the frame...
+        assert!(read_frame(&mut r, &mut rx).is_err());
+        // ...and a retry against the same buffer recovers the whole frame.
+        let f = read_frame(&mut r, &mut rx).expect("resumes after the error");
+        assert_eq!(f.opcode, OPCODE_TEXT);
+        assert_eq!(f.payload, b"hello");
+        assert!(rx.is_empty(), "buffer fully consumed");
     }
 
     #[test]
@@ -1760,7 +1821,8 @@ mod tests {
         // MASK bit set, length 0 — server is not allowed to mask.
         let bytes = [0x81, 0x80, 0, 0, 0, 0];
         let mut cur = Cursor::new(&bytes[..]);
-        let err = read_frame(&mut cur).expect_err("masked server frame must be rejected");
+        let err = read_frame(&mut cur, &mut Vec::new())
+            .expect_err("masked server frame must be rejected");
         match err {
             Error::BadResponse(_) => {}
             other => panic!("wrong error: {other:?}"),
@@ -2392,6 +2454,7 @@ mod tests {
         let compression = pmd.is_some();
         WebSocket {
             stream: Box::new(mock),
+            rxbuf: Vec::new(),
             ctl: None,
             pmd,
             send_closed: false,
