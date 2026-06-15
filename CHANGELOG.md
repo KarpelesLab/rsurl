@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.9...rsurl-v0.0.10) - 2026-06-15
+
+### Added
+
+- add Read-returning raw body API (into_reader + send_reader)
+- add `decompress(false)` to Request and Client
+- gate SSH (puressh) behind a default-on `ssh` feature
+
+### Other
+
+- fix intro to reflect optional SSH/BitTorrent and the intl swap
+- drop the status table; give HTTP/2 and HTTP/3 their own chapters
+- refresh README for new APIs and maturity
+- *(idn)* use the first-party `intl` crate instead of `idna`
+- concurrent TLS connection + WsTransport (no API change yet)
+- buffer inbound frames so a mid-frame read error can't desync
+
 ## [0.0.9](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.8...rsurl-v0.0.9) - 2026-06-14
 
 ### Other
