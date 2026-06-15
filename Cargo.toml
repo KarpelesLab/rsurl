@@ -55,11 +55,11 @@ rustls-tls = ["dep:rustls", "dep:rustls-pemfile"]
 # Internationalized Domain Name (IDN) support: normalise Unicode hostnames to
 # ASCII/punycode (UTS-46) before they hit DNS, the `Host:` header, and TLS SNI —
 # matching curl's default. On by default; build with `--no-default-features`
-# (plus a TLS backend) to drop both the code path and the `idna` dependency and
+# (plus a TLS backend) to drop both the code path and the `intl` dependency and
 # its Unicode tables. The runtime `--no-idn` flag / `Request::idn(false)` still
-# compile in either way (they no-op without this feature). `idna` is pure Rust
-# (no C), so the no-C-toolchain guarantee is preserved.
-idn = ["dep:idna"]
+# compile in either way (they no-op without this feature). `intl` is pure Rust
+# (no C, no transitive deps), so the no-C-toolchain guarantee is preserved.
+idn = ["dep:intl"]
 # `Response::json::<T>()` via serde + serde_json (both pure-Rust, no C). Off by
 # default so the base build pulls neither; enable with `--features json`.
 json = ["dep:serde", "dep:serde_json"]
@@ -112,10 +112,14 @@ puressh = { version = "0.0.4", optional = true, default-features = false, featur
 # minimal-dependency guarantee stays intact.
 psl2 = { version = "0.1", default-features = false }
 # IDN / UTS-46 host normalisation (Unicode → punycode), behind the `idn`
-# feature. Pure Rust (no C / no `*-sys` crate); `compiled_data` ships the
-# Unicode tables and keeps `idna::domain_to_ascii` available with
-# `default-features = false`, so no extra transitive deps come along.
-idna = { version = "1", optional = true, default-features = false, features = ["alloc", "compiled_data"] }
+# feature, via the first-party pure-Rust `intl` i18n crate (same lab). We take
+# only its `idna` feature (pulls `normalization` + `bidi` + the BMP property
+# tables as const-fn lookups; implies `alloc`). No C / no `*-sys` crate and no
+# transitive dependencies, so the no-C-toolchain / minimal-dependency guarantee
+# stays intact. `intl::unicode::idna::to_ascii` applies stricter UTS-46/IDNA2008
+# validation than the old `idna` crate (bidi, CONTEXTJ, hyphen, leading-mark and
+# trailing-dot rules) — see `src/idn.rs`.
+intl = { version = "0.4.1", optional = true, default-features = false, features = ["idna"] }
 
 [dev-dependencies]
 # Used only by the WebSocket integration test's in-process echo server to

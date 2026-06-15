@@ -4,8 +4,9 @@
 //! `münchen.de` → `xn--mnchen-3ya.de`) so it can be used for DNS resolution,
 //! the HTTP `Host:` header, and TLS SNI — all of which expect ASCII.
 //!
-//! Gated by the `idn` Cargo feature (on by default). Without the feature the
-//! `idna` dependency and its Unicode tables are dropped and [`to_ascii`] is a
+//! Gated by the `idn` Cargo feature (on by default), implemented with the
+//! first-party pure-Rust `intl` crate's `idna` module. Without the feature the
+//! `intl` dependency and its Unicode tables are dropped and [`to_ascii`] is a
 //! pure passthrough, so a Unicode host flows through unchanged (and typically
 //! fails to resolve) — the correct "no IDN compiled" behaviour.
 
@@ -23,12 +24,12 @@ use crate::error::Result;
 pub(crate) fn to_ascii(host: &str, enabled: bool) -> Result<String> {
     #[cfg(feature = "idn")]
     if enabled && !host.is_ascii() {
-        let ascii = idna::domain_to_ascii(host)
+        let ascii = intl::unicode::idna::to_ascii(host)
             .map_err(|_| Error::InvalidUrl(format!("invalid IDN host: {host}")))?;
-        // UTS-46 / `domain_to_ascii` runs with UseSTD3ASCIIRules=false, so it
-        // happily maps fullwidth/compatibility code points onto ASCII
-        // authority delimiters (e.g. U+FF20 `＠` → `@`, U+FF0F `／` → `/`,
-        // U+FF1A `：` → `:`). That output is written straight back into
+        // UTS-46 `to_ascii` still maps fullwidth/compatibility code points onto
+        // ASCII authority delimiters (e.g. U+FF20 `＠` → `@`, U+FF0F `／` → `/`,
+        // U+FF1A `：` → `:`) without rejecting them at the source. That output
+        // is written straight back into
         // `Url::host` AFTER parse-time validation, so without re-checking it an
         // attacker can smuggle a delimiter past the parser and trigger
         // origin/host confusion (DNS, SNI, `Host:` header, proxy request line,

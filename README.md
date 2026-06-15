@@ -262,11 +262,11 @@ stack it sits on is part of `purecrypto`.
 International hostnames are normalized to ASCII/punycode (UTS-46, e.g.
 `müller.example` → `xn--mller-kva.example`) before DNS, the `Host:` header,
 and TLS SNI — matching curl. This is the default `idn` feature, backed by the
-pure-Rust `idna` crate (no C). Turn it off per request with `--no-idn`
-(CLI), `Request::idn(false)` (library), or `RSURLOPT_IDN = 0` (C FFI). To
-drop the capability and the `idna` dependency/tables from the build entirely,
-compile without default features, e.g.
-`cargo build --release --no-default-features --features purecrypto-tls`.
+first-party pure-Rust `intl` crate's `idna` module (no C, no transitive deps).
+Turn it off per request with `--no-idn` (CLI), `Request::idn(false)` (library),
+or `RSURLOPT_IDN = 0` (C FFI). To drop the capability and the `intl`
+dependency/tables from the build entirely, compile without default features,
+e.g. `cargo build --release --no-default-features --features purecrypto-tls`.
 
 ### Optional protocol stacks (SSH, BitTorrent)
 
