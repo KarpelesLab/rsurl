@@ -30,13 +30,20 @@ path = "src/bin/rsurl.rs"
 
 [features]
 # Default keeps the historical behaviour: a single TLS backend layered on
-# purecrypto, no extra C-free guarantees lost. `bittorrent` is on by default
-# but can be dropped with `--no-default-features`.
-default = ["purecrypto-tls", "idn", "bittorrent"]
+# purecrypto, plus the SSH and BitTorrent stacks. An HTTP-only consumer can drop
+# both with `--no-default-features --features purecrypto-tls,idn`, which also
+# stops `puressh` from being pulled in at all.
+default = ["purecrypto-tls", "idn", "bittorrent", "ssh"]
 # BitTorrent client (`.torrent` / `magnet:`): bencode, trackers, DHT, peer wire
 # protocol, seeding. Pure Rust on `purecrypto` + std — adds no new dependency,
 # so the feature is purely organizational (lets it be compiled out).
 bittorrent = []
+# SSH transports — `sftp://` and `scp://`, download and upload — built on the
+# pure-Rust `puressh` crate. On by default; drop it (and the `puressh`
+# dependency, plus its `libc`/`nix` bindings) with `--no-default-features` for an
+# HTTP-only build that doesn't want a full SSH client linked in. With the
+# feature off, `sftp`/`scp` URLs are rejected with `Error::UnsupportedScheme`.
+ssh = ["dep:puressh"]
 # Use purecrypto's TLS stack (purecrypto::tls). No additional deps.
 purecrypto-tls = []
 # Use rustls 0.23 + ring instead. Enable with
@@ -85,16 +92,17 @@ rustls-pemfile = { version = "2", optional = true }
 # needed here, so leave default features off and opt in to only what we use.
 compcol = { version = "0.4", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw"] }
 # Pure-Rust SSH stack (same lab, built on purecrypto) behind the `sftp://` and
-# `scp://` schemes. Default-on, not feature-gated. We take only the `client`
-# feature (implies `std`; exposes `client`, `sftp`, `scp`, `known_hosts`, `key`)
-# plus `compress` (zlib@openssh.com). We deliberately do NOT enable `server`,
-# `multichannel`, `ffi`, or — critically — `pam`: the `pam` feature pulls
-# `pam-client2`, a C/FFI crate that would break the no-C-toolchain guarantee.
-# On unix, puressh unconditionally depends on `libc`/`nix`, but those are
-# pure-Rust FFI *binding* crates (extern decls against the libc that std
+# `scp://` schemes. Optional, gated by the default-on `ssh` feature so HTTP-only
+# consumers can drop it entirely (`--no-default-features`). We take only the
+# `client` feature (implies `std`; exposes `client`, `sftp`, `scp`,
+# `known_hosts`, `key`) plus `compress` (zlib@openssh.com). We deliberately do
+# NOT enable `server`, `multichannel`, `ffi`, or — critically — `pam`: the `pam`
+# feature pulls `pam-client2`, a C/FFI crate that would break the no-C-toolchain
+# guarantee. On unix, puressh unconditionally depends on `libc`/`nix`, but those
+# are pure-Rust FFI *binding* crates (extern decls against the libc that std
 # already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
-puressh = { version = "0.0.4", default-features = false, features = ["client", "compress"] }
+puressh = { version = "0.0.4", optional = true, default-features = false, features = ["client", "compress"] }
 # Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
 # `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
 # heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =

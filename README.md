@@ -268,6 +268,22 @@ drop the capability and the `idna` dependency/tables from the build entirely,
 compile without default features, e.g.
 `cargo build --release --no-default-features --features purecrypto-tls`.
 
+### Optional protocol stacks (SSH, BitTorrent)
+
+The SSH transports (`sftp://` / `scp://`) and the BitTorrent client are each
+behind a default-on Cargo feature — `ssh` and `bittorrent` respectively. An
+HTTP-only consumer that doesn't want a full SSH client and BitTorrent stack
+linked in can drop both:
+
+```sh
+cargo build --release --no-default-features --features purecrypto-tls,idn
+```
+
+Dropping `ssh` also stops the `puressh` dependency (and its `libc`/`nix`
+bindings) from being compiled at all. With either feature off, the
+corresponding URL schemes are rejected with `Error::UnsupportedScheme` (the CLI
+prints `this build has no … support`).
+
 ## License
 
 MIT — Copyright © 2026 Karpelès Lab Inc. See [LICENSE](LICENSE).

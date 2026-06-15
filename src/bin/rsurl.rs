@@ -1788,7 +1788,17 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             }
             // SFTP/SCP upload: -T <file> sftp|scp://host/remote.
             if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
-                return run_ssh_upload(&parsed_url, path, args);
+                #[cfg(feature = "ssh")]
+                {
+                    return run_ssh_upload(&parsed_url, path, args);
+                }
+                #[cfg(not(feature = "ssh"))]
+                {
+                    if show_errors(args) {
+                        eprintln!("rsurl: this build has no SSH (sftp/scp) support");
+                    }
+                    return 2;
+                }
             }
             if show_errors(args) {
                 eprintln!(
@@ -1801,7 +1811,17 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
         // -u/userinfo password, --key identities, and -k into SshOptions, and
         // emits the verbose SSH trace under -v.
         if matches!(parsed_url.scheme.as_str(), "sftp" | "scp") {
-            return run_ssh(&parsed_url, args);
+            #[cfg(feature = "ssh")]
+            {
+                return run_ssh(&parsed_url, args);
+            }
+            #[cfg(not(feature = "ssh"))]
+            {
+                if show_errors(args) {
+                    eprintln!("rsurl: this build has no SSH (sftp/scp) support");
+                }
+                return 2;
+            }
         }
         // Any non-HTTP download to a file goes through the streaming sink, which
         // enforces --limit-rate / -# / --max-filesize / -y / -Y /
@@ -2916,6 +2936,7 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
 /// keys); `-k` toggles accept-any host keys. An encrypted-key passphrase reuses
 /// the `-u` password if one was given (a one-shot CLI can't prompt). Returns
 /// `(options, user)`; a missing user is a fatal usage error (curl-style code 2).
+#[cfg(feature = "ssh")]
 fn build_ssh_options(url: &Url, args: &Args) -> Result<(rsurl::ssh::SshOptions, String), String> {
     let (_, url_pass) = rsurl::ssh::userinfo_password(url);
     // -u user:pass — the password half feeds both password auth and the
@@ -2943,6 +2964,7 @@ fn build_ssh_options(url: &Url, args: &Args) -> Result<(rsurl::ssh::SshOptions, 
 /// Download an `sftp://`/`scp://` URL and write the bytes to `-o`/stdout (or
 /// `-O`). Mirrors [`run_transfer`] but threads SSH auth options and, under
 /// `-v`, prints the SSH trace to stderr. Exit codes: 0 ok, 2 usage, 7 transfer.
+#[cfg(feature = "ssh")]
 fn run_ssh(url: &Url, args: &Args) -> u8 {
     let (opts, user) = match build_ssh_options(url, args) {
         Ok(x) => x,
@@ -3013,6 +3035,7 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
 /// Upload a local file to an `sftp://`/`scp://` URL. Reads the whole file into
 /// memory (matching the other `-T` paths), then writes it remotely. `-v` prints
 /// the SSH trace. Exit codes: 0 ok, 2 usage, 7 transfer, 26 local-read error.
+#[cfg(feature = "ssh")]
 fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,

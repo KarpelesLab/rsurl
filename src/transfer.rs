@@ -61,6 +61,7 @@ pub(crate) fn transfer_url_with(url: &Url, cfg: &crate::net::NetConfig) -> Resul
         "mqtt" | "mqtts" => crate::mqtt::fetch_with(url, cfg),
         "pop3" | "pop3s" => crate::pop3::fetch_with(url, cfg),
         "rtsp" => crate::rtsp::fetch_with(url, cfg),
+        #[cfg(feature = "ssh")]
         "sftp" | "scp" => {
             // Library default: derive the user from the URL/`$USER`, take any
             // password from the URL userinfo, and use TOFU known_hosts (no

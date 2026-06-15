@@ -40,6 +40,7 @@ pub mod ldap;
 pub mod mqtt;
 pub mod pop3;
 pub mod rtsp;
+#[cfg(feature = "ssh")]
 pub mod ssh;
 pub mod tftp;
 pub mod websocket;
