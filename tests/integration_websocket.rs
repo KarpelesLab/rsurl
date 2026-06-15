@@ -5,6 +5,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -191,6 +193,99 @@ fn library_round_trips_text_over_real_socket() {
     ws.close().expect("close");
     // After our close, draining yields the server's close echo.
     assert_eq!(ws.recv().expect("drain"), None);
+}
+
+/// The adoption blocker: after `split()`, a reader can block in `recv()` on one
+/// thread while a writer sends from another over the same connection — which
+/// the single-owner `&mut self` API made impossible. The echo server returns
+/// each message in order.
+#[test]
+fn split_allows_concurrent_send_while_recv() {
+    let port = start_echo_server();
+    let ws = WebSocket::connect(&format!("ws://127.0.0.1:{port}/")).expect("connect");
+    let (mut reader, mut writer) = ws.split();
+
+    const N: usize = 25;
+    let rh = thread::spawn(move || {
+        let mut got = Vec::new();
+        for _ in 0..N {
+            match reader.recv() {
+                Ok(Some(WsMessage::Text(t))) => got.push(t),
+                other => panic!("recv: {other:?}"),
+            }
+        }
+        got
+    });
+
+    // Send from this thread while the reader thread is parked in recv().
+    for i in 0..N {
+        writer.send_text(&format!("msg-{i}")).expect("send");
+    }
+
+    let got = rh.join().unwrap();
+    assert_eq!(got.len(), N);
+    for (i, m) in got.iter().enumerate() {
+        assert_eq!(m, &format!("msg-{i}"), "echo order preserved");
+    }
+    writer.close().expect("close");
+}
+
+/// A server pings; the split reader must auto-pong through the shared
+/// (write-serialized) transport even though the writer half lives elsewhere.
+#[test]
+fn split_reader_auto_pongs() {
+    let saw_pong = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&saw_pong);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        // Handshake.
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while s.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        let key = head
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"))
+            })
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept_key(&key)
+        );
+        let _ = s.write_all(resp.as_bytes());
+        // Ping the client, then read its reply: must be a PONG (0xA).
+        let _ = s.write_all(&server_frame(0x9, b"areyouthere"));
+        if let Ok((opcode, payload)) = read_client_frame(&mut s) {
+            if opcode == 0xA && payload == b"areyouthere" {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+        // Then a data frame so the client's recv() returns.
+        let _ = s.write_all(&server_frame(0x1, b"done"));
+    });
+
+    let ws = WebSocket::connect(&format!("ws://127.0.0.1:{port}/")).expect("connect");
+    let (mut reader, _writer) = ws.split();
+    // recv() hides the ping (auto-ponged internally) and returns the data frame.
+    match reader.recv() {
+        Ok(Some(WsMessage::Text(t))) => assert_eq!(t, "done"),
+        other => panic!("recv: {other:?}"),
+    }
+    assert!(saw_pong.load(Ordering::SeqCst), "reader did not auto-pong");
 }
 
 /// #13: a server that selects a subprotocol from the offered list; the client

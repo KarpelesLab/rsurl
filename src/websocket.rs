@@ -46,6 +46,7 @@
 //!     do not proactively send our own on a schedule.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -480,34 +481,46 @@ impl Write for TransportIo<'_> {
 /// **close** is surfaced as `recv` returning `Ok(None)`. permessage-deflate
 /// (RFC 7692) is negotiated transparently when the server supports it.
 ///
-/// The API is single-threaded: drive `send`/`recv` from one thread. (The type
-/// is `Send`, so you may move the whole connection between threads; just don't
-/// call it from two at once.)
+/// Drive `send`/`recv` from one thread, or call [`split`](WebSocket::split) to
+/// get an independent [`WsReader`] and [`WsWriter`] that work concurrently over
+/// the one connection (a reader blocked in `recv` while writer threads send).
 pub struct WebSocket {
-    /// The connection, shared with the split halves. Reads run concurrently
-    /// with (serialized) writes — see [`WsTransport`].
-    transport: Arc<WsTransport>,
-    /// Bytes read off the transport but not yet consumed into a delivered
-    /// frame. Frame parsing only drains this once a whole frame is assembled,
-    /// so a read error mid-frame (e.g. a read timeout) is resumable instead of
-    /// desyncing the stream.
-    rxbuf: Vec<u8>,
-    pmd: Option<Pmd>,
-    /// We have sent a close frame; no more data frames may be sent. We may
-    /// still `recv` to drain the peer's replies and its own close (RFC 6455
-    /// §5.5.1 closing handshake).
-    send_closed: bool,
-    /// The peer has closed (a close frame was received, or the transport hit
-    /// EOF); `recv` yields nothing further.
-    recv_closed: bool,
-    compression: bool,
-    /// Auto-reply to incoming pings with a pong (default `true`). When `false`,
-    /// [`recv_event`](WebSocket::recv_event) surfaces pings without answering
-    /// them (curl's `CURLWS_NOAUTOPONG`). [`recv`](WebSocket::recv) always
-    /// auto-pongs regardless, since it hides control frames.
-    auto_pong: bool,
+    reader: WsReader,
+    writer: WsWriter,
     /// The negotiated subprotocol (`Sec-WebSocket-Protocol`), if any.
     subprotocol: Option<String>,
+}
+
+/// The read half of a [`WebSocket`] (from [`split`](WebSocket::split)). Owns the
+/// receive path; can block in [`recv`](WsReader::recv) on its own thread while a
+/// [`WsWriter`] sends. Incoming pings are still auto-ponged (via the shared,
+/// write-serialized transport) and a peer close is echoed.
+pub struct WsReader {
+    transport: Arc<WsTransport>,
+    /// Wire bytes read but not yet consumed into a delivered frame; only drained
+    /// once a whole frame is assembled, so a mid-frame read error is resumable.
+    rxbuf: Vec<u8>,
+    pmd: Option<Pmd>,
+    compression: bool,
+    /// Auto-reply to incoming pings with a pong (default `true`); curl's
+    /// `CURLWS_NOAUTOPONG`.
+    auto_pong: bool,
+    /// We have sent a close frame (shared with the writer half).
+    send_closed: Arc<AtomicBool>,
+    /// The peer has closed (a close frame arrived, or the transport hit EOF).
+    recv_closed: Arc<AtomicBool>,
+}
+
+/// The write half of a [`WebSocket`] (from [`split`](WebSocket::split)). Sends
+/// messages/control frames; writes are serialized by the transport so a
+/// reader's auto-pong never interleaves with a writer's frame on the wire.
+pub struct WsWriter {
+    transport: Arc<WsTransport>,
+    /// permessage-deflate was negotiated, so outgoing data frames are compressed
+    /// (the send path is context-free, so a bool is all the writer needs).
+    compress: bool,
+    send_closed: Arc<AtomicBool>,
+    recv_closed: Arc<AtomicBool>,
 }
 
 impl WebSocket {
@@ -590,16 +603,35 @@ impl WebSocket {
         let _ = transport.set_read_timeout(read_timeout);
 
         let compression = pmd.is_some();
+        let send_closed = Arc::new(AtomicBool::new(false));
+        let recv_closed = Arc::new(AtomicBool::new(false));
         Ok(WebSocket {
-            transport,
-            rxbuf: Vec::new(),
-            pmd,
-            send_closed: false,
-            recv_closed: false,
-            compression,
-            auto_pong: true,
+            reader: WsReader {
+                transport: Arc::clone(&transport),
+                rxbuf: Vec::new(),
+                pmd,
+                compression,
+                auto_pong: true,
+                send_closed: Arc::clone(&send_closed),
+                recv_closed: Arc::clone(&recv_closed),
+            },
+            writer: WsWriter {
+                transport,
+                compress: compression,
+                send_closed,
+                recv_closed,
+            },
             subprotocol,
         })
+    }
+
+    /// Split into an independent [`WsReader`] and [`WsWriter`] that can run on
+    /// separate threads over the one connection — e.g. a reader blocked in
+    /// [`recv`](WsReader::recv) while writer threads [`send`](WsWriter::send) at
+    /// will. Writes are serialized by the shared transport, and the reader still
+    /// auto-pongs/echoes close. Consumes the `WebSocket`.
+    pub fn split(self) -> (WsReader, WsWriter) {
+        (self.reader, self.writer)
     }
 
     /// The subprotocol the server selected from the offered
@@ -611,68 +643,42 @@ impl WebSocket {
     /// Whether permessage-deflate (RFC 7692) was negotiated for this
     /// connection.
     pub fn compression_enabled(&self) -> bool {
-        self.compression
+        self.reader.compression
     }
 
     /// Whether the connection is closed or closing — either we sent a close
     /// frame ([`close`](Self::close)) or the peer closed (observed in
     /// [`recv`](Self::recv)).
     pub fn is_closed(&self) -> bool {
-        self.send_closed || self.recv_closed
+        self.writer.is_closed()
     }
 
     /// Set the per-read inactivity timeout for [`recv`](Self::recv). `None`
     /// blocks indefinitely (suitable for a connection that waits on sparse
-    /// server pushes). Errors if the transport does not support a cloned socket
-    /// control handle (e.g. some custom connectors).
+    /// server pushes).
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
-        self.transport.set_read_timeout(dur).map_err(Error::Io)
+        self.reader.set_read_timeout(dur)
     }
 
     /// Send a UTF-8 text message (opcode 0x1).
     pub fn send_text(&mut self, text: &str) -> Result<()> {
-        self.ensure_open()?;
-        send_message(
-            &mut TransportIo(self.transport.as_ref()),
-            OPCODE_TEXT,
-            text.as_bytes(),
-            self.pmd.as_mut(),
-        )
+        self.writer.send_text(text)
     }
 
     /// Send a binary message (opcode 0x2).
     pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
-        self.ensure_open()?;
-        send_message(
-            &mut TransportIo(self.transport.as_ref()),
-            OPCODE_BINARY,
-            data,
-            self.pmd.as_mut(),
-        )
+        self.writer.send_binary(data)
     }
 
     /// Send a [`WsMessage`].
     pub fn send(&mut self, msg: &WsMessage) -> Result<()> {
-        match msg {
-            WsMessage::Text(s) => self.send_text(s),
-            WsMessage::Binary(b) => self.send_binary(b),
-        }
+        self.writer.send(msg)
     }
 
     /// Send a ping with `payload` (≤ 125 bytes per RFC 6455 §5.5). The peer's
     /// pong is consumed silently by the next [`recv`](Self::recv).
     pub fn ping(&mut self, payload: &[u8]) -> Result<()> {
-        self.ensure_open()?;
-        if payload.len() > MAX_CONTROL_PAYLOAD {
-            return Err(Error::BadResponse(format!(
-                "websocket: ping payload too large: {} bytes (max {MAX_CONTROL_PAYLOAD})",
-                payload.len()
-            )));
-        }
-        let frame = build_client_frame(OPCODE_PING, payload)?;
-        self.transport.write_all(&frame).map_err(Error::Io)?;
-        self.transport.flush().map_err(Error::Io)?;
-        Ok(())
+        self.writer.ping(payload)
     }
 
     /// Block until the next data message arrives, answering any interleaved
@@ -680,16 +686,7 @@ impl WebSocket {
     /// peer closes the connection (a close is also answered automatically);
     /// every subsequent call then returns `Ok(None)`.
     pub fn recv(&mut self) -> Result<Option<WsMessage>> {
-        loop {
-            match self.recv_event()? {
-                WsEvent::Text(s) => return Ok(Some(WsMessage::Text(s))),
-                WsEvent::Binary(b) => return Ok(Some(WsMessage::Binary(b))),
-                // Control frames are handled inside `recv_event`; skip them and
-                // keep waiting for the next data message.
-                WsEvent::Ping(_) | WsEvent::Pong(_) => continue,
-                WsEvent::Close(_) => return Ok(None),
-            }
-        }
+        self.reader.recv()
     }
 
     /// Enable or disable automatic PONG replies to incoming pings (default
@@ -697,7 +694,7 @@ impl WebSocket {
     /// [`recv_event`](Self::recv_event); [`recv`](Self::recv) always auto-pongs
     /// because it never surfaces control frames.
     pub fn set_auto_pong(&mut self, on: bool) {
-        self.auto_pong = on;
+        self.reader.set_auto_pong(on);
     }
 
     /// Receive the next frame as a [`WsEvent`], surfacing control frames
@@ -712,7 +709,86 @@ impl WebSocket {
     /// received message is always handled internally (pings answered) and is
     /// not surfaced, so reassembly is never interrupted.
     pub fn recv_event(&mut self) -> Result<WsEvent> {
-        if self.recv_closed {
+        self.reader.recv_event()
+    }
+
+    /// Send a pong frame with `payload` (≤ 125 bytes). Normally unnecessary —
+    /// pings are auto-ponged — but available when [`set_auto_pong`](Self::set_auto_pong)
+    /// is off or for an unsolicited keepalive pong (RFC 6455 §5.5.3).
+    pub fn send_pong(&mut self, payload: &[u8]) -> Result<()> {
+        self.writer.send_pong(payload)
+    }
+
+    /// Send a low-level frame, bypassing reassembly and permessage-deflate
+    /// (the analogue of curl's raw mode). Use this to fragment a message
+    /// manually (`fin = false` on all but the last frame, opcode
+    /// [`WsOpcode::Continuation`] after the first) or to send an arbitrary
+    /// control frame. Payloads are masked per §5.3. No compression is applied,
+    /// so do not set this on a permessage-deflate-only path expecting RSV1.
+    pub fn send_frame(&mut self, fin: bool, opcode: WsOpcode, payload: &[u8]) -> Result<()> {
+        self.writer.send_frame(fin, opcode, payload)
+    }
+
+    /// Receive a single raw frame with no reassembly, decompression, or
+    /// automatic control handling (curl's raw mode). Most callers want
+    /// [`recv`](Self::recv) or [`recv_event`](Self::recv_event); use this only
+    /// to drive the framing yourself.
+    pub fn recv_frame(&mut self) -> Result<WsFrame> {
+        self.reader.recv_frame()
+    }
+
+    /// Send a close frame (masked, per §5.3) and mark the connection closed.
+    /// Idempotent. Drain the peer's close echo with a final [`recv`](Self::recv)
+    /// if you need a clean shutdown handshake.
+    pub fn close(&mut self) -> Result<()> {
+        self.writer.close()
+    }
+
+    /// Send a close frame carrying a status code and reason (RFC 6455 §5.5.1 /
+    /// §7.4), then mark the connection closed. Idempotent. `code` is typically
+    /// 1000 (normal closure); the reason (UTF-8) plus the 2-byte code must fit
+    /// in a control frame (≤ 125 bytes).
+    pub fn close_with(&mut self, code: u16, reason: &str) -> Result<()> {
+        self.writer.close_with(code, reason)
+    }
+}
+
+impl WsReader {
+    /// Enable/disable automatic PONG replies to pings (curl's
+    /// `CURLWS_NOAUTOPONG`). Affects [`recv_event`](Self::recv_event) only;
+    /// [`recv`](Self::recv) always auto-pongs.
+    pub fn set_auto_pong(&mut self, on: bool) {
+        self.auto_pong = on;
+    }
+
+    /// Set the per-read inactivity timeout. `None` blocks indefinitely.
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.transport.set_read_timeout(dur).map_err(Error::Io)
+    }
+
+    /// Whether the connection is closed or closing (either half).
+    pub fn is_closed(&self) -> bool {
+        self.send_closed.load(Ordering::SeqCst) || self.recv_closed.load(Ordering::SeqCst)
+    }
+
+    /// Block until the next data message arrives, auto-answering interleaved
+    /// control frames. `Ok(None)` once the peer closes.
+    pub fn recv(&mut self) -> Result<Option<WsMessage>> {
+        loop {
+            match self.recv_event()? {
+                WsEvent::Text(s) => return Ok(Some(WsMessage::Text(s))),
+                WsEvent::Binary(b) => return Ok(Some(WsMessage::Binary(b))),
+                WsEvent::Ping(_) | WsEvent::Pong(_) => continue,
+                WsEvent::Close(_) => return Ok(None),
+            }
+        }
+    }
+
+    /// Receive the next [`WsEvent`], surfacing control frames. A ping is
+    /// auto-ponged (through the shared, write-serialized transport) unless
+    /// auto-pong is off; a close is echoed.
+    pub fn recv_event(&mut self) -> Result<WsEvent> {
+        if self.recv_closed.load(Ordering::SeqCst) {
             return Ok(WsEvent::Close(None));
         }
         let mut frag_opcode: Option<u8> = None;
@@ -732,8 +808,6 @@ impl WebSocket {
                             self.transport.write_all(&pong).map_err(Error::Io)?;
                             self.transport.flush().map_err(Error::Io)?;
                         }
-                        // Don't break a half-reassembled message: only surface a
-                        // ping that arrived between messages.
                         if mid_message {
                             continue;
                         }
@@ -746,16 +820,14 @@ impl WebSocket {
                         return Ok(WsEvent::Pong(frame.payload));
                     }
                     OPCODE_CLOSE => {
-                        // Echo the close (masked, best-effort) unless we already
-                        // sent one — then this frame is the peer's echo of ours.
-                        if !self.send_closed {
+                        // Echo the close (best-effort) unless we already sent one.
+                        if !self.send_closed.swap(true, Ordering::SeqCst) {
                             if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
                                 let _ = self.transport.write_all(&close);
                                 let _ = self.transport.flush();
                             }
-                            self.send_closed = true;
                         }
-                        self.recv_closed = true;
+                        self.recv_closed.store(true, Ordering::SeqCst);
                         return Ok(WsEvent::Close(parse_close_payload(&frame.payload)));
                     }
                     other => {
@@ -766,9 +838,6 @@ impl WebSocket {
                 }
             }
 
-            // Data / continuation frames — reassemble exactly like
-            // `read_message` (kept in sync; that path backs the one-shot
-            // `fetch`).
             match frame.opcode {
                 OPCODE_TEXT | OPCODE_BINARY => {
                     if frag_opcode.is_some() {
@@ -813,8 +882,6 @@ impl WebSocket {
         }
     }
 
-    /// Inflate (if compressed) and turn a reassembled data message into a
-    /// [`WsEvent`], reusing the shared [`finish_data_message`] validation.
     fn finish_event(&mut self, opcode: u8, payload: Vec<u8>, compressed: bool) -> Result<WsEvent> {
         match finish_data_message(opcode, payload, compressed, self.pmd.as_mut())? {
             Message::Data { opcode, payload } if opcode == OPCODE_TEXT => {
@@ -824,25 +891,81 @@ impl WebSocket {
                 Ok(WsEvent::Text(s))
             }
             Message::Data { payload, .. } => Ok(WsEvent::Binary(payload)),
-            // finish_data_message only ever yields Data.
             Message::Closed => Ok(WsEvent::Close(None)),
         }
     }
 
-    /// Send a pong frame with `payload` (≤ 125 bytes). Normally unnecessary —
-    /// pings are auto-ponged — but available when [`set_auto_pong`](Self::set_auto_pong)
-    /// is off or for an unsolicited keepalive pong (RFC 6455 §5.5.3).
+    /// Receive a single raw frame (no reassembly/decompression/control
+    /// handling) — curl's raw mode.
+    pub fn recv_frame(&mut self) -> Result<WsFrame> {
+        let frame = read_frame(&mut TransportIo(self.transport.as_ref()), &mut self.rxbuf)?;
+        Ok(WsFrame {
+            fin: frame.fin,
+            opcode: WsOpcode::from_u8(frame.opcode)?,
+            payload: frame.payload,
+        })
+    }
+}
+
+impl WsWriter {
+    /// Whether the connection is closed or closing (either half).
+    pub fn is_closed(&self) -> bool {
+        self.send_closed.load(Ordering::SeqCst) || self.recv_closed.load(Ordering::SeqCst)
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.send_closed.load(Ordering::SeqCst) {
+            return Err(Error::BadResponse(
+                "websocket: the connection is closed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Send a UTF-8 text message (opcode 0x1).
+    pub fn send_text(&mut self, text: &str) -> Result<()> {
+        self.ensure_open()?;
+        send_message(
+            &mut TransportIo(self.transport.as_ref()),
+            OPCODE_TEXT,
+            text.as_bytes(),
+            self.compress,
+        )
+    }
+
+    /// Send a binary message (opcode 0x2).
+    pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+        self.ensure_open()?;
+        send_message(
+            &mut TransportIo(self.transport.as_ref()),
+            OPCODE_BINARY,
+            data,
+            self.compress,
+        )
+    }
+
+    /// Send a [`WsMessage`].
+    pub fn send(&mut self, msg: &WsMessage) -> Result<()> {
+        match msg {
+            WsMessage::Text(s) => self.send_text(s),
+            WsMessage::Binary(b) => self.send_binary(b),
+        }
+    }
+
+    /// Send a ping with `payload` (≤ 125 bytes).
+    pub fn ping(&mut self, payload: &[u8]) -> Result<()> {
+        self.ensure_open()?;
+        self.send_control(OPCODE_PING, payload)
+    }
+
+    /// Send a pong with `payload` (≤ 125 bytes).
     pub fn send_pong(&mut self, payload: &[u8]) -> Result<()> {
         self.ensure_open()?;
         self.send_control(OPCODE_PONG, payload)
     }
 
     /// Send a low-level frame, bypassing reassembly and permessage-deflate
-    /// (the analogue of curl's raw mode). Use this to fragment a message
-    /// manually (`fin = false` on all but the last frame, opcode
-    /// [`WsOpcode::Continuation`] after the first) or to send an arbitrary
-    /// control frame. Payloads are masked per §5.3. No compression is applied,
-    /// so do not set this on a permessage-deflate-only path expecting RSV1.
+    /// (curl's raw mode).
     pub fn send_frame(&mut self, fin: bool, opcode: WsOpcode, payload: &[u8]) -> Result<()> {
         self.ensure_open()?;
         if opcode.is_control() {
@@ -864,19 +987,6 @@ impl WebSocket {
         Ok(())
     }
 
-    /// Receive a single raw frame with no reassembly, decompression, or
-    /// automatic control handling (curl's raw mode). Most callers want
-    /// [`recv`](Self::recv) or [`recv_event`](Self::recv_event); use this only
-    /// to drive the framing yourself.
-    pub fn recv_frame(&mut self) -> Result<WsFrame> {
-        let frame = read_frame(&mut TransportIo(self.transport.as_ref()), &mut self.rxbuf)?;
-        Ok(WsFrame {
-            fin: frame.fin,
-            opcode: WsOpcode::from_u8(frame.opcode)?,
-            payload: frame.payload,
-        })
-    }
-
     fn send_control(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
         if payload.len() > MAX_CONTROL_PAYLOAD {
             return Err(Error::BadResponse(format!(
@@ -890,28 +1000,19 @@ impl WebSocket {
         Ok(())
     }
 
-    /// Send a close frame (masked, per §5.3) and mark the connection closed.
-    /// Idempotent. Drain the peer's close echo with a final [`recv`](Self::recv)
-    /// if you need a clean shutdown handshake.
+    /// Send a close frame and mark the connection closed. Idempotent.
     pub fn close(&mut self) -> Result<()> {
-        if self.send_closed {
+        if self.send_closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        self.send_closed = true;
         let frame = build_client_frame(OPCODE_CLOSE, &[])?;
         self.transport.write_all(&frame).map_err(Error::Io)?;
         self.transport.flush().map_err(Error::Io)?;
         Ok(())
     }
 
-    /// Send a close frame carrying a status code and reason (RFC 6455 §5.5.1 /
-    /// §7.4), then mark the connection closed. Idempotent. `code` is typically
-    /// 1000 (normal closure); the reason (UTF-8) plus the 2-byte code must fit
-    /// in a control frame (≤ 125 bytes).
+    /// Send a close frame with a status code and reason, then mark closed.
     pub fn close_with(&mut self, code: u16, reason: &str) -> Result<()> {
-        if self.send_closed {
-            return Ok(());
-        }
         let mut payload = Vec::with_capacity(2 + reason.len());
         payload.extend_from_slice(&code.to_be_bytes());
         payload.extend_from_slice(reason.as_bytes());
@@ -922,19 +1023,12 @@ impl WebSocket {
                 MAX_CONTROL_PAYLOAD - 2
             )));
         }
-        self.send_closed = true;
+        if self.send_closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
         let frame = build_client_frame(OPCODE_CLOSE, &payload)?;
         self.transport.write_all(&frame).map_err(Error::Io)?;
         self.transport.flush().map_err(Error::Io)?;
-        Ok(())
-    }
-
-    fn ensure_open(&self) -> Result<()> {
-        if self.send_closed {
-            return Err(Error::BadResponse(
-                "websocket: the connection is closed".into(),
-            ));
-        }
         Ok(())
     }
 }
@@ -1379,14 +1473,14 @@ fn send_message<S: Write>(
     stream: &mut S,
     opcode: u8,
     payload: &[u8],
-    pmd: Option<&mut Pmd>,
+    compress: bool,
 ) -> Result<()> {
     if opcode != OPCODE_TEXT && opcode != OPCODE_BINARY {
         return Err(Error::BadResponse(format!(
             "send_message expects a data opcode (text/binary), got 0x{opcode:x}"
         )));
     }
-    let frame = if pmd.is_some() {
+    let frame = if compress {
         let compressed = deflate_message(payload)?;
         build_client_frame_rsv1(opcode, &compressed)?
     } else {
@@ -2095,7 +2189,7 @@ mod tests {
     #[test]
     fn send_message_produces_masked_frame() {
         let mut s = MockStream::new(Vec::new());
-        send_message(&mut s, OPCODE_TEXT, b"hello", None).expect("sends");
+        send_message(&mut s, OPCODE_TEXT, b"hello", false).expect("sends");
         // Raw bytes: FIN+text, MASK+len, 4-byte mask, 5 masked bytes.
         assert_eq!(s.sent[0], 0x81);
         assert_eq!(s.sent[1], 0x80 | 5);
@@ -2107,7 +2201,7 @@ mod tests {
     #[test]
     fn send_message_rejects_control_opcode() {
         let mut s = MockStream::new(Vec::new());
-        let err = send_message(&mut s, OPCODE_PING, b"x", None)
+        let err = send_message(&mut s, OPCODE_PING, b"x", false)
             .expect_err("control opcode must be rejected for send_message");
         match err {
             Error::BadResponse(_) => {}
@@ -2358,8 +2452,7 @@ mod tests {
         // payload, once the terminator is appended and inflated, equals input.
         let input = b"hello hello hello permessage-deflate round trip";
         let mut s = MockStream::new(Vec::new());
-        let mut pmd = test_pmd();
-        send_message(&mut s, OPCODE_TEXT, input, Some(&mut pmd)).expect("sends compressed");
+        send_message(&mut s, OPCODE_TEXT, input, true).expect("sends compressed");
         let (opcode, rsv1, payload) = decode_first_frame_with_rsv1(&s.sent);
         assert_eq!(opcode, OPCODE_TEXT);
         assert!(rsv1, "compressed frame must have RSV1 set");
@@ -2492,6 +2585,7 @@ mod tests {
 
     // ---- Persistent WebSocket API ----
 
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     /// A `Send` in-memory duplex usable as a [`WebSocket`] data path: `inbound`
@@ -2536,14 +2630,25 @@ mod tests {
     /// no control handle / timeouts).
     fn ws_over(mock: SharedMock, pmd: Option<Pmd>) -> WebSocket {
         let compression = pmd.is_some();
+        let transport = Arc::new(WsTransport::Shared(Mutex::new(Box::new(mock))));
+        let send_closed = Arc::new(AtomicBool::new(false));
+        let recv_closed = Arc::new(AtomicBool::new(false));
         WebSocket {
-            transport: Arc::new(WsTransport::Shared(Mutex::new(Box::new(mock)))),
-            rxbuf: Vec::new(),
-            pmd,
-            send_closed: false,
-            recv_closed: false,
-            compression,
-            auto_pong: true,
+            reader: WsReader {
+                transport: Arc::clone(&transport),
+                rxbuf: Vec::new(),
+                pmd,
+                compression,
+                auto_pong: true,
+                send_closed: Arc::clone(&send_closed),
+                recv_closed: Arc::clone(&recv_closed),
+            },
+            writer: WsWriter {
+                transport,
+                compress: compression,
+                send_closed,
+                recv_closed,
+            },
             subprotocol: None,
         }
     }
