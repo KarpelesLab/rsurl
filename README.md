@@ -19,13 +19,17 @@ no OpenSSL, no system libcurl, no C dependencies. (The SSH stack pulls only
 
 ## Status
 
-Early, in active development.
+Functional across a broad protocol surface — HTTP/1.1, HTTP/2, HTTP/3, FTP(S),
+SSH (SFTP/SCP), the mail and messaging protocols, BitTorrent, and more all work
+(see the table below). Still in active development: APIs may shift before 1.0,
+and a few areas have documented caveats (notably HTTP/3, which works against
+several major servers but is not yet universal).
 
 | Capability | Status | Notes |
 |---|---|---|
 | HTTP/1.1 (all methods) | working | Content-Length, chunked, read-to-EOF body modes |
 | Connection reuse | working | process-wide keep-alive pool for HTTP/1.1 (plain & TLS) and HTTP/2 (post-handshake conns keyed on scheme/host/port, reused across requests) |
-| Response compression | working | `gzip` / `deflate` / `x-gzip` / `zstd` / `br` / `compress` / `x-compress` (Unix `.Z` LZW) decoded transparently (always-on) |
+| Response compression | working | `gzip` / `deflate` / `x-gzip` / `zstd` / `br` / `compress` / `x-compress` (Unix `.Z` LZW) decoded transparently by default; `Request::decompress(false)` / `Client::decompress(false)` returns the raw wire bytes with `Content-Encoding` intact |
 | Cookies (`-b` / `-c`) | working | RFC 6265 jar; Netscape `cookies.txt` I/O, curl-compatible |
 | Proxies (`-x`) | working | HTTP (absolute-form / `CONNECT`), HTTPS-to-proxy, and SOCKS4/4a/5/5h — including SOCKS5 UDP ASSOCIATE for HTTP/3 & TFTP. Basic/`Proxy-Authorization` + SOCKS5 user/pass auth, `--noproxy` / `*_PROXY` env vars. Honoured across every scheme, not just HTTP |
 | Custom transport | working | implement `rsurl::net::Connector` (or `UdpProxy`) and pass it via `Client::connector` / `Request::connector` to supply your own sockets, pool, or test double |
@@ -45,6 +49,7 @@ Early, in active development.
 | SFTP (SSH) | working | download + upload (`-T`) over the SFTP subsystem (`open`/`read`/`write`/`close`); password (`-u`/userinfo) and public-key (`--key` or `~/.ssh/id_*`) auth; host-key verification via `~/.ssh/known_hosts` (TOFU: accept+persist unknown, reject changed; `-k` ⇒ accept-any). Via the pure-Rust `puressh` crate |
 | SCP (SSH) | working | download + upload (`-T`) driving the remote `scp -f`/`scp -t` helper, bridged through a temp file; same auth + known_hosts TOFU as SFTP. Via `puressh` |
 | WS / WSS (RFC 6455) | working | send + receive data frames, fragmented message reassembly, ping/pong/close handling; permessage-deflate (RFC 7692) negotiated in the upgrade — per-message inflate/deflate with RSV1, `client/server_no_context_takeover`, inflated-size cap against compression bombs |
+| BitTorrent (`.torrent` / `magnet:`) | working | pure-Rust bencode, HTTP/UDP trackers, DHT, peer wire protocol, and seeding; metadata inspection and selective / concatenated downloads. Behind the default-on `bittorrent` feature (pulls no extra dependency) |
 
 \* HTTP/2 verified live against nghttp2.org and cloudflare.com from the implementation
 worktree. Available via `--http2` (force) or auto-negotiated via ALPN.
@@ -107,6 +112,33 @@ System CA bundle paths searched, in order: `/etc/ssl/certs/ca-certificates.crt`,
 let resp = rsurl::get("http://example.com")?;
 println!("{} {}", resp.status, resp.reason);
 println!("{}", String::from_utf8_lossy(&resp.body));
+```
+
+### Response body as a `Read` (raw / streaming)
+
+Besides the buffered, transparently-decoded `Response::body`, a body can be
+consumed as a `std::io::Read` — handy for handing it to a media/source driver
+that wants a reader rather than a `Vec`:
+
+```rust
+use std::io::Read;
+use rsurl::Request;
+
+// Buffered + seekable: `into_reader()` is a `Read` + `Seek` cursor. Pair with
+// `decompress(false)` to read the raw, undecoded wire bytes (Content-Encoding
+// left intact) instead of the decoded plaintext.
+let resp = Request::get("https://example.com/clip.bin")?
+    .decompress(false)
+    .send()?;
+let mut reader = resp.into_reader(); // impl Read + Seek over the raw bytes
+
+// Streaming: `send_reader()` hands back an `impl Read` over the undecoded body.
+// On a direct HTTP/1.1 connection a Content-Length / close-delimited body streams
+// straight off the socket (never fully buffered); the head is available up front.
+let mut body = Request::get("https://example.com/big.bin")?.send_reader()?;
+println!("status {}", body.status());
+let mut buf = [0u8; 64 * 1024];
+let n = body.read(&mut buf)?;
 ```
 
 ### Proxies and custom transport
