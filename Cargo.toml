@@ -2,7 +2,7 @@
 name = "rsurl"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.88"
 authors = ["Karpelès Lab Inc."]
 description = "A pure-Rust implementation of curl. Library, C FFI, and CLI for HTTP/HTTPS/FTP/FTPS."
 license = "MIT"
