@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.12](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.11...rsurl-v0.0.12) - 2026-06-19
+## [0.1.0](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.11...rsurl-v0.1.0) - 2026-06-19
 
 ### Added
 
