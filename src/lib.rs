@@ -59,7 +59,7 @@ pub use crate::net::Client;
 pub use crate::transfer::{transfer, transfer_url};
 pub use crate::url::Url;
 pub use crate::websocket::{
-    WebSocket, WsClose, WsEvent, WsFrame, WsMessage, WsOpcode, WsReader, WsWriter,
+    WebSocket, WsClose, WsEvent, WsFrame, WsMessage, WsOpcode, WsReader, WsShutdown, WsWriter,
 };
 
 /// Perform an HTTP GET against `url` and return the full response.

@@ -509,6 +509,9 @@ pub struct WsReader {
     send_closed: Arc<AtomicBool>,
     /// The peer has closed (a close frame arrived, or the transport hit EOF).
     recv_closed: Arc<AtomicBool>,
+    /// A dedicated socket clone for [`WsShutdown`], or `None` if the transport
+    /// can't be cloned (e.g. the in-process mock).
+    shutdown: Option<ShutdownSock>,
 }
 
 /// The write half of a [`WebSocket`] (from [`split`](WebSocket::split)). Sends
@@ -521,6 +524,35 @@ pub struct WsWriter {
     compress: bool,
     send_closed: Arc<AtomicBool>,
     recv_closed: Arc<AtomicBool>,
+    shutdown: Option<ShutdownSock>,
+}
+
+/// A dedicated socket clone used only to abort a blocked read (never for data),
+/// behind a `Mutex` so the transport stays `Sync`. The lock is uncontended
+/// because only [`WsShutdown::shutdown`] touches it.
+type ShutdownSock = Arc<Mutex<Box<dyn crate::net::NetStream>>>;
+
+/// A cheap, cloneable, `Send` handle that force-closes a [`WebSocket`]'s socket
+/// from any thread — unblocking a [`WsReader`] parked in [`recv`](WsReader::recv)
+/// even if the peer has gone silent. Unlike [`WsWriter::close`] (a graceful
+/// close *frame*), this shuts the underlying connection so the blocking read
+/// returns at once; use it on shutdown so a reader can run with no read timeout.
+#[derive(Clone)]
+pub struct WsShutdown {
+    sock: ShutdownSock,
+}
+
+impl WsShutdown {
+    /// Shut down the underlying socket in both directions. A reader blocked in
+    /// `recv()` returns promptly (as EOF/error). Idempotent-ish: a second call
+    /// after the socket is gone is a harmless error.
+    pub fn shutdown(&self) -> Result<()> {
+        self.sock
+            .lock()
+            .unwrap()
+            .shutdown(std::net::Shutdown::Both)
+            .map_err(Error::Io)
+    }
 }
 
 impl WebSocket {
@@ -550,51 +582,70 @@ impl WebSocket {
         // Build the (concurrency-capable) transport, then run the HTTP upgrade
         // handshake over it. Each handshake read is bounded by SEND_TIMEOUT; the
         // wall-clock HANDSHAKE_DEADLINE inside `handshake` defeats a slow drip.
-        let transport: Arc<WsTransport> = match url.scheme.as_str() {
-            "ws" => {
-                let data = cfg.connect(&url.host, url.port)?;
-                data.set_write_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                data.set_read_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                // Two clones of the same fd give independent read/write halves;
-                // if cloning is unsupported, fall back to a single shared stream
-                // (no concurrent split, but the connection still works).
-                match data.try_clone_box() {
-                    Ok(read) => {
-                        read.set_read_timeout(Some(SEND_TIMEOUT))
-                            .map_err(Error::Io)?;
-                        Arc::new(WsTransport::Plain {
-                            read: Mutex::new(read),
-                            write: Mutex::new(data),
-                        })
+        // Also returns a dedicated socket clone for `WsShutdown` (a third fd,
+        // used only to abort a blocked read), or `None` if cloning is
+        // unsupported.
+        let (transport, shutdown_sock): (Arc<WsTransport>, Option<Box<dyn crate::net::NetStream>>) =
+            match url.scheme.as_str() {
+                "ws" => {
+                    let data = cfg.connect(&url.host, url.port)?;
+                    data.set_write_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    data.set_read_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    // Two clones of the same fd give independent read/write halves
+                    // (plus one for shutdown); if cloning is unsupported, fall
+                    // back to a single shared stream (no split / no shutdown
+                    // handle, but the connection still works).
+                    match data.try_clone_box() {
+                        Ok(read) => {
+                            read.set_read_timeout(Some(SEND_TIMEOUT))
+                                .map_err(Error::Io)?;
+                            let shutdown = data.try_clone_box().ok();
+                            (
+                                Arc::new(WsTransport::Plain {
+                                    read: Mutex::new(read),
+                                    write: Mutex::new(data),
+                                }),
+                                shutdown,
+                            )
+                        }
+                        Err(_) => (
+                            Arc::new(WsTransport::Shared(Mutex::new(Box::new(data)))),
+                            None,
+                        ),
                     }
-                    Err(_) => Arc::new(WsTransport::Shared(Mutex::new(Box::new(data)))),
                 }
-            }
-            "wss" => {
-                let data = cfg.connect(&url.host, url.port)?;
-                data.set_write_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                data.set_read_timeout(Some(SEND_TIMEOUT))
-                    .map_err(Error::Io)?;
-                // A raw-socket clone for the concurrent read side, taken before
-                // TLS owns the socket.
-                let read_clone = data.try_clone_box().ok();
-                let mut opts = crate::tls::TlsOpts::verifying();
-                opts.verify = cfg.verify;
-                let tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
-                match read_clone {
-                    Some(read) => {
-                        read.set_read_timeout(Some(SEND_TIMEOUT))
-                            .map_err(Error::Io)?;
-                        Arc::new(WsTransport::Tls(Box::new(tls.into_concurrent(read))))
+                "wss" => {
+                    let data = cfg.connect(&url.host, url.port)?;
+                    data.set_write_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    data.set_read_timeout(Some(SEND_TIMEOUT))
+                        .map_err(Error::Io)?;
+                    // Raw-socket clones (read side + shutdown), taken before TLS
+                    // owns the socket.
+                    let read_clone = data.try_clone_box().ok();
+                    let shutdown = data.try_clone_box().ok();
+                    let mut opts = crate::tls::TlsOpts::verifying();
+                    opts.verify = cfg.verify;
+                    let tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
+                    match read_clone {
+                        Some(read) => {
+                            read.set_read_timeout(Some(SEND_TIMEOUT))
+                                .map_err(Error::Io)?;
+                            (
+                                Arc::new(WsTransport::Tls(Box::new(tls.into_concurrent(read)))),
+                                shutdown,
+                            )
+                        }
+                        None => (
+                            Arc::new(WsTransport::Shared(Mutex::new(Box::new(tls)))),
+                            None,
+                        ),
                     }
-                    None => Arc::new(WsTransport::Shared(Mutex::new(Box::new(tls)))),
                 }
-            }
-            other => return Err(Error::UnsupportedScheme(other.to_string())),
-        };
+                other => return Err(Error::UnsupportedScheme(other.to_string())),
+            };
 
         let (pmd, subprotocol) = handshake(&mut TransportIo(&transport), url, subprotocols)?;
 
@@ -605,6 +656,7 @@ impl WebSocket {
         let compression = pmd.is_some();
         let send_closed = Arc::new(AtomicBool::new(false));
         let recv_closed = Arc::new(AtomicBool::new(false));
+        let shutdown: Option<ShutdownSock> = shutdown_sock.map(|s| Arc::new(Mutex::new(s)));
         Ok(WebSocket {
             reader: WsReader {
                 transport: Arc::clone(&transport),
@@ -614,12 +666,14 @@ impl WebSocket {
                 auto_pong: true,
                 send_closed: Arc::clone(&send_closed),
                 recv_closed: Arc::clone(&recv_closed),
+                shutdown: shutdown.clone(),
             },
             writer: WsWriter {
                 transport,
                 compress: compression,
                 send_closed,
                 recv_closed,
+                shutdown,
             },
             subprotocol,
         })
@@ -632,6 +686,14 @@ impl WebSocket {
     /// auto-pongs/echoes close. Consumes the `WebSocket`.
     pub fn split(self) -> (WsReader, WsWriter) {
         (self.reader, self.writer)
+    }
+
+    /// A handle that force-closes the socket from any thread, unblocking a
+    /// parked [`recv`](Self::recv) (e.g. on shutdown when the peer is silent).
+    /// `None` if the transport can't be cloned (some custom connectors / the
+    /// in-process mock). See [`WsShutdown`].
+    pub fn shutdown_handle(&self) -> Option<WsShutdown> {
+        self.reader.shutdown_handle()
     }
 
     /// The subprotocol the server selected from the offered
@@ -764,6 +826,14 @@ impl WsReader {
     /// Set the per-read inactivity timeout. `None` blocks indefinitely.
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
         self.transport.set_read_timeout(dur).map_err(Error::Io)
+    }
+
+    /// A handle to force-close the socket from another thread, unblocking this
+    /// reader if it's parked in [`recv`](Self::recv). See [`WsShutdown`].
+    pub fn shutdown_handle(&self) -> Option<WsShutdown> {
+        self.shutdown.as_ref().map(|s| WsShutdown {
+            sock: Arc::clone(s),
+        })
     }
 
     /// Whether the connection is closed or closing (either half).
@@ -911,6 +981,14 @@ impl WsWriter {
     /// Whether the connection is closed or closing (either half).
     pub fn is_closed(&self) -> bool {
         self.send_closed.load(Ordering::SeqCst) || self.recv_closed.load(Ordering::SeqCst)
+    }
+
+    /// A handle to force-close the socket from another thread (e.g. to unblock
+    /// the paired reader on shutdown). See [`WsShutdown`].
+    pub fn shutdown_handle(&self) -> Option<WsShutdown> {
+        self.shutdown.as_ref().map(|s| WsShutdown {
+            sock: Arc::clone(s),
+        })
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -2642,12 +2720,14 @@ mod tests {
                 auto_pong: true,
                 send_closed: Arc::clone(&send_closed),
                 recv_closed: Arc::clone(&recv_closed),
+                shutdown: None,
             },
             writer: WsWriter {
                 transport,
                 compress: compression,
                 send_closed,
                 recv_closed,
+                shutdown: None,
             },
             subprotocol: None,
         }

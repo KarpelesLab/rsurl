@@ -230,6 +230,70 @@ fn split_allows_concurrent_send_while_recv() {
     writer.close().expect("close");
 }
 
+/// A `WsShutdown` handle unblocks a reader parked in `recv()` with no read
+/// timeout, even when the server has gone silent — the shutdown backstop a
+/// consumer wants instead of a steady-state read timeout.
+#[test]
+fn shutdown_handle_unblocks_parked_reader() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _server = thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        // Complete the handshake, then go silent (send nothing) for a while.
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while s.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        let key = head
+            .lines()
+            .find_map(|l| {
+                l.split_once(':')
+                    .filter(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"))
+            })
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+            accept_key(&key)
+        );
+        let _ = s.write_all(resp.as_bytes());
+        thread::sleep(Duration::from_secs(5)); // silent, holding the connection
+    });
+
+    let ws = WebSocket::connect(&format!("ws://127.0.0.1:{port}/")).expect("connect");
+    ws.set_read_timeout(None).expect("block forever"); // no steady-state timeout
+    let sh = ws.shutdown_handle().expect("shutdown handle");
+    let (mut reader, _writer) = ws.split();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let rh = thread::spawn(move || {
+        let r = reader.recv(); // parks until the socket is shut down
+        let _ = tx.send(());
+        r
+    });
+
+    // Let the reader park, then force the socket closed from this thread.
+    thread::sleep(Duration::from_millis(200));
+    sh.shutdown().expect("shutdown");
+
+    // Must return well before the server's 5 s silence elapses.
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("reader did not unblock after shutdown()");
+    let r = rh.join().unwrap();
+    assert!(
+        matches!(r, Ok(None) | Err(_)),
+        "after shutdown, recv should yield close/EOF or an error, got {r:?}"
+    );
+}
+
 /// A server pings; the split reader must auto-pong through the shared
 /// (write-serialized) transport even though the writer half lives elsewhere.
 #[test]
