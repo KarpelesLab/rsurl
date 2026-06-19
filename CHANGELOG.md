@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.11...rsurl-v0.0.12) - 2026-06-19
+
+### Added
+
+- *(websocket)* add WsShutdown to force-unblock a parked recv()
+
 ## [0.0.11](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.0.10...rsurl-v0.0.11) - 2026-06-15
 
 ### Added
