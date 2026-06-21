@@ -63,6 +63,11 @@ idn = ["dep:intl"]
 # `Response::json::<T>()` via serde + serde_json (both pure-Rust, no C). Off by
 # default so the base build pulls neither; enable with `--features json`.
 json = ["dep:serde", "dep:serde_json"]
+# Built-in Tokio adapter for the async (sans-IO) driver. Off by default so the
+# base build — and especially the http-only build — pulls in NO async runtime;
+# the async core is runtime-agnostic (the quinn model) and only this adapter
+# names `tokio`. Enable with `--features tokio-rt`.
+tokio-rt = ["dep:tokio"]
 
 [dependencies]
 # Optional, only for the `json` feature (`Response::json`). Pure Rust, no C.
@@ -121,11 +126,20 @@ psl2 = { version = "0.1", default-features = false }
 # validation than the old `idna` crate (bidi, CONTEXTJ, hyphen, leading-mark and
 # trailing-dot rules) — see `src/idn.rs`.
 intl = { version = "0.4.1", optional = true, default-features = false, features = ["idna"] }
+# Optional Tokio adapter for the async sans-IO driver, behind the `tokio-rt`
+# feature. Off by default — the base/http-only builds pull in no async runtime.
+# Only the `src/io/tokio.rs` adapter references it; the async core stays
+# runtime-agnostic. `macros`/`rt` are needed so the adapter is usable (and
+# testable with `#[tokio::test]`) on its own.
+tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "io-util", "rt", "macros"] }
 
 [dev-dependencies]
 # Used only by the WebSocket integration test's in-process echo server to
 # compute the `Sec-WebSocket-Accept` SHA-1 (already a normal dependency).
 purecrypto = "0.6.14"
+# Async combinators (FuturesUnordered) for the `tokio-rt` adapter tests that
+# demonstrate concurrent transfer fan-out. Dev-only — never in the library.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"

@@ -18,7 +18,11 @@
 //! routes through the driver.
 #![allow(dead_code)]
 
+pub(crate) mod asyncio;
 pub(crate) mod blocking;
 pub(crate) mod machine;
+pub(crate) mod runtime;
+#[cfg(feature = "tokio-rt")]
+pub(crate) mod tokio;
 
 pub(crate) use machine::Machine;
