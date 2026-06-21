@@ -9,10 +9,11 @@
 //! machines, so a thin [`TlsEngine`] adapter over the active backend lets TLS
 //! carry HTTP/1, HTTP/2, WebSocket, etc., with no socket logic of its own.
 //!
-//! This module lands the composition and proves it end-to-end (including
-//! through the real blocking driver) with a deterministic mock engine. The
-//! rustls/purecrypto [`TlsEngine`] adapters and the wiring into the connect path
-//! are the next increment.
+//! This module lands the composition (proven through the real blocking driver
+//! with a deterministic mock engine) and the real [`RustlsEngine`] adapter
+//! (proven with a full in-memory rustls client↔server handshake carrying an
+//! HTTP/1.1 exchange). The purecrypto adapter and the wiring into the connect
+//! path are the next increment.
 
 use std::time::Instant;
 
@@ -136,6 +137,62 @@ impl<E: TlsEngine, M: Machine> Machine for TlsClient<E, M> {
         // The exchange is done when the inner application machine is done; a TLS
         // close_notify is best-effort and not required for completeness.
         self.inner.is_finished()
+    }
+}
+
+/// The real [`TlsEngine`] over rustls's `ClientConnection`, which is itself a
+/// sans-IO buffer state machine (`read_tls`/`process_new_packets`/`write_tls`/
+/// `reader`/`writer`). Available with the `rustls-tls` backend. Construction of
+/// a configured `ClientConnection` (verification, SNI, ALPN, client auth) is
+/// factored out of the connect path in the wiring increment; this adapter only
+/// drives an already-built engine.
+#[cfg(feature = "rustls-tls")]
+pub(crate) struct RustlsEngine(pub(crate) rustls::ClientConnection);
+
+#[cfg(feature = "rustls-tls")]
+impl TlsEngine for RustlsEngine {
+    fn is_handshaking(&self) -> bool {
+        self.0.is_handshaking()
+    }
+
+    fn feed_incoming(&mut self, mut ciphertext: &[u8]) -> Result<()> {
+        // Read ciphertext records into the engine and process them. `read_tls`
+        // may take less than offered when its internal buffer fills, so loop.
+        while !ciphertext.is_empty() {
+            let used = self
+                .0
+                .read_tls(&mut ciphertext)
+                .map_err(crate::error::Error::Io)?;
+            if used == 0 {
+                break;
+            }
+            self.0
+                .process_new_packets()
+                .map_err(|e| crate::error::Error::Io(std::io::Error::other(format!("tls: {e}"))))?;
+        }
+        Ok(())
+    }
+
+    fn drain_outgoing(&mut self, out: &mut Vec<u8>) {
+        // Writing pending ciphertext into a Vec never fails.
+        while self.0.wants_write() {
+            let _ = self.0.write_tls(out);
+        }
+    }
+
+    fn read_plaintext(&mut self, dst: &mut [u8]) -> Result<usize> {
+        use std::io::Read;
+        match self.0.reader().read(dst) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(crate::error::Error::Io(e)),
+        }
+    }
+
+    fn write_plaintext(&mut self, plaintext: &[u8]) {
+        use std::io::Write;
+        // Buffered into the engine; emitted as ciphertext by `drain_outgoing`.
+        let _ = self.0.writer().write_all(plaintext);
     }
 }
 
@@ -279,5 +336,147 @@ mod tests {
         let Event::Response { head, body } = &events[0];
         assert_eq!(head.status, 200);
         assert_eq!(body, b"hello");
+    }
+}
+
+/// Real-crypto proof for [`RustlsEngine`]: a full in-memory rustls handshake
+/// (client engine ↔ server engine, no socket) carrying an HTTP/1.1 exchange
+/// through the layered [`TlsClient`]. The test cert/key are an `openssl`-
+/// generated self-signed pair valid until 2126 (embedded, so no cert-gen
+/// dependency and no C toolchain — respecting the crate's no-C guarantee).
+#[cfg(all(test, feature = "rustls-tls"))]
+mod rustls_tests {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    use rustls::pki_types::ServerName;
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+
+    use super::*;
+    use crate::proto::http1::{ClientExchange, Event};
+
+    // A test CA (trusted by the client) and a `localhost` leaf signed by it
+    // (presented by the server). Using the CA cert itself as an end-entity is
+    // rejected by webpki (`CaUsedAsEndEntity`), so a real chain is required.
+    const CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBhzCCAS2gAwIBAgIUEJAJGguFhUu6Wi64F9FYb6oJ9bkwCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTAgFw0yNjA2MjEyMzI2MjFaGA8yMTI2
+MDUyODIzMjYyMVowGDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABGvezLhNMu/DJw3ClBkhcK571eQz/QctqGAf1whkMiXf
+Sj46b9bBymWIV706DP/x2nXzSJgiXTv9rnTli35el0CjUzBRMB0GA1UdDgQWBBQU
+AOFhWcYfxuM+R86kRFZWr/KATzAfBgNVHSMEGDAWgBQUAOFhWcYfxuM+R86kRFZW
+r/KATzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIBWUfubWKWST
+arQvZPn0jqXOwKG0x+xYs5UtcjVf3vOiAiEAlxoTAAh0nVLMrmTsnJXD131iPHz7
+Uk3Wt1xw1blCE/8=
+-----END CERTIFICATE-----
+";
+
+    const LEAF_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBuDCCAV2gAwIBAgIUcMudt8JBWAsDX8h+3CC46SiY14EwCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTAgFw0yNjA2MjEyMzI2MjFaGA8yMTI2
+MDUyODIzMjYyMVowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAEuBVdUYNtZqpWDO9h4nw0HF9sTKT3R7p/WJYsNgIfeO4hi/AM
+9x+n7MP1tYi6zPlfR6qG/ZbEJLFDzZShfHPc/KOBhjCBgzAUBgNVHREEDTALggls
+b2NhbGhvc3QwCQYDVR0TBAIwADALBgNVHQ8EBAMCB4AwEwYDVR0lBAwwCgYIKwYB
+BQUHAwEwHQYDVR0OBBYEFAAZvjmK2EXoiEDqFV3wFGMS8GBJMB8GA1UdIwQYMBaA
+FBQA4WFZxh/G4z5HzqREVlav8oBPMAoGCCqGSM49BAMCA0kAMEYCIQCPQPF3G07F
+EhDmMDPLFGbF/ZdfuDFfBN6Sjs3DuIgSXAIhAMGqymq6vFwXRbvrhbGljFfJQjtz
+98VOQz3xfzdRnPC2
+-----END CERTIFICATE-----
+";
+
+    const LEAF_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8mp/gpytQtzNMwlE
+fXfhylHGgcKzHtmkPeil9MKfoSyhRANCAAS4FV1Rg21mqlYM72HifDQcX2xMpPdH
+un9Yliw2Ah947iGL8Az3H6fsw/W1iLrM+V9Hqob9lsQksUPNlKF8c9z8
+-----END PRIVATE KEY-----
+";
+
+    fn server_config() -> Arc<ServerConfig> {
+        let certs = rustls_pemfile::certs(&mut LEAF_CERT_PEM.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut LEAF_KEY_PEM.as_bytes())
+            .unwrap()
+            .unwrap();
+        Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        )
+    }
+
+    fn client_conn() -> ClientConnection {
+        let mut roots = RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut CA_CERT_PEM.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from("localhost").unwrap();
+        ClientConnection::new(Arc::new(config), name).unwrap()
+    }
+
+    #[test]
+    fn real_rustls_handshake_carries_http_exchange() {
+        let req =
+            ClientExchange::encode_request("GET", "/", &[("Host".into(), "localhost".into())], b"");
+        let mut client =
+            TlsClient::new(RustlsEngine(client_conn()), ClientExchange::new("GET", req));
+        let mut server = ServerConnection::new(server_config()).unwrap();
+
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nhello rustls";
+        let mut server_req = Vec::new();
+        let mut replied = false;
+
+        // Shuttle ciphertext both ways until the client decodes the response.
+        for _ in 0..64 {
+            // client -> server
+            let mut c2s = Vec::new();
+            while client.poll_transmit(&mut c2s) {}
+            let mut cur = &c2s[..];
+            while !cur.is_empty() {
+                let used = server.read_tls(&mut cur).unwrap();
+                if used == 0 {
+                    break;
+                }
+                server.process_new_packets().unwrap();
+            }
+
+            // Server app logic: collect the request, reply once it's complete.
+            if !server.is_handshaking() {
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match server.reader().read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => server_req.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("server read: {e}"),
+                    }
+                }
+                if !replied && server_req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    server.writer().write_all(response).unwrap();
+                    replied = true;
+                }
+            }
+
+            // server -> client
+            let mut s2c = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut s2c).unwrap();
+            }
+            if !s2c.is_empty() {
+                client.handle_input(&s2c).unwrap();
+            }
+
+            if let Some(Event::Response { head, body }) = client.poll_event() {
+                assert_eq!(head.status, 200);
+                assert_eq!(body, b"hello rustls");
+                return;
+            }
+        }
+        panic!("TLS exchange did not complete within the iteration budget");
     }
 }
