@@ -36,7 +36,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use puressh::auth::ClientCredential;
-use puressh::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
+use puressh::client::{
+    AlgoOverrides, Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction,
+};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
 use puressh::sftp::{Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE};
@@ -189,6 +191,7 @@ fn build_config(opts: &SshOptions) -> Result<Config> {
         return Ok(Config {
             host_key_policy: HostKeyPolicy::AcceptAny,
             timeout: opts.timeout,
+            algorithms: AlgoOverrides::default(),
         });
     }
     let kh_path = opts.known_hosts_path.clone().or_else(default_known_hosts);
@@ -214,6 +217,7 @@ fn build_config(opts: &SshOptions) -> Result<Config> {
     Ok(Config {
         host_key_policy: HostKeyPolicy::KnownHosts(policy),
         timeout: opts.timeout,
+        algorithms: AlgoOverrides::default(),
     })
 }
 
@@ -258,7 +262,7 @@ fn collect_credentials(opts: &SshOptions) -> Result<Vec<ClientCredential>> {
         }
     }
     if let Some(pw) = &opts.password {
-        creds.push(ClientCredential::Password(pw.clone()));
+        creds.push(ClientCredential::Password(pw.clone().into()));
     }
     if creds.is_empty() {
         return Err(Error::Ssh(

@@ -71,8 +71,9 @@ serde_json = { version = "1", optional = true }
 # Required regardless of TLS backend: SHA1 + RNG (WebSocket, MQTT), X.509
 # parsing for verbose cert display, and the QUIC stack behind HTTP/3.
 # 0.6.8 adds the peer-certificate / close_notify accessors we use for HTTP/3
-# public-key pinning + SAN checks and TLS truncation detection.
-purecrypto = "0.6.8"
+# public-key pinning + SAN checks and TLS truncation detection; 0.6.14 lowers
+# the declared MSRV to 1.88 (matching this crate — see `rust-version` above).
+purecrypto = "0.6.14"
 # Zero out client private-key material (the `--key`/`--pass` bytes held in
 # `TlsOpts`) on drop, so a long-lived process doesn't leave decrypted key
 # bytes lingering in freed heap. Pure Rust, no C; always on (tiny crate).
@@ -102,7 +103,7 @@ compcol = { version = "0.4", default-features = false, features = ["std", "gzip"
 # are pure-Rust FFI *binding* crates (extern decls against the libc that std
 # already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
-puressh = { version = "0.0.4", optional = true, default-features = false, features = ["client", "compress"] }
+puressh = { version = "0.0.6", optional = true, default-features = false, features = ["client", "compress"] }
 # Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
 # `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
 # heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =
@@ -124,7 +125,7 @@ intl = { version = "0.4.1", optional = true, default-features = false, features 
 [dev-dependencies]
 # Used only by the WebSocket integration test's in-process echo server to
 # compute the `Sec-WebSocket-Accept` SHA-1 (already a normal dependency).
-purecrypto = "0.6.8"
+purecrypto = "0.6.14"
 
 [profile.release]
 lto = "thin"
