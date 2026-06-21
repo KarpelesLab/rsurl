@@ -394,7 +394,7 @@ impl<T: Read + Write + Send + ?Sized> ReadWrite for T {}
 ///    outside its engine lock and serializes writes under it.
 ///  * `Shared` — a single stream behind one lock (used by the in-process test
 ///    mock; not concurrency-capable).
-enum WsTransport {
+enum WsTransportKind {
     Plain {
         read: Mutex<Box<dyn crate::net::NetStream>>,
         write: Mutex<Box<dyn crate::net::NetStream>>,
@@ -405,33 +405,141 @@ enum WsTransport {
     Shared(Mutex<Box<dyn ReadWrite>>),
 }
 
+/// How long a parked read sleeps (at the OS level) between checks of the
+/// shutdown flag. A [`WsShutdown`] thus unblocks a reader within one tick even
+/// on Windows, where a socket `shutdown()` does not wake a sibling handle's
+/// in-progress blocking `recv()` the way it does on Unix.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(250);
+
+/// The shared transport: a [`WsTransportKind`] plus the cross-thread shutdown
+/// flag and the caller's inactivity timeout. Reads poll the flag so a
+/// [`WsShutdown`] can unblock a parked reader on every platform, while the
+/// caller's read timeout is enforced in software (the OS read carries only the
+/// short poll tick).
+struct WsTransport {
+    kind: WsTransportKind,
+    /// Set by [`WsShutdown::shutdown`]; a parked read observes it within one
+    /// [`SHUTDOWN_POLL`] tick and returns `ConnectionAborted`.
+    shutdown: Arc<AtomicBool>,
+    /// The caller's per-read inactivity timeout (`None` = block until data,
+    /// shutdown, or EOF).
+    read_timeout: Mutex<Option<Duration>>,
+}
+
+/// A socket read timeout/`WouldBlock` — i.e. a poll tick elapsed with no data,
+/// not a hard error. Unix reports `WouldBlock`, Windows `TimedOut`.
+fn is_read_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
 impl WsTransport {
+    /// Wrap a transport kind. The inactivity timeout starts at the handshake
+    /// bound ([`SEND_TIMEOUT`]); callers switch it to the persistent read
+    /// timeout once the handshake completes.
+    fn new(kind: WsTransportKind) -> WsTransport {
+        WsTransport {
+            kind,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            read_timeout: Mutex::new(Some(SEND_TIMEOUT)),
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // The in-process mock has no real socket (so no OS timeout and no
+        // shutdown handle); read it directly. Real sockets poll the flag.
+        match &self.kind {
+            WsTransportKind::Shared(s) => s.lock().unwrap().read(buf),
+            _ => self.read_polled(buf),
+        }
+    }
+
+    /// Read with a bounded OS-level poll tick, re-checking the shutdown flag
+    /// each tick and enforcing the caller's inactivity deadline in software.
+    fn read_polled(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let deadline = (*self.read_timeout.lock().unwrap()).map(|d| Instant::now() + d);
+        let mut programmed: Option<Duration> = None;
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "websocket shut down by WsShutdown handle",
+                ));
+            }
+            // Program the OS read timeout to the lesser of the poll tick and
+            // the time left on the caller's deadline (never zero — a zero
+            // SO_RCVTIMEO means "block forever").
+            let tick = match deadline {
+                Some(dl) => dl
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or(Duration::from_millis(1))
+                    .min(SHUTDOWN_POLL)
+                    .max(Duration::from_millis(1)),
+                None => SHUTDOWN_POLL,
+            };
+            if programmed != Some(tick) {
+                self.kind.set_read_timeout(Some(tick))?;
+                programmed = Some(tick);
+            }
+            match self.kind.read(buf) {
+                Ok(n) => return Ok(n),
+                // A tick elapsed with no data: surface a genuine timeout only
+                // once the caller's deadline has truly passed; otherwise keep
+                // waiting (re-checking the shutdown flag).
+                Err(e) if is_read_timeout(&e) => match deadline {
+                    Some(dl) if Instant::now() >= dl => return Err(e),
+                    _ => continue,
+                },
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn write_all(&self, data: &[u8]) -> io::Result<()> {
+        self.kind.write_all(data)
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.kind.flush()
+    }
+
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        // Recorded here and enforced in software by `read_polled`; the OS
+        // socket only ever carries the short poll tick.
+        *self.read_timeout.lock().unwrap() = dur;
+        Ok(())
+    }
+}
+
+impl WsTransportKind {
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            WsTransport::Plain { read, .. } => read.lock().unwrap().read(buf),
-            WsTransport::Tls(c) => c.read(buf),
-            WsTransport::Shared(s) => s.lock().unwrap().read(buf),
+            WsTransportKind::Plain { read, .. } => read.lock().unwrap().read(buf),
+            WsTransportKind::Tls(c) => c.read(buf),
+            WsTransportKind::Shared(s) => s.lock().unwrap().read(buf),
         }
     }
     fn write_all(&self, data: &[u8]) -> io::Result<()> {
         match self {
-            WsTransport::Plain { write, .. } => write.lock().unwrap().write_all(data),
-            WsTransport::Tls(c) => c.write(data),
-            WsTransport::Shared(s) => s.lock().unwrap().write_all(data),
+            WsTransportKind::Plain { write, .. } => write.lock().unwrap().write_all(data),
+            WsTransportKind::Tls(c) => c.write(data),
+            WsTransportKind::Shared(s) => s.lock().unwrap().write_all(data),
         }
     }
     fn flush(&self) -> io::Result<()> {
         match self {
-            WsTransport::Plain { write, .. } => write.lock().unwrap().flush(),
-            WsTransport::Tls(c) => c.flush(),
-            WsTransport::Shared(s) => s.lock().unwrap().flush(),
+            WsTransportKind::Plain { write, .. } => write.lock().unwrap().flush(),
+            WsTransportKind::Tls(c) => c.flush(),
+            WsTransportKind::Shared(s) => s.lock().unwrap().flush(),
         }
     }
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match self {
-            WsTransport::Plain { read, .. } => read.lock().unwrap().set_read_timeout(dur),
-            WsTransport::Tls(c) => c.set_read_timeout(dur),
-            WsTransport::Shared(_) => Ok(()), // mock: no real timeout
+            WsTransportKind::Plain { read, .. } => read.lock().unwrap().set_read_timeout(dur),
+            WsTransportKind::Tls(c) => c.set_read_timeout(dur),
+            WsTransportKind::Shared(_) => Ok(()), // mock: no real timeout
         }
     }
 }
@@ -540,6 +648,9 @@ type ShutdownSock = Arc<Mutex<Box<dyn crate::net::NetStream>>>;
 #[derive(Clone)]
 pub struct WsShutdown {
     sock: ShutdownSock,
+    /// Shared with the reader's transport: setting it unblocks a parked read
+    /// within one poll tick on every platform (see [`SHUTDOWN_POLL`]).
+    flag: Arc<AtomicBool>,
 }
 
 impl WsShutdown {
@@ -547,6 +658,10 @@ impl WsShutdown {
     /// `recv()` returns promptly (as EOF/error). Idempotent-ish: a second call
     /// after the socket is gone is a harmless error.
     pub fn shutdown(&self) -> Result<()> {
+        // Raise the flag first: a reader parked with no read timeout observes
+        // it within one poll tick and unblocks even on Windows, where a socket
+        // `shutdown()` does not wake a sibling handle's blocking `recv()`.
+        self.flag.store(true, Ordering::SeqCst);
         self.sock
             .lock()
             .unwrap()
@@ -603,15 +718,17 @@ impl WebSocket {
                                 .map_err(Error::Io)?;
                             let shutdown = data.try_clone_box().ok();
                             (
-                                Arc::new(WsTransport::Plain {
+                                Arc::new(WsTransport::new(WsTransportKind::Plain {
                                     read: Mutex::new(read),
                                     write: Mutex::new(data),
-                                }),
+                                })),
                                 shutdown,
                             )
                         }
                         Err(_) => (
-                            Arc::new(WsTransport::Shared(Mutex::new(Box::new(data)))),
+                            Arc::new(WsTransport::new(WsTransportKind::Shared(Mutex::new(
+                                Box::new(data),
+                            )))),
                             None,
                         ),
                     }
@@ -634,12 +751,16 @@ impl WebSocket {
                             read.set_read_timeout(Some(SEND_TIMEOUT))
                                 .map_err(Error::Io)?;
                             (
-                                Arc::new(WsTransport::Tls(Box::new(tls.into_concurrent(read)))),
+                                Arc::new(WsTransport::new(WsTransportKind::Tls(Box::new(
+                                    tls.into_concurrent(read),
+                                )))),
                                 shutdown,
                             )
                         }
                         None => (
-                            Arc::new(WsTransport::Shared(Mutex::new(Box::new(tls)))),
+                            Arc::new(WsTransport::new(WsTransportKind::Shared(Mutex::new(
+                                Box::new(tls),
+                            )))),
                             None,
                         ),
                     }
@@ -833,6 +954,7 @@ impl WsReader {
     pub fn shutdown_handle(&self) -> Option<WsShutdown> {
         self.shutdown.as_ref().map(|s| WsShutdown {
             sock: Arc::clone(s),
+            flag: Arc::clone(&self.transport.shutdown),
         })
     }
 
@@ -988,6 +1110,7 @@ impl WsWriter {
     pub fn shutdown_handle(&self) -> Option<WsShutdown> {
         self.shutdown.as_ref().map(|s| WsShutdown {
             sock: Arc::clone(s),
+            flag: Arc::clone(&self.transport.shutdown),
         })
     }
 
@@ -2708,7 +2831,9 @@ mod tests {
     /// no control handle / timeouts).
     fn ws_over(mock: SharedMock, pmd: Option<Pmd>) -> WebSocket {
         let compression = pmd.is_some();
-        let transport = Arc::new(WsTransport::Shared(Mutex::new(Box::new(mock))));
+        let transport = Arc::new(WsTransport::new(WsTransportKind::Shared(Mutex::new(
+            Box::new(mock),
+        ))));
         let send_closed = Arc::new(AtomicBool::new(false));
         let recv_closed = Arc::new(AtomicBool::new(false));
         WebSocket {

@@ -36,9 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use puressh::auth::ClientCredential;
-use puressh::client::{
-    AlgoOverrides, Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction,
-};
+use puressh::client::{AlgoOverrides, Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
 use puressh::sftp::{Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE};
