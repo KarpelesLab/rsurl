@@ -10,10 +10,11 @@
 //! carry HTTP/1, HTTP/2, WebSocket, etc., with no socket logic of its own.
 //!
 //! This module lands the composition (proven through the real blocking driver
-//! with a deterministic mock engine) and the real [`RustlsEngine`] adapter
-//! (proven with a full in-memory rustls client↔server handshake carrying an
-//! HTTP/1.1 exchange). The purecrypto adapter and the wiring into the connect
-//! path are the next increment.
+//! with a deterministic mock engine) plus the real [`RustlsEngine`] and
+//! [`PurecryptoEngine`] adapters — proven with full in-memory handshakes
+//! (rustls client↔server, and purecrypto client↔rustls server cross-backend)
+//! carrying an HTTP/1.1 exchange. Wiring these into the connect path (so a
+//! configured engine is built without a socket) is the next increment.
 
 use std::time::Instant;
 
@@ -196,6 +197,109 @@ impl TlsEngine for RustlsEngine {
     }
 }
 
+/// The real [`TlsEngine`] over purecrypto's sans-IO `Connection`. Available with
+/// the `purecrypto-tls` backend (the default). Unlike rustls, purecrypto's
+/// handshake is *advanced* by `feed` (which runs `process_new_packets` and
+/// queues the next flight) and *reported* by `handshake()` — so we feed, then
+/// refresh a cached completion flag, and never loop on `handshake()` (which
+/// would spin on `WantWrite` since it only reports queued output).
+#[cfg(feature = "purecrypto-tls")]
+pub(crate) struct PurecryptoEngine {
+    conn: purecrypto::tls::Connection,
+    /// Inbound wire that `feed` did not consume yet (it takes only a prefix).
+    pending_wire: Vec<u8>,
+    /// Decrypted plaintext pulled from `recv` but not yet handed out.
+    plaintext: Vec<u8>,
+    done: bool,
+}
+
+#[cfg(feature = "purecrypto-tls")]
+fn pc_err(e: impl std::fmt::Debug) -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::other(format!("tls: {e:?}")))
+}
+
+#[cfg(feature = "purecrypto-tls")]
+impl PurecryptoEngine {
+    pub(crate) fn new(conn: purecrypto::tls::Connection) -> Result<PurecryptoEngine> {
+        // `Connection::client` already queues the ClientHello, popped by the
+        // first `drain_outgoing`; nothing to pump here.
+        let mut e = PurecryptoEngine {
+            conn,
+            pending_wire: Vec::new(),
+            plaintext: Vec::new(),
+            done: false,
+        };
+        e.refresh_done()?;
+        Ok(e)
+    }
+
+    /// Update the cached handshake-completion flag from the engine's status.
+    fn refresh_done(&mut self) -> Result<()> {
+        if matches!(
+            self.conn.handshake().map_err(pc_err)?,
+            purecrypto::tls::HandshakeStatus::Complete
+        ) {
+            self.done = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "purecrypto-tls")]
+impl TlsEngine for PurecryptoEngine {
+    fn is_handshaking(&self) -> bool {
+        !self.done
+    }
+
+    fn feed_incoming(&mut self, ciphertext: &[u8]) -> Result<()> {
+        // `feed` consumes only a prefix per call; buffer any unconsumed tail and
+        // retry it (prepended) on the next inbound bytes.
+        self.pending_wire.extend_from_slice(ciphertext);
+        let mut taken = 0;
+        while taken < self.pending_wire.len() {
+            let n = self
+                .conn
+                .feed(&self.pending_wire[taken..])
+                .map_err(pc_err)?;
+            if n == 0 {
+                break;
+            }
+            taken += n;
+        }
+        self.pending_wire.drain(..taken);
+        // `feed` advanced the handshake and may have queued our next flight.
+        self.refresh_done()?;
+        Ok(())
+    }
+
+    fn drain_outgoing(&mut self, out: &mut Vec<u8>) {
+        loop {
+            match self.conn.pop() {
+                Ok(rec) if rec.is_empty() => break,
+                Ok(rec) => out.extend_from_slice(&rec),
+                // A pop error means the engine is broken; the next fallible call
+                // (feed/recv) surfaces the real error.
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn read_plaintext(&mut self, dst: &mut [u8]) -> Result<usize> {
+        if self.plaintext.is_empty() {
+            let app = self.conn.recv().map_err(pc_err)?;
+            self.plaintext.extend_from_slice(&app);
+        }
+        let n = dst.len().min(self.plaintext.len());
+        dst[..n].copy_from_slice(&self.plaintext[..n]);
+        self.plaintext.drain(..n);
+        Ok(n)
+    }
+
+    fn write_plaintext(&mut self, plaintext: &[u8]) {
+        let _ = self.conn.send(plaintext);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,7 +462,7 @@ mod rustls_tests {
     // A test CA (trusted by the client) and a `localhost` leaf signed by it
     // (presented by the server). Using the CA cert itself as an end-entity is
     // rejected by webpki (`CaUsedAsEndEntity`), so a real chain is required.
-    const CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+    pub(super) const CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
 MIIBhzCCAS2gAwIBAgIUEJAJGguFhUu6Wi64F9FYb6oJ9bkwCgYIKoZIzj0EAwIw
 GDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTAgFw0yNjA2MjEyMzI2MjFaGA8yMTI2
 MDUyODIzMjYyMVowGDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTBZMBMGByqGSM49
@@ -392,7 +496,7 @@ un9Yliw2Ah947iGL8Az3H6fsw/W1iLrM+V9Hqob9lsQksUPNlKF8c9z8
 -----END PRIVATE KEY-----
 ";
 
-    fn server_config() -> Arc<ServerConfig> {
+    pub(super) fn server_config() -> Arc<ServerConfig> {
         let certs = rustls_pemfile::certs(&mut LEAF_CERT_PEM.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
@@ -478,5 +582,118 @@ un9Yliw2Ah947iGL8Az3H6fsw/W1iLrM+V9Hqob9lsQksUPNlKF8c9z8
             }
         }
         panic!("TLS exchange did not complete within the iteration budget");
+    }
+}
+
+/// Real-engine proof for [`PurecryptoEngine`] that needs no peer: a genuine
+/// purecrypto client emits a well-formed TLS ClientHello through the adapter.
+/// Covers the purecrypto-only lanes (http-only / default); the full handshake
+/// is proven cross-backend against a rustls server when both backends are on.
+#[cfg(all(test, feature = "purecrypto-tls"))]
+mod purecrypto_tests {
+    use super::*;
+
+    #[test]
+    fn purecrypto_adapter_emits_client_hello() {
+        let cfg = purecrypto::tls::Config::builder()
+            .roots(purecrypto::tls::RootCertStore::new())
+            .server_name("localhost")
+            .build();
+        let conn = purecrypto::tls::Connection::client(&cfg).unwrap();
+        let mut eng = PurecryptoEngine::new(conn).unwrap();
+
+        assert!(eng.is_handshaking());
+        let mut out = Vec::new();
+        eng.drain_outgoing(&mut out);
+        // TLS record: content type 0x16 (handshake); first handshake message
+        // (byte 5, after the 5-byte record header) is 0x01 (ClientHello).
+        assert!(out.len() > 5, "expected a ClientHello record");
+        assert_eq!(out[0], 0x16, "record content type should be handshake");
+        assert_eq!(out[5], 0x01, "handshake message type should be ClientHello");
+    }
+}
+
+/// Cross-backend interop proof: a real purecrypto **client** ([`PurecryptoEngine`])
+/// completes a full TLS handshake against a real rustls **server** and carries an
+/// HTTP/1.1 exchange through the layered [`TlsClient`] — entirely in memory.
+/// Runs only when both backends are compiled (the `--all-features` CI lane), and
+/// doubles as a cross-stack interoperability check.
+#[cfg(all(test, feature = "purecrypto-tls", feature = "rustls-tls"))]
+mod cross_backend_tests {
+    use std::io::{Read, Write};
+
+    use rustls::ServerConnection;
+
+    use super::*;
+    use crate::proto::http1::{ClientExchange, Event};
+
+    #[test]
+    fn purecrypto_client_against_rustls_server() {
+        // purecrypto client trusting the test CA.
+        let mut roots = purecrypto::tls::RootCertStore::new();
+        roots.add_pem(super::rustls_tests::CA_CERT_PEM).unwrap();
+        let cfg = purecrypto::tls::Config::builder()
+            .roots(roots)
+            .server_name("localhost")
+            .build();
+        let client_conn = purecrypto::tls::Connection::client(&cfg).unwrap();
+
+        let req =
+            ClientExchange::encode_request("GET", "/", &[("Host".into(), "localhost".into())], b"");
+        let mut client = TlsClient::new(
+            PurecryptoEngine::new(client_conn).unwrap(),
+            ClientExchange::new("GET", req),
+        );
+        let mut server = ServerConnection::new(super::rustls_tests::server_config()).unwrap();
+
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\ninterop ok";
+        let mut server_req = Vec::new();
+        let mut replied = false;
+
+        for _ in 0..64 {
+            // client -> server
+            let mut c2s = Vec::new();
+            while client.poll_transmit(&mut c2s) {}
+            let mut cur = &c2s[..];
+            while !cur.is_empty() {
+                let used = server.read_tls(&mut cur).unwrap();
+                if used == 0 {
+                    break;
+                }
+                server.process_new_packets().unwrap();
+            }
+
+            if !server.is_handshaking() {
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match server.reader().read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => server_req.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("server read: {e}"),
+                    }
+                }
+                if !replied && server_req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    server.writer().write_all(response).unwrap();
+                    replied = true;
+                }
+            }
+
+            // server -> client
+            let mut s2c = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut s2c).unwrap();
+            }
+            if !s2c.is_empty() {
+                client.handle_input(&s2c).unwrap();
+            }
+
+            if let Some(Event::Response { head, body }) = client.poll_event() {
+                assert_eq!(head.status, 200);
+                assert_eq!(body, b"interop ok");
+                return;
+            }
+        }
+        panic!("cross-backend TLS exchange did not complete");
     }
 }
