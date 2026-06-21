@@ -8,7 +8,7 @@ use crate::net::{connector_from_proxy_url, Connector, DirectConnector, NetStream
 use crate::url::Url;
 
 const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
-const MAX_HEADER_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Preference for which HTTP version to use over HTTPS. The HTTPS dispatcher
@@ -3555,7 +3555,7 @@ pub(crate) fn maybe_decode_body(
     }
 }
 
-fn parse_status_line(line: &str) -> Result<(String, u16, String)> {
+pub(crate) fn parse_status_line(line: &str) -> Result<(String, u16, String)> {
     let mut parts = line.splitn(3, ' ');
     let version = parts
         .next()
@@ -3579,7 +3579,7 @@ fn parse_status_line(line: &str) -> Result<(String, u16, String)> {
 /// acceptable if every value parses and they all agree; any disagreement (or
 /// an unparseable value) is a hard error. Returns `None` when no
 /// `Content-Length` is present.
-fn parse_content_length(headers: &[(String, String)]) -> Result<Option<u64>> {
+pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<Option<u64>> {
     let mut seen: Option<u64> = None;
     for (k, v) in headers {
         if !k.eq_ignore_ascii_case("content-length") {
