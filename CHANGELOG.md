@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.1...rsurl-v0.1.2) - 2026-06-22
+
+### Added
+
+- *(aio)* public runtime-agnostic async HTTP client (P2 entry point)
+- *(tls)* socket-free engine construction for the sans-IO stack (P2)
+- *(proto)* purecrypto TlsEngine adapter + cross-backend handshake proof
+- *(proto)* real rustls TlsEngine adapter + in-memory handshake proof
+- *(proto)* sans-IO TLS as a layered Machine (Phase 1)
+- *(io)* runtime-agnostic async driver + Tokio adapter (Phase 1)
+- *(io)* sans-IO foundation + HTTP/1.1 core + blocking driver (Phase 1)
+
+### Other
+
+- *(deps)* update purecrypto 0.6.14 -> 0.6.17 (wire explicit TLS entropy)
+- *(tls)* make connect-wiring test hermetic (fix Windows-rustls CI)
+
 ## [0.1.1](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.0...rsurl-v0.1.1) - 2026-06-21
 
 ### Added
