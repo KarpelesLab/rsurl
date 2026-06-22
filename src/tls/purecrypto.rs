@@ -185,13 +185,13 @@ pub fn connect_over_with_alpn<S: Read + Write>(
     connect_over_tls(transport, sni, opts)
 }
 
-/// Like [`connect_over_with_alpn`], but takes the full [`TlsOpts`] so callers
-/// can disable verification (`-k`) or supply a custom root store (`--cacert`).
-pub fn connect_over_tls<S: Read + Write>(
-    transport: S,
-    sni: &str,
-    mut opts: TlsOpts,
-) -> Result<TlsStream<S>> {
+/// Build a configured, *un-handshaken* purecrypto [`Connection`] from `sni` and
+/// `opts` — the socket-free engine-construction half of [`connect_over_tls`].
+/// The sans-IO TLS driver (`crate::proto::tls`) uses this to obtain an engine it
+/// drives over its own transport; [`connect_over_tls`] uses it and then runs the
+/// blocking handshake. Post-handshake checks (verify callback, SAN-less-leaf,
+/// public-key pinning) remain the caller's responsibility.
+pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connection> {
     // `TlsOpts` has a `Drop` impl (TLS-5: it zeroizes the key material), which
     // forbids moving fields out by value. Take the owned fields we hand to the
     // builder via `Option::take` / `mem::take` so the struct stays whole and
@@ -261,7 +261,20 @@ pub fn connect_over_tls<S: Read + Write>(
         builder = builder.crls(store);
     }
     let cfg = builder.build();
-    let conn = Connection::client(&cfg).map_err(tls_err)?;
+    Connection::client(&cfg).map_err(tls_err)
+}
+
+/// Like [`connect_over_with_alpn`], but takes the full [`TlsOpts`] so callers
+/// can disable verification (`-k`) or supply a custom root store (`--cacert`).
+pub fn connect_over_tls<S: Read + Write>(
+    transport: S,
+    sni: &str,
+    mut opts: TlsOpts,
+) -> Result<TlsStream<S>> {
+    // Recomputed here (it is also derived inside `build_client_conn`) for the
+    // post-handshake SAN check below, since that runs after construction.
+    let effective_verify = opts.verify && opts.verify_callback.is_none();
+    let conn = build_client_conn(sni, &mut opts)?;
     let mut s = TlsStream {
         conn,
         sock: transport,

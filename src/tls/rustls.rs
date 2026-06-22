@@ -244,14 +244,14 @@ pub fn connect_over_with_alpn<S: Read + Write>(
     connect_over_tls(transport, sni, opts)
 }
 
-/// Like [`connect_over_with_alpn`], but takes the full [`TlsOpts`] so
-/// callers can disable verification (`-k`) or supply a custom root store
-/// (`--cacert`).
-pub fn connect_over_tls<S: Read + Write>(
-    transport: S,
-    sni: &str,
-    mut opts: TlsOpts,
-) -> Result<TlsStream<S>> {
+/// Build a configured, *un-handshaken* rustls [`ClientConnection`] from `sni`
+/// and `opts` — the socket-free engine-construction half of [`connect_over_tls`].
+/// The sans-IO TLS driver (`crate::proto::tls`) uses this to obtain an engine it
+/// drives over its own transport; [`connect_over_tls`] uses it and then runs the
+/// blocking handshake. Post-handshake checks (verify callback, public-key
+/// pinning) remain the caller's responsibility — they need the peer chain, which
+/// only exists after the handshake.
+pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientConnection> {
     // `TlsOpts` has a `Drop` impl (TLS-5: it zeroizes the key material), which
     // forbids moving fields out by value. Take the owned `roots`/`alpn` via
     // `Option::take` / `mem::take` so the struct stays whole and its `Drop`
@@ -341,7 +341,18 @@ pub fn connect_over_tls<S: Read + Write>(
 
     let server_name: ServerName<'static> = ServerName::try_from(sni.to_string())
         .map_err(|e| Error::BadResponse(format!("invalid SNI {sni:?}: {e}")))?;
-    let conn = ClientConnection::new(Arc::new(config), server_name).map_err(rustls_err)?;
+    ClientConnection::new(Arc::new(config), server_name).map_err(rustls_err)
+}
+
+/// Like [`connect_over_with_alpn`], but takes the full [`TlsOpts`] so
+/// callers can disable verification (`-k`) or supply a custom root store
+/// (`--cacert`).
+pub fn connect_over_tls<S: Read + Write>(
+    transport: S,
+    sni: &str,
+    mut opts: TlsOpts,
+) -> Result<TlsStream<S>> {
+    let conn = build_client_conn(sni, &mut opts)?;
 
     let mut s = TlsStream {
         conn,

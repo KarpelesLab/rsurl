@@ -59,3 +59,32 @@ pub use backend::{
     connect_over, connect_over_tls, connect_over_with_alpn, load_roots_from_dir,
     load_roots_from_file, load_system_roots, RootCertStore, TlsConn, TlsOpts, TlsStream,
 };
+
+/// Build a socket-free sans-IO TLS client engine for the active backend,
+/// configured from `sni` and `opts`. The blocking/async drivers drive the
+/// returned engine via [`crate::proto::tls::TlsClient`]; this is the
+/// connect-construction half of the new (sans-IO) request stack. Post-handshake
+/// checks (verify callback, public-key pinning) remain the driver's
+/// responsibility — they need the peer chain, available only after the
+/// handshake. Returns the active backend's concrete engine type (exactly one
+/// backend compiles, so this is a single type per build).
+// Exercised by tests now; routed into the request path at the cutover phase.
+#[allow(dead_code)]
+#[cfg(feature = "rustls-tls")]
+pub(crate) fn build_client_engine(
+    sni: &str,
+    opts: &mut TlsOpts,
+) -> crate::error::Result<crate::proto::tls::RustlsEngine> {
+    Ok(crate::proto::tls::RustlsEngine(backend::build_client_conn(
+        sni, opts,
+    )?))
+}
+
+#[allow(dead_code)]
+#[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+pub(crate) fn build_client_engine(
+    sni: &str,
+    opts: &mut TlsOpts,
+) -> crate::error::Result<crate::proto::tls::PurecryptoEngine> {
+    crate::proto::tls::PurecryptoEngine::new(backend::build_client_conn(sni, opts)?)
+}

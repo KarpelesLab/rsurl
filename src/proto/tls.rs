@@ -697,3 +697,78 @@ mod cross_backend_tests {
         panic!("cross-backend TLS exchange did not complete");
     }
 }
+
+/// Connect-wiring proof: the real backend config path
+/// (`crate::tls::build_client_engine`) yields a working sans-IO engine that
+/// completes a TLS handshake and carries an HTTP/1.1 exchange through
+/// [`TlsClient`] against an in-memory rustls server. Under `--all-features` the
+/// active backend is rustls, so this exercises [`RustlsEngine`] end to end from
+/// the crate's own configuration code.
+#[cfg(all(test, feature = "rustls-tls"))]
+mod connect_wiring_tests {
+    use std::io::{Read, Write};
+
+    use rustls::ServerConnection;
+
+    use super::*;
+    use crate::proto::http1::{ClientExchange, Event};
+
+    #[test]
+    fn engine_from_build_client_engine_completes_handshake() {
+        // `-k`-style: skip chain validation so the test need not thread the test
+        // CA into TlsOpts roots; we are proving construction + drive, not the
+        // (separately tested) verifier.
+        let mut opts = crate::tls::TlsOpts::verifying();
+        opts.verify = false;
+        let engine = crate::tls::build_client_engine("localhost", &mut opts).unwrap();
+
+        let req =
+            ClientExchange::encode_request("GET", "/", &[("Host".into(), "localhost".into())], b"");
+        let mut client = TlsClient::new(engine, ClientExchange::new("GET", req));
+        let mut server = ServerConnection::new(super::rustls_tests::server_config()).unwrap();
+
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nwired";
+        let mut server_req = Vec::new();
+        let mut replied = false;
+        for _ in 0..64 {
+            let mut c2s = Vec::new();
+            while client.poll_transmit(&mut c2s) {}
+            let mut cur = &c2s[..];
+            while !cur.is_empty() {
+                let used = server.read_tls(&mut cur).unwrap();
+                if used == 0 {
+                    break;
+                }
+                server.process_new_packets().unwrap();
+            }
+            if !server.is_handshaking() {
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match server.reader().read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => server_req.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("server read: {e}"),
+                    }
+                }
+                if !replied && server_req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    server.writer().write_all(response).unwrap();
+                    replied = true;
+                }
+            }
+            let mut s2c = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut s2c).unwrap();
+            }
+            if !s2c.is_empty() {
+                client.handle_input(&s2c).unwrap();
+            }
+            if let Some(Event::Response { head, body }) = client.poll_event() {
+                assert_eq!(head.status, 200);
+                assert_eq!(body, b"wired");
+                return;
+            }
+        }
+        panic!("handshake/exchange did not complete");
+    }
+}
