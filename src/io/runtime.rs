@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 /// A full-duplex async byte stream handed back by a [`Runtime`]. The byte-level
 /// analogue of [`std::io::Read`] + [`std::io::Write`]; the driver reads inbound
 /// wire bytes and writes a machine's transmits over it.
-pub(crate) trait AsyncConn: Send {
+pub trait AsyncConn: Send {
     /// Read up to `buf.len()` bytes into `buf`. `Ok(0)` signals end-of-input.
     fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send;
 
@@ -38,7 +38,7 @@ pub(crate) trait AsyncConn: Send {
 /// runtime of choice (or enables the built-in `tokio-rt` adapter); the crate's
 /// async code never names a concrete runtime, so it does not fragment the
 /// ecosystem into per-runtime crates.
-pub(crate) trait Runtime {
+pub trait Runtime {
     /// The connection type this runtime produces.
     type Conn: AsyncConn;
 
@@ -46,7 +46,7 @@ pub(crate) trait Runtime {
     fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Conn>> + Send;
 
     /// Complete after at least `dur` has elapsed (the timer primitive a driver
-    /// races a read against to honour a [`Machine`](super::Machine) deadline).
+    /// races a read against to honour a protocol state-machine deadline).
     fn sleep(&self, dur: Duration) -> impl Future<Output = ()> + Send;
 
     /// The current instant, per this runtime's clock.

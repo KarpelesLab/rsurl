@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod aio;
 mod cancel;
 mod compress;
 mod cookie;

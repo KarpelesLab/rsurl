@@ -15,10 +15,10 @@ use crate::io::runtime::{AsyncConn, Runtime};
 /// A [`Runtime`] backed by the ambient Tokio runtime (the caller drives it with
 /// `#[tokio::main]` / `Runtime::block_on` / `tokio::spawn`).
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TokioRuntime;
+pub struct TokioRuntime;
 
 /// A Tokio [`TcpStream`] adapted to [`AsyncConn`].
-pub(crate) struct TokioConn(TcpStream);
+pub struct TokioConn(TcpStream);
 
 impl AsyncConn for TokioConn {
     async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
