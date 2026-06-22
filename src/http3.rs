@@ -1776,6 +1776,9 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         .roots(roots)
         .server_name(req.url.host.clone())
         .verify_certificates(req.verify_tls)
+        // purecrypto 0.6.17 requires an explicit TLS/QUIC entropy source (no
+        // implicit OsRng default); supply the OS CSPRNG.
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         // RFC 9114 §3.1 — HTTP/3 is selected via ALPN identifier "h3".
         .alpn(vec![b"h3".to_vec()]);
 

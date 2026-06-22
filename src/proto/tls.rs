@@ -598,6 +598,7 @@ mod purecrypto_tests {
         let cfg = purecrypto::tls::Config::builder()
             .roots(purecrypto::tls::RootCertStore::new())
             .server_name("localhost")
+            .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
             .build();
         let conn = purecrypto::tls::Connection::client(&cfg).unwrap();
         let mut eng = PurecryptoEngine::new(conn).unwrap();
@@ -635,6 +636,7 @@ mod cross_backend_tests {
         let cfg = purecrypto::tls::Config::builder()
             .roots(roots)
             .server_name("localhost")
+            .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
             .build();
         let client_conn = purecrypto::tls::Connection::client(&cfg).unwrap();
 

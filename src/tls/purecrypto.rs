@@ -207,7 +207,10 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connect
         .tls_only()
         .roots(roots)
         .server_name(sni.to_string())
-        .verify_certificates(effective_verify);
+        .verify_certificates(effective_verify)
+        // purecrypto 0.6.17 made the TLS entropy source explicit (it no longer
+        // defaults to OsRng); supply the OS CSPRNG, restoring the prior default.
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng));
     if !opts.alpn.is_empty() {
         builder = builder.alpn(std::mem::take(&mut opts.alpn));
     }
