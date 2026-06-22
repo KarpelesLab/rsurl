@@ -717,9 +717,12 @@ mod connect_wiring_tests {
     fn engine_from_build_client_engine_completes_handshake() {
         // `-k`-style: skip chain validation so the test need not thread the test
         // CA into TlsOpts roots; we are proving construction + drive, not the
-        // (separately tested) verifier.
+        // (separately tested) verifier. Supply an explicit (empty) root store so
+        // construction does not fall back to `load_system_roots()`, which is
+        // Unix-only in the rustls backend and would fail on Windows CI.
         let mut opts = crate::tls::TlsOpts::verifying();
         opts.verify = false;
+        opts.roots = Some(rustls::RootCertStore::empty());
         let engine = crate::tls::build_client_engine("localhost", &mut opts).unwrap();
 
         let req =
