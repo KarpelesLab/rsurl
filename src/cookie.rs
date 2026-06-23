@@ -467,6 +467,13 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
             }
         } else if k.eq_ignore_ascii_case("path") {
             if let Some(v) = v {
+                // Reject the whole cookie if the path carries a control byte
+                // (CR/LF/NUL/TAB/...): keeps the jar-wide invariant that no
+                // stored field can forge a cookies.txt boundary or inject a
+                // downstream header, matching the name/value check above.
+                if has_forbidden_cookie_char(v) {
+                    return None;
+                }
                 if v.starts_with('/') {
                     path = v.to_string();
                 }
@@ -888,6 +895,22 @@ mod tests {
         assert_eq!(by("b").same_site, SameSite::None);
         assert!(by("b").partitioned);
         assert_eq!(by("c").same_site, SameSite::Unspecified);
+    }
+
+    #[test]
+    fn path_with_control_byte_is_dropped() {
+        // A control byte (CR/LF/NUL/TAB) in Path= must drop the whole cookie,
+        // mirroring the name/value forbidden-char rejection, so no stored field
+        // can carry a byte that forges a cookies.txt boundary downstream.
+        for bad in ["/x\ry", "/x\ny", "/x\0y", "/x\ty"] {
+            let mut j = CookieJar::new();
+            j.add_set_cookie(&url("https://example.com/"), &format!("a=1; Path={bad}"), 0);
+            assert!(j.is_empty(), "Path={bad:?} should drop the cookie");
+        }
+        // A clean path is still accepted.
+        let mut j = CookieJar::new();
+        j.add_set_cookie(&url("https://example.com/"), "a=1; Path=/ok", 0);
+        assert_eq!(j.iter().count(), 1);
     }
 
     #[test]
