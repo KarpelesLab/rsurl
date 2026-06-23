@@ -55,7 +55,9 @@ pub(crate) fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
 const ALLOC_HDR: usize = 16; // keeps 16-byte payload alignment; stores the size
 
 unsafe fn c_alloc(len: usize) -> *mut u8 {
-    let total = len + ALLOC_HDR;
+    let Some(total) = len.checked_add(ALLOC_HDR) else {
+        return ptr::null_mut();
+    };
     let Ok(layout) = Layout::from_size_align(total, 16) else {
         return ptr::null_mut();
     };
@@ -270,7 +272,12 @@ pub unsafe extern "C" fn curl_easy_escape(
         } else {
             CStr::from_ptr(string).to_bytes()
         };
-        let mut out = Vec::with_capacity(input.len() * 3);
+        // Worst case is 3 bytes out per input byte; an absurd caller-supplied
+        // length must not overflow the capacity into a too-small allocation.
+        let Some(cap) = input.len().checked_mul(3) else {
+            return ptr::null_mut();
+        };
+        let mut out = Vec::with_capacity(cap);
         for &b in input {
             if is_unreserved(b) {
                 out.push(b);
