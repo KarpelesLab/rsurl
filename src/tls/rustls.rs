@@ -430,7 +430,13 @@ fn build_identity(
         let kb = key_bytes.ok_or_else(|| {
             Error::BadResponse("client cert: a DER key needs --key (no embedded key)".into())
         })?;
-        PrivateKeyDer::try_from(kb.to_vec())
+        // Hold the transient decoded-DER copy in a `Zeroizing` buffer so the
+        // freed heap is wiped: `PrivateKeyDer::try_from` takes ownership of the
+        // bytes it keeps, but on the error path (or if it copies internally)
+        // the local copy would otherwise linger. Clone into the owned
+        // `PrivateKeyDer` and let `der` zero itself on drop.
+        let der = zeroize::Zeroizing::new(kb.to_vec());
+        PrivateKeyDer::try_from(der.to_vec())
             .map_err(|e| Error::BadResponse(format!("client key (DER): {e}")))?
     } else {
         // Look in the key file if given, else fall back to the cert file.
