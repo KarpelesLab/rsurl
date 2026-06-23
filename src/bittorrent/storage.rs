@@ -127,7 +127,10 @@ impl Storage {
 
     pub fn piece_size(&self, index: usize) -> u64 {
         let start = self.piece_length * index as u64;
-        (self.total - start).min(self.piece_length)
+        // Saturating: defense in depth so a degenerate piece table (e.g. an
+        // index whose start exceeds `total`) yields 0 rather than underflowing
+        // and panicking under overflow-checks (or wrapping in release).
+        self.total.saturating_sub(start).min(self.piece_length)
     }
 
     pub fn has(&self, index: usize) -> bool {
@@ -399,6 +402,21 @@ mod tests {
 
         // The output holds exactly data[5..9].
         assert_eq!(std::fs::read(&f).unwrap(), data[5..9].to_vec());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// Defense in depth: even a degenerate piece table (total 0 but several
+    /// hashes) must not underflow/panic in `piece_size`.
+    #[test]
+    fn piece_size_does_not_underflow_on_zero_total() {
+        let f = tmp("zero.bin");
+        let _ = std::fs::remove_file(&f);
+        let st = Storage::create(vec![(f.clone(), 0)], 4, vec![[0u8; 20]; 3]).unwrap();
+        assert_eq!(st.total_length(), 0);
+        // No panic / wrap for any index, including index >= 1.
+        assert_eq!(st.piece_size(0), 0);
+        assert_eq!(st.piece_size(1), 0);
+        assert_eq!(st.piece_size(2), 0);
         let _ = std::fs::remove_file(&f);
     }
 

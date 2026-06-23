@@ -147,9 +147,19 @@ impl Metainfo {
             return Err(terr("info has neither length nor files"));
         };
 
-        // The piece table must cover exactly the data.
-        let expected_pieces = total_length.div_ceil(piece_length).max(1) as usize;
-        if total_length > 0 && pieces.len() != expected_pieces {
+        // The piece table must cover exactly the data — including the
+        // degenerate total_length == 0 case, which must carry no piece hashes.
+        // (A zero-length torrent with >= 2 hashes would otherwise make
+        // `piece_size`/`Storage::piece_size` compute `total - start` with
+        // `start > total`, underflowing to a bogus huge size.) Note `pieces` is
+        // already guaranteed non-empty above, so a zero-length torrent (which
+        // must have zero pieces) is consistently rejected here.
+        let expected_pieces = if total_length == 0 {
+            0
+        } else {
+            total_length.div_ceil(piece_length) as usize
+        };
+        if pieces.len() != expected_pieces {
             return Err(terr("piece count does not match total length"));
         }
 
@@ -306,6 +316,21 @@ mod tests {
         assert_eq!(m.num_pieces(), 2);
         assert_eq!(m.piece_size(0), 4);
         assert_eq!(m.piece_size(1), 4);
+    }
+
+    /// A hostile torrent declaring total_length == 0 but carrying piece hashes
+    /// must be rejected, so `piece_size` can never see `start > total`.
+    #[test]
+    fn rejects_zero_length_with_pieces() {
+        let mut info = BTreeMap::new();
+        info.insert(b"name".to_vec(), Value::Bytes(b"hello.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), Value::Int(16384));
+        info.insert(b"length".to_vec(), Value::Int(0));
+        info.insert(b"pieces".to_vec(), Value::Bytes(vec![0u8; 40])); // 2 hashes
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Value::Dict(info));
+        let bytes = bencode::encode(&Value::Dict(root));
+        assert!(Metainfo::from_bytes(&bytes).is_err());
     }
 
     #[test]
