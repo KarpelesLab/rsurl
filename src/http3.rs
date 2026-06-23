@@ -1710,6 +1710,40 @@ fn process_uni_stream(state: &mut Http3State, sid: u64) -> Result<()> {
 fn verify_peer_certificates(conn: &QuicConnection, req: &Request, pins: &[[u8; 32]]) -> Result<()> {
     let leaf = conn.peer_certificates().first().map(Vec::as_slice);
 
+    // Public-key pinning (curl `--pinnedpubkey`): require the leaf SPKI to
+    // match at least one pin. Enforced even under `--insecure` and regardless
+    // of any verify callback, exactly like the TCP path.
+    if !pins.is_empty() {
+        match leaf {
+            Some(der) if crate::tls::client_auth::spki_pin_matches(der, pins) => {}
+            _ => {
+                return Err(Error::BadResponse(
+                    "pinned public key does not match server certificate".into(),
+                ))
+            }
+        }
+    }
+
+    // Caller-owned verification (the browser model): when a verify callback is
+    // set it is the *sole* trust authority — engine verification was disabled
+    // in `build_client` (`.verify_certificates(false)`), mirroring the TCP TLS
+    // path. Hand the callback the full peer chain and honour its verdict. The
+    // SAN check below is skipped: it is the engine's job, which the callback now
+    // owns.
+    if let Some(cb) = &req.tls_verify_callback {
+        let chain = conn.peer_certificates().to_vec();
+        let verdict = cb.call(&crate::tls::CertVerify {
+            server_name: &req.url.host,
+            chain_der: &chain,
+        });
+        if verdict == crate::tls::CertVerdict::Reject {
+            return Err(Error::BadResponse(
+                "server certificate rejected by verify callback".into(),
+            ));
+        }
+        return Ok(());
+    }
+
     // SAN-required hostname verification (TLS-4): reject a leaf that carries no
     // Subject Alternative Name (purecrypto's verifier would otherwise fall
     // back to the deprecated Common Name). Only meaningful when verifying.
@@ -1729,19 +1763,6 @@ fn verify_peer_certificates(conn: &QuicConnection, req: &Request, pins: &[[u8; 3
         }
     }
 
-    // Public-key pinning (curl `--pinnedpubkey`): require the leaf SPKI to
-    // match at least one pin. Enforced even under `--insecure`, exactly like
-    // the TCP path.
-    if !pins.is_empty() {
-        match leaf {
-            Some(der) if crate::tls::client_auth::spki_pin_matches(der, pins) => {}
-            _ => {
-                return Err(Error::BadResponse(
-                    "pinned public key does not match server certificate".into(),
-                ))
-            }
-        }
-    }
     Ok(())
 }
 
@@ -1775,7 +1796,11 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         .tls_only()
         .roots(roots)
         .server_name(req.url.host.clone())
-        .verify_certificates(req.verify_tls)
+        // A verify callback is the sole trust authority (browser model): when
+        // one is set, disable the engine's own chain verification and defer to
+        // the callback post-handshake (see `verify_peer_certificates`). This
+        // mirrors the TCP path's `effective_verify = verify && callback.is_none()`.
+        .verify_certificates(req.verify_tls && req.tls_verify_callback.is_none())
         // purecrypto 0.6.17 requires an explicit TLS/QUIC entropy source (no
         // implicit OsRng default); supply the OS CSPRNG.
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
