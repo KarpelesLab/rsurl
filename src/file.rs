@@ -29,11 +29,21 @@ pub(crate) fn fetch_to(url: &Url, sink: &mut dyn std::io::Write) -> Result<u64> 
 
     let path = Path::new(&url.path);
 
-    // Reject directories explicitly; we don't generate listings.
+    // Require a regular file. `fs::metadata` follows symlinks, so this also
+    // covers a symlink pointing at a directory, FIFO, or device. Rejecting
+    // non-regular files closes an unbounded read on e.g. /dev/zero or a FIFO,
+    // which would otherwise stream forever into `sink` (there's no size cap
+    // here). Directories are reported with their original, clearer message.
     let meta = fs::metadata(path)?;
     if meta.is_dir() {
         return Err(Error::BadResponse(format!(
             "path is a directory, not a file: {}",
+            url.path
+        )));
+    }
+    if !meta.is_file() {
+        return Err(Error::BadResponse(format!(
+            "path is not a regular file: {}",
             url.path
         )));
     }
@@ -118,6 +128,20 @@ mod tests {
         match fetch(&url) {
             Err(Error::Io(_)) => {}
             other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    /// A non-regular file (here the character device /dev/zero) must be
+    /// rejected rather than streamed unbounded into the sink.
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_file_is_rejected() {
+        let url = url_for("/dev/zero", "");
+        match fetch(&url) {
+            Err(Error::BadResponse(msg)) => {
+                assert!(msg.contains("not a regular file"), "msg = {msg}");
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
         }
     }
 
