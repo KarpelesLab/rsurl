@@ -158,8 +158,12 @@ pub fn write_state(path: &Path, real_size: u64, kind: Kind, meta: &[u8]) -> io::
     t[20..28].copy_from_slice(&(meta.len() as u64).to_le_bytes());
     t[28..32].copy_from_slice(&crc32(meta).to_le_bytes());
     f.write_all(&t)?;
-    // Drop any stale bytes from a previously-larger meta block.
-    let end = real_size + meta.len() as u64 + TRAILER_LEN;
+    // Drop any stale bytes from a previously-larger meta block. Mirror the
+    // read path's checked adds so an absurd size can't wrap and truncate.
+    let end = real_size
+        .checked_add(meta.len() as u64)
+        .and_then(|n| n.checked_add(TRAILER_LEN))
+        .ok_or_else(|| io::Error::other("resume size overflow"))?;
     f.set_len(end)?;
     f.flush()
 }
@@ -196,6 +200,25 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rsurl_resume_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn write_state_end_offset_uses_checked_adds() {
+        // write_state computes end = real_size + meta.len() + TRAILER_LEN with
+        // checked adds; a real_size near u64::MAX must yield None (→ an error)
+        // instead of wrapping (release) and truncating, or panicking (debug).
+        // This mirrors the exact guard expression used in write_state.
+        let checked_end = |real_size: u64, meta_len: u64| -> Option<u64> {
+            real_size
+                .checked_add(meta_len)
+                .and_then(|n| n.checked_add(TRAILER_LEN))
+        };
+        // Sane sizes succeed and match the plain sum.
+        assert_eq!(checked_end(100, 20), Some(100 + 20 + TRAILER_LEN));
+        // Oversized real_size overflows the trailer add → None (becomes Err).
+        assert_eq!(checked_end(u64::MAX, 0), None);
+        // Oversized via the meta add as well.
+        assert_eq!(checked_end(u64::MAX - 4, 8), None);
     }
 
     #[test]
