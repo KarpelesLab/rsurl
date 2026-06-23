@@ -437,7 +437,12 @@ fn read_response<R: Read>(reader: BufReader<R>) -> Result<RtspResponse> {
         .and_then(|(_, v)| v.parse::<u64>().ok())
         .unwrap_or(0);
 
-    if content_length as usize > MAX_BODY_BYTES {
+    // Compare the u64 directly against the cap *before* any cast: `as usize`
+    // truncates on 32-bit targets, so a value whose low 32 bits are small (e.g.
+    // 4294967297 → 1) would otherwise slip past the cap and then drive a
+    // multi-GiB read. After this guard `content_length <= MAX_BODY_BYTES`, so
+    // the casts below are provably lossless.
+    if content_length > MAX_BODY_BYTES as u64 {
         return Err(Error::BadResponse(format!(
             "body too large: {content_length}"
         )));
@@ -663,6 +668,25 @@ mod tests {
         let reader = BufReader::new(Cursor::new(response.to_vec()));
         let err = read_response(reader).unwrap_err();
         assert!(matches!(err, Error::UnexpectedEof));
+    }
+
+    #[test]
+    fn read_response_content_length_over_cap_is_rejected() {
+        // A Content-Length whose low 32 bits are small (4294967297 & 0xffff_ffff
+        // == 1) but whose u64 value exceeds MAX_BODY_BYTES must be rejected. The
+        // guard compares the u64 directly, so it fails the cap check before any
+        // truncating `as usize` cast or large `with_capacity` reservation. (usize
+        // is 64-bit on the test host; this asserts the u64 comparison path, which
+        // is what protects 32-bit targets where the cast would truncate.)
+        let response = b"RTSP/1.0 200 OK\r\n\
+                         Content-Length: 4294967297\r\n\
+                         \r\n";
+        let reader = BufReader::new(Cursor::new(response.to_vec()));
+        let err = read_response(reader).unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("body too large"), "msg = {msg}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
     }
 
     #[test]
