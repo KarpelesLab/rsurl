@@ -873,5 +873,6 @@ pub fn map_error(e: &Error) -> CURLcode {
         Error::Ssh(_) => CURLE_UNSUPPORTED_PROTOCOL,
         Error::Decode(_) => CURLE_BAD_CONTENT_ENCODING,
         Error::Status { .. } => CURLE_HTTP_RETURNED_ERROR,
+        Error::Cancelled => CURLE_ABORTED_BY_CALLBACK,
     }
 }
