@@ -365,19 +365,22 @@ pub fn connect_over_tls<S: Read + Write>(
     };
     s.run_handshake()?;
     s.snapshot_post_handshake();
-    // Caller-owned verification (the browser model): hand the full peer chain to
-    // the callback and honour its verdict. rsurl did no validation of its own.
-    if let Some(cb) = &opts.verify_callback {
-        let chain = s.peer_certificates().to_vec();
-        let verdict = cb.call(&super::common::CertVerify {
-            server_name: sni,
-            chain_der: &chain,
-        });
-        if verdict == super::common::CertVerdict::Reject {
-            return Err(Error::BadResponse(
-                "server certificate rejected by verify callback".into(),
-            ));
-        }
+    // Post-handshake trust policy (shared with the purecrypto backend): enforce
+    // public-key pinning FIRST and unconditionally — a pin mismatch fails closed
+    // even when a verify callback is present (SPKI extraction uses purecrypto's
+    // x509 parser, always linked) — then defer to a caller-owned verify callback
+    // if one is set (authoritative; the browser model). The HTTP/3 path enforces
+    // pins in the same order.
+    let chain = s.peer_certificates().to_vec();
+    let leaf = chain.first().map(Vec::as_slice);
+    if client_auth::enforce_pins_then_callback(
+        leaf,
+        &opts.pinned_spki_sha256,
+        sni,
+        &chain,
+        opts.verify_callback.as_ref(),
+    )? == client_auth::PostHandshakeDecision::CallbackAccepted
+    {
         return Ok(s);
     }
     // TLS-4: no SAN-less-leaf check is needed here. webpki (used by the rustls
@@ -385,20 +388,6 @@ pub fn connect_over_tls<S: Read + Write>(
     // it does not fall back to Common Name matching — so a SAN-less server cert
     // fails the handshake above. Only the purecrypto backend, which still has a
     // CN fallback, needs the explicit post-handshake check.
-    // Public-key pinning (curl `--pinnedpubkey`): hash the leaf cert SPKI and
-    // require a match against at least one pin. SPKI extraction uses
-    // purecrypto's x509 parser (always linked), shared with the other backend.
-    if !opts.pinned_spki_sha256.is_empty() {
-        let leaf = s.peer_certificates().first().map(Vec::as_slice);
-        match leaf {
-            Some(der) if client_auth::spki_pin_matches(der, &opts.pinned_spki_sha256) => {}
-            _ => {
-                return Err(Error::BadResponse(
-                    "pinned public key does not match server certificate".into(),
-                ))
-            }
-        }
-    }
     Ok(s)
 }
 

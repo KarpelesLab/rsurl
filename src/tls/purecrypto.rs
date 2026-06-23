@@ -286,19 +286,21 @@ pub fn connect_over_tls<S: Read + Write>(
         seen_eof: false,
     };
     s.run_handshake()?;
-    // Caller-owned verification (the browser model): hand the full peer chain to
-    // the callback and honour its verdict. rsurl did no validation of its own.
-    if let Some(cb) = &opts.verify_callback {
-        let chain = s.peer_certificates().to_vec();
-        let verdict = cb.call(&super::common::CertVerify {
-            server_name: sni,
-            chain_der: &chain,
-        });
-        if verdict == super::common::CertVerdict::Reject {
-            return Err(Error::BadResponse(
-                "server certificate rejected by verify callback".into(),
-            ));
-        }
+    // Post-handshake trust policy (shared with the rustls backend): enforce
+    // public-key pinning FIRST and unconditionally — a pin mismatch fails closed
+    // even when a verify callback is present — then defer to a caller-owned
+    // verify callback if one is set (authoritative; the browser model). The
+    // HTTP/3 path enforces pins in the same order.
+    let chain = s.peer_certificates().to_vec();
+    let leaf = chain.first().map(Vec::as_slice);
+    if client_auth::enforce_pins_then_callback(
+        leaf,
+        &opts.pinned_spki_sha256,
+        sni,
+        &chain,
+        opts.verify_callback.as_ref(),
+    )? == client_auth::PostHandshakeDecision::CallbackAccepted
+    {
         return Ok(s);
     }
     // TLS-4: reject a server leaf with no Subject Alternative Name. purecrypto's
@@ -314,19 +316,6 @@ pub fn connect_over_tls<S: Read + Write>(
                      (CN fallback is not accepted)"
                         .into(),
                 ));
-            }
-        }
-    }
-    // Public-key pinning (curl `--pinnedpubkey`): after the handshake, hash the
-    // leaf cert's SPKI and require a match against at least one pin.
-    if !opts.pinned_spki_sha256.is_empty() {
-        let leaf = s.peer_certificates().first().map(Vec::as_slice);
-        match leaf {
-            Some(der) if client_auth::spki_pin_matches(der, &opts.pinned_spki_sha256) => {}
-            _ => {
-                return Err(Error::BadResponse(
-                    "pinned public key does not match server certificate".into(),
-                ))
             }
         }
     }

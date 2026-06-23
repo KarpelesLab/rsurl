@@ -103,6 +103,64 @@ pub fn leaf_spki_sha256(leaf_der: &[u8]) -> Option<[u8; 32]> {
     Some(purecrypto::hash::sha256(spki))
 }
 
+/// Outcome of [`enforce_pins_then_callback`]: either the post-handshake policy
+/// is fully settled (a verify callback accepted, so the caller must stop and
+/// trust the chain) or no callback was present and the caller should continue
+/// to its own (engine) verification path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostHandshakeDecision {
+    /// A verify callback accepted the chain: trust it, run no further checks.
+    CallbackAccepted,
+    /// No verify callback was set: fall through to the normal verification path.
+    NoCallback,
+}
+
+/// Shared post-handshake trust policy for the TCP TLS backends, encoding the
+/// ordering that finding-1 requires: public-key **pinning is enforced first and
+/// unconditionally** (a mismatch fails closed), and only *then* is a
+/// caller-owned verify callback consulted. This guarantees a configured pin is
+/// honoured even when a verify callback is present — a pin is an explicit
+/// additional constraint, never delegated. The HTTP/3 path enforces pins in the
+/// same order.
+///
+/// `leaf` is the server leaf cert DER (the first peer certificate), or `None`
+/// when the peer surfaced no chain. Returns an error if the pin does not match
+/// or the callback rejects; otherwise reports whether a callback already
+/// settled the trust decision.
+pub fn enforce_pins_then_callback(
+    leaf: Option<&[u8]>,
+    pins: &[[u8; 32]],
+    server_name: &str,
+    chain_der: &[Vec<u8>],
+    callback: Option<&super::common::VerifyCallback>,
+) -> Result<PostHandshakeDecision> {
+    // Pinning first: must pass regardless of whether a callback is set.
+    if !pins.is_empty() {
+        match leaf {
+            Some(der) if spki_pin_matches(der, pins) => {}
+            _ => {
+                return Err(Error::BadResponse(
+                    "pinned public key does not match server certificate".into(),
+                ))
+            }
+        }
+    }
+    // Caller-owned verification (the browser model): authoritative when set.
+    if let Some(cb) = callback {
+        let verdict = cb.call(&super::common::CertVerify {
+            server_name,
+            chain_der,
+        });
+        if verdict == super::common::CertVerdict::Reject {
+            return Err(Error::BadResponse(
+                "server certificate rejected by verify callback".into(),
+            ));
+        }
+        return Ok(PostHandshakeDecision::CallbackAccepted);
+    }
+    Ok(PostHandshakeDecision::NoCallback)
+}
+
 /// TLS-4: return `true` if the server leaf certificate has at least one
 /// Subject Alternative Name. Used by the purecrypto backend to reject a
 /// SAN-less leaf (which would otherwise fall back to deprecated Common Name
@@ -567,5 +625,85 @@ mod tests {
         // DER loader yields the same single-entry chain.
         let chain_der = load_cert_chain_der(&leaf_der).expect("load DER chain");
         assert_eq!(chain_der[0], leaf_der);
+    }
+
+    use super::super::common::{CertVerdict, VerifyCallback};
+
+    /// Finding 1 regression: a `--pinnedpubkey` mismatch must fail closed even
+    /// when a verify callback is present (so a pin is never silently skipped by
+    /// delegating the decision to a callback). The callback here accepts
+    /// everything; the wrong pin must still make `enforce_pins_then_callback`
+    /// error rather than return `CallbackAccepted`.
+    #[test]
+    fn pin_mismatch_fails_closed_even_with_accepting_callback() {
+        let (leaf_der, _key) = test_ed25519_leaf();
+        let chain = vec![leaf_der.clone()];
+        let accept_all = VerifyCallback::new(|_| CertVerdict::Accept);
+        let wrong = [0xABu8; 32];
+
+        let r = enforce_pins_then_callback(
+            Some(&leaf_der),
+            &[wrong],
+            "localhost",
+            &chain,
+            Some(&accept_all),
+        );
+        assert!(
+            r.is_err(),
+            "a mismatched pin must fail closed regardless of the callback verdict"
+        );
+
+        // Sanity: with the *correct* pin and the same accepting callback, the
+        // callback is consulted and reported as authoritative.
+        let pin = leaf_spki_sha256(&leaf_der).expect("extract SPKI hash");
+        let ok = enforce_pins_then_callback(
+            Some(&leaf_der),
+            &[pin],
+            "localhost",
+            &chain,
+            Some(&accept_all),
+        )
+        .expect("matching pin + accepting callback succeeds");
+        assert_eq!(ok, PostHandshakeDecision::CallbackAccepted);
+    }
+
+    /// A rejecting callback fails the connection even when the pin matches —
+    /// the callback is authoritative once the pin has passed.
+    #[test]
+    fn rejecting_callback_fails_after_pin_passes() {
+        let (leaf_der, _key) = test_ed25519_leaf();
+        let chain = vec![leaf_der.clone()];
+        let pin = leaf_spki_sha256(&leaf_der).expect("extract SPKI hash");
+        let reject_all = VerifyCallback::new(|_| CertVerdict::Reject);
+        assert!(enforce_pins_then_callback(
+            Some(&leaf_der),
+            &[pin],
+            "localhost",
+            &chain,
+            Some(&reject_all),
+        )
+        .is_err());
+    }
+
+    /// With no callback set, a matching pin reports `NoCallback` (the caller
+    /// then runs its own engine verification) and a mismatch still fails closed.
+    #[test]
+    fn no_callback_path_enforces_pin() {
+        let (leaf_der, _key) = test_ed25519_leaf();
+        let chain = vec![leaf_der.clone()];
+        let pin = leaf_spki_sha256(&leaf_der).expect("extract SPKI hash");
+        assert_eq!(
+            enforce_pins_then_callback(Some(&leaf_der), &[pin], "localhost", &chain, None)
+                .expect("matching pin, no callback"),
+            PostHandshakeDecision::NoCallback,
+        );
+        assert!(enforce_pins_then_callback(
+            Some(&leaf_der),
+            &[[0u8; 32]],
+            "localhost",
+            &chain,
+            None,
+        )
+        .is_err());
     }
 }
