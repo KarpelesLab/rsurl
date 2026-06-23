@@ -1773,6 +1773,16 @@ fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
         }
         _ => unreachable!(),
     };
+    // Control frames (opcode >= 0x8) carry at most 125 bytes (RFC 6455 §5.5).
+    // Enforce that here, before the payload is buffered, so a PING/PONG/CLOSE
+    // declaring a huge length is rejected without first allocating up to
+    // MAX_PAYLOAD_BYTES (64 MiB). The same rule is re-checked by the caller via
+    // `validate_control_frame`; this is the early, allocation-bounding guard.
+    if opcode >= 0x8 && payload_len > MAX_CONTROL_PAYLOAD as u64 {
+        return Err(Error::BadResponse(format!(
+            "control frame payload too large: {payload_len} bytes (max {MAX_CONTROL_PAYLOAD})"
+        )));
+    }
     if payload_len > MAX_PAYLOAD_BYTES {
         return Err(Error::BadResponse(format!(
             "WS payload too large: {payload_len} bytes"
@@ -2149,6 +2159,26 @@ mod tests {
         assert_eq!(f.opcode, OPCODE_BINARY);
         assert_eq!(f.payload.len(), 200);
         assert!(f.payload.iter().all(|&b| b == b'A'));
+    }
+
+    #[test]
+    fn read_frame_rejects_oversized_control_frame_before_alloc() {
+        // A PING (control opcode 0x9) declaring a 126-byte payload must be
+        // rejected by read_frame *before* the payload is buffered (RFC 6455
+        // §5.5: control frames carry ≤ 125 bytes). We feed only the 4-byte
+        // header (0x89, 126, u16=126) with NO payload bytes: if read_frame tried
+        // to buffer the declared payload it would hit UnexpectedEof, but the
+        // early control-frame guard fires first and returns the protocol error.
+        let bytes = [0x89u8, 126, 0x00, 126];
+        let mut cur = Cursor::new(&bytes[..]);
+        let err = read_frame(&mut cur, &mut Vec::new()).expect_err("must reject");
+        match err {
+            Error::BadResponse(msg) => assert!(
+                msg.contains("control frame payload too large"),
+                "msg = {msg}"
+            ),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
     }
 
     #[test]
