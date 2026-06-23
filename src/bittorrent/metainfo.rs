@@ -12,6 +12,12 @@ fn terr(msg: &str) -> Error {
     Error::BadResponse(format!("torrent: {msg}"))
 }
 
+/// Upper bound on a torrent's declared `piece length`. Real-world torrents use
+/// 16 KiB–16 MiB; we cap generously at 128 MiB so a hostile torrent cannot make
+/// each peer thread pre-allocate a multi-GiB piece buffer before any data
+/// arrives (a per-peer memory-exhaustion DoS).
+const MAX_PIECE_LENGTH: u64 = 128 * 1024 * 1024;
+
 /// SHA-1 of `data` as a 20-byte array.
 pub(crate) fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h = Sha1::new();
@@ -80,6 +86,9 @@ impl Metainfo {
                 .and_then(Value::as_int)
                 .filter(|&n| n > 0)
                 .ok_or_else(|| terr("missing/invalid info.piece length"))? as u64;
+        if piece_length > MAX_PIECE_LENGTH {
+            return Err(terr("info.piece length exceeds maximum"));
+        }
 
         let pieces_raw = info
             .get(b"pieces")
@@ -327,6 +336,24 @@ mod tests {
         info.insert(b"piece length".to_vec(), Value::Int(16384));
         info.insert(b"length".to_vec(), Value::Int(0));
         info.insert(b"pieces".to_vec(), Value::Bytes(vec![0u8; 40])); // 2 hashes
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Value::Dict(info));
+        let bytes = bencode::encode(&Value::Dict(root));
+        assert!(Metainfo::from_bytes(&bytes).is_err());
+    }
+
+    /// A torrent declaring a piece length above the cap is rejected (per-peer
+    /// pre-allocation DoS).
+    #[test]
+    fn rejects_oversized_piece_length() {
+        let mut info = BTreeMap::new();
+        info.insert(b"name".to_vec(), Value::Bytes(b"hello.txt".to_vec()));
+        info.insert(
+            b"piece length".to_vec(),
+            Value::Int(MAX_PIECE_LENGTH as i64 + 1),
+        );
+        info.insert(b"length".to_vec(), Value::Int(10));
+        info.insert(b"pieces".to_vec(), Value::Bytes(vec![0u8; 20]));
         let mut root = BTreeMap::new();
         root.insert(b"info".to_vec(), Value::Dict(info));
         let bytes = bencode::encode(&Value::Dict(root));
