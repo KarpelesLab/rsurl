@@ -235,7 +235,19 @@ impl Metainfo {
     }
 }
 
-/// Reject a path component that could escape the download directory.
+/// Windows reserved device names (case-insensitive, matched with or without an
+/// extension, e.g. `CON`, `nul.txt`). On Windows these alias devices rather
+/// than files, so a torrent component bearing one is a surprising-write
+/// primitive; we reject them on every platform for reproducible behavior.
+const WINDOWS_RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Reject a path component that could escape the download directory or trigger
+/// a surprising write target. Windows-specific checks (`:`, reserved device
+/// names, trailing dot/space) run on every platform so behavior is identical
+/// across hosts.
 fn sanitize_component(s: &str) -> Result<()> {
     if s.is_empty()
         || s == "."
@@ -243,6 +255,22 @@ fn sanitize_component(s: &str) -> Result<()> {
         || s.contains('/')
         || s.contains('\\')
         || s.contains('\0')
+        // `:` is a drive separator (`C:`) or NTFS alternate-data-stream
+        // separator (`file.txt:stream`) on Windows.
+        || s.contains(':')
+        // Windows silently strips trailing dots and spaces, which would let a
+        // component resolve to a different name than the one we validated.
+        || s.ends_with('.')
+        || s.ends_with(' ')
+    {
+        return Err(terr("unsafe path component"));
+    }
+    // Reserved device names, with or without an extension (the stem before the
+    // first `.` is what Windows matches against).
+    let stem = s.split('.').next().unwrap_or(s);
+    if WINDOWS_RESERVED
+        .iter()
+        .any(|r| stem.eq_ignore_ascii_case(r))
     {
         return Err(terr("unsafe path component"));
     }
@@ -358,6 +386,24 @@ mod tests {
         root.insert(b"info".to_vec(), Value::Dict(info));
         let bytes = bencode::encode(&Value::Dict(root));
         assert!(Metainfo::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn sanitize_component_rejects_windows_hazards() {
+        // Drive-letter / NTFS alternate-data-stream separator.
+        assert!(sanitize_component("C:").is_err());
+        assert!(sanitize_component("file.txt:stream").is_err());
+        // Reserved device names, bare and with an extension, any case.
+        assert!(sanitize_component("CON").is_err());
+        assert!(sanitize_component("nul.txt").is_err());
+        assert!(sanitize_component("Com1").is_err());
+        assert!(sanitize_component("LPT9").is_err());
+        // Trailing dot / space (Windows strips these).
+        assert!(sanitize_component("name.").is_err());
+        assert!(sanitize_component("name ").is_err());
+        // A plain component is still accepted.
+        assert!(sanitize_component("readme.txt").is_ok());
+        assert!(sanitize_component("console.log").is_ok());
     }
 
     #[test]
