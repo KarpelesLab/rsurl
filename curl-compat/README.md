@@ -44,9 +44,18 @@ LD_LIBRARY_PATH=target/release LD_PRELOAD=target/release/libcurl.so.4 ./your-pro
   library only if its original libcurl used the same node name (distros that
   build libcurl against GnuTLS/NSS use a different node). Programs recompiled
   against this header — or linked at build time — are unaffected.
-- **64-bit Unix ABI.** `curl_easy_setopt`/`curl_easy_getinfo` rely on the
-  third (variadic) argument landing in a register, as it does on 64-bit
-  SysV/AArch64. 32-bit `curl_off_t` varargs are not handled.
+- **32-bit (ILP32) support, with one caveat.** `curl_easy_setopt` takes the
+  variadic third argument as a single pointer-width slot. That is ABI-correct on
+  any target for the pointer-width option classes — `long`, pointer, and
+  function-pointer options — and for every `curl_easy_getinfo` arm (the caller
+  supplies the typed out-pointer), so i686 / 32-bit-ARM embedded builds are
+  supported and CI-tested on the pure-Rust backends. The **only** exception is
+  64-bit `curl_off_t` (`*_LARGE`) setopt options: on a 32-bit target the 64-bit
+  argument spans two arg slots that this non-variadic signature cannot read, so
+  `CURLOPT_POSTFIELDSIZE_LARGE` returns `CURLE_NOT_BUILT_IN` there rather than
+  truncating — use the `long`-typed `CURLOPT_POSTFIELDSIZE` instead (good for
+  bodies under 2 GiB). (The rustls TLS backend additionally needs an i686
+  cross-toolchain for its `ring` provider; the pure-Rust default does not.)
 - **Subset, growing toward parity.** A high-value set of options/info and the
   easy + multi interfaces are implemented; unimplemented options return
   `CURLE_UNKNOWN_OPTION`/`CURLE_NOT_BUILT_IN` rather than silently succeeding.

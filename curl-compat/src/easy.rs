@@ -255,10 +255,20 @@ unsafe fn opt_string(value: usize) -> Option<String> {
 
 /// `CURLcode curl_easy_setopt(CURL*, CURLoption, ...)`.
 ///
-/// Declared non-variadic: on 64-bit SysV/AArch64 the single third argument
-/// (long / pointer / curl_off_t / function pointer) is passed in the same
-/// register, so taking it as `usize` and reinterpreting by the option's type
-/// class (`option / 10000`) is ABI-compatible. See the crate README.
+/// Declared non-variadic: the single third argument is taken as `usize` and
+/// reinterpreted by the option's type class (`option / 10000`). This is
+/// ABI-compatible on any target for the pointer-width option classes — `long`,
+/// pointer, and function-pointer options — because those occupy one
+/// pointer-width argument slot, the same slot a fixed prototype reads. All
+/// `curl_easy_getinfo` arms are likewise width-independent (the caller supplies
+/// the typed out-pointer).
+///
+/// The one exception is 64-bit `curl_off_t` (`*_LARGE`) options: on a 64-bit
+/// target the value fits the single `value` slot, but on a 32-bit (ILP32)
+/// target a variadic 64-bit argument spans two arg slots that this faked
+/// signature cannot read, so those options are rejected there rather than
+/// stored truncated (see `CURLOPT_POSTFIELDSIZE_LARGE` below). See the crate
+/// README.
 #[no_mangle]
 pub unsafe extern "C" fn curl_easy_setopt(
     handle: *mut CURL,
@@ -365,8 +375,22 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLOPT_CONNECTTIMEOUT_MS => h.connect_timeout_ms = Some(lv.max(0) as u64),
             CURLOPT_POSTFIELDSIZE => h.post_len = if lv < 0 { None } else { Some(lv as usize) },
             CURLOPT_POSTFIELDSIZE_LARGE => {
-                let off = value as i64;
-                h.post_len = if off < 0 { None } else { Some(off as usize) };
+                // `curl_off_t` is 64-bit. On a 64-bit target it arrives in the
+                // single pointer-width `value` slot and is reinterpreted
+                // directly. On a 32-bit (ILP32) target the variadic 64-bit
+                // argument spans two arg slots that this non-variadic signature
+                // cannot read, so reject it rather than store a truncated size;
+                // callers should use the `long`-typed CURLOPT_POSTFIELDSIZE
+                // instead (sufficient for bodies below 2 GiB).
+                #[cfg(target_pointer_width = "64")]
+                {
+                    let off = value as i64;
+                    h.post_len = if off < 0 { None } else { Some(off as usize) };
+                }
+                #[cfg(not(target_pointer_width = "64"))]
+                {
+                    return CURLE_NOT_BUILT_IN;
+                }
             }
             // --- recognized but behaviorally irrelevant here: accept silently ---
             CURLOPT_SSL_VERIFYHOST
@@ -874,5 +898,39 @@ pub fn map_error(e: &Error) -> CURLcode {
         Error::Decode(_) => CURLE_BAD_CONTENT_ENCODING,
         Error::Status { .. } => CURLE_HTTP_RETURNED_ERROR,
         Error::Cancelled => CURLE_ABORTED_BY_CALLBACK,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pointer-width options (here a plain `long`) work on every target.
+    #[test]
+    fn long_option_is_accepted_on_any_target() {
+        unsafe {
+            let h = curl_easy_init();
+            assert!(!h.is_null());
+            assert_eq!(curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, 16), CURLE_OK);
+            curl_easy_cleanup(h);
+        }
+    }
+
+    /// `CURLOPT_POSTFIELDSIZE_LARGE` carries a 64-bit `curl_off_t`. It is honored
+    /// on 64-bit targets and rejected with `CURLE_NOT_BUILT_IN` on 32-bit (ILP32),
+    /// where the variadic 64-bit argument cannot be read through the faked
+    /// non-variadic signature. The 32-bit arm is exercised by the i686 CI leg.
+    #[test]
+    fn postfieldsize_large_depends_on_pointer_width() {
+        unsafe {
+            let h = curl_easy_init();
+            assert!(!h.is_null());
+            let rc = curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, 123);
+            #[cfg(target_pointer_width = "64")]
+            assert_eq!(rc, CURLE_OK);
+            #[cfg(not(target_pointer_width = "64"))]
+            assert_eq!(rc, CURLE_NOT_BUILT_IN);
+            curl_easy_cleanup(h);
+        }
     }
 }
