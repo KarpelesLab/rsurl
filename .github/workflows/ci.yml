@@ -95,6 +95,68 @@ jobs:
              -o ffi_smoke_shared
           LD_LIBRARY_PATH=target/release ./ffi_smoke_shared
 
+      - name: Install clippy
+        run: rustup component add clippy
+
+      - name: Build, lint & test the curl-compat shim
+        # curl-compat is an optional workspace member (not in default-members),
+        # so the steps above never touch it. Gate it here too — a non-exhaustive
+        # match or other breakage in the libcurl-ABI shim must turn CI red.
+        run: |
+          cargo clippy -p curl-compat --all-targets -- -D warnings
+          cargo build -p curl-compat --release
+          cargo test -p curl-compat
+
+  linux32:
+    name: 32-bit (i686, pure-Rust backends)
+    runs-on: ubuntu-latest
+    # rsurl's pure-Rust path (the purecrypto default and the http-only build)
+    # targets 32-bit/ILP32 embedded devices. x86-64 runners execute i686
+    # binaries natively with multilib, so the tests actually run. The rustls
+    # backend is intentionally excluded: its `ring` provider compiles C/asm and
+    # needs an i686 cross-toolchain, which is a `ring` concern, not rsurl's.
+    strategy:
+      fail-fast: false
+      matrix:
+        backend:
+          - name: default
+            flags: ""
+          - name: http-only
+            flags: "--no-default-features --features purecrypto-tls,idn"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (with i686 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+          components: clippy
+
+      - name: Install 32-bit link support
+        # rustc shells out to gcc to link the i686 binaries; gcc-multilib
+        # provides the 32-bit crt/libc and `-m32` support.
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: i686-${{ matrix.backend.name }}
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --target i686-unknown-linux-gnu --all-targets ${{ matrix.backend.flags }} -- -D warnings
+
+      - name: Test (release)
+        run: cargo test --release --target i686-unknown-linux-gnu ${{ matrix.backend.flags }}
+
+      - name: Build, lint & test the curl-compat shim (i686)
+        # Exercises the pointer-width gate: CURLOPT_POSTFIELDSIZE_LARGE rejects
+        # with CURLE_NOT_BUILT_IN on ILP32 instead of truncating the curl_off_t.
+        if: matrix.backend.name == 'default'
+        run: |
+          cargo clippy -p curl-compat --target i686-unknown-linux-gnu --all-targets -- -D warnings
+          cargo build -p curl-compat --release --target i686-unknown-linux-gnu
+          cargo test -p curl-compat --target i686-unknown-linux-gnu
+
   docs:
     name: Docs build (warnings denied)
     runs-on: ubuntu-latest
