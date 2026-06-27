@@ -2256,8 +2256,9 @@ fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     let method = effective_method(req);
     let mut exchange = ClientExchange::new(&method, request_bytes);
     let events = crate::io::blocking::drive(&mut exchange, &mut stream)?;
-    let Http1Event::Response { head, body } =
-        events.into_iter().next().ok_or(Error::UnexpectedEof)?;
+    let Some(Http1Event::Response { head, body }) = events.into_iter().next() else {
+        return Err(Error::UnexpectedEof);
+    };
 
     let (headers, body) = maybe_decode_body(head.headers, body, req.decompress, trace)?;
     let mut resp = Response {
@@ -2309,8 +2310,9 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     let events = crate::io::blocking::drive(&mut tls, &mut tcp)?;
     let params = tls.tls_params();
 
-    let Http1Event::Response { head, body } =
-        events.into_iter().next().ok_or(Error::UnexpectedEof)?;
+    let Some(Http1Event::Response { head, body }) = events.into_iter().next() else {
+        return Err(Error::UnexpectedEof);
+    };
     let (headers, body) = maybe_decode_body(head.headers, body, req.decompress, trace)?;
     let mut resp = Response {
         status: head.status,

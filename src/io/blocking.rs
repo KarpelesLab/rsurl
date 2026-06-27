@@ -26,6 +26,25 @@ where
     S: NetStream + ?Sized,
 {
     let mut events = Vec::new();
+    drive_streaming(machine, io, |ev| {
+        events.push(ev);
+        Ok(())
+    })?;
+    Ok(events)
+}
+
+/// Like [`drive`], but relay each event to `on_event` as it is produced instead
+/// of collecting them into a `Vec` returned at completion. This is what a
+/// streaming frontend uses: a machine in streaming mode emits its head and body
+/// chunks incrementally, and `on_event` (e.g. writing a body chunk to a sink)
+/// runs during the transfer rather than after it. An `on_event` error aborts the
+/// drive and propagates.
+pub(crate) fn drive_streaming<M, S, F>(machine: &mut M, io: &mut S, mut on_event: F) -> Result<()>
+where
+    M: Machine,
+    S: NetStream + ?Sized,
+    F: FnMut(M::Event) -> Result<()>,
+{
     let mut scratch = [0u8; 16 * 1024];
     let mut out = Vec::new();
     let mut eof_seen = false;
@@ -39,14 +58,14 @@ where
             io.flush().map_err(Error::Io)?;
         }
 
-        // 2. Hand the caller every event produced so far.
+        // 2. Relay every event produced so far to the caller.
         while let Some(ev) = machine.poll_event() {
-            events.push(ev);
+            on_event(ev)?;
         }
 
         // 3. Done?
         if machine.is_finished() {
-            return Ok(events);
+            return Ok(());
         }
 
         // A machine that already saw EOF but still isn't finished would spin on
@@ -128,7 +147,9 @@ mod tests {
         let events = super::drive(&mut x, &mut sock).unwrap();
 
         assert_eq!(events.len(), 1);
-        let Event::Response { head, body } = &events[0];
+        let Event::Response { head, body } = &events[0] else {
+            panic!("expected Response event");
+        };
         assert_eq!(head.status, 200);
         assert_eq!(body, b"hello");
     }
@@ -143,8 +164,46 @@ mod tests {
         let mut x = ClientExchange::new("GET", req);
         let events = super::drive(&mut x, &mut sock).unwrap();
 
-        let Event::Response { head, body } = &events[0];
+        let Event::Response { head, body } = &events[0] else {
+            panic!("expected Response event");
+        };
         assert_eq!(head.status, 200);
         assert_eq!(body, b"streamed payload");
+    }
+
+    #[test]
+    fn drive_streaming_relays_head_body_end_in_order() {
+        let port = serve_once(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+        );
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+        let req = ClientExchange::encode_request("GET", "/", &[("Host".into(), "x".into())], b"");
+        let mut x = ClientExchange::new_streaming("GET", req);
+
+        let mut kinds = Vec::new();
+        let mut body = Vec::new();
+        super::drive_streaming(&mut x, &mut sock, |ev| {
+            match ev {
+                Event::Head(h) => {
+                    assert_eq!(h.status, 200);
+                    kinds.push("head");
+                }
+                Event::Body(b) => {
+                    body.extend_from_slice(&b);
+                    kinds.push("body");
+                }
+                Event::End => kinds.push("end"),
+                Event::Response { .. } => panic!("streaming mode should not emit Response"),
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(kinds.first().copied(), Some("head"));
+        assert_eq!(kinds.last().copied(), Some("end"));
+        assert!(kinds.iter().any(|k| *k == "body"));
+        assert_eq!(body, b"hello world");
     }
 }

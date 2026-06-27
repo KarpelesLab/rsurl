@@ -2,13 +2,14 @@
 //! request and decodes one response. No sockets, no clock — driven by
 //! [`crate::io`]'s blocking or async driver.
 //!
-//! This is the Phase-1 vertical slice of the sans-IO re-architecture. It mirrors
-//! the framing rules of the legacy streaming path in [`crate::http`]
+//! It mirrors the framing rules of the legacy streaming path in [`crate::http`]
 //! (`read_head`/`read_body`/`read_chunked`) byte-for-byte, and reuses that
 //! module's validated parsers ([`parse_status_line`](crate::http::parse_status_line),
 //! [`parse_content_length`](crate::http::parse_content_length)) so the
-//! security-sensitive header logic is not duplicated. Response bodies are
-//! delivered whole on completion; streaming delivery is a later phase.
+//! security-sensitive header logic is not duplicated. A buffered exchange
+//! ([`ClientExchange::new`]) delivers the body whole on completion; a streaming
+//! exchange ([`ClientExchange::new_streaming`]) emits the head and body
+//! incrementally so a frontend can relay the body to a sink without buffering it.
 
 use std::collections::VecDeque;
 
@@ -27,12 +28,24 @@ pub(crate) struct Http1Head {
 }
 
 /// Application-level outputs of a [`ClientExchange`].
+///
+/// A buffered exchange ([`ClientExchange::new`]) emits a single [`Event::Response`].
+/// A streaming exchange ([`ClientExchange::new_streaming`]) instead emits
+/// [`Event::Head`] once, then an [`Event::Body`] per decoded chunk as bytes
+/// arrive, then [`Event::End`] — so a frontend can stream the body to a sink or
+/// reader without buffering the whole response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Event {
     /// The full response: head plus the complete (still wire-encoded, i.e. not
-    /// yet content-decoded) body. Emitted exactly once, then the machine
-    /// finishes.
+    /// yet content-decoded) body. Emitted exactly once (buffered mode), then the
+    /// machine finishes.
     Response { head: Http1Head, body: Vec<u8> },
+    /// Streaming mode: the response head, emitted once as soon as it is parsed.
+    Head(Http1Head),
+    /// Streaming mode: a run of decoded (still wire-encoded) body bytes.
+    Body(Vec<u8>),
+    /// Streaming mode: the body is complete; the machine finishes.
+    End,
 }
 
 /// How the response body is framed, decided from the head per RFC 9112.
@@ -83,13 +96,35 @@ pub(crate) struct ClientExchange {
     state: State,
     head: Option<Http1Head>,
     body: Vec<u8>,
+    /// Total body bytes accumulated so far. Tracked separately from `body.len()`
+    /// because streaming mode drains `body` after each emit, yet `Length` framing
+    /// and the size cap need the running received total.
+    body_total: u64,
     events: VecDeque<Event>,
+    /// Stream the response as incremental `Head`/`Body`/`End` events instead of
+    /// one buffered `Response`.
+    streaming: bool,
+    /// In streaming mode, whether the one-shot `Head` event has been emitted.
+    head_emitted: bool,
 }
 
 impl ClientExchange {
     /// Build an exchange that will send `request_bytes` (a fully-encoded HTTP/1.1
     /// request) and decode the response. `method` drives body-presence rules.
     pub(crate) fn new(method: &str, request_bytes: Vec<u8>) -> ClientExchange {
+        ClientExchange::build(method, request_bytes, false)
+    }
+
+    /// Like [`new`](Self::new) but streams the response: the machine emits
+    /// [`Event::Head`] once, an [`Event::Body`] per decoded chunk as bytes
+    /// arrive, then [`Event::End`] — instead of one buffered [`Event::Response`].
+    /// Pair with [`crate::io::blocking::drive_streaming`] to deliver the body
+    /// without buffering it whole.
+    pub(crate) fn new_streaming(method: &str, request_bytes: Vec<u8>) -> ClientExchange {
+        ClientExchange::build(method, request_bytes, true)
+    }
+
+    fn build(method: &str, request_bytes: Vec<u8>, streaming: bool) -> ClientExchange {
         ClientExchange {
             out: request_bytes,
             method: method.to_ascii_uppercase(),
@@ -97,7 +132,10 @@ impl ClientExchange {
             state: State::Head,
             head: None,
             body: Vec::new(),
+            body_total: 0,
             events: VecDeque::new(),
+            streaming,
+            head_emitted: false,
         }
     }
 
@@ -154,11 +192,13 @@ impl ClientExchange {
                 }
                 State::Length(n) => {
                     let n = *n;
-                    if (self.body.len() as u64) + (self.rx.len() as u64) >= n {
-                        let need = (n - self.body.len() as u64) as usize;
+                    if self.body_total + (self.rx.len() as u64) >= n {
+                        let need = (n - self.body_total) as usize;
                         self.body.extend(self.rx.drain(..need));
+                        self.body_total += need as u64;
                         self.state = self.finish();
                     } else {
+                        self.body_total += self.rx.len() as u64;
                         self.body.append(&mut self.rx);
                         return Ok(()); // need more bytes
                     }
@@ -172,9 +212,10 @@ impl ClientExchange {
                 }
                 State::Eof => {
                     // Accumulate; completion happens on handle_eof.
-                    if self.body.len() + self.rx.len() > MAX_BODY_BYTES {
+                    if self.body_total + (self.rx.len() as u64) > MAX_BODY_BYTES as u64 {
                         return Err(Error::BadResponse("body too large".into()));
                     }
+                    self.body_total += self.rx.len() as u64;
                     self.body.append(&mut self.rx);
                     return Ok(());
                 }
@@ -227,6 +268,7 @@ impl ClientExchange {
                     return Ok(false);
                 }
                 self.body.extend(self.rx.drain(..take));
+                self.body_total += take as u64;
                 cs.remaining -= take as u64;
                 if cs.remaining == 0 {
                     cs.crlf_pending = true;
@@ -243,7 +285,7 @@ impl ClientExchange {
             };
             let line: Vec<u8> = self.rx.drain(..=nl).collect();
             let size = parse_chunk_size(&line)?;
-            if self.body.len().saturating_add(size as usize) > MAX_BODY_BYTES {
+            if self.body_total.saturating_add(size) > MAX_BODY_BYTES as u64 {
                 return Err(Error::BadResponse("body too large".into()));
             }
             if size == 0 {
@@ -254,12 +296,35 @@ impl ClientExchange {
         }
     }
 
-    /// Queue the completion event and return the `Done` state.
+    /// Queue the completion event(s) and return the `Done` state. Buffered mode
+    /// emits one [`Event::Response`]; streaming mode flushes any pending
+    /// `Head`/`Body` then emits [`Event::End`].
     fn finish(&mut self) -> State {
-        let head = self.head.clone().expect("head set before finish");
-        let body = std::mem::take(&mut self.body);
-        self.events.push_back(Event::Response { head, body });
+        if self.streaming {
+            self.emit_streaming();
+            self.events.push_back(Event::End);
+        } else {
+            let head = self.head.clone().expect("head set before finish");
+            let body = std::mem::take(&mut self.body);
+            self.events.push_back(Event::Response { head, body });
+        }
         State::Done
+    }
+
+    /// Streaming mode only: emit the one-shot [`Event::Head`] once it is parsed,
+    /// then drain whatever body bytes have accumulated so far as an
+    /// [`Event::Body`]. Called after each input batch and from [`finish`].
+    fn emit_streaming(&mut self) {
+        if !self.head_emitted {
+            if let Some(head) = self.head.clone() {
+                self.events.push_back(Event::Head(head));
+                self.head_emitted = true;
+            }
+        }
+        if !self.body.is_empty() {
+            let chunk = std::mem::take(&mut self.body);
+            self.events.push_back(Event::Body(chunk));
+        }
     }
 }
 
@@ -273,6 +338,12 @@ impl Machine for ClientExchange {
         self.rx.extend_from_slice(wire);
         let before = self.rx.len();
         self.advance()?;
+        // Streaming mode: surface the head and any body decoded this batch now,
+        // so the driver can relay them before the response completes. (A no-op
+        // once `advance` has already finished, which flushes via `finish`.)
+        if self.streaming {
+            self.emit_streaming();
+        }
         // We always take ownership of the offered bytes into `rx`, so report the
         // whole slice as consumed (any unconsumed tail lives in `rx`).
         let _ = before;
@@ -447,7 +518,9 @@ mod tests {
     }
 
     fn head_body(ev: Event) -> (Http1Head, Vec<u8>) {
-        let Event::Response { head, body } = ev;
+        let Event::Response { head, body } = ev else {
+            panic!("expected Response event, got {ev:?}");
+        };
         (head, body)
     }
 
@@ -469,6 +542,63 @@ mod tests {
         assert!(x.poll_transmit(&mut out));
         assert_eq!(out, b"GET / HTTP/1.1\r\n\r\n");
         assert!(!x.poll_transmit(&mut out));
+    }
+
+    #[test]
+    fn streaming_emits_head_then_body_chunks_then_end() {
+        // A streaming exchange surfaces the head as soon as it is parsed, body
+        // bytes as they arrive across separate input batches, and a final End.
+        let mut x = ClientExchange::new_streaming("GET", Vec::new());
+        x.handle_input(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhel")
+            .unwrap();
+        // First batch: head + the first body slice, no End yet.
+        assert!(matches!(x.poll_event(), Some(Event::Head(h)) if h.status == 200));
+        assert!(matches!(x.poll_event(), Some(Event::Body(b)) if b == b"hel"));
+        assert!(x.poll_event().is_none());
+        assert!(!x.is_finished());
+
+        // Second batch completes the body; head is not re-emitted.
+        x.handle_input(b"lo wor").unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::Body(b)) if b == b"lo wor"));
+        assert!(x.poll_event().is_none());
+        assert!(!x.is_finished());
+
+        // Final batch reaches Content-Length → trailing body flush then End.
+        x.handle_input(b"ld").unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::Body(b)) if b == b"ld"));
+        assert!(matches!(x.poll_event(), Some(Event::End)));
+        assert!(x.poll_event().is_none());
+        assert!(x.is_finished());
+    }
+
+    #[test]
+    fn streaming_chunked_body_decodes_across_batches() {
+        let mut x = ClientExchange::new_streaming("GET", Vec::new());
+        x.handle_input(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::Head(h)) if h.status == 200));
+        assert!(x.poll_event().is_none());
+
+        x.handle_input(b"5\r\nhello\r\n").unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::Body(b)) if b == b"hello"));
+
+        x.handle_input(b"6\r\n world\r\n0\r\n\r\n").unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::Body(b)) if b == b" world"));
+        assert!(matches!(x.poll_event(), Some(Event::End)));
+        assert!(x.is_finished());
+    }
+
+    #[test]
+    fn streaming_eof_framed_body_flushes_then_ends() {
+        let mut x = ClientExchange::new_streaming("GET", Vec::new());
+        x.handle_input(b"HTTP/1.1 200 OK\r\n\r\nstreamed").unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::Head(_))));
+        assert!(matches!(x.poll_event(), Some(Event::Body(b)) if b == b"streamed"));
+        assert!(x.poll_event().is_none());
+
+        x.handle_eof().unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::End)));
+        assert!(x.is_finished());
     }
 
     #[test]

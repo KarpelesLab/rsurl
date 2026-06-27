@@ -222,7 +222,9 @@ async fn send_once<R: Runtime>(
         other => return Err(Error::UnsupportedScheme(other.to_string())),
     };
 
-    let Event::Response { head, body } = events.into_iter().next().ok_or(Error::UnexpectedEof)?;
+    let Some(Event::Response { head, body }) = events.into_iter().next() else {
+        return Err(Error::UnexpectedEof);
+    };
     Ok(Response {
         status: head.status,
         reason: head.reason,

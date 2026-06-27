@@ -449,7 +449,9 @@ mod tests {
         // 4. Feed the encrypted HTTP response; the inner machine decodes it.
         tls.handle_input(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
             .unwrap();
-        let Event::Response { head, body } = tls.poll_event().expect("response");
+        let Event::Response { head, body } = tls.poll_event().expect("response") else {
+            panic!("expected Response event");
+        };
         assert_eq!(head.status, 200);
         assert_eq!(body, b"hi");
         assert!(tls.is_finished());
@@ -463,7 +465,9 @@ mod tests {
         tls.poll_transmit(&mut out); // CHLO
         tls.handle_input(b"SHLOHTTP/1.1 204 No Content\r\n\r\n")
             .unwrap();
-        let Event::Response { head, .. } = tls.poll_event().expect("response");
+        let Event::Response { head, .. } = tls.poll_event().expect("response") else {
+            panic!("expected Response event");
+        };
         assert_eq!(head.status, 204);
     }
 
@@ -503,7 +507,9 @@ mod tests {
         let events = crate::io::blocking::drive(&mut tls, &mut sock).unwrap();
 
         assert_eq!(events.len(), 1);
-        let Event::Response { head, body } = &events[0];
+        let Event::Response { head, body } = &events[0] else {
+            panic!("expected Response event");
+        };
         assert_eq!(head.status, 200);
         assert_eq!(body, b"hello");
     }
