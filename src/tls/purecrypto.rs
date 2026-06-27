@@ -196,13 +196,21 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connect
     // forbids moving fields out by value. Take the owned fields we hand to the
     // builder via `Option::take` / `mem::take` so the struct stays whole and
     // its `Drop` still runs.
-    let roots = match opts.roots.take() {
-        Some(r) => r,
-        None => load_system_roots()?,
-    };
     // A verify callback is the sole trust authority: run the handshake without
     // our own chain validation, then defer accept/reject to the callback.
     let effective_verify = opts.verify && opts.verify_callback.is_none();
+    // Only the verifying path needs a trust store. When verification is off
+    // (`curl -k`) or a verify callback owns the decision, skip loading the
+    // system CA bundle entirely (an empty store) so it doesn't needlessly fail
+    // on platforms without a Unix CA path (e.g. Windows).
+    let roots = if effective_verify {
+        match opts.roots.take() {
+            Some(r) => r,
+            None => load_system_roots()?,
+        }
+    } else {
+        RootCertStore::new()
+    };
     let mut builder = Config::builder()
         .tls_only()
         .roots(roots)

@@ -272,11 +272,6 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientC
                 .into(),
         ));
     }
-    let roots = match opts.roots.take() {
-        Some(r) => r,
-        None => load_system_roots()?,
-    };
-
     // Build the ClientConfig. Two paths: the standard webpki verifier
     // (verify=true) or a "trust everything" verifier (verify=false), the
     // latter delegating signature math to the ring CryptoProvider so the
@@ -305,7 +300,6 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientC
                 })
                 .collect()
         };
-    let builder = ClientConfig::builder_with_protocol_versions(&versions);
     // Parse the client identity (curl `-E`/`--key`/`--pass`), if any, before
     // choosing the verifier branch so both branches share it.
     let identity = if let Some(cert_bytes) = &opts.client_cert {
@@ -323,19 +317,33 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientC
     // so the handshake reaches the point where we have the chain, then defer to
     // the callback below.
     let effective_verify = opts.verify && opts.verify_callback.is_none();
-    let verified = builder.with_root_certificates(roots);
-    let dangerous = ClientConfig::builder_with_protocol_versions(&versions)
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify::new()));
-    let mut config = match (effective_verify, identity) {
-        (true, Some((chain, key))) => verified
-            .with_client_auth_cert(chain, key)
-            .map_err(rustls_err)?,
-        (true, None) => verified.with_no_client_auth(),
-        (false, Some((chain, key))) => dangerous
-            .with_client_auth_cert(chain, key)
-            .map_err(rustls_err)?,
-        (false, None) => dangerous.with_no_client_auth(),
+    let mut config = if effective_verify {
+        // Only the verifying path needs a trust store. Resolve it lazily here so
+        // verification-off (`curl -k`) and verify-callback requests don't load
+        // the system CA bundle — which would needlessly fail on platforms
+        // without a Unix CA path (e.g. Windows).
+        let roots = match opts.roots.take() {
+            Some(r) => r,
+            None => load_system_roots()?,
+        };
+        let verified =
+            ClientConfig::builder_with_protocol_versions(&versions).with_root_certificates(roots);
+        match identity {
+            Some((chain, key)) => verified
+                .with_client_auth_cert(chain, key)
+                .map_err(rustls_err)?,
+            None => verified.with_no_client_auth(),
+        }
+    } else {
+        let dangerous = ClientConfig::builder_with_protocol_versions(&versions)
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify::new()));
+        match identity {
+            Some((chain, key)) => dangerous
+                .with_client_auth_cert(chain, key)
+                .map_err(rustls_err)?,
+            None => dangerous.with_no_client_auth(),
+        }
     };
     config.alpn_protocols = std::mem::take(&mut opts.alpn);
 
