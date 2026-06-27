@@ -5154,6 +5154,7 @@ mod tests {
                     }
                 }
                 let _ = sock.write_all(&response);
+                crate::test_support::graceful_close(&mut sock);
                 served += 1;
                 if served >= n {
                     break;
@@ -5228,18 +5229,25 @@ mod tests {
             };
             let cfg = crate::proto::tls::rustls_tests::server_config();
             let mut server = ServerConnection::new(cfg).unwrap();
-            let mut tls = rustls::Stream::new(&mut server, &mut sock);
-            // rustls::Stream runs the handshake lazily on first I/O.
-            let mut buf = Vec::new();
-            let mut byte = [0u8; 1];
-            while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
-                buf.push(byte[0]);
-                if buf.ends_with(b"\r\n\r\n") {
-                    break;
+            // Scope the TLS stream so its `&mut sock` borrow ends before the
+            // graceful close below.
+            {
+                let mut tls = rustls::Stream::new(&mut server, &mut sock);
+                // rustls::Stream runs the handshake lazily on first I/O.
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
                 }
+                let _ = tls.write_all(response);
+                let _ = tls.flush();
             }
-            let _ = tls.write_all(response);
-            let _ = tls.flush();
+            // Close the TCP socket gracefully so Windows/macOS don't RST the
+            // client mid-read.
+            crate::test_support::graceful_close(&mut sock);
         });
         port
     }
@@ -5296,6 +5304,7 @@ mod tests {
                 }
                 let _ = sock.write_all(&response);
             }
+            crate::test_support::graceful_close(&mut sock);
         });
         port
     }
@@ -5344,22 +5353,29 @@ mod tests {
             drop(listener);
             let cfg = crate::proto::tls::rustls_tests::server_config();
             let mut server = ServerConnection::new(cfg).unwrap();
-            let mut tls = rustls::Stream::new(&mut server, &mut sock);
-            for _ in 0..requests {
-                let mut buf = Vec::new();
-                let mut byte = [0u8; 1];
-                while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
-                    buf.push(byte[0]);
-                    if buf.ends_with(b"\r\n\r\n") {
+            // Scope the TLS stream so its `&mut sock` borrow ends before the
+            // graceful close below.
+            {
+                let mut tls = rustls::Stream::new(&mut server, &mut sock);
+                for _ in 0..requests {
+                    let mut buf = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                        buf.push(byte[0]);
+                        if buf.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if buf.is_empty() {
                         break;
                     }
+                    let _ = tls.write_all(response);
+                    let _ = tls.flush();
                 }
-                if buf.is_empty() {
-                    break;
-                }
-                let _ = tls.write_all(response);
-                let _ = tls.flush();
             }
+            // Close the TCP socket gracefully so Windows/macOS don't RST the
+            // client mid-read.
+            crate::test_support::graceful_close(&mut sock);
         });
         port
     }

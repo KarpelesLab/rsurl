@@ -26,6 +26,9 @@ mod telnet;
 mod transfer;
 mod url;
 
+#[cfg(test)]
+mod test_support;
+
 pub mod net;
 pub mod tls;
 
