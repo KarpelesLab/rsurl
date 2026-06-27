@@ -16,10 +16,10 @@
 //! # Ok(()) }
 //! ```
 //!
-//! Scope (first cut): HTTP/1.1 `GET` over `http`/`https`, buffered response.
-//! DNS is resolved synchronously for now; redirects, pooling, streaming bodies,
-//! and the full [`Request`](crate::Request) surface follow as the cutover
-//! proceeds.
+//! Scope (current cut): HTTP/1.1 over `http`/`https` with an arbitrary method,
+//! request body, and caller headers (see [`Request`]), buffered response.
+//! DNS is resolved synchronously for now; redirects, pooling, and streaming
+//! bodies follow as the cutover proceeds.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -47,13 +47,79 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+/// An async HTTP request: a method, a URL, caller headers, and a body.
+///
+/// Build one with [`Request::new`] (or the [`Request::get`] / [`Request::post`]
+/// shortcuts) and send it with [`request`]. rsurl fills in the mandatory
+/// framing headers the caller did not set — `Host`, `User-Agent`, `Accept`,
+/// `Connection: close`, and a `Content-Length` matching the body — but never
+/// overrides or de-duplicates a header the caller supplied, so passing any of
+/// those yourself takes precedence.
+#[derive(Debug, Clone)]
+pub struct Request {
+    /// HTTP method (e.g. `GET`, `POST`). Sent verbatim.
+    pub method: String,
+    /// Absolute request URL (`http`/`https`).
+    pub url: String,
+    /// Caller headers, sent in order after rsurl's defaults.
+    pub headers: Vec<(String, String)>,
+    /// Request body. An empty body sends no payload.
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    /// A request with the given method and URL, no extra headers, and an empty
+    /// body.
+    pub fn new(method: impl Into<String>, url: impl Into<String>) -> Request {
+        Request {
+            method: method.into(),
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// A `GET` request for `url`.
+    pub fn get(url: impl Into<String>) -> Request {
+        Request::new("GET", url)
+    }
+
+    /// A `POST` request for `url` carrying `body`.
+    pub fn post(url: impl Into<String>, body: impl Into<Vec<u8>>) -> Request {
+        Request::new("POST", url).with_body(body)
+    }
+
+    /// Append a header. Call repeatedly to set several; order is preserved.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Request {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the request body.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Request {
+        self.body = body.into();
+        self
+    }
+}
+
 /// Perform an HTTP/1.1 `GET` of `url` over `rt`, returning the buffered
-/// [`Response`]. `https` builds the active TLS backend's engine via
-/// [`crate::tls`] and carries the exchange through the sans-IO TLS layer; `http`
-/// drives the request directly. The connection is closed after the response
-/// (`Connection: close`).
+/// [`Response`]. Convenience wrapper over [`request`].
 pub async fn get<R: Runtime>(rt: &R, url: &str) -> Result<Response> {
-    let u = Url::parse(url)?;
+    request(rt, &Request::get(url)).await
+}
+
+/// Perform an HTTP/1.1 `POST` of `body` to `url` over `rt`, returning the
+/// buffered [`Response`]. Convenience wrapper over [`request`].
+pub async fn post<R: Runtime>(rt: &R, url: &str, body: impl Into<Vec<u8>>) -> Result<Response> {
+    request(rt, &Request::post(url, body)).await
+}
+
+/// Send `req` over `rt`, returning the buffered [`Response`]. `https` builds the
+/// active TLS backend's engine via [`crate::tls`] and carries the exchange
+/// through the sans-IO TLS layer; `http` drives the request directly. The
+/// connection is closed after the response (`Connection: close`).
+pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
+    let u = Url::parse(&req.url)?;
     let addr = resolve(&u.host, u.port)?;
     let mut conn = rt.connect(addr).await.map_err(Error::Io)?;
 
@@ -62,21 +128,17 @@ pub async fn get<R: Runtime>(rt: &R, url: &str) -> Result<Response> {
     } else {
         u.path.clone()
     };
-    let headers = vec![
-        ("Host".to_string(), host_header(&u)),
-        ("User-Agent".to_string(), "rsurl".to_string()),
-        ("Accept".to_string(), "*/*".to_string()),
-        ("Connection".to_string(), "close".to_string()),
-    ];
-    let request = ClientExchange::encode_request("GET", &target, &headers, b"");
+    let method = req.method.to_ascii_uppercase();
+    let headers = build_headers(&u, &req.headers, req.body.len());
+    let bytes = ClientExchange::encode_request(&method, &target, &headers, &req.body);
 
     let events: Vec<Event> = match u.scheme.as_str() {
         "http" => {
-            let mut exchange = ClientExchange::new("GET", request);
+            let mut exchange = ClientExchange::new(&method, bytes);
             asyncio::drive(&mut exchange, &mut conn).await?
         }
         "https" => {
-            let exchange = ClientExchange::new("GET", request);
+            let exchange = ClientExchange::new(&method, bytes);
             let mut opts = crate::tls::TlsOpts::verifying();
             let engine = crate::tls::build_client_engine(&u.host, &mut opts)?;
             let mut tls = TlsClient::new(engine, exchange);
@@ -92,6 +154,34 @@ pub async fn get<R: Runtime>(rt: &R, url: &str) -> Result<Response> {
         headers: head.headers,
         body,
     })
+}
+
+/// Merge rsurl's mandatory framing headers with the caller's. Each default is
+/// emitted only when the caller did not already supply a header of that name
+/// (case-insensitively); `Content-Length` is added for a non-empty body unless
+/// the caller set `Content-Length` or `Transfer-Encoding`. Caller headers are
+/// then appended verbatim, in order.
+fn build_headers(u: &Url, caller: &[(String, String)], body_len: usize) -> Vec<(String, String)> {
+    let has = |name: &str| caller.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+
+    let mut headers = Vec::with_capacity(caller.len() + 5);
+    if !has("Host") {
+        headers.push(("Host".to_string(), host_header(u)));
+    }
+    if !has("User-Agent") {
+        headers.push(("User-Agent".to_string(), "rsurl".to_string()));
+    }
+    if !has("Accept") {
+        headers.push(("Accept".to_string(), "*/*".to_string()));
+    }
+    if !has("Connection") {
+        headers.push(("Connection".to_string(), "close".to_string()));
+    }
+    if body_len > 0 && !has("Content-Length") && !has("Transfer-Encoding") {
+        headers.push(("Content-Length".to_string(), body_len.to_string()));
+    }
+    headers.extend(caller.iter().cloned());
+    headers
 }
 
 /// Resolve `host:port` to a socket address (synchronous DNS for now).
@@ -191,5 +281,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body, b"yes");
+    }
+
+    /// Capture the full raw request the server received, then reply 200.
+    fn echo_request() -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                // Read headers, then any declared Content-Length body.
+                loop {
+                    let n = sock.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                    if let Some(end) = head_end {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                        let want = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + want {
+                            break;
+                        }
+                    }
+                }
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                let _ = tx.send(buf);
+            }
+        });
+        (port, rx)
+    }
+
+    #[tokio::test]
+    async fn async_post_sends_body_and_length() {
+        let (port, rx) = echo_request();
+        let rt = TokioRuntime;
+        let resp = post(&rt, &format!("http://127.0.0.1:{port}/sub"), b"name=value".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok");
+
+        let raw = String::from_utf8(rx.recv().unwrap()).unwrap();
+        assert!(raw.starts_with("POST /sub HTTP/1.1\r\n"), "request line: {raw:?}");
+        assert!(
+            raw.to_lowercase().contains("content-length: 10\r\n"),
+            "missing content-length: {raw:?}"
+        );
+        assert!(raw.ends_with("\r\n\r\nname=value"), "missing body: {raw:?}");
+    }
+
+    #[tokio::test]
+    async fn async_request_sends_caller_headers_without_duplicating_defaults() {
+        let (port, rx) = echo_request();
+        let rt = TokioRuntime;
+        let req = Request::new("PUT", format!("http://127.0.0.1:{port}/x"))
+            .header("X-Custom", "abc")
+            .header("User-Agent", "mine/1.0")
+            .with_body(b"hi".to_vec());
+        let resp = request(&rt, &req).await.unwrap();
+        assert_eq!(resp.status, 200);
+
+        let raw = String::from_utf8(rx.recv().unwrap()).unwrap();
+        let lower = raw.to_lowercase();
+        assert!(raw.starts_with("PUT /x HTTP/1.1\r\n"), "request line: {raw:?}");
+        assert!(raw.contains("X-Custom: abc\r\n"), "missing custom header: {raw:?}");
+        // Caller's User-Agent wins; rsurl's default is suppressed.
+        assert!(lower.contains("user-agent: mine/1.0\r\n"), "ua: {raw:?}");
+        assert_eq!(lower.matches("user-agent:").count(), 1, "duplicate UA: {raw:?}");
     }
 }
