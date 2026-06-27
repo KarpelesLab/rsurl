@@ -100,6 +100,14 @@ impl<E: TlsEngine, M: Machine> TlsClient<E, M> {
         self.tls.tls_params()
     }
 
+    /// Consume the wrapper and return the underlying TLS engine, abandoning the
+    /// (finished) inner exchange. Used to park a warm TLS session in the
+    /// connection pool: a later request rebuilds a fresh [`TlsClient`] around the
+    /// same engine, reusing the negotiated session instead of re-handshaking.
+    pub(crate) fn into_engine(self) -> E {
+        self.tls
+    }
+
     /// Drain all currently-available decrypted plaintext into the inner machine.
     fn pump_inner_input(&mut self) -> Result<()> {
         loop {

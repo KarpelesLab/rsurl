@@ -2237,22 +2237,57 @@ fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
 /// decoding, so only the wire read/write loop differs — that is exactly the
 /// piece the cutover replaces. Mirrors [`send_plain_fresh`]'s timing.
 ///
-/// Not yet wired into [`send_once`]; exercised directly by parity tests while
-/// the migration proceeds (a fresh `Connection: close` socket, no pooling yet).
-// Wired into `send_once` at cutover P3; until then only the parity tests call it.
+/// On a direct connection a warm socket is checked out of the sans-IO core pool
+/// ([`crate::pool::core_plain`]) and reused; a pooled socket that the peer has
+/// since dropped retries once on a fresh dial. After a reusable response the
+/// socket is parked again. Not yet wired into [`send_once`] (see cutover P3);
+/// exercised directly by parity/pooling tests while the migration proceeds.
+// Wired into `send_once` at cutover P3; until then only the tests call it.
 #[allow(dead_code)]
 fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
-    let start = std::time::Instant::now();
-    let (mut stream, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
-    let connect = start.elapsed();
+    // Pooling is only safe on direct connections (see `send_plain`): a proxied
+    // socket multiplexes origins via absolute-form lines and mixes badly with
+    // per-origin `Proxy-Authorization:`.
+    let direct = req.proxy.is_none() || proxy_bypassed(req);
+    if direct {
+        if let Some(stream) = core_pool_checkout_plain(req) {
+            let _ = writeln!(trace, "* Reusing existing connection from pool");
+            match run_plain_core(stream, req, true, None, trace) {
+                Ok(resp) => return Ok(resp),
+                Err(e) => match stale_or_hard(e) {
+                    PooledError::Stale(why) => {
+                        let _ =
+                            writeln!(trace, "* Pooled connection unusable ({why}); reconnecting");
+                        // fall through to a fresh dial
+                    }
+                    PooledError::Hard(e) => return Err(e),
+                },
+            }
+        }
+    }
 
-    // Build the full request (request line + headers + body) with the shared
-    // encoder, capturing the bytes instead of writing them to the socket.
+    let start = std::time::Instant::now();
+    let (stream, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
+    let connect = start.elapsed();
+    run_plain_core(stream, req, direct, Some((namelookup, connect)), trace)
+}
+
+/// Run one plaintext HTTP/1.1 exchange over an already-connected `stream` using
+/// the sans-IO core, then—if `may_pool` and the response permits keep-alive—park
+/// the socket in the core pool for reuse. `timing` carries `(namelookup,
+/// connect)` for a fresh dial and is `None` when reusing a pooled socket. The
+/// shared [`write_request`]/[`maybe_decode_body`] still build the request and
+/// decode `Content-Encoding`; only the wire read/write loop is the sans-IO core.
+fn run_plain_core(
+    mut stream: TcpStream,
+    req: &Request,
+    may_pool: bool,
+    timing: Option<(Option<Duration>, Duration)>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     let mut request_bytes = Vec::new();
     write_request(&mut request_bytes, req, via_plain_http_proxy(req), trace)?;
 
-    // Drive the sans-IO exchange over the real socket: it flushes the request
-    // and decodes the response (status/headers + length/chunked/eof framing).
     let method = effective_method(req);
     let mut exchange = ClientExchange::new(&method, request_bytes);
     let events = crate::io::blocking::drive(&mut exchange, &mut stream)?;
@@ -2271,9 +2306,21 @@ fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
         timing: Timing::default(),
         final_url: String::new(),
     };
-    resp.timing.namelookup = namelookup;
-    resp.timing.connect = Some(connect);
-    resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
+    if let Some((namelookup, connect)) = timing {
+        resp.timing.namelookup = namelookup;
+        resp.timing.connect = Some(connect);
+        resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
+    }
+
+    if may_pool && response_is_reusable(&req.method, &resp) {
+        crate::pool::core_plain()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(pool_key_for(req), stream);
+        let _ = writeln!(trace, "* Connection kept alive (pooled)");
+    } else {
+        let _ = writeln!(trace, "* Connection closed");
+    }
     Ok(resp)
 }
 
@@ -2288,27 +2335,79 @@ fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
 ///
 /// Direct HTTPS only for now (a proxied `CONNECT` tunnel still uses the legacy
 /// path); `appconnect`/`pretransfer` timings are left unset because the driver
-/// runs the handshake and the exchange in one pass. Not yet wired into
-/// [`send_once`] (see cutover P3).
-// Wired into `send_once` at cutover P3; until then only the parity tests call it.
+/// runs the handshake and the exchange in one pass.
+///
+/// When the request's TLS posture is pool-eligible ([`tls_pool_eligible`]) a
+/// warm session is checked out of the core TLS pool ([`crate::pool::core_tls`])
+/// and reused without a fresh handshake; a stale pooled socket retries once on a
+/// fresh dial. After a reusable response the `(socket, engine)` pair is parked
+/// again. Not yet wired into [`send_once`] (see cutover P3).
+// Wired into `send_once` at cutover P3; until then only the tests call it.
 #[allow(dead_code)]
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
 fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
-    let start = std::time::Instant::now();
-    let (mut tcp, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
-    let connect = start.elapsed();
+    // Direct, pool-eligible requests may reuse a warm TLS session.
+    let direct = req.proxy.is_none() || proxy_bypassed(req);
+    if direct && tls_pool_eligible(req) {
+        if let Some((tcp, engine)) = core_pool_checkout_tls(req) {
+            let _ = writeln!(trace, "* Reusing existing TLS connection from pool");
+            match run_https_core(tcp, req, Some(engine), true, None, trace) {
+                Ok(resp) => return Ok(resp),
+                Err(e) => match stale_or_hard(e) {
+                    PooledError::Stale(why) => {
+                        let _ = writeln!(
+                            trace,
+                            "* Pooled TLS connection unusable ({why}); reconnecting"
+                        );
+                        // fall through to a fresh handshake
+                    }
+                    PooledError::Hard(e) => return Err(e),
+                },
+            }
+        }
+    }
 
+    let start = std::time::Instant::now();
+    let (tcp, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
+    let connect = start.elapsed();
+    let may_pool = direct && tls_pool_eligible(req);
+    run_https_core(tcp, req, None, may_pool, Some((namelookup, connect)), trace)
+}
+
+/// Run one HTTPS HTTP/1.1 exchange over the sans-IO [`TlsClient`] stack on an
+/// already-connected `tcp`. `engine_in` is `Some(..)` to resume a pooled warm
+/// session (no handshake) or `None` to build and handshake a fresh engine from
+/// the Request's TLS options. On a reusable response and `may_pool`, the
+/// `(socket, engine)` pair is parked in the core TLS pool — the caller is
+/// responsible for only setting `may_pool` when the request is pool-eligible
+/// ([`tls_pool_eligible`]). `timing` carries `(namelookup, connect)` for a fresh
+/// dial; `None` when reusing a pooled socket.
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+fn run_https_core(
+    mut tcp: TcpStream,
+    req: &Request,
+    engine_in: Option<crate::pool::CoreTlsEngine>,
+    may_pool: bool,
+    timing: Option<(Option<Duration>, Duration)>,
+    trace: &mut dyn Write,
+) -> Result<Response> {
     let mut request_bytes = Vec::new();
     write_request(&mut request_bytes, req, false, trace)?;
 
-    // Build the configured sans-IO TLS engine, wrap the HTTP/1.1 exchange in it,
-    // and drive the whole stack over TCP (handshake, then the request/response).
+    // Resume a warm session, or build + handshake a fresh engine.
+    let engine = match engine_in {
+        Some(e) => e,
+        None => {
+            let mut opts = tls_opts_from(req, &[])?;
+            crate::tls::build_client_engine(&req.url.host, &mut opts)?
+        }
+    };
     let method = effective_method(req);
-    let mut opts = tls_opts_from(req, &[])?;
-    let engine = crate::tls::build_client_engine(&req.url.host, &mut opts)?;
     let exchange = ClientExchange::new(&method, request_bytes);
     let mut tls = crate::proto::tls::TlsClient::new(engine, exchange);
     let events = crate::io::blocking::drive(&mut tls, &mut tcp)?;
     let params = tls.tls_params();
+    let engine = tls.into_engine();
 
     let Some(Http1Event::Response { head, body }) = events.into_iter().next() else {
         return Err(Error::UnexpectedEof);
@@ -2329,8 +2428,22 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
         timing: Timing::default(),
         final_url: String::new(),
     };
-    resp.timing.namelookup = namelookup;
-    resp.timing.connect = Some(connect);
+    if let Some((namelookup, connect)) = timing {
+        resp.timing.namelookup = namelookup;
+        resp.timing.connect = Some(connect);
+    }
+
+    // Park the warm session for reuse. The caller sets `may_pool` only for
+    // pool-eligible requests (verify on, no custom CA/cert/pins/ciphers).
+    if may_pool && response_is_reusable(&req.method, &resp) {
+        crate::pool::core_tls()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(pool_key_for(req), (tcp, engine));
+        let _ = writeln!(trace, "* TLS connection kept alive (pooled)");
+    } else {
+        let _ = writeln!(trace, "* Connection closed");
+    }
     Ok(resp)
 }
 
@@ -2502,6 +2615,29 @@ pub(crate) fn pool_key_for(req: &Request) -> crate::pool::Key {
 
 fn pool_checkout_plain(req: &Request) -> Option<BufReader<TcpStream>> {
     crate::pool::plain()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .checkout(&pool_key_for(req))
+}
+
+/// Check out a warm plaintext socket for the sans-IO core path, if one is parked.
+#[allow(dead_code)]
+fn core_pool_checkout_plain(req: &Request) -> Option<TcpStream> {
+    crate::pool::core_plain()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .checkout(&pool_key_for(req))
+}
+
+/// Check out a warm TLS session (socket + engine) for the sans-IO core path. As
+/// with [`pool_checkout_tls`], only pool-eligible requests may reuse a session.
+#[allow(dead_code)]
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+fn core_pool_checkout_tls(req: &Request) -> Option<crate::pool::CoreTlsConn> {
+    if !tls_pool_eligible(req) {
+        return None;
+    }
+    crate::pool::core_tls()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .checkout(&pool_key_for(req))
@@ -5078,5 +5214,142 @@ mod tests {
             !info.peer_certificates.is_empty(),
             "peer certificate chain present"
         );
+    }
+
+    // --- Cutover P2: connection pooling on the sans-IO core path ---
+
+    /// Accept exactly ONE connection, then drop the listener so any later dial is
+    /// refused, and serve `requests` sequential keep-alive request/response
+    /// cycles on that single socket. A second request that succeeds therefore
+    /// *proves* the socket was reused from the pool (a fresh dial would be
+    /// refused). Returns the bound port.
+    fn serve_keepalive(requests: usize, response: Vec<u8>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            drop(listener); // refuse any subsequent (fresh-dial) connection
+            for _ in 0..requests {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while sock.read(&mut byte).map(|r| r == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if buf.is_empty() {
+                    break; // client hung up
+                }
+                let _ = sock.write_all(&response);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn p2_core_plain_reuses_pooled_connection() {
+        // Keep-alive response (Content-Length framed, no Connection: close).
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let port = serve_keepalive(2, response);
+        let url = format!("http://127.0.0.1:{port}/");
+
+        // First request dials fresh and parks the warm socket.
+        let r1 = send_plain_via_core(&Request::get(&url).unwrap(), &mut io::sink()).unwrap();
+        assert_eq!(r1.body, b"hi");
+        // Second request MUST reuse the parked socket — a fresh dial would be
+        // refused (the server dropped its listener after one accept).
+        let r2 = send_plain_via_core(&Request::get(&url).unwrap(), &mut io::sink()).unwrap();
+        assert_eq!(r2.body, b"hi");
+    }
+
+    #[test]
+    fn p2_core_plain_close_response_is_not_pooled() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_vec();
+        let port = serve_n(1, response);
+        let url = format!("http://127.0.0.1:{port}/");
+        let r1 = send_plain_via_core(&Request::get(&url).unwrap(), &mut io::sink()).unwrap();
+        assert_eq!(r1.body, b"hi");
+        assert!(
+            core_pool_checkout_plain(&Request::get(&url).unwrap()).is_none(),
+            "a Connection: close response must not be pooled"
+        );
+    }
+
+    /// TLS keep-alive server: accept one connection, then serve `requests`
+    /// sequential cycles over a single rustls session (proving session reuse).
+    #[cfg(feature = "rustls-tls")]
+    fn serve_https_keepalive(requests: usize, response: &'static [u8]) -> u16 {
+        use rustls::ServerConnection;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            drop(listener);
+            let cfg = crate::proto::tls::rustls_tests::server_config();
+            let mut server = ServerConnection::new(cfg).unwrap();
+            let mut tls = rustls::Stream::new(&mut server, &mut sock);
+            for _ in 0..requests {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if buf.is_empty() {
+                    break;
+                }
+                let _ = tls.write_all(response);
+                let _ = tls.flush();
+            }
+        });
+        port
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn p2_core_tls_reuses_pooled_session() {
+        // The test server uses a self-signed cert, so the request must run with
+        // verification off — which makes it pool-*ineligible* through the public
+        // `send_https_via_core` gate. So drive `run_https_core` directly with
+        // `may_pool` forced on, and check out the parked session straight from
+        // the pool, to exercise the reuse plumbing end to end.
+        let port = serve_https_keepalive(2, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+        let req = Request::get(&format!("https://127.0.0.1:{port}/"))
+            .unwrap()
+            .verify_tls(false);
+        let key = pool_key_for(&req);
+
+        // Leg 1: fresh handshake; park the warm (socket, engine).
+        let (tcp, _g, nl) = tcp_connect_cancellable(&req, &mut io::sink()).unwrap();
+        let r1 = run_https_core(
+            tcp,
+            &req,
+            None,
+            true,
+            Some((nl, Duration::ZERO)),
+            &mut io::sink(),
+        )
+        .unwrap();
+        assert_eq!(r1.body, b"hi");
+
+        // The session must now be parked.
+        let parked = crate::pool::core_tls()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .checkout(&key);
+        let (tcp2, engine) = parked.expect("warm TLS session should be parked after leg 1");
+
+        // Leg 2: resume the pooled session — no fresh dial, no new handshake (the
+        // server dropped its listener and reused one ServerConnection).
+        let r2 = run_https_core(tcp2, &req, Some(engine), false, None, &mut io::sink()).unwrap();
+        assert_eq!(r2.body, b"hi");
     }
 }

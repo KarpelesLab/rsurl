@@ -173,6 +173,84 @@ pub(crate) fn tls() -> &'static Mutex<Pool<TlsStream<TcpStream>>> {
     POOL_TLS.get_or_init(|| Mutex::new(Pool::new()))
 }
 
+/// Idle-connection pool for the **sans-IO core** request path
+/// ([`crate::proto::http1`] driven over a [`NetStream`](crate::net::NetStream)).
+///
+/// Unlike [`Pool`], it stores the connection bare — no `BufReader`. The sans-IO
+/// exchange buffers received bytes internally, and the driver reads exactly the
+/// framed response and stops, so there are never prefetched bytes to carry
+/// alongside the socket. Plain connections park the raw `TcpStream`; TLS
+/// connections park the socket together with the live sans-IO TLS engine, so the
+/// next request resumes the negotiated session instead of re-handshaking.
+///
+/// Keying (`Key`) and the per-key/global caps are shared with [`Pool`] via
+/// [`configure`], so the two pools obey one configured budget shape.
+pub(crate) struct CorePool<C> {
+    entries: HashMap<Key, Vec<C>>,
+}
+
+impl<C> CorePool<C> {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Pop one parked conn for `key`, LIFO (most-recently-used first).
+    pub(crate) fn checkout(&mut self, key: &Key) -> Option<C> {
+        let bucket = self.entries.get_mut(key)?;
+        let c = bucket.pop();
+        if bucket.is_empty() {
+            self.entries.remove(key);
+        }
+        c
+    }
+
+    /// Park `conn` for reuse under `key`, enforcing both caps (overflow drops it).
+    pub(crate) fn release(&mut self, key: Key, conn: C) {
+        let total: usize = self.entries.values().map(Vec::len).sum();
+        if total >= global_cap() {
+            return;
+        }
+        let bucket = self.entries.entry(key).or_default();
+        if bucket.len() >= per_key_cap() {
+            return;
+        }
+        bucket.push(conn);
+    }
+
+    #[cfg(test)]
+    fn total_len(&self) -> usize {
+        self.entries.values().map(Vec::len).sum()
+    }
+}
+
+/// Plain-HTTP idle conns for the sans-IO core path.
+static POOL_CORE_PLAIN: OnceLock<Mutex<CorePool<TcpStream>>> = OnceLock::new();
+
+pub(crate) fn core_plain() -> &'static Mutex<CorePool<TcpStream>> {
+    POOL_CORE_PLAIN.get_or_init(|| Mutex::new(CorePool::new()))
+}
+
+/// The active backend's concrete sans-IO TLS engine type (exactly one backend
+/// compiles in). Parked alongside its socket for session reuse.
+#[cfg(feature = "rustls-tls")]
+pub(crate) type CoreTlsEngine = crate::proto::tls::RustlsEngine;
+#[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+pub(crate) type CoreTlsEngine = crate::proto::tls::PurecryptoEngine;
+
+/// A warm TLS session parked in the core pool: the socket plus its live engine.
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+pub(crate) type CoreTlsConn = (TcpStream, CoreTlsEngine);
+
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+static POOL_CORE_TLS: OnceLock<Mutex<CorePool<CoreTlsConn>>> = OnceLock::new();
+
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+pub(crate) fn core_tls() -> &'static Mutex<CorePool<CoreTlsConn>> {
+    POOL_CORE_TLS.get_or_init(|| Mutex::new(CorePool::new()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +319,28 @@ mod tests {
             // Each key has at most per_key_cap entries — so spread releases
             // across many keys to actually exercise the global cap.
             p.release(k("h", i as u16), BufReader::new(Stub));
+        }
+        assert_eq!(p.total_len(), cap);
+    }
+
+    #[test]
+    fn core_pool_lifo_and_caps() {
+        let _g = CAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        configure(DEFAULT_PER_KEY_CAP, DEFAULT_GLOBAL_CAP);
+        // CorePool stores connections bare (here, plain integers as stand-ins).
+        let mut p: CorePool<u32> = CorePool::new();
+        p.release(k("h", 80), 1);
+        p.release(k("h", 80), 2);
+        // LIFO: most-recently-released comes out first.
+        assert_eq!(p.checkout(&k("h", 80)), Some(2));
+        assert_eq!(p.checkout(&k("h", 80)), Some(1));
+        assert_eq!(p.checkout(&k("h", 80)), None);
+        assert_eq!(p.total_len(), 0);
+
+        // Per-key cap is enforced; overflow is dropped.
+        let cap = per_key_cap();
+        for i in 0..(cap as u32 + 3) {
+            p.release(k("h", 80), i);
         }
         assert_eq!(p.total_len(), cap);
     }
