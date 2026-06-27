@@ -6,8 +6,18 @@
 //! `crate::net` (UDP/TCP), `crate::http` (HTTP trackers) — and `std` threads +
 //! channels; no async runtime and no new external dependency.
 //!
-//! This is delivered in phases. Phase 1 (here): bencode, `.torrent` metainfo +
-//! infohash, and magnet parsing.
+//! The full client is implemented here:
+//!
+//! * **Metadata** — bencode codec ([`bencode`]), `.torrent` metainfo parsing +
+//!   infohash ([`metainfo`]), `magnet:` link parsing ([`magnet`]), and
+//!   metadata-from-peers fetch for magnets via `ut_metadata` ([`metadata`]).
+//! * **Peer discovery** — HTTP and UDP trackers ([`tracker`]) and the
+//!   mainline DHT ([`dht`]).
+//! * **Transfer** — the peer wire protocol ([`peer`]), a rarest-first piece
+//!   picker ([`picker`]), on-disk storage with SHA-1 verification
+//!   ([`storage`]), and the threaded swarm engine that drives them
+//!   ([`engine`], [`download`]).
+//! * **Seeding** — serve verified pieces back to the swarm ([`seed`]).
 
 pub mod bencode;
 pub mod dht;
