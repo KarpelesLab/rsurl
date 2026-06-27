@@ -17,9 +17,11 @@
 //! ```
 //!
 //! Scope (current cut): HTTP/1.1 over `http`/`https` with an arbitrary method,
-//! request body, and caller headers (see [`Request`]), buffered response.
-//! DNS is resolved synchronously for now; redirects, pooling, and streaming
-//! bodies follow as the cutover proceeds.
+//! request body, and caller headers (see [`Request`]); optional redirect
+//! following and automatic response decompression; buffered response. DNS is
+//! resolved synchronously and each request uses a fresh `Connection: close`
+//! socket — connection pooling and streaming (non-buffered) bodies are part of
+//! the ongoing sans-IO cutover and are not yet wired on this async path.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 
@@ -42,8 +44,11 @@ pub struct Response {
     pub reason: String,
     /// Response headers, in received order.
     pub headers: Vec<(String, String)>,
-    /// The response body (still content-encoded if the server compressed it;
-    /// decompression is a later cutover step).
+    /// The response body. Decoded by default when the server applied a
+    /// `Content-Encoding` (gzip / deflate / zstd / br); the
+    /// `Content-Encoding`/`Content-Length` headers are stripped to match. Set
+    /// [`Request::decompress(false)`](Request::decompress) to receive the raw
+    /// encoded bytes instead.
     pub body: Vec<u8>,
 }
 
@@ -65,17 +70,30 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     /// Request body. An empty body sends no payload.
     pub body: Vec<u8>,
+    /// Follow `3xx` redirects (default `false`, matching the blocking API). On
+    /// 301/302/303 a non-GET/HEAD request becomes a bodyless `GET`; 307/308
+    /// preserve method and body. Capped at [`MAX_REDIRECTS`] hops.
+    pub follow_redirects: bool,
+    /// Decode the response body per its `Content-Encoding` (default `true`).
+    pub decompress: bool,
 }
 
+/// Maximum number of redirects [`request`] follows when
+/// [`Request::follow_redirects`] is on, before failing with an
+/// [`Error::BadResponse`].
+pub const MAX_REDIRECTS: usize = 10;
+
 impl Request {
-    /// A request with the given method and URL, no extra headers, and an empty
-    /// body.
+    /// A request with the given method and URL, no extra headers, an empty
+    /// body, redirects off, and response decompression on.
     pub fn new(method: impl Into<String>, url: impl Into<String>) -> Request {
         Request {
             method: method.into(),
             url: url.into(),
             headers: Vec::new(),
             body: Vec::new(),
+            follow_redirects: false,
+            decompress: true,
         }
     }
 
@@ -100,6 +118,19 @@ impl Request {
         self.body = body.into();
         self
     }
+
+    /// Follow `3xx` redirects (off by default). See
+    /// [`follow_redirects`](Self::follow_redirects).
+    pub fn follow_redirects(mut self, on: bool) -> Request {
+        self.follow_redirects = on;
+        self
+    }
+
+    /// Decode the response body per its `Content-Encoding` (on by default).
+    pub fn decompress(mut self, on: bool) -> Request {
+        self.decompress = on;
+        self
+    }
 }
 
 /// Perform an HTTP/1.1 `GET` of `url` over `rt`, returning the buffered
@@ -116,10 +147,55 @@ pub async fn post<R: Runtime>(rt: &R, url: &str, body: impl Into<Vec<u8>>) -> Re
 
 /// Send `req` over `rt`, returning the buffered [`Response`]. `https` builds the
 /// active TLS backend's engine via [`crate::tls`] and carries the exchange
-/// through the sans-IO TLS layer; `http` drives the request directly. The
-/// connection is closed after the response (`Connection: close`).
+/// through the sans-IO TLS layer; `http` drives the request directly. Each
+/// connection is closed after its response (`Connection: close`).
+///
+/// When [`Request::follow_redirects`] is set, `3xx` responses with a `Location`
+/// are followed (up to [`MAX_REDIRECTS`] hops, rewriting method/body per the
+/// status). When [`Request::decompress`] is set (the default), the final
+/// response body is decoded per its `Content-Encoding`.
 pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
-    let u = Url::parse(&req.url)?;
+    let mut url = Url::parse(&req.url)?;
+    let mut method = req.method.to_ascii_uppercase();
+    let mut body = req.body.clone();
+    let mut hops = 0usize;
+
+    loop {
+        let resp = send_once(rt, &url, &method, &req.headers, &body).await?;
+
+        // Follow a redirect, or fall through to return this response.
+        if req.follow_redirects && is_redirect(resp.status) {
+            if let Some(location) = header_value(&resp.headers, "location") {
+                if hops >= MAX_REDIRECTS {
+                    return Err(Error::BadResponse(format!(
+                        "aio: maximum ({MAX_REDIRECTS}) redirects followed"
+                    )));
+                }
+                hops += 1;
+                url = crate::url::resolve(&url, &location)?;
+                // 301/302/303 turn a non-idempotent request into a bodyless GET;
+                // 307/308 preserve method and body (RFC 9110 §15.4).
+                if (301..=303).contains(&resp.status) && method != "GET" && method != "HEAD" {
+                    method = "GET".to_string();
+                    body.clear();
+                }
+                continue;
+            }
+        }
+
+        return finish_response(resp, req.decompress);
+    }
+}
+
+/// One request/response round-trip over a fresh `Connection: close` connection,
+/// with no redirect or decompression handling.
+async fn send_once<R: Runtime>(
+    rt: &R,
+    u: &Url,
+    method: &str,
+    caller_headers: &[(String, String)],
+    body: &[u8],
+) -> Result<Response> {
     let addr = resolve(&u.host, u.port)?;
     let mut conn = rt.connect(addr).await.map_err(Error::Io)?;
 
@@ -128,17 +204,16 @@ pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
     } else {
         u.path.clone()
     };
-    let method = req.method.to_ascii_uppercase();
-    let headers = build_headers(&u, &req.headers, req.body.len());
-    let bytes = ClientExchange::encode_request(&method, &target, &headers, &req.body);
+    let headers = build_headers(u, caller_headers, body.len());
+    let bytes = ClientExchange::encode_request(method, &target, &headers, body);
 
     let events: Vec<Event> = match u.scheme.as_str() {
         "http" => {
-            let mut exchange = ClientExchange::new(&method, bytes);
+            let mut exchange = ClientExchange::new(method, bytes);
             asyncio::drive(&mut exchange, &mut conn).await?
         }
         "https" => {
-            let exchange = ClientExchange::new(&method, bytes);
+            let exchange = ClientExchange::new(method, bytes);
             let mut opts = crate::tls::TlsOpts::verifying();
             let engine = crate::tls::build_client_engine(&u.host, &mut opts)?;
             let mut tls = TlsClient::new(engine, exchange);
@@ -154,6 +229,38 @@ pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
         headers: head.headers,
         body,
     })
+}
+
+/// Status codes [`request`] follows when redirects are enabled.
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// First value for header `name` (case-insensitive), if present.
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+}
+
+/// Apply response decompression when requested: decode the body per its
+/// `Content-Encoding` and strip the now-stale `Content-Encoding`/`Content-Length`
+/// headers. A decode failure (truncated/corrupt stream) is surfaced as an error
+/// rather than returning a partial body.
+fn finish_response(mut resp: Response, decompress: bool) -> Result<Response> {
+    if !decompress {
+        return Ok(resp);
+    }
+    let Some(encoding) = header_value(&resp.headers, "content-encoding") else {
+        return Ok(resp);
+    };
+    let decoded = crate::compress::decode_body(resp.body, &encoding)?;
+    if decoded.decoded {
+        resp.headers = crate::compress::strip_after_decode(resp.headers);
+    }
+    resp.body = decoded.body;
+    Ok(resp)
 }
 
 /// Merge rsurl's mandatory framing headers with the caller's. Each default is
@@ -375,5 +482,142 @@ mod tests {
             1,
             "duplicate UA: {raw:?}"
         );
+    }
+
+    /// Serve `/final` with 200 "done" and everything else with a `status`
+    /// redirect to `/final`. Handles sequential `Connection: close` sockets,
+    /// so one listener covers both the redirect hop and the final request.
+    fn serve_redirect(status: u16, reason: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while sock.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf);
+                if head.starts_with("GET /final ") {
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone",
+                    );
+                } else {
+                    let resp = format!(
+                        "HTTP/1.1 {status} {reason}\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                }
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn async_follows_redirect_when_enabled() {
+        let port = serve_redirect(302, "Found");
+        let rt = TokioRuntime;
+        let req = Request::get(format!("http://127.0.0.1:{port}/start")).follow_redirects(true);
+        let resp = request(&rt, &req).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"done");
+    }
+
+    #[tokio::test]
+    async fn async_redirect_not_followed_by_default() {
+        let port = serve_redirect(302, "Found");
+        let rt = TokioRuntime;
+        let resp = get(&rt, &format!("http://127.0.0.1:{port}/start"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 302);
+    }
+
+    #[tokio::test]
+    async fn async_303_downgrades_post_to_get() {
+        // The server only answers 200 for `GET /final`, so a 200 proves the
+        // POST was rewritten to a bodyless GET on the redirect hop.
+        let port = serve_redirect(303, "See Other");
+        let rt = TokioRuntime;
+        let req = Request::post(format!("http://127.0.0.1:{port}/start"), b"x=1".to_vec())
+            .follow_redirects(true);
+        let resp = request(&rt, &req).await.unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"done");
+    }
+
+    #[tokio::test]
+    async fn async_decompresses_gzip_body() {
+        let plain = b"hello gzip world, hello gzip world";
+        let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(plain).expect("gzip encode");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while sock.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    gz.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(&gz);
+            }
+        });
+        let rt = TokioRuntime;
+        let resp = get(&rt, &format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, plain);
+        // The stale Content-Encoding header is stripped after decoding.
+        assert!(
+            !resp
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")),
+            "content-encoding should be stripped after decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_decompress_disabled_returns_raw_gzip() {
+        let plain = b"raw bytes please";
+        let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(plain).expect("gzip encode");
+        let gz_for_server = gz.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while sock.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    gz_for_server.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(&gz_for_server);
+            }
+        });
+        let rt = TokioRuntime;
+        let req = Request::get(format!("http://127.0.0.1:{port}/")).decompress(false);
+        let resp = request(&rt, &req).await.unwrap();
+        assert_eq!(resp.body, gz, "raw encoded bytes when decompress is off");
     }
 }
