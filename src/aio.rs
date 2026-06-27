@@ -514,6 +514,10 @@ mod tests {
                     );
                     let _ = sock.write_all(resp.as_bytes());
                 }
+                // We only read the request head, so a POST body still sits unread
+                // in the kernel buffer; dropping the socket would RST it on
+                // Windows/macOS and fail the client mid-read. Close gracefully.
+                crate::test_support::graceful_close(&mut sock);
             }
         });
         port
