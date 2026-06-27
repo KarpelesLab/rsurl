@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::net::{connector_from_proxy_url, Connector, DirectConnector, NetStream};
+use crate::proto::http1::{ClientExchange, Event as Http1Event};
 use crate::url::Url;
 
 const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
@@ -2225,6 +2226,53 @@ fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     resp.timing.connect = Some(connect);
     resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
     finalize_plain(bufrd, &req, &resp, may_pool, trace);
+    Ok(resp)
+}
+
+/// **Cutover P0.** The plaintext HTTP/1.1 transfer driven by the sans-IO core
+/// ([`crate::proto::http1`] + [`crate::io::blocking`]) instead of the legacy
+/// inline `read_head`/`read_body`/`read_chunked` loop. The shared
+/// [`write_request`] still builds the request bytes (method, Host, auth,
+/// headers, body) and [`maybe_decode_body`] still applies `Content-Encoding`
+/// decoding, so only the wire read/write loop differs — that is exactly the
+/// piece the cutover replaces. Mirrors [`send_plain_fresh`]'s timing.
+///
+/// Not yet wired into [`send_once`]; exercised directly by parity tests while
+/// the migration proceeds (a fresh `Connection: close` socket, no pooling yet).
+// Wired into `send_once` at cutover P3; until then only the parity tests call it.
+#[allow(dead_code)]
+fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
+    let start = std::time::Instant::now();
+    let (mut stream, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
+    let connect = start.elapsed();
+
+    // Build the full request (request line + headers + body) with the shared
+    // encoder, capturing the bytes instead of writing them to the socket.
+    let mut request_bytes = Vec::new();
+    write_request(&mut request_bytes, req, via_plain_http_proxy(req), trace)?;
+
+    // Drive the sans-IO exchange over the real socket: it flushes the request
+    // and decodes the response (status/headers + length/chunked/eof framing).
+    let method = effective_method(req);
+    let mut exchange = ClientExchange::new(&method, request_bytes);
+    let events = crate::io::blocking::drive(&mut exchange, &mut stream)?;
+    let Http1Event::Response { head, body } =
+        events.into_iter().next().ok_or(Error::UnexpectedEof)?;
+
+    let (headers, body) = maybe_decode_body(head.headers, body, req.decompress, trace)?;
+    let mut resp = Response {
+        status: head.status,
+        reason: head.reason,
+        version: head.version,
+        headers,
+        body,
+        tls: None,
+        timing: Timing::default(),
+        final_url: String::new(),
+    };
+    resp.timing.namelookup = namelookup;
+    resp.timing.connect = Some(connect);
+    resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
     Ok(resp)
 }
 
@@ -4839,5 +4887,85 @@ mod tests {
         }
         // unused so clippy doesn't complain about `mock`
         let _ = mock.write(&[]);
+    }
+
+    // --- Cutover P0: parity of `send_plain_via_core` with the legacy engine ---
+
+    /// Reply `response` verbatim to the next `n` sequential connections, after
+    /// draining each request head. Returns the bound port.
+    fn serve_n(n: usize, response: Vec<u8>) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut served = 0;
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while sock.read(&mut byte).map(|r| r == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let _ = sock.write_all(&response);
+                served += 1;
+                if served >= n {
+                    break;
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn p0_core_matches_legacy_plain_get() {
+        // Same response served to two connections; the sans-IO path and the
+        // legacy path must produce identical status/version/headers/body.
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world"
+                .to_vec();
+        let port = serve_n(2, response);
+        let url = format!("http://127.0.0.1:{port}/");
+
+        let legacy = send_plain_fresh(Request::get(&url).unwrap(), false, &mut io::sink()).unwrap();
+        let core = send_plain_via_core(&Request::get(&url).unwrap(), &mut io::sink()).unwrap();
+
+        assert_eq!(core.status, legacy.status);
+        assert_eq!(core.version, legacy.version);
+        assert_eq!(core.reason, legacy.reason);
+        assert_eq!(core.headers, legacy.headers);
+        assert_eq!(core.body, legacy.body);
+        assert_eq!(core.body, b"hello world");
+    }
+
+    #[test]
+    fn p0_core_decodes_chunked_body() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec();
+        let port = serve_n(1, response);
+        let url = format!("http://127.0.0.1:{port}/");
+        let core = send_plain_via_core(&Request::get(&url).unwrap(), &mut io::sink()).unwrap();
+        assert_eq!(core.status, 200);
+        assert_eq!(core.body, b"hello world");
+    }
+
+    #[test]
+    fn p0_core_decompresses_gzip_body() {
+        let plain = b"gzip body over the sans-IO core";
+        let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(plain).unwrap();
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", gz.len())
+                .into_bytes();
+        response.extend_from_slice(&gz);
+        let port = serve_n(1, response);
+        let url = format!("http://127.0.0.1:{port}/");
+        let core = send_plain_via_core(&Request::get(&url).unwrap(), &mut io::sink()).unwrap();
+        assert_eq!(core.status, 200);
+        assert_eq!(core.body, plain);
+        // Decoding strips the now-stale Content-Encoding header (parity with legacy).
+        assert!(!core
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")));
     }
 }
