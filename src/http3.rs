@@ -43,18 +43,19 @@
 //!   then opens a request bidi stream and serializes a `:method`/`:scheme`/
 //!   `:authority`/`:path` HEADERS frame followed by an optional DATA frame.
 //!
-//! Out-of-scope behaviours (HTTP/3 framing and transport, not QPACK):
+//! Stream framing on the response stream (RFC 9114 §4.1, §7.2): an interim
+//! 1xx HEADERS block is recognised and skipped so the following final HEADERS
+//! becomes the response head; a HEADERS block after the final response is
+//! treated as trailers and discarded; reserved/grease frame types (§7.2.8) are
+//! drained; and a control-stream-only frame (SETTINGS / GOAWAY / CANCEL_PUSH /
+//! MAX_PUSH_ID) or a PUSH_PROMISE (we never enable server push) seen on a
+//! request stream is rejected as H3_FRAME_UNEXPECTED.
 //!
-//! * **Stream framing edge cases**: we assume the server sends HEADERS
-//!   then DATA in a single ordered pair. Trailers (a second HEADERS
-//!   frame after DATA), interleaved PUSH_PROMISE, GOAWAY before the
-//!   response, and reserved frame types (RFC 9114 §7.2.8) are all
-//!   ignored or treated as errors.
-//! * **Loss recovery / PTO timer**: the I/O loop polls
-//!   [`QuicConnection::next_timeout`] and calls [`on_timeout`], but the
-//!   socket read timeout is a simple wall-clock cap, not a tightly
-//!   integrated select-style multiplexer. A heavily lossy network may
-//!   stall.
+//! Loss recovery (RFC 9002 §6.2): the I/O loop waits no longer than the QUIC
+//! connection's next timeout ([`QuicConnection::next_timeout`]) before waking,
+//! and drives [`on_timeout`] with the real elapsed-since-start, so a lost
+//! packet's PTO fires and retransmits promptly rather than stalling on a fixed
+//! read cap.
 //!
 //! [`on_timeout`]: purecrypto::quic::QuicConnection::on_timeout
 
@@ -489,6 +490,11 @@ const MAX_HEADERS_FRAME_LEN: u64 = 256 * 1024;
 /// Maximum total wall-clock time spent in the I/O loop, irrespective of the
 /// per-read timeout from the request. Backstop against pathological servers.
 const MAX_TOTAL_DEADLINE: Duration = Duration::from_secs(300);
+/// Upper bound on how long a single pump recv parks the I/O loop. The actual
+/// wait is the lesser of this and the QUIC next-timeout (the PTO), so loss
+/// recovery stays responsive while a quiet connection still wakes periodically
+/// to re-check the overall deadline and shutdown.
+const PUMP_READ_CAP: Duration = Duration::from_millis(100);
 /// Maximum UDP datagram we expect to receive (a hair over the QUIC default).
 const MAX_DATAGRAM: usize = 65_535;
 
@@ -578,7 +584,7 @@ fn send_inner(
     let (sock, peer) = open_udp(&req)?;
     let connect = dial_start.elapsed();
     let _ = writeln!(trace, "*   Trying {peer} (UDP)...");
-    handshake(&mut conn, &*sock, peer, req.read_timeout)?;
+    handshake(&mut conn, &*sock, peer, req.read_timeout, dial_start)?;
     let appconnect = dial_start.elapsed();
     // Post-handshake certificate policy, identical to the TCP TLS path now
     // that purecrypto surfaces the QUIC peer chain (purecrypto#31): a
@@ -640,7 +646,7 @@ fn send_inner(
     if !req.body.is_empty() {
         let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
     }
-    pump(&mut conn, &*sock, peer, req.read_timeout)?;
+    pump(&mut conn, &*sock, peer, req.read_timeout, dial_start)?;
 
     let mut resp = read_response(
         &mut conn,
@@ -652,6 +658,7 @@ fn send_inner(
         sink,
         on_head,
         trace,
+        dial_start,
     )?;
     resp.tls = Some(tls_info);
     resp.timing.connect = Some(connect);
@@ -943,6 +950,7 @@ fn pump_once(
     sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
     can_block: bool,
+    start: Instant,
 ) -> Result<bool> {
     // Egress: keep draining until pop returns empty.
     let mut sent_anything = false;
@@ -960,6 +968,16 @@ fn pump_once(
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut got_anything = false;
     if can_block {
+        // Wake no later than the next QUIC timer (the PTO) so a loss is
+        // retransmitted promptly instead of waiting out a fixed cap — RFC 9002
+        // §6.2 loss recovery. Floor at 1 ms (a zero timeout means "block
+        // forever" on some platforms) and cap at PUMP_READ_CAP so a stalled
+        // peer never parks us indefinitely.
+        let wait = conn
+            .next_timeout()
+            .unwrap_or(PUMP_READ_CAP)
+            .clamp(Duration::from_millis(1), PUMP_READ_CAP);
+        sock.set_read_timeout(Some(wait))?;
         match sock.recv_from(&mut buf) {
             // The QUIC engine routes on the datagram contents, not the UDP
             // 4-tuple, so we always attribute it to the server `peer` (which
@@ -976,11 +994,12 @@ fn pump_once(
         }
     }
 
-    // Run timers. We use a monotonic anchor inside the connection, so
-    // `next_timeout` already returns the right delta.
-    if let Some(_dl) = conn.next_timeout() {
-        conn.on_timeout(Duration::ZERO);
-    }
+    // Run timers. `on_timeout` compares the elapsed-since-connection-start we
+    // pass against its internal deadlines, so it must receive the real elapsed
+    // time (passing zero would make `has_fired` perpetually false and a PTO
+    // would never retransmit). `start` is anchored at connection build, a hair
+    // before the engine's own start, so we never fire a timer early.
+    conn.on_timeout(start.elapsed());
 
     // Drain any retransmissions the timer / feed triggered.
     loop {
@@ -1001,11 +1020,11 @@ fn handshake(
     sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
     deadline_hint: Option<Duration>,
+    start: Instant,
 ) -> Result<()> {
     let total_deadline = deadline_hint
         .unwrap_or(MAX_TOTAL_DEADLINE)
         .min(MAX_TOTAL_DEADLINE);
-    let start = Instant::now();
     while !conn.is_handshake_complete() {
         if start.elapsed() > total_deadline {
             return Err(Error::Io(io::Error::new(
@@ -1013,7 +1032,7 @@ fn handshake(
                 "http3: QUIC handshake timed out",
             )));
         }
-        pump_once(conn, sock, peer, true)?;
+        pump_once(conn, sock, peer, true, start)?;
         if conn.is_closed() {
             return Err(Error::BadResponse(
                 "http3: connection closed mid-handshake".into(),
@@ -1206,10 +1225,11 @@ fn pump(
     sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
     _read_timeout: Option<Duration>,
+    start: Instant,
 ) -> Result<()> {
     // A couple of non-blocking ticks just to flush our pending datagrams.
     for _ in 0..3 {
-        pump_once(conn, sock, peer, false)?;
+        pump_once(conn, sock, peer, false, start)?;
     }
     Ok(())
 }
@@ -1227,6 +1247,7 @@ fn read_response(
     mut sink: Option<&mut dyn Write>,
     mut on_head: Option<crate::http::HeadObserver<'_>>,
     trace: &mut dyn Write,
+    conn_start: Instant,
 ) -> Result<Response> {
     let mut streamed_len: u64 = 0;
     let total_deadline = req
@@ -1329,7 +1350,7 @@ fn read_response(
         }
 
         // Drive the I/O loop forward so more bytes can arrive.
-        pump_once(conn, sock, peer, true)?;
+        pump_once(conn, sock, peer, true, conn_start)?;
     }
 
     let fields = headers.ok_or_else(|| Error::BadResponse("http3: no HEADERS frame".into()))?;
@@ -1382,6 +1403,20 @@ fn try_consume_frame(
                 ));
             }
         }
+        // RFC 9114 §7.2: these frames belong on the control stream (or, for
+        // PUSH_PROMISE, require a push we never enabled). Seeing one on a
+        // request stream is H3_FRAME_UNEXPECTED — reject before buffering its
+        // (possibly huge) declared length rather than silently draining it.
+        frame_type::SETTINGS
+        | frame_type::GOAWAY
+        | frame_type::CANCEL_PUSH
+        | frame_type::MAX_PUSH_ID
+        | frame_type::PUSH_PROMISE => {
+            return FrameOutcome::Err(Error::BadResponse(format!(
+                "http3: frame type {:#x} not allowed on a request stream",
+                frame.ty
+            )));
+        }
         _ => {}
     }
     // `frame.len` is a QUIC varint (up to 2^62-1). On a 32-bit target a plain
@@ -1403,13 +1438,20 @@ fn try_consume_frame(
     match frame.ty {
         frame_type::HEADERS => match decode_header_block(decoder, payload) {
             Ok(fields) => {
+                // A block always owes a Section Ack if it referenced the
+                // dynamic table, regardless of which kind of HEADERS it is.
+                let ack_owed = block_references_dynamic_table(payload);
                 if headers.is_some() {
-                    // Trailers — RFC 9114 §4.1 allows them, but we don't
-                    // surface them. Discard silently.
+                    // A HEADERS block after the final response is trailers
+                    // (RFC 9114 §4.1) — allowed, but we don't surface them.
+                    // Discard silently.
+                } else if header_status(&fields).is_some_and(|s| (100..200).contains(&s)) {
+                    // An interim 1xx informational response (RFC 9114 §4.1):
+                    // not the final head. Skip it and keep reading for the
+                    // real HEADERS block.
                 } else {
                     *headers = Some(fields);
                 }
-                let ack_owed = block_references_dynamic_table(payload);
                 FrameOutcome::Consumed(total, ack_owed)
             }
             Err(e) => FrameOutcome::Err(e),
@@ -1444,6 +1486,16 @@ fn send_section_ack(conn: &mut QuicConnection, request_sid: StreamId, state: &Ht
         encode_section_ack(request_sid.value(), &mut out);
         let _ = write_all(conn, dec, &out);
     }
+}
+
+/// The numeric `:status` pseudo-header of a decoded field section, if present
+/// and parseable. Used to tell an interim 1xx HEADERS block from the final
+/// response (RFC 9114 §4.1).
+fn header_status(fields: &Fields) -> Option<u16> {
+    fields
+        .iter()
+        .find(|(k, _)| k == ":status")
+        .and_then(|(_, v)| v.parse::<u16>().ok())
 }
 
 /// Invoke `on_head` once with the decoded response head, taking the observer so
@@ -2039,5 +2091,112 @@ mod tests {
             try_consume_frame(&buf, &mut headers, &mut body, &mut dec, None, &mut 0),
             FrameOutcome::NeedMore
         ));
+    }
+
+    /// Build a HEADERS frame carrying `fields`, statically QPACK-encoded.
+    fn headers_frame(fields: &[(&str, &str)]) -> Vec<u8> {
+        let owned: Vec<(String, String)> = fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let block = encode_header_block(&owned);
+        let mut buf = Vec::new();
+        Frame::encode_header(frame_type::HEADERS, block.len() as u64, &mut buf);
+        buf.extend_from_slice(&block);
+        buf
+    }
+
+    #[test]
+    fn control_frame_on_request_stream_is_rejected() {
+        // SETTINGS / GOAWAY / CANCEL_PUSH / MAX_PUSH_ID / PUSH_PROMISE belong on
+        // the control stream (or need a push we never enabled). On a request
+        // stream they are H3_FRAME_UNEXPECTED — rejected even before the
+        // declared payload is buffered (here only the header is present).
+        for ty in [
+            frame_type::SETTINGS,
+            frame_type::GOAWAY,
+            frame_type::CANCEL_PUSH,
+            frame_type::MAX_PUSH_ID,
+            frame_type::PUSH_PROMISE,
+        ] {
+            let mut buf = Vec::new();
+            Frame::encode_header(ty, 8, &mut buf); // declares 8 bytes, sends none
+            let mut headers = None;
+            let mut body = Vec::new();
+            let mut dec = decoder();
+            assert!(
+                matches!(
+                    try_consume_frame(&buf, &mut headers, &mut body, &mut dec, None, &mut 0),
+                    FrameOutcome::Err(Error::BadResponse(_))
+                ),
+                "frame type {ty:#x} must be rejected on a request stream"
+            );
+        }
+    }
+
+    #[test]
+    fn interim_1xx_headers_is_skipped_then_final_used() {
+        // A 1xx informational HEADERS block must not become the response head;
+        // the following final block is the real one (RFC 9114 §4.1).
+        let interim = headers_frame(&[(":status", "103")]);
+        let final_block = headers_frame(&[(":status", "200"), ("content-type", "text/plain")]);
+        let mut headers = None;
+        let mut body = Vec::new();
+        let mut dec = decoder();
+
+        assert!(matches!(
+            try_consume_frame(&interim, &mut headers, &mut body, &mut dec, None, &mut 0),
+            FrameOutcome::Consumed(_, _)
+        ));
+        assert!(
+            headers.is_none(),
+            "interim 1xx must not be stored as the head"
+        );
+
+        assert!(matches!(
+            try_consume_frame(
+                &final_block,
+                &mut headers,
+                &mut body,
+                &mut dec,
+                None,
+                &mut 0
+            ),
+            FrameOutcome::Consumed(_, _)
+        ));
+        let fields = headers.expect("final HEADERS should be stored");
+        assert_eq!(header_status(&fields), Some(200));
+    }
+
+    #[test]
+    fn trailers_after_final_headers_are_discarded() {
+        let final_block = headers_frame(&[(":status", "200")]);
+        let trailers = headers_frame(&[("x-trailer", "v")]);
+        let mut headers = None;
+        let mut body = Vec::new();
+        let mut dec = decoder();
+
+        let _ = try_consume_frame(
+            &final_block,
+            &mut headers,
+            &mut body,
+            &mut dec,
+            None,
+            &mut 0,
+        );
+        assert_eq!(header_status(headers.as_ref().unwrap()), Some(200));
+
+        // A second HEADERS block (after the final response) is trailers: consumed
+        // but does not replace the stored head.
+        assert!(matches!(
+            try_consume_frame(&trailers, &mut headers, &mut body, &mut dec, None, &mut 0),
+            FrameOutcome::Consumed(_, _)
+        ));
+        let fields = headers.unwrap();
+        assert_eq!(header_status(&fields), Some(200));
+        assert!(
+            !fields.iter().any(|(k, _)| k == "x-trailer"),
+            "trailers must not be merged into the head"
+        );
     }
 }
