@@ -325,14 +325,21 @@ mod tests {
     async fn async_post_sends_body_and_length() {
         let (port, rx) = echo_request();
         let rt = TokioRuntime;
-        let resp = post(&rt, &format!("http://127.0.0.1:{port}/sub"), b"name=value".to_vec())
-            .await
-            .unwrap();
+        let resp = post(
+            &rt,
+            &format!("http://127.0.0.1:{port}/sub"),
+            b"name=value".to_vec(),
+        )
+        .await
+        .unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"ok");
 
         let raw = String::from_utf8(rx.recv().unwrap()).unwrap();
-        assert!(raw.starts_with("POST /sub HTTP/1.1\r\n"), "request line: {raw:?}");
+        assert!(
+            raw.starts_with("POST /sub HTTP/1.1\r\n"),
+            "request line: {raw:?}"
+        );
         assert!(
             raw.to_lowercase().contains("content-length: 10\r\n"),
             "missing content-length: {raw:?}"
@@ -353,10 +360,20 @@ mod tests {
 
         let raw = String::from_utf8(rx.recv().unwrap()).unwrap();
         let lower = raw.to_lowercase();
-        assert!(raw.starts_with("PUT /x HTTP/1.1\r\n"), "request line: {raw:?}");
-        assert!(raw.contains("X-Custom: abc\r\n"), "missing custom header: {raw:?}");
+        assert!(
+            raw.starts_with("PUT /x HTTP/1.1\r\n"),
+            "request line: {raw:?}"
+        );
+        assert!(
+            raw.contains("X-Custom: abc\r\n"),
+            "missing custom header: {raw:?}"
+        );
         // Caller's User-Agent wins; rsurl's default is suppressed.
         assert!(lower.contains("user-agent: mine/1.0\r\n"), "ua: {raw:?}");
-        assert_eq!(lower.matches("user-agent:").count(), 1, "duplicate UA: {raw:?}");
+        assert_eq!(
+            lower.matches("user-agent:").count(),
+            1,
+            "duplicate UA: {raw:?}"
+        );
     }
 }
