@@ -17,9 +17,15 @@ use crate::net::NetStream;
 /// Drive `machine` to completion over the blocking stream `io`, returning the
 /// application events it produced, in order.
 ///
+/// A convenience wrapper over [`drive_streaming`] that collects events into a
+/// `Vec`. The production HTTP path streams events instead (see
+/// [`drive_streaming_observed`], used by `http::drive_collect`), so this is only
+/// used by the driver's own tests.
+///
 /// Returns [`Error::UnexpectedEof`] if the transport closes while the machine
 /// still expects bytes (its [`handle_eof`](Machine::handle_eof) rejects), and
 /// propagates any transport or protocol error.
+#[cfg(test)]
 pub(crate) fn drive<M, S>(machine: &mut M, io: &mut S) -> Result<Vec<M::Event>>
 where
     M: Machine,
@@ -33,12 +39,13 @@ where
     Ok(events)
 }
 
-/// Like [`drive`], but relay each event to `on_event` as it is produced instead
-/// of collecting them into a `Vec` returned at completion. This is what a
-/// streaming frontend uses: a machine in streaming mode emits its head and body
-/// chunks incrementally, and `on_event` (e.g. writing a body chunk to a sink)
-/// runs during the transfer rather than after it. An `on_event` error aborts the
-/// drive and propagates.
+/// Like [`drive_streaming_observed`] without the per-tick observer: relay each
+/// event to `on_event` as it is produced. A machine in streaming mode emits its
+/// head and body chunks incrementally, and `on_event` (e.g. writing a body chunk
+/// to a sink) runs during the transfer rather than after it. An `on_event` error
+/// aborts the drive and propagates. The HTTP path needs the observer variant (to
+/// time `appconnect`), so this thinner wrapper is exercised by tests.
+#[cfg(test)]
 pub(crate) fn drive_streaming<M, S, F>(machine: &mut M, io: &mut S, on_event: F) -> Result<()>
 where
     M: Machine,
@@ -48,11 +55,13 @@ where
     drive_streaming_observed(machine, io, on_event, |_| {})
 }
 
-/// Like [`drive_streaming`], but also calls `on_tick(machine)` once per driver
-/// iteration, after wire bytes have been processed. This lets a frontend observe
-/// machine state transitions that aren't surfaced as events — notably the TLS
-/// handshake completing ([`Machine::handshake_done`]) so it can time
-/// `appconnect`. `on_tick` must not perform I/O; it only reads machine state.
+/// Drive `machine` to completion over the blocking stream `io`, relaying each
+/// event to `on_event` and calling `on_tick(machine)` once per driver iteration
+/// (after wire bytes are processed). The tick lets a frontend observe machine
+/// state transitions that aren't surfaced as events — notably the TLS handshake
+/// completing ([`Machine::handshake_done`]) so it can time `appconnect`.
+/// `on_tick` must not perform I/O; it only reads machine state. This is the
+/// entry the synchronous HTTP path uses.
 pub(crate) fn drive_streaming_observed<M, S, F, O>(
     machine: &mut M,
     io: &mut S,

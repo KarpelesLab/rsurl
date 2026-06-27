@@ -63,13 +63,12 @@ pub use backend::{
 /// Build a socket-free sans-IO TLS client engine for the active backend,
 /// configured from `sni` and `opts`. The blocking/async drivers drive the
 /// returned engine via [`crate::proto::tls::TlsClient`]; this is the
-/// connect-construction half of the new (sans-IO) request stack. Post-handshake
-/// checks (verify callback, public-key pinning) remain the driver's
-/// responsibility — they need the peer chain, available only after the
-/// handshake. Returns the active backend's concrete engine type (exactly one
-/// backend compiles, so this is a single type per build).
-// Exercised by tests now; routed into the request path at the cutover phase.
-#[allow(dead_code)]
+/// connect-construction half of the sans-IO request stack, used by
+/// `http::run_https_core`. Post-handshake checks (verify callback, public-key
+/// pinning) remain the driver's responsibility — they need the peer chain,
+/// available only after the handshake (see `http::verify_core_peer_certificates`).
+/// Returns the active backend's concrete engine type (exactly one backend
+/// compiles, so this is a single type per build).
 #[cfg(feature = "rustls-tls")]
 pub(crate) fn build_client_engine(
     sni: &str,
@@ -80,7 +79,6 @@ pub(crate) fn build_client_engine(
     )?))
 }
 
-#[allow(dead_code)]
 #[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
 pub(crate) fn build_client_engine(
     sni: &str,

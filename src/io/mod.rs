@@ -12,11 +12,10 @@
 //! See [`machine`] for the contract and the rationale (the sans-IO pattern as
 //! used by rustls, quinn, and str0m).
 //!
-//! NOTE: this module is built in parallel to the legacy blocking engine and is
-//! not yet on the public path, so parts are currently only exercised by tests.
-//! The `allow(dead_code)` is removed at the cutover phase, when `Request::send`
-//! routes through the driver.
-#![allow(dead_code)]
+//! As of the cutover, the blocking driver is on the live request path:
+//! [`crate::Request::send`] routes HTTP/1.1 (plaintext and direct HTTPS) through
+//! [`blocking`], and the async `aio` frontend drives the same machines through
+//! [`asyncio`].
 
 pub(crate) mod asyncio;
 pub(crate) mod blocking;

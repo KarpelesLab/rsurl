@@ -2200,25 +2200,6 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
     send_plain_via_core(&req, trace)
 }
 
-// Legacy direct-plain HTTP/1.1 engine, superseded by `send_plain_via_core` at
-// cutover P3. Retained as the parity reference (the P0/P2 tests compare the core
-// path against it) until cutover P4 retires it.
-#[allow(dead_code)]
-fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
-    let start = std::time::Instant::now();
-    let (stream, _cancel_guard, namelookup) = tcp_connect_cancellable(&req, trace)?;
-    let connect = start.elapsed();
-    let mut bufrd = BufReader::new(stream);
-    write_request(bufrd.get_mut(), &req, via_plain_http_proxy(&req), trace)?;
-    let mut resp =
-        read_response_timed(&mut bufrd, &req.method, req.decompress, Some(start), trace)?;
-    resp.timing.namelookup = namelookup;
-    resp.timing.connect = Some(connect);
-    resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
-    finalize_plain(bufrd, &req, &resp, may_pool, trace);
-    Ok(resp)
-}
-
 /// The plaintext HTTP/1.1 transfer, driven by the sans-IO core
 /// ([`crate::proto::http1`] + [`crate::io::blocking`]) instead of the legacy
 /// inline `read_head`/`read_body`/`read_chunked` loop. The shared
@@ -2665,45 +2646,6 @@ fn send_https_via_connector(req: Request, trace: &mut dyn Write) -> Result<Respo
     Ok(resp)
 }
 
-// Legacy direct-plain pooled reuse, superseded by `send_plain_via_core` (P3).
-// Retired at cutover P4.
-#[allow(dead_code)]
-fn perform_on_pooled_plain(
-    mut bufrd: BufReader<TcpStream>,
-    req: &Request,
-    trace: &mut dyn Write,
-) -> std::result::Result<Response, PooledError> {
-    if let Err(e) = write_request(bufrd.get_mut(), req, via_plain_http_proxy(req), trace) {
-        return Err(stale_or_hard(e));
-    }
-    let resp = match read_response(&mut bufrd, &req.method, req.decompress, trace) {
-        Ok(r) => r,
-        Err(e) => return Err(stale_or_hard(e)),
-    };
-    finalize_plain(bufrd, req, &resp, true, trace);
-    Ok(resp)
-}
-
-// Legacy plain keep-alive/park, superseded by `run_plain_core` (P3). Retired P4.
-#[allow(dead_code)]
-fn finalize_plain(
-    bufrd: BufReader<TcpStream>,
-    req: &Request,
-    resp: &Response,
-    may_pool: bool,
-    trace: &mut dyn Write,
-) {
-    if may_pool && response_is_reusable(&req.method, resp) {
-        crate::pool::plain()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .release(pool_key_for(req), bufrd);
-        let _ = writeln!(trace, "* Connection kept alive (pooled)");
-    } else {
-        let _ = writeln!(trace, "* Connection closed");
-    }
-}
-
 /// Why a request attempt over a pooled connection failed. `Stale` means the
 /// peer probably killed it under us, and the caller should silently retry on
 /// a fresh socket. `Hard` is anything else (TLS verification failure, body
@@ -2779,17 +2721,7 @@ pub(crate) fn pool_key_for(req: &Request) -> crate::pool::Key {
     }
 }
 
-// Legacy plain pool checkout, superseded by `core_pool_checkout_plain` (P3).
-#[allow(dead_code)]
-fn pool_checkout_plain(req: &Request) -> Option<BufReader<TcpStream>> {
-    crate::pool::plain()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .checkout(&pool_key_for(req))
-}
-
 /// Check out a warm plaintext socket for the sans-IO core path, if one is parked.
-#[allow(dead_code)]
 fn core_pool_checkout_plain(req: &Request) -> Option<TcpStream> {
     crate::pool::core_plain()
         .lock()
@@ -2797,9 +2729,8 @@ fn core_pool_checkout_plain(req: &Request) -> Option<TcpStream> {
         .checkout(&pool_key_for(req))
 }
 
-/// Check out a warm TLS session (socket + engine) for the sans-IO core path. As
-/// with [`pool_checkout_tls`], only pool-eligible requests may reuse a session.
-#[allow(dead_code)]
+/// Check out a warm TLS session (socket + engine) for the sans-IO core path.
+/// Only pool-eligible requests ([`tls_pool_eligible`]) may reuse a session.
 #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
 fn core_pool_checkout_tls(req: &Request) -> Option<crate::pool::CoreTlsConn> {
     if !tls_pool_eligible(req) {
@@ -2827,19 +2758,6 @@ pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
         && req.crl_file.is_none()
         && req.ciphers.is_none()
         && req.tls13_ciphers.is_none()
-}
-
-// Legacy direct-HTTPS pool checkout, superseded by `core_pool_checkout_tls`
-// (P3). Retired at cutover P4.
-#[allow(dead_code)]
-fn pool_checkout_tls(req: &Request) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
-    if !tls_pool_eligible(req) {
-        return None;
-    }
-    crate::pool::tls()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .checkout(&pool_key_for(req))
 }
 
 /// Server-side keep-alive eligibility. Caller must also have read the body
@@ -3192,10 +3110,10 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     if direct {
         return send_https_via_core(&req, trace);
     }
-    send_https_fresh(req, false, trace)
+    send_https_fresh(req, trace)
 }
 
-fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
+fn send_https_fresh(req: Request, trace: &mut dyn Write) -> Result<Response> {
     let start = std::time::Instant::now();
     let (tcp, _cancel_guard, namelookup) = tcp_connect_cancellable(&req, trace)?;
     let connect = start.elapsed();
@@ -3226,50 +3144,13 @@ fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     resp.timing.appconnect = Some(appconnect);
     resp.timing.pretransfer = Some(appconnect); // request goes out right after TLS
     resp.tls = Some(tls_info);
-    finalize_tls(bufrd, &req, &resp, may_pool, trace);
+    // This path serves only proxied `CONNECT` HTTPS, which is not pooled (a
+    // tunnelled socket is bound to one origin and mixes badly with per-origin
+    // Proxy-Authorization), so the connection closes after one exchange. Direct
+    // HTTPS pools via the sans-IO core (`send_https_via_core`).
+    drop(bufrd);
+    let _ = writeln!(trace, "* Connection closed");
     Ok(resp)
-}
-
-// Legacy direct-HTTPS pooled reuse, superseded by `send_https_via_core` (P3).
-// Retired at cutover P4.
-#[allow(dead_code)]
-fn perform_on_pooled_tls(
-    mut bufrd: BufReader<crate::tls::TlsStream<TcpStream>>,
-    req: &Request,
-    trace: &mut dyn Write,
-) -> std::result::Result<Response, PooledError> {
-    if let Err(e) = write_request(bufrd.get_mut(), req, false, trace) {
-        return Err(stale_or_hard(e));
-    }
-    let mut resp = match read_response(&mut bufrd, &req.method, req.decompress, trace) {
-        Ok(r) => r,
-        Err(e) => return Err(stale_or_hard(e)),
-    };
-    // TLS parameters are a property of the (reused) connection — report them.
-    resp.tls = Some(tls_info_from(bufrd.get_ref()));
-    finalize_tls(bufrd, req, &resp, true, trace);
-    Ok(resp)
-}
-
-fn finalize_tls(
-    bufrd: BufReader<crate::tls::TlsStream<TcpStream>>,
-    req: &Request,
-    resp: &Response,
-    may_pool: bool,
-    trace: &mut dyn Write,
-) {
-    // Only park sockets whose verification posture matches a default
-    // verifying request — never an `-k`/`--cacert` socket — so a later
-    // verifying request can't silently inherit a weaker trust decision.
-    if may_pool && tls_pool_eligible(req) && response_is_reusable(&req.method, resp) {
-        crate::pool::tls()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .release(pool_key_for(req), bufrd);
-        let _ = writeln!(trace, "* Connection kept alive (pooled)");
-    } else {
-        let _ = writeln!(trace, "* Connection closed");
-    }
 }
 
 /// Open a TCP socket pointed at whatever the next-hop endpoint actually
@@ -5283,24 +5164,24 @@ mod tests {
     }
 
     #[test]
-    fn p0_core_matches_legacy_plain_get() {
-        // Same response served to two connections; the sans-IO path and the
-        // legacy path must produce identical status/version/headers/body.
+    fn core_plain_get_parses_status_headers_body() {
+        // The sans-IO plaintext path decodes status line, headers and a
+        // Content-Length body into the public `Response` shape.
         let response =
             b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world"
                 .to_vec();
-        let port = serve_n(2, response);
+        let port = serve_n(1, response);
         let url = format!("http://127.0.0.1:{port}/");
 
-        let legacy = send_plain_fresh(Request::get(&url).unwrap(), false, &mut io::sink()).unwrap();
         let core = send_plain_via_core(&Request::get(&url).unwrap(), &mut io::sink()).unwrap();
-
-        assert_eq!(core.status, legacy.status);
-        assert_eq!(core.version, legacy.version);
-        assert_eq!(core.reason, legacy.reason);
-        assert_eq!(core.headers, legacy.headers);
-        assert_eq!(core.body, legacy.body);
+        assert_eq!(core.status, 200);
+        assert_eq!(core.version, "HTTP/1.1");
+        assert_eq!(core.reason, "OK");
         assert_eq!(core.body, b"hello world");
+        assert!(core
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "11"));
     }
 
     #[test]

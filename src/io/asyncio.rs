@@ -16,8 +16,8 @@ use crate::io::runtime::AsyncConn;
 use crate::io::Machine;
 
 /// Drive `machine` to completion over the async connection `conn`, returning the
-/// application events it produced, in order. Mirrors
-/// [`blocking::drive`](super::blocking::drive).
+/// application events it produced, in order. The async counterpart of the
+/// blocking driver in [`super::blocking`].
 pub(crate) async fn drive<M, C>(machine: &mut M, conn: &mut C) -> Result<Vec<M::Event>>
 where
     M: Machine,

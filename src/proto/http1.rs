@@ -118,8 +118,8 @@ impl ClientExchange {
     /// Like [`new`](Self::new) but streams the response: the machine emits
     /// [`Event::Head`] once, an [`Event::Body`] per decoded chunk as bytes
     /// arrive, then [`Event::End`] — instead of one buffered [`Event::Response`].
-    /// Pair with [`crate::io::blocking::drive_streaming`] to deliver the body
-    /// without buffering it whole.
+    /// Pair with [`crate::io::blocking::drive_streaming_observed`] to deliver the
+    /// body without buffering it whole.
     pub(crate) fn new_streaming(method: &str, request_bytes: Vec<u8>) -> ClientExchange {
         ClientExchange::build(method, request_bytes, true)
     }
