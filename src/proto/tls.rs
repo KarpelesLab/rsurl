@@ -265,7 +265,13 @@ impl TlsEngine for RustlsEngine {
 /// queues the next flight) and *reported* by `handshake()` — so we feed, then
 /// refresh a cached completion flag, and never loop on `handshake()` (which
 /// would spin on `WantWrite` since it only reports queued output).
+///
+/// When both TLS backends are compiled in (`--all-features`), `build_client_engine`
+/// picks rustls (the cfg cascade), so the library never constructs this engine —
+/// but it stays compiled because the cross-backend tests (purecrypto client ↔
+/// rustls server) exercise it. Hence the conditional dead-code allow.
 #[cfg(feature = "purecrypto-tls")]
+#[cfg_attr(feature = "rustls-tls", allow(dead_code))]
 pub(crate) struct PurecryptoEngine {
     conn: purecrypto::tls::Connection,
     /// Inbound wire that `feed` did not consume yet (it takes only a prefix).
@@ -276,11 +282,13 @@ pub(crate) struct PurecryptoEngine {
 }
 
 #[cfg(feature = "purecrypto-tls")]
+#[cfg_attr(feature = "rustls-tls", allow(dead_code))]
 fn pc_err(e: impl std::fmt::Debug) -> crate::error::Error {
     crate::error::Error::Io(std::io::Error::other(format!("tls: {e:?}")))
 }
 
 #[cfg(feature = "purecrypto-tls")]
+#[cfg_attr(feature = "rustls-tls", allow(dead_code))]
 impl PurecryptoEngine {
     pub(crate) fn new(conn: purecrypto::tls::Connection) -> Result<PurecryptoEngine> {
         // `Connection::client` already queues the ClientHello, popped by the

@@ -93,7 +93,9 @@ mod tests {
         let req = ClientExchange::encode_request("GET", "/", &[("Host".into(), "x".into())], b"");
         let mut x = ClientExchange::new("GET", req);
         let mut events = asyncio::drive(&mut x, &mut conn).await.unwrap();
-        let Event::Response { body, .. } = events.remove(0);
+        let Event::Response { body, .. } = events.remove(0) else {
+            panic!("expected Response event");
+        };
         body
     }
 

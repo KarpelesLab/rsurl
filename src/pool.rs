@@ -4,7 +4,7 @@
 //! and storing `Arc<Mutex<Connection<TlsStream<TcpStream>>>>`. HTTP/2 needs
 //! shared connections because it multiplexes requests on a single stream-id
 //! space; the value is an `Arc<Mutex<…>>` and many callers can hold one. It only
-//! shares this module's runtime caps ([`configure`]/[`per_key_cap`]/[`global_cap`]).
+//! shares this module's runtime caps ([`configure`]/`per_key_cap`/`global_cap`).
 //!
 //! HTTP/1.1 doesn't need sharing: a connection carries one request at a time.
 //! What it *does* need is parking — after a response is fully read, the warm
@@ -12,11 +12,11 @@
 //! instead of doing a fresh TCP+TLS handshake. This is what curl calls
 //! "connection cache" and is the single biggest steady-state win.
 //!
-//! The pool is [`CorePool`], driven by the sans-IO request path
-//! ([`crate::proto::http1`] over [`crate::io::blocking`]). Design points:
+//! The pool is `CorePool`, driven by the sans-IO request path (`proto::http1`
+//! over `io::blocking`). Design points:
 //!
 //! * Keyed on `(scheme, host, port)` plus a dial-target/partition discriminator
-//!   ([`Key`]) — exact-match, no virtual-host trickery.
+//!   (`Key`) — exact-match, no virtual-host trickery.
 //! * Connections are stored **bare** (no `BufReader`): the sans-IO exchange
 //!   buffers received bytes internally and the driver reads exactly the framed
 //!   response, so there are never prefetched bytes to carry. Plain entries park

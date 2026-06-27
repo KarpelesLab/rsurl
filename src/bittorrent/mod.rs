@@ -16,7 +16,7 @@
 //! * **Transfer** — the peer wire protocol ([`peer`]), a rarest-first piece
 //!   picker ([`picker`]), on-disk storage with SHA-1 verification
 //!   ([`storage`]), and the threaded swarm engine that drives them
-//!   ([`engine`], [`download`]).
+//!   ([`engine`], [`mod@download`]).
 //! * **Seeding** — serve verified pieces back to the swarm ([`seed`]).
 
 pub mod bencode;

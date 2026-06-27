@@ -236,7 +236,7 @@ mod tests {
 
         assert_eq!(kinds.first().copied(), Some("head"));
         assert_eq!(kinds.last().copied(), Some("end"));
-        assert!(kinds.iter().any(|k| *k == "body"));
+        assert!(kinds.contains(&"body"));
         assert_eq!(body, b"hello world");
     }
 }
