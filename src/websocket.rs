@@ -40,14 +40,24 @@
 //!     and RSV1 on a control frame is rejected. See `Pmd` for the
 //!     context-takeover decision.
 //!
-//! Limitations of this scaffold (intentionally deferred):
-//!   * Streaming/large payloads — the whole message is buffered in memory.
-//!   * Ping *intervals* / timer-driven keepalive; we react to peer pings but
-//!     do not proactively send our own on a schedule.
+//! Streaming and keepalive:
+//!   * Send streaming — [`WebSocket::send_stream`] / [`WsWriter::send_stream`]
+//!     fragment an [`io::Read`] source into a data frame + CONTINUATION frames
+//!     with a two-chunk look-ahead, so a large body is never fully buffered in
+//!     memory (sent uncompressed, since per-message DEFLATE needs the whole
+//!     message). Receive streaming is available frame-by-frame via
+//!     [`WsReader::recv_frame`]; the message-level [`recv`](WsReader::recv)
+//!     reassembles and is bounded by `MAX_PAYLOAD_BYTES` by design.
+//!   * Keepalive — [`WebSocket::keepalive`] / [`WsWriter::keepalive`] start a
+//!     background thread that sends a PING whenever the connection has been
+//!     idle (no outbound write) for the configured interval, returning a
+//!     [`WsKeepalive`] guard that stops the thread when dropped. Incoming pings
+//!     are still auto-ponged by the receive path.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use compcol::deflate::Deflate;
@@ -424,6 +434,10 @@ struct WsTransport {
     /// The caller's per-read inactivity timeout (`None` = block until data,
     /// shutdown, or EOF).
     read_timeout: Mutex<Option<Duration>>,
+    /// When the last outbound frame was written. Drives idle-based keepalive
+    /// ([`WsWriter::keepalive`]): a ping is sent only after this much time has
+    /// elapsed with no write, so a busy connection is never pinged needlessly.
+    last_write: Mutex<Instant>,
 }
 
 /// A socket read timeout/`WouldBlock` — i.e. a poll tick elapsed with no data,
@@ -444,7 +458,14 @@ impl WsTransport {
             kind,
             shutdown: Arc::new(AtomicBool::new(false)),
             read_timeout: Mutex::new(Some(SEND_TIMEOUT)),
+            last_write: Mutex::new(Instant::now()),
         }
+    }
+
+    /// How long since the last successful outbound write. Used by the keepalive
+    /// thread to decide whether the connection is idle enough to ping.
+    fn idle(&self) -> Duration {
+        self.last_write.lock().unwrap().elapsed()
     }
 
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -498,7 +519,9 @@ impl WsTransport {
     }
 
     fn write_all(&self, data: &[u8]) -> io::Result<()> {
-        self.kind.write_all(data)
+        self.kind.write_all(data)?;
+        *self.last_write.lock().unwrap() = Instant::now();
+        Ok(())
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -667,6 +690,83 @@ impl WsShutdown {
             .unwrap()
             .shutdown(std::net::Shutdown::Both)
             .map_err(Error::Io)
+    }
+}
+
+/// A running keepalive task (from [`WebSocket::keepalive`] /
+/// [`WsWriter::keepalive`]). A background thread sends a PING whenever the
+/// connection has been idle for the configured interval. Dropping this guard
+/// stops the thread; it also stops on its own once the connection closes.
+pub struct WsKeepalive {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl WsKeepalive {
+    /// Stop the keepalive thread and wait for it to exit. Equivalent to
+    /// dropping the guard, but explicit.
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for WsKeepalive {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+/// Spawn the idle-ping keepalive thread shared by both halves. The thread wakes
+/// every [`SHUTDOWN_POLL`] tick so a `stop`/close/shutdown is observed promptly,
+/// and pings only once the transport has been idle for `interval` (a ping is
+/// itself a write, so it resets the idle clock).
+fn spawn_keepalive(
+    transport: Arc<WsTransport>,
+    send_closed: Arc<AtomicBool>,
+    recv_closed: Arc<AtomicBool>,
+    interval: Duration,
+) -> WsKeepalive {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        let done = |t: &WsTransport| {
+            stop_thread.load(Ordering::SeqCst)
+                || send_closed.load(Ordering::SeqCst)
+                || recv_closed.load(Ordering::SeqCst)
+                || t.shutdown.load(Ordering::SeqCst)
+        };
+        loop {
+            if done(&transport) {
+                return;
+            }
+            thread::sleep(SHUTDOWN_POLL);
+            if done(&transport) {
+                return;
+            }
+            if transport.idle() >= interval {
+                // A failed ping means the socket is gone — stop quietly.
+                match build_client_frame(OPCODE_PING, &[]) {
+                    Ok(frame) => {
+                        if transport.write_all(&frame).is_err() {
+                            return;
+                        }
+                        let _ = transport.flush();
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+    });
+    WsKeepalive {
+        stop,
+        handle: Some(handle),
     }
 }
 
@@ -856,6 +956,20 @@ impl WebSocket {
     /// Send a [`WsMessage`].
     pub fn send(&mut self, msg: &WsMessage) -> Result<()> {
         self.writer.send(msg)
+    }
+
+    /// Stream a data message from `reader`, fragmenting it across frames so the
+    /// whole payload is never buffered in memory. See
+    /// [`WsWriter::send_stream`].
+    pub fn send_stream<R: Read>(&mut self, opcode: WsOpcode, reader: &mut R) -> Result<()> {
+        self.writer.send_stream(opcode, reader)
+    }
+
+    /// Send a PING whenever the connection is idle for `interval`. Returns a
+    /// guard that stops the keepalive when dropped. See
+    /// [`WsWriter::keepalive`].
+    pub fn keepalive(&self, interval: Duration) -> WsKeepalive {
+        self.writer.keepalive(interval)
     }
 
     /// Send a ping with `payload` (≤ 125 bytes per RFC 6455 §5.5). The peer's
@@ -1142,6 +1256,34 @@ impl WsWriter {
             OPCODE_BINARY,
             data,
             self.compress,
+        )
+    }
+
+    /// Stream a data message from `reader`, fragmenting it across frames so the
+    /// whole payload is never buffered in memory. `opcode` must be
+    /// [`WsOpcode::Text`] or [`WsOpcode::Binary`]. The message is sent
+    /// uncompressed regardless of the negotiated permessage-deflate (streaming
+    /// DEFLATE would need the whole message). Control frames (e.g. a reader's
+    /// auto-pong) may interleave between fragments, which is spec-legal.
+    pub fn send_stream<R: Read>(&mut self, opcode: WsOpcode, reader: &mut R) -> Result<()> {
+        self.ensure_open()?;
+        send_stream_inner(
+            &mut TransportIo(self.transport.as_ref()),
+            opcode.to_u8(),
+            reader,
+        )
+    }
+
+    /// Start sending a PING whenever the connection is idle (no outbound write)
+    /// for `interval`. Returns a [`WsKeepalive`] guard; drop it (or call
+    /// [`WsKeepalive::stop`]) to stop. The thread also exits when the
+    /// connection closes.
+    pub fn keepalive(&self, interval: Duration) -> WsKeepalive {
+        spawn_keepalive(
+            Arc::clone(&self.transport),
+            Arc::clone(&self.send_closed),
+            Arc::clone(&self.recv_closed),
+            interval,
         )
     }
 
@@ -1688,6 +1830,57 @@ fn send_message<S: Write>(
         build_client_frame(opcode, payload)?
     };
     stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// How much of a streamed body to pull from the source per WebSocket frame.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// Read up to `cap` bytes into a fresh buffer, looping over short reads until
+/// the buffer is full or the source hits EOF. Returns a shorter (possibly
+/// empty) buffer only at EOF.
+fn read_chunk<R: Read>(reader: &mut R, cap: usize) -> io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; cap];
+    let mut filled = 0;
+    while filled < cap {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// Stream a data message from `reader`, fragmenting it into a leading data
+/// frame plus CONTINUATION frames so the whole payload is never buffered at
+/// once (only two `STREAM_CHUNK` buffers are held). Sent uncompressed: a
+/// per-message DEFLATE layer would require buffering the entire message. A
+/// zero-byte source sends a single empty `FIN` frame.
+fn send_stream_inner<S: Write, R: Read>(stream: &mut S, opcode: u8, reader: &mut R) -> Result<()> {
+    if opcode != OPCODE_TEXT && opcode != OPCODE_BINARY {
+        return Err(Error::BadResponse(format!(
+            "send_stream expects a data opcode (text/binary), got 0x{opcode:x}"
+        )));
+    }
+    let mut cur = read_chunk(reader, STREAM_CHUNK).map_err(Error::Io)?;
+    let mut first = true;
+    loop {
+        // Peek the next chunk so we know whether `cur` is the final fragment.
+        let next = read_chunk(reader, STREAM_CHUNK).map_err(Error::Io)?;
+        let fin = next.is_empty();
+        let op = if first { opcode } else { OPCODE_CONT };
+        let frame = build_client_frame_inner(fin, op, &cur, false)?;
+        stream.write_all(&frame)?;
+        first = false;
+        if fin {
+            break;
+        }
+        cur = next;
+    }
     stream.flush()?;
     Ok(())
 }
@@ -3054,6 +3247,135 @@ mod tests {
                 opcode: WsOpcode::Text,
                 payload: b"raw".to_vec(),
             }
+        );
+    }
+
+    /// Decode client frames including the FIN bit: `(fin, opcode, payload)`.
+    /// Like [`decode_sent`] but exposes FIN so fragmentation can be asserted.
+    fn decode_sent_fin(sent: &[u8]) -> Vec<(bool, u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        let mut i = 0;
+        while i < sent.len() {
+            let fin = (sent[i] & 0x80) != 0;
+            let opcode = sent[i] & 0x0F;
+            assert!((sent[i + 1] & 0x80) != 0, "client frame must be masked");
+            let len7 = sent[i + 1] & 0x7F;
+            i += 2;
+            let len = match len7 {
+                0..=125 => len7 as usize,
+                126 => {
+                    let l = u16::from_be_bytes([sent[i], sent[i + 1]]) as usize;
+                    i += 2;
+                    l
+                }
+                127 => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&sent[i..i + 8]);
+                    i += 8;
+                    u64::from_be_bytes(b) as usize
+                }
+                _ => unreachable!(),
+            };
+            let mask = [sent[i], sent[i + 1], sent[i + 2], sent[i + 3]];
+            i += 4;
+            let mut payload = sent[i..i + len].to_vec();
+            i += len;
+            for (j, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[j & 3];
+            }
+            frames.push((fin, opcode, payload));
+        }
+        frames
+    }
+
+    #[test]
+    fn send_stream_fragments_payload_across_frames() {
+        let data: Vec<u8> = (0..(STREAM_CHUNK * 2 + 100)).map(|n| n as u8).collect();
+        let mut sink = Vec::new();
+        send_stream_inner(&mut sink, OPCODE_BINARY, &mut Cursor::new(data.clone())).unwrap();
+        let frames = decode_sent_fin(&sink);
+        assert_eq!(frames.len(), 3, "two 64 KiB chunks + a tail => 3 frames");
+        assert_eq!((frames[0].0, frames[0].1), (false, OPCODE_BINARY));
+        assert_eq!((frames[1].0, frames[1].1), (false, OPCODE_CONT));
+        assert_eq!((frames[2].0, frames[2].1), (true, OPCODE_CONT));
+        let got: Vec<u8> = frames.iter().flat_map(|f| f.2.clone()).collect();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn send_stream_empty_source_sends_single_fin_frame() {
+        let mut sink = Vec::new();
+        send_stream_inner(&mut sink, OPCODE_TEXT, &mut Cursor::new(Vec::new())).unwrap();
+        let frames = decode_sent_fin(&sink);
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].0, frames[0].1), (true, OPCODE_TEXT));
+        assert!(frames[0].2.is_empty());
+    }
+
+    #[test]
+    fn send_stream_rejects_control_opcode() {
+        let mut sink = Vec::new();
+        assert!(
+            send_stream_inner(&mut sink, OPCODE_PING, &mut Cursor::new(vec![1, 2, 3])).is_err()
+        );
+    }
+
+    #[test]
+    fn send_stream_via_public_writer_api() {
+        let mock = SharedMock::new(vec![]);
+        let sent = Arc::clone(&mock.sent);
+        let mut ws = ws_over(mock, None);
+        let data = vec![7u8; STREAM_CHUNK + 5];
+        ws.send_stream(WsOpcode::Binary, &mut Cursor::new(data.clone()))
+            .unwrap();
+        let frames = decode_sent_fin(&sent.lock().unwrap());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].1, OPCODE_BINARY);
+        assert_eq!((frames[1].0, frames[1].1), (true, OPCODE_CONT));
+        let got: Vec<u8> = frames.iter().flat_map(|f| f.2.clone()).collect();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn keepalive_pings_an_idle_connection() {
+        let mock = SharedMock::new(vec![]);
+        let sent = Arc::clone(&mock.sent);
+        let transport = Arc::new(WsTransport::new(WsTransportKind::Shared(Mutex::new(
+            Box::new(mock),
+        ))));
+        let ka = spawn_keepalive(
+            transport,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(10),
+        );
+        // Keepalive granularity is SHUTDOWN_POLL; wait a couple of ticks.
+        thread::sleep(SHUTDOWN_POLL * 2 + Duration::from_millis(100));
+        ka.stop();
+        let frames = decode_sent_fin(&sent.lock().unwrap());
+        assert!(!frames.is_empty(), "expected at least one keepalive ping");
+        assert!(frames.iter().all(|f| f.1 == OPCODE_PING && f.0));
+    }
+
+    #[test]
+    fn keepalive_skips_a_busy_connection() {
+        let mock = SharedMock::new(vec![]);
+        let sent = Arc::clone(&mock.sent);
+        let transport = Arc::new(WsTransport::new(WsTransportKind::Shared(Mutex::new(
+            Box::new(mock),
+        ))));
+        // Interval far longer than the wait: the connection never looks idle.
+        let ka = spawn_keepalive(
+            transport,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(3600),
+        );
+        thread::sleep(SHUTDOWN_POLL + Duration::from_millis(100));
+        ka.stop();
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "no ping should fire before the idle interval elapses"
         );
     }
 }
