@@ -159,12 +159,16 @@ impl<S: Read + Write> Pool<S> {
 /// Plain-HTTP idle conns parked here. `OnceLock` keeps init lazy and
 /// lock-free after first use; the inner `Mutex` serialises the brief
 /// map updates.
+// Superseded by the sans-IO core pool (`core_plain`) once the plaintext path was
+// cut over (P3); retained until the legacy direct engine is retired (P4).
+#[allow(dead_code)]
 static POOL_PLAIN: OnceLock<Mutex<Pool<TcpStream>>> = OnceLock::new();
 
 /// HTTPS idle conns parked here, post-handshake. HTTP/2's own pool sits
 /// at a different layer (an `Arc<Mutex<Connection>>` rather than raw IO).
 static POOL_TLS: OnceLock<Mutex<Pool<TlsStream<TcpStream>>>> = OnceLock::new();
 
+#[allow(dead_code)]
 pub(crate) fn plain() -> &'static Mutex<Pool<TcpStream>> {
     POOL_PLAIN.get_or_init(|| Mutex::new(Pool::new()))
 }

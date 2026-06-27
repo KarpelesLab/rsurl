@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::net::{connector_from_proxy_url, Connector, DirectConnector, NetStream};
-use crate::proto::http1::{ClientExchange, Event as Http1Event};
+use crate::proto::http1::{ClientExchange, Event as Http1Event, Http1Head};
 use crate::url::Url;
 
 const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
@@ -2193,27 +2193,17 @@ fn send_plain(req: Request, trace: &mut dyn Write) -> Result<Response> {
     if !req.connector.is_direct() {
         return send_plain_via_connector(req, trace);
     }
-    // Pool reuse is only safe for direct connections. Via-proxy we'd be
-    // sharing one socket across many origins via absolute-form lines, which
-    // works on paper but mixes badly with `Proxy-Authorization:` per-origin
-    // semantics — out of scope for this milestone.
-    let direct = req.proxy.is_none() || proxy_bypassed(&req);
-    if direct {
-        if let Some(bufrd) = pool_checkout_plain(&req) {
-            let _ = writeln!(trace, "* Reusing existing connection from pool");
-            match perform_on_pooled_plain(bufrd, &req, trace) {
-                Ok(resp) => return Ok(resp),
-                Err(PooledError::Stale(why)) => {
-                    let _ = writeln!(trace, "* Pooled connection unusable ({why}); reconnecting");
-                    // fall through to a fresh dial
-                }
-                Err(PooledError::Hard(e)) => return Err(e),
-            }
-        }
-    }
-    send_plain_fresh(req, direct, trace)
+    // Cutover P3: the direct (and plain-proxy) HTTP/1.1 transfer now runs on the
+    // sans-IO core ([`send_plain_via_core`]) — one engine shared with the async
+    // `aio` frontend — instead of the legacy inline read loop. It handles the
+    // core connection pool, keep-alive reuse, and stale-socket retry itself.
+    send_plain_via_core(&req, trace)
 }
 
+// Legacy direct-plain HTTP/1.1 engine, superseded by `send_plain_via_core` at
+// cutover P3. Retained as the parity reference (the P0/P2 tests compare the core
+// path against it) until cutover P4 retires it.
+#[allow(dead_code)]
 fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
     let start = std::time::Instant::now();
     let (stream, _cancel_guard, namelookup) = tcp_connect_cancellable(&req, trace)?;
@@ -2229,21 +2219,18 @@ fn send_plain_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     Ok(resp)
 }
 
-/// **Cutover P0.** The plaintext HTTP/1.1 transfer driven by the sans-IO core
+/// The plaintext HTTP/1.1 transfer, driven by the sans-IO core
 /// ([`crate::proto::http1`] + [`crate::io::blocking`]) instead of the legacy
 /// inline `read_head`/`read_body`/`read_chunked` loop. The shared
 /// [`write_request`] still builds the request bytes (method, Host, auth,
 /// headers, body) and [`maybe_decode_body`] still applies `Content-Encoding`
-/// decoding, so only the wire read/write loop differs — that is exactly the
-/// piece the cutover replaces. Mirrors [`send_plain_fresh`]'s timing.
+/// decoding, so only the wire read/write loop differs.
 ///
+/// This is the live `http://` path as of cutover P3 ([`send_plain`] routes here).
 /// On a direct connection a warm socket is checked out of the sans-IO core pool
 /// ([`crate::pool::core_plain`]) and reused; a pooled socket that the peer has
 /// since dropped retries once on a fresh dial. After a reusable response the
-/// socket is parked again. Not yet wired into [`send_once`] (see cutover P3);
-/// exercised directly by parity/pooling tests while the migration proceeds.
-// Wired into `send_once` at cutover P3; until then only the tests call it.
-#[allow(dead_code)]
+/// socket is parked again.
 fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
     // Pooling is only safe on direct connections (see `send_plain`): a proxied
     // socket multiplexes origins via absolute-form lines and mixes badly with
@@ -2269,32 +2256,110 @@ fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     let start = std::time::Instant::now();
     let (stream, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
     let connect = start.elapsed();
-    run_plain_core(stream, req, direct, Some((namelookup, connect)), trace)
+    run_plain_core(
+        stream,
+        req,
+        direct,
+        Some((start, namelookup, connect)),
+        trace,
+    )
+}
+
+/// Timing markers captured while driving a streaming exchange, for parity with
+/// the legacy [`read_response_timed`]/[`send_https_fresh`] timing.
+#[derive(Default)]
+struct CoreTiming {
+    /// Time to the TLS handshake completing (`appconnect`); `None` for plaintext.
+    appconnect: Option<Duration>,
+    /// Time to the first response byte / head (`starttransfer`).
+    starttransfer: Option<Duration>,
+}
+
+/// Emit the response head to `trace` in the curl-style `< ` form, matching the
+/// legacy [`read_head`] output (status line, each header, terminating blank
+/// line) so `-v` traces are identical on the sans-IO path.
+fn trace_response_head(trace: &mut dyn Write, head: &Http1Head) {
+    let _ = writeln!(trace, "< {} {} {}", head.version, head.status, head.reason);
+    for (k, v) in &head.headers {
+        let _ = writeln!(trace, "< {k}: {v}");
+    }
+    let _ = writeln!(trace, "< ");
+}
+
+/// Drive a streaming sans-IO HTTP/1.1 exchange `machine` over `io` to
+/// completion, returning the response head, assembled body, and—when `start` is
+/// `Some`—the captured [`CoreTiming`]. `starttransfer` is stamped at head
+/// arrival; `appconnect` is stamped (only when `track_appconnect`) the first
+/// driver tick at which the transport handshake reports complete. The response
+/// head is echoed to `trace` (`< ` lines) as soon as it parses, matching the
+/// legacy `-v` output. Shared by the plaintext and TLS core paths; both produce
+/// a [`Http1Event`] stream.
+fn drive_collect<M, S>(
+    machine: &mut M,
+    io: &mut S,
+    start: Option<std::time::Instant>,
+    track_appconnect: bool,
+    trace: &mut dyn Write,
+) -> Result<(Http1Head, Vec<u8>, CoreTiming)>
+where
+    M: crate::io::Machine<Event = Http1Event>,
+    S: crate::net::NetStream + ?Sized,
+{
+    let mut head: Option<Http1Head> = None;
+    let mut body = Vec::new();
+    let mut timing = CoreTiming::default();
+    crate::io::blocking::drive_streaming_observed(
+        machine,
+        io,
+        |ev| {
+            match ev {
+                Http1Event::Head(h) => {
+                    // First byte of the response head: time-to-first-byte.
+                    timing.starttransfer = start.map(|s| s.elapsed());
+                    trace_response_head(trace, &h);
+                    head = Some(h);
+                }
+                Http1Event::Body(chunk) => body.extend_from_slice(&chunk),
+                Http1Event::End => {}
+                // Streaming mode never emits the buffered one-shot Response.
+                Http1Event::Response { .. } => {}
+            }
+            Ok(())
+        },
+        |m| {
+            if track_appconnect && timing.appconnect.is_none() && m.handshake_done() {
+                timing.appconnect = start.map(|s| s.elapsed());
+            }
+        },
+    )?;
+    let head = head.ok_or(Error::UnexpectedEof)?;
+    Ok((head, body, timing))
 }
 
 /// Run one plaintext HTTP/1.1 exchange over an already-connected `stream` using
 /// the sans-IO core, then—if `may_pool` and the response permits keep-alive—park
-/// the socket in the core pool for reuse. `timing` carries `(namelookup,
-/// connect)` for a fresh dial and is `None` when reusing a pooled socket. The
-/// shared [`write_request`]/[`maybe_decode_body`] still build the request and
-/// decode `Content-Encoding`; only the wire read/write loop is the sans-IO core.
+/// the socket in the core pool for reuse. `timing` carries `(start, namelookup,
+/// connect)` for a fresh dial and is `None` when reusing a pooled socket (which,
+/// like the legacy pooled path, records no per-hop timing). The shared
+/// [`write_request`]/[`maybe_decode_body`] still build the request and decode
+/// `Content-Encoding`; only the wire read/write loop is the sans-IO core.
 fn run_plain_core(
     mut stream: TcpStream,
     req: &Request,
     may_pool: bool,
-    timing: Option<(Option<Duration>, Duration)>,
+    timing: Option<(std::time::Instant, Option<Duration>, Duration)>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let mut request_bytes = Vec::new();
     write_request(&mut request_bytes, req, via_plain_http_proxy(req), trace)?;
 
     let method = effective_method(req);
-    let mut exchange = ClientExchange::new(&method, request_bytes);
-    let events = crate::io::blocking::drive(&mut exchange, &mut stream)?;
-    let Some(Http1Event::Response { head, body }) = events.into_iter().next() else {
-        return Err(Error::UnexpectedEof);
-    };
+    let mut exchange = ClientExchange::new_streaming(&method, request_bytes);
+    let start = timing.map(|(s, _, _)| s);
+    let (head, body, core_timing) = drive_collect(&mut exchange, &mut stream, start, false, trace)?;
 
+    let wire_len = body.len();
+    let _ = writeln!(trace, "* Received {wire_len} body bytes");
     let (headers, body) = maybe_decode_body(head.headers, body, req.decompress, trace)?;
     let mut resp = Response {
         status: head.status,
@@ -2306,10 +2371,11 @@ fn run_plain_core(
         timing: Timing::default(),
         final_url: String::new(),
     };
-    if let Some((namelookup, connect)) = timing {
+    if let Some((_, namelookup, connect)) = timing {
         resp.timing.namelookup = namelookup;
         resp.timing.connect = Some(connect);
         resp.timing.pretransfer = Some(connect); // plaintext: no TLS gap before sending
+        resp.timing.starttransfer = core_timing.starttransfer;
     }
 
     if may_pool && response_is_reusable(&req.method, &resp) {
@@ -2333,16 +2399,22 @@ fn run_plain_core(
 /// verify, CA, client cert, pins, ciphers, versions), and `TlsInfo` is taken
 /// from the negotiated parameters after the handshake.
 ///
-/// Direct HTTPS only for now (a proxied `CONNECT` tunnel still uses the legacy
-/// path); `appconnect`/`pretransfer` timings are left unset because the driver
-/// runs the handshake and the exchange in one pass.
+/// Direct HTTPS only (a proxied `CONNECT` tunnel still uses the legacy path).
+/// The driver captures `appconnect` (handshake complete, via
+/// [`Machine::handshake_done`](crate::io::Machine::handshake_done)) and
+/// `starttransfer` for timing parity.
 ///
 /// When the request's TLS posture is pool-eligible ([`tls_pool_eligible`]) a
 /// warm session is checked out of the core TLS pool ([`crate::pool::core_tls`])
 /// and reused without a fresh handshake; a stale pooled socket retries once on a
 /// fresh dial. After a reusable response the `(socket, engine)` pair is parked
-/// again. Not yet wired into [`send_once`] (see cutover P3).
-// Wired into `send_once` at cutover P3; until then only the tests call it.
+/// again.
+///
+/// NOT yet wired into [`send_once`]: flipping the HTTPS path additionally
+/// requires replicating the legacy post-handshake trust policy
+/// (`enforce_pins_then_callback`: public-key pinning + verify callback) here,
+/// which is a separate security-sensitive slice.
+// Wired into `send_once` after the post-handshake-policy slice; tests call it now.
 #[allow(dead_code)]
 #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
 fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
@@ -2371,7 +2443,14 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     let (tcp, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
     let connect = start.elapsed();
     let may_pool = direct && tls_pool_eligible(req);
-    run_https_core(tcp, req, None, may_pool, Some((namelookup, connect)), trace)
+    run_https_core(
+        tcp,
+        req,
+        None,
+        may_pool,
+        Some((start, namelookup, connect)),
+        trace,
+    )
 }
 
 /// Run one HTTPS HTTP/1.1 exchange over the sans-IO [`TlsClient`] stack on an
@@ -2380,21 +2459,24 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
 /// the Request's TLS options. On a reusable response and `may_pool`, the
 /// `(socket, engine)` pair is parked in the core TLS pool — the caller is
 /// responsible for only setting `may_pool` when the request is pool-eligible
-/// ([`tls_pool_eligible`]). `timing` carries `(namelookup, connect)` for a fresh
-/// dial; `None` when reusing a pooled socket.
+/// ([`tls_pool_eligible`]). `timing` carries `(start, namelookup, connect)` for a
+/// fresh dial; `None` when reusing a pooled socket. On a fresh dial the driver
+/// also captures `appconnect` (TLS handshake complete) and `starttransfer`.
 #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
 fn run_https_core(
     mut tcp: TcpStream,
     req: &Request,
     engine_in: Option<crate::pool::CoreTlsEngine>,
     may_pool: bool,
-    timing: Option<(Option<Duration>, Duration)>,
+    timing: Option<(std::time::Instant, Option<Duration>, Duration)>,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let mut request_bytes = Vec::new();
     write_request(&mut request_bytes, req, false, trace)?;
 
-    // Resume a warm session, or build + handshake a fresh engine.
+    // Resume a warm session, or build + handshake a fresh engine. Only a fresh
+    // handshake has an `appconnect` to time.
+    let fresh_handshake = engine_in.is_none();
     let engine = match engine_in {
         Some(e) => e,
         None => {
@@ -2403,15 +2485,16 @@ fn run_https_core(
         }
     };
     let method = effective_method(req);
-    let exchange = ClientExchange::new(&method, request_bytes);
+    let exchange = ClientExchange::new_streaming(&method, request_bytes);
     let mut tls = crate::proto::tls::TlsClient::new(engine, exchange);
-    let events = crate::io::blocking::drive(&mut tls, &mut tcp)?;
+    let start = timing.map(|(s, _, _)| s);
+    let (head, body, core_timing) =
+        drive_collect(&mut tls, &mut tcp, start, fresh_handshake, trace)?;
     let params = tls.tls_params();
     let engine = tls.into_engine();
 
-    let Some(Http1Event::Response { head, body }) = events.into_iter().next() else {
-        return Err(Error::UnexpectedEof);
-    };
+    let wire_len = body.len();
+    let _ = writeln!(trace, "* Received {wire_len} body bytes");
     let (headers, body) = maybe_decode_body(head.headers, body, req.decompress, trace)?;
     let mut resp = Response {
         status: head.status,
@@ -2428,9 +2511,14 @@ fn run_https_core(
         timing: Timing::default(),
         final_url: String::new(),
     };
-    if let Some((namelookup, connect)) = timing {
+    if let Some((_, namelookup, connect)) = timing {
         resp.timing.namelookup = namelookup;
         resp.timing.connect = Some(connect);
+        resp.timing.appconnect = core_timing.appconnect;
+        // The request goes out right after the TLS handshake, so pretransfer is
+        // appconnect (fresh) — or, on a reused session, the connect mark.
+        resp.timing.pretransfer = core_timing.appconnect.or(Some(connect));
+        resp.timing.starttransfer = core_timing.starttransfer;
     }
 
     // Park the warm session for reuse. The caller sets `may_pool` only for
@@ -2504,6 +2592,9 @@ fn send_https_via_connector(req: Request, trace: &mut dyn Write) -> Result<Respo
     Ok(resp)
 }
 
+// Legacy direct-plain pooled reuse, superseded by `send_plain_via_core` (P3).
+// Retired at cutover P4.
+#[allow(dead_code)]
 fn perform_on_pooled_plain(
     mut bufrd: BufReader<TcpStream>,
     req: &Request,
@@ -2520,6 +2611,8 @@ fn perform_on_pooled_plain(
     Ok(resp)
 }
 
+// Legacy plain keep-alive/park, superseded by `run_plain_core` (P3). Retired P4.
+#[allow(dead_code)]
 fn finalize_plain(
     bufrd: BufReader<TcpStream>,
     req: &Request,
@@ -2613,6 +2706,8 @@ pub(crate) fn pool_key_for(req: &Request) -> crate::pool::Key {
     }
 }
 
+// Legacy plain pool checkout, superseded by `core_pool_checkout_plain` (P3).
+#[allow(dead_code)]
 fn pool_checkout_plain(req: &Request) -> Option<BufReader<TcpStream>> {
     crate::pool::plain()
         .lock()
@@ -5334,7 +5429,7 @@ mod tests {
             &req,
             None,
             true,
-            Some((nl, Duration::ZERO)),
+            Some((std::time::Instant::now(), nl, Duration::ZERO)),
             &mut io::sink(),
         )
         .unwrap();

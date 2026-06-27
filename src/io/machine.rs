@@ -84,6 +84,14 @@ pub trait Machine {
     /// receive, and no timer outstanding. Once `true`, the driver stops pumping
     /// after draining the final events.
     fn is_finished(&self) -> bool;
+
+    /// Whether any transport-level handshake has completed and application data
+    /// may now flow. A plain machine has no handshake and is always "done" here;
+    /// a TLS-wrapping machine reports the live handshake state. A driver uses the
+    /// `false → true` transition to time connection establishment (`appconnect`).
+    fn handshake_done(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -39,11 +39,31 @@ where
 /// chunks incrementally, and `on_event` (e.g. writing a body chunk to a sink)
 /// runs during the transfer rather than after it. An `on_event` error aborts the
 /// drive and propagates.
-pub(crate) fn drive_streaming<M, S, F>(machine: &mut M, io: &mut S, mut on_event: F) -> Result<()>
+pub(crate) fn drive_streaming<M, S, F>(machine: &mut M, io: &mut S, on_event: F) -> Result<()>
 where
     M: Machine,
     S: NetStream + ?Sized,
     F: FnMut(M::Event) -> Result<()>,
+{
+    drive_streaming_observed(machine, io, on_event, |_| {})
+}
+
+/// Like [`drive_streaming`], but also calls `on_tick(machine)` once per driver
+/// iteration, after wire bytes have been processed. This lets a frontend observe
+/// machine state transitions that aren't surfaced as events — notably the TLS
+/// handshake completing ([`Machine::handshake_done`]) so it can time
+/// `appconnect`. `on_tick` must not perform I/O; it only reads machine state.
+pub(crate) fn drive_streaming_observed<M, S, F, O>(
+    machine: &mut M,
+    io: &mut S,
+    mut on_event: F,
+    mut on_tick: O,
+) -> Result<()>
+where
+    M: Machine,
+    S: NetStream + ?Sized,
+    F: FnMut(M::Event) -> Result<()>,
+    O: FnMut(&M),
 {
     let mut scratch = [0u8; 16 * 1024];
     let mut out = Vec::new();
@@ -100,6 +120,10 @@ where
             }
             Err(e) => return Err(Error::Io(e)),
         }
+
+        // 6. Let the caller observe post-input machine state (e.g. the TLS
+        // handshake completing) so it can time transitions like `appconnect`.
+        on_tick(machine);
     }
 }
 

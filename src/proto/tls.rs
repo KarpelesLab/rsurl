@@ -174,6 +174,12 @@ impl<E: TlsEngine, M: Machine> Machine for TlsClient<E, M> {
         // close_notify is best-effort and not required for completeness.
         self.inner.is_finished()
     }
+
+    fn handshake_done(&self) -> bool {
+        // Application data may flow once the TLS handshake has completed. The
+        // driver times the `false → true` transition as `appconnect`.
+        !self.tls.is_handshaking()
+    }
 }
 
 /// The real [`TlsEngine`] over rustls's `ClientConnection`, which is itself a
