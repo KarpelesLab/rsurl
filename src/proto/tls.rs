@@ -21,6 +21,22 @@ use std::time::Instant;
 use crate::error::Result;
 use crate::io::Machine;
 
+/// Negotiated TLS parameters a [`TlsEngine`] surfaces after the handshake, so a
+/// frontend can populate its own TLS-info type ([`crate::http::TlsInfo`])
+/// without depending on the active backend. All fields hold their default
+/// ("unknown"/empty) value until the handshake completes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TlsParams {
+    /// Negotiated protocol version (e.g. TLS 1.3).
+    pub version: Option<crate::tls::ProtocolVersion>,
+    /// Negotiated cipher suite (IANA id).
+    pub cipher_suite: Option<u16>,
+    /// Server-selected ALPN protocol (e.g. `b"h2"`), if any.
+    pub alpn: Option<Vec<u8>>,
+    /// Peer certificate chain, leaf first, each entry DER-encoded.
+    pub peer_certificates: Vec<Vec<u8>>,
+}
+
 /// The sans-IO half of a TLS connection: a pure in-memory state machine that
 /// converts between ciphertext (on the wire) and plaintext (the application).
 ///
@@ -52,6 +68,11 @@ pub(crate) trait TlsEngine {
     /// the next [`drain_outgoing`](TlsEngine::drain_outgoing). In-memory and
     /// infallible.
     fn write_plaintext(&mut self, plaintext: &[u8]);
+
+    /// The negotiated TLS parameters once the handshake has completed (version,
+    /// cipher suite, ALPN, peer certificate chain). Returns defaults while
+    /// still handshaking.
+    fn tls_params(&self) -> TlsParams;
 }
 
 /// A TLS-wrapped application exchange: drives the handshake, then carries the
@@ -71,6 +92,12 @@ impl<E: TlsEngine, M: Machine> TlsClient<E, M> {
             inner,
             scratch: vec![0u8; 16 * 1024],
         }
+    }
+
+    /// The negotiated TLS parameters of the wrapped connection (valid after the
+    /// driver has run the handshake to completion).
+    pub(crate) fn tls_params(&self) -> TlsParams {
+        self.tls.tls_params()
     }
 
     /// Drain all currently-available decrypted plaintext into the inner machine.
@@ -195,6 +222,27 @@ impl TlsEngine for RustlsEngine {
         // Buffered into the engine; emitted as ciphertext by `drain_outgoing`.
         let _ = self.0.writer().write_all(plaintext);
     }
+
+    fn tls_params(&self) -> TlsParams {
+        use crate::tls::ProtocolVersion;
+        TlsParams {
+            version: self.0.protocol_version().map(|v| match v {
+                rustls::ProtocolVersion::TLSv1_2 => ProtocolVersion::TLSv1_2,
+                rustls::ProtocolVersion::TLSv1_3 => ProtocolVersion::TLSv1_3,
+                other => ProtocolVersion::Other(u16::from(other)),
+            }),
+            cipher_suite: self
+                .0
+                .negotiated_cipher_suite()
+                .map(|cs| u16::from(cs.suite())),
+            alpn: self.0.alpn_protocol().map(|p| p.to_vec()),
+            peer_certificates: self
+                .0
+                .peer_certificates()
+                .map(|certs| certs.iter().map(|c| c.to_vec()).collect())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// The real [`TlsEngine`] over purecrypto's sans-IO `Connection`. Available with
@@ -298,6 +346,20 @@ impl TlsEngine for PurecryptoEngine {
     fn write_plaintext(&mut self, plaintext: &[u8]) {
         let _ = self.conn.send(plaintext);
     }
+
+    fn tls_params(&self) -> TlsParams {
+        use crate::tls::ProtocolVersion;
+        TlsParams {
+            version: self.conn.negotiated_version().map(|v| match v {
+                purecrypto::tls::ProtocolVersion::TLSv1_2 => ProtocolVersion::TLSv1_2,
+                purecrypto::tls::ProtocolVersion::TLSv1_3 => ProtocolVersion::TLSv1_3,
+                other => ProtocolVersion::Other(other.as_u16()),
+            }),
+            cipher_suite: self.conn.negotiated_cipher_suite(),
+            alpn: self.conn.alpn_selected().map(|p| p.to_vec()),
+            peer_certificates: self.conn.peer_certificates().to_vec(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +414,10 @@ mod tests {
 
         fn write_plaintext(&mut self, plaintext: &[u8]) {
             self.outbox.extend_from_slice(plaintext); // identity "encryption"
+        }
+
+        fn tls_params(&self) -> TlsParams {
+            TlsParams::default() // the mock negotiates nothing
         }
     }
 
@@ -449,7 +515,7 @@ mod tests {
 /// generated self-signed pair valid until 2126 (embedded, so no cert-gen
 /// dependency and no C toolchain — respecting the crate's no-C guarantee).
 #[cfg(all(test, feature = "rustls-tls"))]
-mod rustls_tests {
+pub(crate) mod rustls_tests {
     use std::io::{Read, Write};
     use std::sync::Arc;
 
@@ -496,7 +562,7 @@ un9Yliw2Ah947iGL8Az3H6fsw/W1iLrM+V9Hqob9lsQksUPNlKF8c9z8
 -----END PRIVATE KEY-----
 ";
 
-    pub(super) fn server_config() -> Arc<ServerConfig> {
+    pub(crate) fn server_config() -> Arc<ServerConfig> {
         let certs = rustls_pemfile::certs(&mut LEAF_CERT_PEM.as_bytes())
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();

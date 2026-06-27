@@ -2276,6 +2276,62 @@ fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     Ok(resp)
 }
 
+/// **Cutover P1.** HTTPS over the sans-IO core: the HTTP/1.1 exchange is wrapped
+/// in the sans-IO [`TlsClient`](crate::proto::tls::TlsClient) machine — the same
+/// one the async `aio` frontend uses, so both frontends share one TLS core — and
+/// the whole stack (handshake + request + response) is driven over a raw TCP
+/// socket by [`crate::io::blocking::drive`]. The engine is built from the
+/// Request's full TLS options ([`tls_opts_from`] → [`crate::tls::build_client_engine`]:
+/// verify, CA, client cert, pins, ciphers, versions), and `TlsInfo` is taken
+/// from the negotiated parameters after the handshake.
+///
+/// Direct HTTPS only for now (a proxied `CONNECT` tunnel still uses the legacy
+/// path); `appconnect`/`pretransfer` timings are left unset because the driver
+/// runs the handshake and the exchange in one pass. Not yet wired into
+/// [`send_once`] (see cutover P3).
+// Wired into `send_once` at cutover P3; until then only the parity tests call it.
+#[allow(dead_code)]
+fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
+    let start = std::time::Instant::now();
+    let (mut tcp, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
+    let connect = start.elapsed();
+
+    let mut request_bytes = Vec::new();
+    write_request(&mut request_bytes, req, false, trace)?;
+
+    // Build the configured sans-IO TLS engine, wrap the HTTP/1.1 exchange in it,
+    // and drive the whole stack over TCP (handshake, then the request/response).
+    let method = effective_method(req);
+    let mut opts = tls_opts_from(req, &[])?;
+    let engine = crate::tls::build_client_engine(&req.url.host, &mut opts)?;
+    let exchange = ClientExchange::new(&method, request_bytes);
+    let mut tls = crate::proto::tls::TlsClient::new(engine, exchange);
+    let events = crate::io::blocking::drive(&mut tls, &mut tcp)?;
+    let params = tls.tls_params();
+
+    let Http1Event::Response { head, body } =
+        events.into_iter().next().ok_or(Error::UnexpectedEof)?;
+    let (headers, body) = maybe_decode_body(head.headers, body, req.decompress, trace)?;
+    let mut resp = Response {
+        status: head.status,
+        reason: head.reason,
+        version: head.version,
+        headers,
+        body,
+        tls: Some(TlsInfo {
+            version: params.version,
+            cipher_suite: params.cipher_suite,
+            alpn: params.alpn,
+            peer_certificates: params.peer_certificates,
+        }),
+        timing: Timing::default(),
+        final_url: String::new(),
+    };
+    resp.timing.namelookup = namelookup;
+    resp.timing.connect = Some(connect);
+    Ok(resp)
+}
+
 /// Dial the origin through `req.connector` and return a configured boxed
 /// stream. The connector establishes a transparent pipe to `host:port`
 /// (via SOCKS or `CONNECT`), so the caller then speaks origin-form HTTP.
@@ -4967,5 +5023,58 @@ mod tests {
             .headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")));
+    }
+
+    /// Serve one HTTPS request over a real socket using the test rustls server
+    /// cert, replying `response` after draining the request head. Only built
+    /// under the rustls backend (the server side needs `rustls::ServerConnection`).
+    #[cfg(feature = "rustls-tls")]
+    fn serve_https_once(response: &'static [u8]) -> u16 {
+        use rustls::ServerConnection;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let cfg = crate::proto::tls::rustls_tests::server_config();
+            let mut server = ServerConnection::new(cfg).unwrap();
+            let mut tls = rustls::Stream::new(&mut server, &mut sock);
+            // rustls::Stream runs the handshake lazily on first I/O.
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tls.write_all(response);
+            let _ = tls.flush();
+        });
+        port
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn p1_https_core_get_over_real_socket() {
+        // The sans-IO TLS path (TlsClient + io::blocking::drive) carries a real
+        // HTTP/1.1 GET over a real TLS handshake, and surfaces TlsInfo.
+        let port = serve_https_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        // Self-signed test cert → connect with verification off.
+        let req = Request::get(&format!("https://127.0.0.1:{port}/"))
+            .unwrap()
+            .verify_tls(false);
+        let resp = send_https_via_core(&req, &mut io::sink()).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello");
+        let info = resp.tls.expect("TlsInfo populated from the handshake");
+        assert!(info.version.is_some(), "negotiated TLS version present");
+        assert!(
+            !info.peer_certificates.is_empty(),
+            "peer certificate chain present"
+        );
     }
 }
