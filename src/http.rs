@@ -2390,18 +2390,20 @@ fn run_plain_core(
     Ok(resp)
 }
 
-/// **Cutover P1.** HTTPS over the sans-IO core: the HTTP/1.1 exchange is wrapped
-/// in the sans-IO [`TlsClient`](crate::proto::tls::TlsClient) machine — the same
-/// one the async `aio` frontend uses, so both frontends share one TLS core — and
-/// the whole stack (handshake + request + response) is driven over a raw TCP
-/// socket by [`crate::io::blocking::drive`]. The engine is built from the
-/// Request's full TLS options ([`tls_opts_from`] → [`crate::tls::build_client_engine`]:
-/// verify, CA, client cert, pins, ciphers, versions), and `TlsInfo` is taken
-/// from the negotiated parameters after the handshake.
+/// HTTPS over the sans-IO core: the HTTP/1.1 exchange is wrapped in the sans-IO
+/// [`TlsClient`](crate::proto::tls::TlsClient) machine — the same one the async
+/// `aio` frontend uses, so both frontends share one TLS core — and the whole
+/// stack (handshake + request + response) is driven over a raw TCP socket by
+/// [`crate::io::blocking`]. The engine is built from the Request's full TLS
+/// options ([`tls_opts_from`] → [`crate::tls::build_client_engine`]: verify, CA,
+/// client cert, ciphers, versions), the post-handshake trust policy (pinning +
+/// verify callback + SAN check) is applied by [`verify_core_peer_certificates`],
+/// and `TlsInfo` is taken from the negotiated parameters.
 ///
-/// Direct HTTPS only (a proxied `CONNECT` tunnel still uses the legacy path).
-/// The driver captures `appconnect` (handshake complete, via
-/// [`Machine::handshake_done`](crate::io::Machine::handshake_done)) and
+/// This is the live direct `https://` HTTP/1.1 path as of cutover P3
+/// ([`send_https`] routes here); a proxied `CONNECT` tunnel still uses the legacy
+/// [`send_https_fresh`]. The driver captures `appconnect` (handshake complete,
+/// via [`Machine::handshake_done`](crate::io::Machine::handshake_done)) and
 /// `starttransfer` for timing parity.
 ///
 /// When the request's TLS posture is pool-eligible ([`tls_pool_eligible`]) a
@@ -2409,13 +2411,6 @@ fn run_plain_core(
 /// and reused without a fresh handshake; a stale pooled socket retries once on a
 /// fresh dial. After a reusable response the `(socket, engine)` pair is parked
 /// again.
-///
-/// NOT yet wired into [`send_once`]: flipping the HTTPS path additionally
-/// requires replicating the legacy post-handshake trust policy
-/// (`enforce_pins_then_callback`: public-key pinning + verify callback) here,
-/// which is a separate security-sensitive slice.
-// Wired into `send_once` after the post-handshake-policy slice; tests call it now.
-#[allow(dead_code)]
 #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
 fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
     // Direct, pool-eligible requests may reuse a warm TLS session.
@@ -2453,6 +2448,71 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     )
 }
 
+/// Post-handshake server-certificate policy for the sans-IO HTTPS core path,
+/// mirroring the legacy [`crate::tls::connect_over_tls`] and the HTTP/3 path:
+///
+/// 1. **Public-key pinning** (`--pinnedpubkey`) is enforced first and
+///    unconditionally — a mismatch fails closed even under `-k` or with a verify
+///    callback present.
+/// 2. A **caller verify callback**, when set, is the sole trust authority (engine
+///    verification was disabled in `build_client_engine` via the
+///    `verify && callback.is_none()` rule): its verdict decides, and the SAN
+///    check is skipped (the callback owns it).
+/// 3. Otherwise, when verifying, a **SAN-required hostname check** (TLS-4): reject
+///    a leaf with no Subject Alternative Name (the purecrypto backend would
+///    otherwise fall back to deprecated Common-Name matching; harmless on the
+///    rustls/webpki backend, which already rejected it during the handshake).
+///
+/// `chain` is the peer certificate chain (leaf first, DER) from the completed
+/// handshake; `pins` are the parsed SPKI pins.
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+fn verify_core_peer_certificates(
+    chain: &[Vec<u8>],
+    req: &Request,
+    pins: &[[u8; 32]],
+) -> Result<()> {
+    let leaf = chain.first().map(Vec::as_slice);
+
+    if !pins.is_empty() {
+        match leaf {
+            Some(der) if crate::tls::client_auth::spki_pin_matches(der, pins) => {}
+            _ => {
+                return Err(Error::BadResponse(
+                    "pinned public key does not match server certificate".into(),
+                ))
+            }
+        }
+    }
+
+    if let Some(cb) = &req.tls_verify_callback {
+        let verdict = cb.call(&crate::tls::CertVerify {
+            server_name: &req.url.host,
+            chain_der: chain,
+        });
+        if verdict == crate::tls::CertVerdict::Reject {
+            return Err(Error::BadResponse(
+                "server certificate rejected by verify callback".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if req.verify_tls {
+        match leaf {
+            Some(der) if crate::tls::client_auth::leaf_has_san(der) => {}
+            Some(_) => {
+                return Err(Error::BadResponse(
+                    "server certificate has no Subject Alternative Name \
+                     (CN fallback is not accepted)"
+                        .into(),
+                ))
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 /// Run one HTTPS HTTP/1.1 exchange over the sans-IO [`TlsClient`] stack on an
 /// already-connected `tcp`. `engine_in` is `Some(..)` to resume a pooled warm
 /// session (no handshake) or `None` to build and handshake a fresh engine from
@@ -2475,13 +2535,17 @@ fn run_https_core(
     write_request(&mut request_bytes, req, false, trace)?;
 
     // Resume a warm session, or build + handshake a fresh engine. Only a fresh
-    // handshake has an `appconnect` to time.
+    // handshake has an `appconnect` to time and a post-handshake trust policy to
+    // enforce (a pooled session was already verified — and is only pooled when
+    // pin/callback-free, see `tls_pool_eligible`).
     let fresh_handshake = engine_in.is_none();
-    let engine = match engine_in {
-        Some(e) => e,
+    let (engine, pins) = match engine_in {
+        Some(e) => (e, Vec::new()),
         None => {
             let mut opts = tls_opts_from(req, &[])?;
-            crate::tls::build_client_engine(&req.url.host, &mut opts)?
+            let pins = opts.pinned_spki_sha256.clone();
+            let engine = crate::tls::build_client_engine(&req.url.host, &mut opts)?;
+            (engine, pins)
         }
     };
     let method = effective_method(req);
@@ -2492,6 +2556,15 @@ fn run_https_core(
         drive_collect(&mut tls, &mut tcp, start, fresh_handshake, trace)?;
     let params = tls.tls_params();
     let engine = tls.into_engine();
+
+    // Post-handshake trust policy, replicating the legacy `connect_over_tls`:
+    // public-key pinning + caller verify callback + SAN-required hostname check.
+    // The engine already verified the chain against the roots during the
+    // handshake (unless `-k`, or a callback that owns verification); this adds
+    // the checks that need the peer chain. Only on a fresh handshake.
+    if fresh_handshake {
+        verify_core_peer_certificates(&params.peer_certificates, req, &pins)?;
+    }
 
     let wire_len = body.len();
     let _ = writeln!(trace, "* Received {wire_len} body bytes");
@@ -2756,6 +2829,9 @@ pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
         && req.tls13_ciphers.is_none()
 }
 
+// Legacy direct-HTTPS pool checkout, superseded by `core_pool_checkout_tls`
+// (P3). Retired at cutover P4.
+#[allow(dead_code)]
 fn pool_checkout_tls(req: &Request) -> Option<BufReader<crate::tls::TlsStream<TcpStream>>> {
     if !tls_pool_eligible(req) {
         return None;
@@ -3107,20 +3183,16 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // the cert-only handshake doesn't change behaviour for h2-only servers
     // (those would have been satisfied by the h2 attempt above).
     let direct = req.proxy.is_none() || proxy_bypassed(&req);
+    // Cutover P3 (HTTPS): a direct HTTPS HTTP/1.1 transfer runs on the sans-IO
+    // core ([`send_https_via_core`]) — the same TLS stack as the async `aio`
+    // frontend — with the legacy post-handshake trust policy (pinning + verify
+    // callback + SAN check) replicated by `verify_core_peer_certificates`. A
+    // proxied `CONNECT` tunnel still uses the legacy `send_https_fresh`, which
+    // splices through the proxy before the handshake.
     if direct {
-        if let Some(bufrd) = pool_checkout_tls(&req) {
-            let _ = writeln!(trace, "* Reusing existing connection from pool");
-            match perform_on_pooled_tls(bufrd, &req, trace) {
-                Ok(resp) => return Ok(resp),
-                Err(PooledError::Stale(why)) => {
-                    let _ = writeln!(trace, "* Pooled connection unusable ({why}); reconnecting");
-                    // fall through
-                }
-                Err(PooledError::Hard(e)) => return Err(e),
-            }
-        }
+        return send_https_via_core(&req, trace);
     }
-    send_https_fresh(req, direct, trace)
+    send_https_fresh(req, false, trace)
 }
 
 fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Result<Response> {
@@ -3158,6 +3230,9 @@ fn send_https_fresh(req: Request, may_pool: bool, trace: &mut dyn Write) -> Resu
     Ok(resp)
 }
 
+// Legacy direct-HTTPS pooled reuse, superseded by `send_https_via_core` (P3).
+// Retired at cutover P4.
+#[allow(dead_code)]
 fn perform_on_pooled_tls(
     mut bufrd: BufReader<crate::tls::TlsStream<TcpStream>>,
     req: &Request,
@@ -5446,5 +5521,58 @@ mod tests {
         // server dropped its listener and reused one ServerConnection).
         let r2 = run_https_core(tcp2, &req, Some(engine), false, None, &mut io::sink()).unwrap();
         assert_eq!(r2.body, b"hi");
+    }
+
+    // --- Cutover P3: post-handshake trust policy on the sans-IO HTTPS path ---
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn p3_core_tls_pin_mismatch_fails_closed() {
+        // Pinning is enforced after the handshake even with verification off, so
+        // a wrong pin must fail closed (no body returned).
+        let port = serve_https_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        // 32 zero bytes, base64 — guaranteed not to match the real cert's SPKI.
+        let wrong_pin = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let req = Request::get(&format!("https://127.0.0.1:{port}/"))
+            .unwrap()
+            .verify_tls(false)
+            .pinned_pubkey(wrong_pin);
+        let err = send_https_via_core(&req, &mut io::sink());
+        assert!(err.is_err(), "a pin mismatch must fail closed: {err:?}");
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn p3_core_tls_verify_callback_reject_fails() {
+        let port = serve_https_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        let req = Request::get(&format!("https://127.0.0.1:{port}/"))
+            .unwrap()
+            .verify_tls(false)
+            .tls_verify_callback(crate::tls::VerifyCallback::new(|_| {
+                crate::tls::CertVerdict::Reject
+            }));
+        let err = send_https_via_core(&req, &mut io::sink());
+        assert!(err.is_err(), "callback Reject must fail: {err:?}");
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn p3_core_tls_verify_callback_accept_succeeds() {
+        let port = serve_https_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        let req = Request::get(&format!("https://127.0.0.1:{port}/"))
+            .unwrap()
+            .verify_tls(false)
+            .tls_verify_callback(crate::tls::VerifyCallback::new(|_| {
+                crate::tls::CertVerdict::Accept
+            }));
+        let resp = send_https_via_core(&req, &mut io::sink()).expect("callback Accept succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hi");
     }
 }
