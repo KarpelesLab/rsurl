@@ -96,7 +96,9 @@ rustls-pemfile = { version = "2", optional = true }
 # so we can decode those response encodings without breaking the no-C guarantee.
 # `lzw` is the Unix `compress(1)` / `.Z` format. `factory` and `rle` are not
 # needed here, so leave default features off and opt in to only what we use.
-compcol = { version = "0.4", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw"] }
+# `qpack` (RFC 9204, pulls in `hpack`) is HTTP/3 header compression — the
+# encoder (Huffman + dynamic table) and decoder used by `crate::http3`.
+compcol = { version = "0.6.6", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
 # Pure-Rust SSH stack (same lab, built on purecrypto) behind the `sftp://` and
 # `scp://` schemes. Optional, gated by the default-on `ssh` feature so HTTP-only
 # consumers can drop it entirely (`--no-default-features`). We take only the
