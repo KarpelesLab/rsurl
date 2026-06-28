@@ -678,18 +678,22 @@ pub struct WsShutdown {
 
 impl WsShutdown {
     /// Shut down the underlying socket in both directions. A reader blocked in
-    /// `recv()` returns promptly (as EOF/error). Idempotent-ish: a second call
-    /// after the socket is gone is a harmless error.
+    /// `recv()` returns promptly (as EOF/error). Idempotent: calling it again,
+    /// or once the socket is already torn down, is a no-op.
     pub fn shutdown(&self) -> Result<()> {
         // Raise the flag first: a reader parked with no read timeout observes
         // it within one poll tick and unblocks even on Windows, where a socket
         // `shutdown()` does not wake a sibling handle's blocking `recv()`.
         self.flag.store(true, Ordering::SeqCst);
-        self.sock
-            .lock()
-            .unwrap()
-            .shutdown(std::net::Shutdown::Both)
-            .map_err(Error::Io)
+        match self.sock.lock().unwrap().shutdown(std::net::Shutdown::Both) {
+            Ok(()) => Ok(()),
+            // The socket is already shut down — by a prior shutdown() call or a
+            // teardown race with the sibling reader. The postcondition (socket
+            // no longer usable) already holds, so this is success, not an error.
+            // Windows surfaces it as WSAENOTCONN (10057); Unix as ENOTCONN.
+            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        }
     }
 }
 
