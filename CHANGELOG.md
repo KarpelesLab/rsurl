@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.2...rsurl-v0.1.3) - 2026-06-28
+
+### Added
+
+- *(http)* route direct HTTPS HTTP/1.1 through the sans-IO core
+- *(http)* route plaintext HTTP/1.1 through the sans-IO core
+- *(pool)* connection pooling + keep-alive on the sans-IO core path
+- *(proto/http1)* stream response bodies via Head/Body/End events
+- *(http)* cutover P1 — HTTPS over the sans-IO core via the shared TlsClient
+- *(http)* cutover P0 — blocking HTTP/1.1 transfer over the sans-IO core
+- *(aio)* follow redirects and decompress response bodies
+- *(http3)* handle response-stream framing edge cases and fix PTO loss recovery
+- *(websocket)* add streaming send and idle keepalive
+- *(http3)* replace hand-rolled QPACK with compcol::qpack
+- *(aio)* support arbitrary method, body, and headers
+- *(curl-compat)* support 32-bit (ILP32) targets
+
+### Fixed
+
+- *(tls)* don't load the system CA bundle when verification is off
+- satisfy CI lint/doc gates across all feature combos
+- *(curl-compat)* map Error::Cancelled to CURLE_ABORTED_BY_CALLBACK
+- *(resume)* use checked size arithmetic in write_state end offset
+- *(curl-compat)* use checked size arithmetic in c_alloc and curl_easy_escape
+- *(cookie)* reject Set-Cookie Path= containing control bytes
+- *(bittorrent)* reject Windows drive-letter/ADS/reserved path components
+- *(bittorrent)* cap torrent piece length to prevent pre-allocation DoS
+- *(bittorrent)* reject zero-length torrents carrying piece hashes
+- *(file)* reject non-regular files to bound file:// reads
+- *(websocket)* bound control-frame length before buffering payload
+- *(rtsp)* compare Content-Length against cap as u64 before cast
+- *(tls)* zeroize the transient decoded client-key DER (rustls backend)
+- *(http3)* honor tls_verify_callback on the HTTP/3 path
+- *(tls)* enforce --pinnedpubkey even when a verify callback is set
+
+### Other
+
+- *(multi)* make incremental_poll_and_running_count deterministic
+- *(aio)* gracefully close the redirect test server to avoid Windows RST
+- *(http)* gracefully close in-process test servers to avoid Windows RST
+- *(http)* retire the legacy direct HTTP/1.1 engine (cutover P4)
+- *(aio)* apply rustfmt to test bodies
+- *(bittorrent)* document the full client, drop stale "Phase 1" note
+- add 32-bit (i686) leg and build curl-compat in CI
+
 ## [0.1.2](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.1...rsurl-v0.1.2) - 2026-06-22
 
 ### Added
