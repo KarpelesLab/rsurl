@@ -44,19 +44,37 @@ fn incremental_poll_and_running_count() {
     m.add(Request::get(&server.url("/2")).unwrap());
     m.add(Request::get(&server.url("/3")).unwrap());
 
+    // Nothing starts until perform().
+    assert_eq!(m.running(), 0, "no transfer runs before perform()");
+
+    // perform() starts all three, then collects whatever already finished, so
+    // its return value is racy (0..=3 depending on how fast the loopback
+    // transfers complete) — assert only the bound, not an exact count. The
+    // deterministic guarantees are below: every transfer is reported exactly
+    // once and running() drains to zero.
     let running = m.perform();
-    assert_eq!(running, 3);
+    assert!(
+        running <= 3,
+        "perform() reported more transfers than started"
+    );
 
     let mut collected = 0;
-    while m.running() > 0 || m.next_completed().is_some() {
-        if !m.poll(Some(Duration::from_secs(5))) {
-            break;
-        }
+    // Drive to completion: drain everything currently ready, then block for the
+    // next completion while any transfer is still running. Terminates once the
+    // handle is idle (no pending, none running, ready queue empty).
+    while !m.is_empty() {
         while let Some((_, r)) = m.next_completed() {
             assert_eq!(r.expect("ok").status, 200);
             collected += 1;
         }
+        if m.running() > 0 {
+            assert!(
+                m.poll(Some(Duration::from_secs(5))),
+                "poll timed out waiting for a completion"
+            );
+        }
     }
+
     assert_eq!(collected, 3);
     assert_eq!(m.running(), 0);
 }
