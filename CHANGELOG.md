@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.3...rsurl-v0.1.4) - 2026-06-28
+
+### Fixed
+
+- *(websocket)* make WsShutdown::shutdown idempotent on an already-closed socket
+
 ## [0.1.3](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.2...rsurl-v0.1.3) - 2026-06-28
 
 ### Added
