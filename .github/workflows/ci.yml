@@ -75,9 +75,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build the C library (static + shared)
-        # Cargo.toml declares crate-type = ["rlib", "cdylib", "staticlib"],
-        # so a plain release build produces librsurl.a and librsurl.so.
-        run: cargo build --release
+        # Cargo.toml declares crate-type = ["rlib", "cdylib", "staticlib"], so
+        # the build produces librsurl.a and librsurl.so. The `rsurl_*` C ABI
+        # symbols are gated behind the (off-by-default) `ffi` feature, so it must
+        # be enabled here for the smoke tests below to link.
+        run: cargo build --release --features ffi
 
       - name: Compile and run the C smoke test (static link)
         run: |

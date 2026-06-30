@@ -3551,6 +3551,7 @@ fn cli_ftp_active_mode_download() {
 /// The C ABI honors the newer options: RSURLOPT_USERPWD (Basic auth),
 /// RSURLOPT_FOLLOWLOCATION, and RSURLOPT_REFERER. Driven through the real
 /// extern "C" entry points against a loopback server.
+#[cfg(feature = "ffi")]
 #[test]
 fn ffi_easy_extended_options() {
     use rsurl::ffi::{

@@ -68,6 +68,15 @@ json = ["dep:serde", "dep:serde_json"]
 # the async core is runtime-agnostic (the quinn model) and only this adapter
 # names `tokio`. Enable with `--features tokio-rt`.
 tokio-rt = ["dep:tokio"]
+# C ABI (the libcurl-shaped `rsurl_*` "easy" API in `src/ffi.rs`). Off by
+# default: it only matters when building rsurl *as* a C library — a plain
+# `cargo build --features ffi` then emits the `rsurl_*` symbols into the
+# cdylib/staticlib (link `tests/ffi_smoke.c` against them). Gating it keeps the
+# `#[no_mangle] extern "C"` surface out of pure-Rust consumers, who would
+# otherwise carry those un-elidable, clash-prone global symbols in their
+# binaries. (The cdylib/staticlib crate-types still build without it, just with
+# no rsurl_* symbols — `crate-type` can't be feature-conditional in Cargo.)
+ffi = []
 
 [dependencies]
 # Optional, only for the `json` feature (`Response::json`). Pure Rust, no C.

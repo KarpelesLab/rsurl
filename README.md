@@ -279,13 +279,22 @@ rsurl_easy_cleanup(h);
 Link with `-lrsurl`. Function names use a `rsurl_` prefix so the library
 can coexist with libcurl in the same process.
 
+The C ABI is gated behind the off-by-default `ffi` feature — build with
+`--features ffi` (see below) to emit the `rsurl_*` symbols. Pure-Rust
+consumers using rsurl as a crate dependency therefore don't carry the
+`extern "C"` surface.
+
 ## Build
 
 ```sh
 cargo build --release
 # Binary:       target/release/rsurl
 # Rust rlib:    target/release/librsurl.rlib
+
+# For the C library (rsurl_* symbols), enable the `ffi` feature:
+cargo build --release --features ffi
 # C cdylib:     target/release/librsurl.so
+# C staticlib:  target/release/librsurl.a
 # C header:     include/rsurl.h
 ```
 

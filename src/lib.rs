@@ -51,6 +51,10 @@ pub mod ssh;
 pub mod tftp;
 pub mod websocket;
 
+// C ABI — only compiled with the `ffi` feature, so pure-Rust consumers don't
+// carry the `#[no_mangle] extern "C"` symbols. Build with `--features ffi` to
+// produce a C-linkable library (see the feature doc in Cargo.toml).
+#[cfg(feature = "ffi")]
 pub mod ffi;
 
 pub use crate::cancel::CancelToken;
