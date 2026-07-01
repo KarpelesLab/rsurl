@@ -27,16 +27,6 @@ use crate::error::{Error, Result};
 
 pub use rustls::RootCertStore;
 
-/// Search paths for a system-wide CA bundle, in order of preference.
-/// Same list and rationale as the purecrypto backend — see comments there.
-const SYSTEM_CA_PATHS: &[&str] = &[
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/pki/tls/certs/ca-bundle.crt",
-    "/etc/ssl/cert.pem",
-    "/etc/ssl/ca-bundle.pem",
-    "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
-];
-
 /// Knobs the caller can flip on a single TLS handshake. Same shape as the
 /// purecrypto backend so consumer code compiles against both unchanged.
 #[derive(Clone)]
@@ -119,20 +109,22 @@ impl Drop for TlsOpts {
     }
 }
 
-/// Load every CA found in the first existing bundle on disk. Mirrors the
-/// purecrypto backend's behaviour (skip-the-broken, error on empty).
-pub fn load_system_roots() -> Result<RootCertStore> {
-    for path in SYSTEM_CA_PATHS {
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(Error::Io(e)),
-        };
-        return parse_roots(BufReader::new(file), path);
-    }
-    Err(Error::BadResponse(
-        "no system CA bundle found; tried common Unix paths".into(),
-    ))
+/// The default trust anchors when the caller supplies neither `--cacert` nor
+/// `--capath`: the embedded [`cacrt`](https://crates.io/crates/cacrt) CA bundle,
+/// built into a rustls store once on first use and cached behind an `Arc` (the
+/// builder takes `Into<Arc<RootCertStore>>`, so reuse is a cheap refcount bump).
+/// Deliberately does NOT read the OS trust store, so verification works
+/// identically on every platform, Windows included.
+fn embedded_roots() -> Arc<RootCertStore> {
+    static CACHE: std::sync::OnceLock<Arc<RootCertStore>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut roots = RootCertStore::empty();
+            let certs = cacrt::all().iter().map(|c| CertificateDer::from(c.der()));
+            let (_added, _ignored) = roots.add_parsable_certificates(certs);
+            Arc::new(roots)
+        })
+        .clone()
 }
 
 /// Load CA certificates from a user-supplied PEM bundle (curl's
@@ -144,15 +136,13 @@ pub fn load_roots_from_file(path: &str) -> Result<RootCertStore> {
 }
 
 /// Add every CA in `dir` to a base root store and return it (curl `--capath`,
-/// which *adds* to the trust set). When `base` is `None` the system bundle is
-/// loaded first, so `--capath` alone augments the default roots; when `base`
-/// is `Some` (e.g. a `--cacert` bundle) the directory's CAs are added on top.
+/// which *adds* to the trust set). When `base` is `None` the embedded default
+/// roots are used first, so `--capath` alone augments them; when `base` is
+/// `Some` (e.g. a `--cacert` bundle) the directory's CAs are added on top.
 /// Files that don't parse as PEM certs are skipped, matching curl/OpenSSL.
 pub fn load_roots_from_dir(base: Option<RootCertStore>, dir: &str) -> Result<RootCertStore> {
-    let mut roots = match base {
-        Some(r) => r,
-        None => load_system_roots()?,
-    };
+    // `--capath` alone augments the embedded default roots.
+    let mut roots = base.unwrap_or_else(|| (*embedded_roots()).clone());
     let mut added = 0usize;
     for entry in std::fs::read_dir(dir).map_err(Error::Io)? {
         let entry = entry.map_err(Error::Io)?;
@@ -319,12 +309,12 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientC
     let effective_verify = opts.verify && opts.verify_callback.is_none();
     let mut config = if effective_verify {
         // Only the verifying path needs a trust store. Resolve it lazily here so
-        // verification-off (`curl -k`) and verify-callback requests don't load
-        // the system CA bundle — which would needlessly fail on platforms
-        // without a Unix CA path (e.g. Windows).
-        let roots = match opts.roots.take() {
-            Some(r) => r,
-            None => load_system_roots()?,
+        // verification-off (`curl -k`) and verify-callback requests don't build
+        // the default roots for nothing. With no `--cacert`, trust comes from
+        // the embedded CA bundle (loaded on demand), not the OS store.
+        let roots: Arc<RootCertStore> = match opts.roots.take() {
+            Some(r) => Arc::new(r),
+            None => embedded_roots(),
         };
         let verified =
             ClientConfig::builder_with_protocol_versions(&versions).with_root_certificates(roots);
@@ -824,5 +814,15 @@ mod tests {
         // disabling certificate verification for `..Default::default()` callers.
         assert!(TlsOpts::default().verify);
         assert!(TlsOpts::verifying().verify);
+    }
+
+    #[test]
+    fn embedded_roots_are_populated() {
+        // The default trust store is the embedded cacrt bundle (a full curated
+        // root set), not the OS store — so it must be well-populated on every
+        // platform. Cached, so a second call returns the same Arc.
+        let a = embedded_roots();
+        assert!(a.len() > 100, "embedded CA bundle should be populated");
+        assert!(Arc::ptr_eq(&a, &embedded_roots()), "roots are cached");
     }
 }

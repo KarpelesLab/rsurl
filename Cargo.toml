@@ -51,7 +51,7 @@ purecrypto-tls = []
 # When both `purecrypto-tls` and `rustls-tls` are active, rustls wins (see
 # the cfg cascade in src/tls/mod.rs). HTTP/3 always uses purecrypto's TLS
 # regardless of this feature, because the QUIC stack is bound to it.
-rustls-tls = ["dep:rustls", "dep:rustls-pemfile"]
+rustls-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:cacrt"]
 # Internationalized Domain Name (IDN) support: normalise Unicode hostnames to
 # ASCII/punycode (UTS-46) before they hit DNS, the `Host:` header, and TLS SNI —
 # matching curl's default. On by default; build with `--no-default-features`
@@ -88,6 +88,14 @@ serde_json = { version = "1", optional = true }
 # public-key pinning + SAN checks and TLS truncation detection; 0.6.14 lowers
 # the declared MSRV to 1.88 (matching this crate — see `rust-version` above).
 purecrypto = "0.6.17"
+# Embedded CA trust bundle (curated Mozilla-derived roots as static DER). The
+# purecrypto backend reaches it via `RootCertStore::with_embedded_roots()`;
+# the rustls backend needs the raw DER directly, so `cacrt` is pulled in as a
+# direct (optional) dependency only under `rustls-tls`. Same crate purecrypto
+# already embeds, so cargo dedups — no duplicated cert data. This is what lets
+# TLS verification work out of the box on every platform (notably Windows,
+# which has no Unix CA path) without reading the OS trust store.
+cacrt = { version = "0.1", optional = true }
 # Zero out client private-key material (the `--key`/`--pass` bytes held in
 # `TlsOpts`) on drop, so a long-lived process doesn't leave decrypted key
 # bytes lingering in freed heap. Pure Rust, no C; always on (tiny crate).

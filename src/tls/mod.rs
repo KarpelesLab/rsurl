@@ -57,7 +57,7 @@ compile_error!(
 #[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
 pub use backend::{
     connect_over, connect_over_tls, connect_over_with_alpn, load_roots_from_dir,
-    load_roots_from_file, load_system_roots, RootCertStore, TlsConn, TlsOpts, TlsStream,
+    load_roots_from_file, RootCertStore, TlsConn, TlsOpts, TlsStream,
 };
 
 /// Build a socket-free sans-IO TLS client engine for the active backend,

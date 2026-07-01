@@ -822,14 +822,14 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
     // gets the same protection over h3 as over h2. Fail closed: when
     // verification is on we still need a usable root store.
     //
-    // Base trust store: `--cacert <file>` replaces the system roots; otherwise
-    // load the system bundle. `--capath <dir>` then *adds* a directory of CAs
+    // Base trust store: `--cacert <file>` replaces the defaults; otherwise use
+    // the embedded CA bundle. `--capath <dir>` then *adds* a directory of CAs
     // on top of whichever base is in effect (curl semantics). Going through
     // `pc_roots` directly sidesteps the active `crate::tls::*` backend (which
     // may be rustls), because QUIC always needs a purecrypto root store.
     let mut roots = match &req.ca_bundle {
         Some(path) => crate::tls::pc_roots::load_from_file(path)?,
-        None => crate::tls::pc_roots::load_system_roots()?,
+        None => crate::tls::pc_roots::embedded_roots(),
     };
     if let Some(dir) = &req.ca_path {
         crate::tls::pc_roots::add_from_dir(&mut roots, dir)?;

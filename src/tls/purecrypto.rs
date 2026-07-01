@@ -122,14 +122,6 @@ fn to_pc_version(v: ProtocolVersion) -> purecrypto::tls::ProtocolVersion {
     }
 }
 
-/// Load every CA found in the first existing bundle on disk. Thin wrapper
-/// around the always-compiled purecrypto-flavoured loader in
-/// [`super::pc_roots`], so the QUIC/HTTP/3 path and this backend stay in
-/// agreement about which paths are searched and how PEM is parsed.
-pub fn load_system_roots() -> Result<RootCertStore> {
-    pc_roots::load_system_roots()
-}
-
 /// Load CA certificates from a user-supplied PEM bundle (the `--cacert <file>`
 /// flag in curl). Thin wrapper around [`super::pc_roots::load_from_file`].
 pub fn load_roots_from_file(path: &str) -> Result<RootCertStore> {
@@ -137,15 +129,11 @@ pub fn load_roots_from_file(path: &str) -> Result<RootCertStore> {
 }
 
 /// Add every CA in `dir` to a base root store and return it (curl `--capath`,
-/// which *adds* to the trust set). When `base` is `None` the system bundle is
-/// loaded first, so `--capath` alone augments the default roots; when `base`
-/// is `Some` (e.g. a `--cacert` bundle) the directory's CAs are added on top
-/// of that.
+/// which *adds* to the trust set). When `base` is `None` the embedded default
+/// roots are used first, so `--capath` alone augments them; when `base` is
+/// `Some` (e.g. a `--cacert` bundle) the directory's CAs are added on top.
 pub fn load_roots_from_dir(base: Option<RootCertStore>, dir: &str) -> Result<RootCertStore> {
-    let mut roots = match base {
-        Some(r) => r,
-        None => load_system_roots()?,
-    };
+    let mut roots = base.unwrap_or_else(pc_roots::embedded_roots);
     pc_roots::add_from_dir(&mut roots, dir)?;
     Ok(roots)
 }
@@ -200,14 +188,11 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connect
     // our own chain validation, then defer accept/reject to the callback.
     let effective_verify = opts.verify && opts.verify_callback.is_none();
     // Only the verifying path needs a trust store. When verification is off
-    // (`curl -k`) or a verify callback owns the decision, skip loading the
-    // system CA bundle entirely (an empty store) so it doesn't needlessly fail
-    // on platforms without a Unix CA path (e.g. Windows).
+    // (`curl -k`) or a verify callback owns the decision, use an empty store so
+    // we don't build the default roots for nothing. Otherwise fall back to the
+    // embedded CA bundle (loaded on demand) when the caller gave no `--cacert`.
     let roots = if effective_verify {
-        match opts.roots.take() {
-            Some(r) => r,
-            None => load_system_roots()?,
-        }
+        opts.roots.take().unwrap_or_else(pc_roots::embedded_roots)
     } else {
         RootCertStore::new()
     };
