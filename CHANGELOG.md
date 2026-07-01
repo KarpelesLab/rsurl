@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/KarpelesLab/rsurl/compare/v0.1.5...v0.1.6) - 2026-07-01
+
+### Other
+
+- stop being a Cargo workspace; curl-compat is a standalone sub-crate
+
 ## [0.1.5](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.4...rsurl-v0.1.5) - 2026-07-01
 
 ### Added
