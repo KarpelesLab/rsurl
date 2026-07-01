@@ -11,14 +11,10 @@ readme = "README.md"
 keywords = ["http", "https", "curl", "client", "tls"]
 categories = ["network-programming", "web-programming::http-client", "command-line-utilities"]
 
-# `curl-compat` is an OPTIONAL workspace member that builds a libcurl-ABI
-# drop-in (`libcurl.so`) on top of this crate. `default-members` keeps it OUT
-# of the normal `cargo build`/`cargo test`; build it explicitly with
-# `cargo build -p curl-compat --release`.
-[workspace]
-members = ["curl-compat"]
-default-members = ["."]
-resolver = "2"
+# This crate is intentionally NOT a Cargo workspace. `curl-compat/` is a
+# standalone sub-crate (a libcurl-ABI drop-in built on this one) that is
+# excluded from the normal `cargo build`/`cargo test` here; build it separately
+# when needed with `cargo build --release --manifest-path curl-compat/Cargo.toml`.
 
 [lib]
 name = "rsurl"

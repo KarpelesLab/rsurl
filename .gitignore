@@ -1,4 +1,5 @@
-/target
+# Build output — both this crate's and the standalone curl-compat/ sub-crate's.
+target/
 Cargo.lock
 *.swp
 .DS_Store

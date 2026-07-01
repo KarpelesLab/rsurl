@@ -101,13 +101,13 @@ jobs:
         run: rustup component add clippy
 
       - name: Build, lint & test the curl-compat shim
-        # curl-compat is an optional workspace member (not in default-members),
+        # curl-compat is a standalone sub-crate (this repo is not a workspace),
         # so the steps above never touch it. Gate it here too — a non-exhaustive
         # match or other breakage in the libcurl-ABI shim must turn CI red.
         run: |
-          cargo clippy -p curl-compat --all-targets -- -D warnings
-          cargo build -p curl-compat --release
-          cargo test -p curl-compat
+          cargo clippy --manifest-path curl-compat/Cargo.toml --all-targets -- -D warnings
+          cargo build --manifest-path curl-compat/Cargo.toml --release
+          cargo test --manifest-path curl-compat/Cargo.toml
 
   linux32:
     name: 32-bit (i686, pure-Rust backends)
@@ -155,9 +155,9 @@ jobs:
         # with CURLE_NOT_BUILT_IN on ILP32 instead of truncating the curl_off_t.
         if: matrix.backend.name == 'default'
         run: |
-          cargo clippy -p curl-compat --target i686-unknown-linux-gnu --all-targets -- -D warnings
-          cargo build -p curl-compat --release --target i686-unknown-linux-gnu
-          cargo test -p curl-compat --target i686-unknown-linux-gnu
+          cargo clippy --manifest-path curl-compat/Cargo.toml --target i686-unknown-linux-gnu --all-targets -- -D warnings
+          cargo build --manifest-path curl-compat/Cargo.toml --release --target i686-unknown-linux-gnu
+          cargo test --manifest-path curl-compat/Cargo.toml --target i686-unknown-linux-gnu
 
   docs:
     name: Docs build (warnings denied)
