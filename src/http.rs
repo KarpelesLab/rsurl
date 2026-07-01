@@ -901,6 +901,11 @@ impl Request {
     /// so the CLI can apply progress / rate-limit / size-cap per chunk and not
     /// hold large downloads in memory.
     ///
+    /// Because the body is never held in memory, it is *not* bounded by the
+    /// in-memory size cap that governs the buffered [`send`](Self::send) path:
+    /// the `sink` (e.g. a file) is the only bound, so arbitrarily large files
+    /// stream through without being truncated.
+    ///
     /// Streaming applies only to a direct (no proxy / custom connector)
     /// HTTP/1.1 connection whose final response has no `Content-Encoding`.
     /// Every other case (HTTP/2 or /3, a proxy, a compressed or empty body)
@@ -924,6 +929,13 @@ impl Request {
     /// `Vec`, decoded) and [`send_download`](Self::send_download) (raw bytes to a
     /// `Write` sink): it hands back a reader of raw wire bytes, which makes a
     /// media/source driver that consumes a `Read` a drop-in.
+    ///
+    /// The body streams off the socket and is never buffered whole in memory, so
+    /// it is *not* subject to the buffered path's in-memory size cap — the
+    /// consumer bounds it. This is what lets [`download_resumable`] fetch files
+    /// larger than that cap.
+    ///
+    /// [`download_resumable`]: Self::download_resumable
     ///
     /// Body bytes are returned exactly as the wire delivered them — any
     /// `Content-Encoding` is left in place and the header is preserved (this
@@ -1363,14 +1375,14 @@ impl Request {
                         crate::compress::single_streamable_layer(&ce),
                         parse_content_length(&head.headers)?,
                     ) {
-                        if len > MAX_BODY_BYTES as u64 {
-                            return Err(Error::BadResponse(format!("body too large: {len}")));
-                        }
+                        // Decoded straight to the sink (not buffered in memory),
+                        // so the decoded size is bounded by the sink / disk, not
+                        // by `MAX_BODY_BYTES`.
                         let n = crate::compress::stream_decode(
                             bufrd.by_ref().take(len),
                             codec,
                             sink,
-                            MAX_BODY_BYTES as u64,
+                            u64::MAX,
                         )?;
                         let _ = writeln!(trace, "* Stream-decoded {n} body bytes ({codec:?})");
                         return Ok(Response {
@@ -1914,7 +1926,8 @@ enum BodyInner {
     Buffered(io::Cursor<Vec<u8>>),
     /// A `Content-Length`-bounded raw byte stream straight off the socket.
     Length(LengthBody),
-    /// A connection-close-delimited stream, capped at [`MAX_BODY_BYTES`].
+    /// A connection-close-delimited stream, read to the transport close
+    /// (unbounded — the caller/sink bounds it, unlike the buffered path).
     Eof(io::Take<BufReader<Box<dyn Rw>>>),
 }
 
@@ -2072,24 +2085,23 @@ fn build_body_reader(
         });
     }
 
+    // A `BodyReader` streams off the socket; the body is never held in memory,
+    // so it is NOT bounded by `MAX_BODY_BYTES` (the caller — e.g. a file sink —
+    // bounds it). This lets `send_reader` / `download_resumable` fetch files
+    // larger than the in-memory cap that governs the buffered `send` path.
     match parse_content_length(&head.headers)? {
-        Some(len) => {
-            if len > MAX_BODY_BYTES as u64 {
-                return Err(Error::BadResponse(format!("body too large: {len}")));
-            }
-            Ok(BodyReader {
-                head: rhead,
-                inner: BodyInner::Length(LengthBody {
-                    src: bufrd,
-                    remaining: len,
-                }),
-                _cancel: cancel,
-            })
-        }
+        Some(len) => Ok(BodyReader {
+            head: rhead,
+            inner: BodyInner::Length(LengthBody {
+                src: bufrd,
+                remaining: len,
+            }),
+            _cancel: cancel,
+        }),
         // No Content-Length, not chunked — connection-close-delimited.
         None => Ok(BodyReader {
             head: rhead,
-            inner: BodyInner::Eof(bufrd.take(MAX_BODY_BYTES as u64)),
+            inner: BodyInner::Eof(bufrd.take(u64::MAX)),
             _cancel: cancel,
         }),
     }
@@ -4135,11 +4147,11 @@ fn stream_body<R: BufRead + TruncationAware, W: Write + ?Sized>(
     if chunked {
         return stream_chunked(r, sink);
     }
+    // Streaming straight to the sink: unlike the buffered path, the body is
+    // never held in memory, so it is NOT bounded by `MAX_BODY_BYTES` (the sink /
+    // disk is the natural bound). A legitimately large file is not truncated.
     match parse_content_length(headers)? {
         Some(len) => {
-            if len > MAX_BODY_BYTES as u64 {
-                return Err(Error::BadResponse(format!("body too large: {len}")));
-            }
             let n = io::copy(&mut r.by_ref().take(len), sink)?;
             if n < len {
                 return Err(Error::UnexpectedEof);
@@ -4149,7 +4161,7 @@ fn stream_body<R: BufRead + TruncationAware, W: Write + ?Sized>(
         None => {
             // EOF-delimited: see the TLS-1 note in `read_body`. Reject a body
             // whose framing close was an unauthenticated transport EOF.
-            let n = io::copy(&mut r.by_ref().take(MAX_BODY_BYTES as u64), sink)?;
+            let n = io::copy(&mut r.by_ref().take(u64::MAX), sink)?;
             if r.response_truncated() {
                 return Err(Error::UnexpectedEof);
             }
@@ -4178,9 +4190,7 @@ fn stream_chunked<R: BufRead, W: Write + ?Sized>(r: &mut R, sink: &mut W) -> Res
         }
         let size = usize::from_str_radix(s, 16)
             .map_err(|_| Error::BadResponse(format!("bad chunk size: {size_str:?}")))?;
-        if total.saturating_add(size as u64) > MAX_BODY_BYTES as u64 {
-            return Err(Error::BadResponse("body too large".into()));
-        }
+        // Streaming to the sink: no in-memory cap on the aggregate body size.
         if size == 0 {
             // Bound the total trailer block (each line is already capped) so a
             // server can't stream non-empty trailer lines forever.
@@ -5162,6 +5172,48 @@ mod tests {
             }
         });
         port
+    }
+
+    #[test]
+    fn send_reader_is_not_bounded_by_the_in_memory_cap() {
+        // Advertise a Content-Length beyond MAX_BODY_BYTES but send only a few
+        // real bytes. The streaming reader must still be constructed — the old
+        // in-memory cap rejected this up front as "body too large". This is the
+        // path `download_resumable` relies on for files larger than the cap.
+        let big = MAX_BODY_BYTES as u64 + 4096;
+        let mut resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\n\r\n").into_bytes();
+        resp.extend_from_slice(b"hello");
+        let port = serve_n(1, resp);
+
+        let mut reader = Request::get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .http11_only()
+            .send_reader()
+            .expect("send_reader must not reject a large Content-Length");
+        assert_eq!(reader.status(), 200);
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf).unwrap();
+        assert!(n > 0 && buf[..n] == b"hello"[..n]);
+    }
+
+    #[test]
+    fn send_download_streams_past_the_in_memory_cap() {
+        // A Content-Length beyond the cap must stream to the sink rather than be
+        // rejected up front; the bytes actually delivered are written, and the
+        // (unmet) promised length surfaces as a truncation, not "body too large".
+        let big = MAX_BODY_BYTES as u64 + 4096;
+        let mut resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\n\r\n").into_bytes();
+        resp.extend_from_slice(&vec![b'x'; 4096]);
+        let port = serve_n(1, resp);
+
+        let mut sink = Vec::new();
+        let err = Request::get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .http11_only()
+            .send_download(&mut sink, None, &mut io::sink())
+            .unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof), "got {err:?}");
+        assert_eq!(sink.len(), 4096, "streamed bytes were written to the sink");
     }
 
     #[test]
