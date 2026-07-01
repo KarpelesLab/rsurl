@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.4...rsurl-v0.1.5) - 2026-07-01
+
+### Added
+
+- *(tls)* use the embedded cacrt bundle as default trust; drop load_system_roots
+- *(download)* unified fetch_to_file front door across schemes
+- *(download)* support data: URIs in download()
+
+### Fixed
+
+- *(cli)* print a final progress line for library downloads
+
+### Other
+
+- *(download)* gate the front-door file:// case to unix
+- *(download)* drop the HEAD probe; learn size from the first GET
+
 ## [0.1.4](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.3...rsurl-v0.1.4) - 2026-07-01
 
 ### Added
