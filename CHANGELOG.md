@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.3...rsurl-v0.1.4) - 2026-07-01
+
+### Added
+
+- *(http)* don't apply the in-memory body cap to streaming transfers
+- *(download)* resumable, retrying HTTP downloads in the library
+- *(ffi)* [**breaking**] gate the C ABI behind an off-by-default `ffi` feature
+
+### Fixed
+
+- *(websocket)* make WsShutdown::shutdown idempotent on an already-closed socket
+
+### Other
+
+- *(download)* unify segmented/parallel downloads into one engine
+
 ## [0.1.3](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.2...rsurl-v0.1.3) - 2026-06-28
 
 ### Added
