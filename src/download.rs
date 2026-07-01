@@ -1958,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn front_door_dispatches_data_http_and_file() {
+    fn front_door_dispatches_data_and_http() {
         // data:
         let out = tmp("fd_data");
         fetch_to_file("data:;base64,aGVsbG8=", &out, no_backoff()).expect("data");
@@ -1975,8 +1975,15 @@ mod tests {
         assert_eq!(outcome.bytes_written, 3_000);
         assert_eq!(std::fs::read(&out).unwrap(), body);
         cleanup(&out);
+    }
 
-        // file:// → streamed via the transfer dispatcher.
+    // `file://` URL formatting is platform-specific (Windows drive letters /
+    // backslashes); the `file` module owns those semantics. Here we only need to
+    // confirm the front door routes `file:` through the transfer dispatcher, so
+    // exercise it where the path→URL mapping is trivial.
+    #[cfg(unix)]
+    #[test]
+    fn front_door_dispatches_file_scheme() {
         let src = tmp("fd_src");
         std::fs::write(&src, b"local file contents").unwrap();
         let out = tmp("fd_file");
