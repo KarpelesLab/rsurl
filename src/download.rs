@@ -193,6 +193,91 @@ pub fn download(url: &str, path: &Path, mut opts: DownloadOptions) -> Result<Dow
     Request::get(url)?.download_resumable(path, opts)
 }
 
+/// Fetch any supported URL into `path`, dispatching to the right engine — a
+/// single front door over the crate's transfer backends.
+///
+/// * `http(s)://` and `data:` → the resumable/segmented engine ([`download`]);
+///   `DownloadOptions` (retry, segmentation, parallelism, size/hash checks,
+///   progress) apply in full.
+/// * `ftp(s)://`, `file://`, and the other one-shot schemes (`dict`, `gopher`,
+///   `tftp`, `sftp`/`scp`, `ws(s)`, …) → streamed (FTP/file) or buffered to the
+///   file. Of `DownloadOptions`, `max_size` / `expected_sha256` / `progress`
+///   apply; resume/segmentation do not (those transports aren't range-based).
+/// * `magnet:` / BitTorrent → not handled here: it needs tracker/DHT peer
+///   discovery. Use [`crate::bittorrent`] directly. Returns
+///   [`Error::UnsupportedScheme`].
+pub fn fetch_to_file(url: &str, path: &Path, mut opts: DownloadOptions) -> Result<DownloadOutcome> {
+    match url_scheme(url).as_deref() {
+        // `data:` is recognised by prefix; `download` handles it and http(s).
+        Some("data") | Some("http") | Some("https") => download(url, path, opts),
+        Some("magnet") => Err(Error::UnsupportedScheme(
+            "magnet: use the bittorrent module (front door has no peer discovery)".into(),
+        )),
+        Some(_) => {
+            let n = fetch_via_transfer(url, path, &mut opts)?;
+            Ok(DownloadOutcome {
+                bytes_written: n,
+                total: Some(n),
+                resumed_from: 0,
+            })
+        }
+        None => Err(Error::InvalidUrl(url.to_string())),
+    }
+}
+
+/// Lower-cased URI scheme (the token before the first `:`), or `None` if `url`
+/// has no valid scheme.
+fn url_scheme(url: &str) -> Option<String> {
+    let colon = url.find(':')?;
+    let scheme = &url[..colon];
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(scheme.to_ascii_lowercase())
+}
+
+/// Stream/buffer a non-HTTP scheme to `path` via the universal
+/// [`crate::transfer`] dispatcher, applying the size/hash/progress options that
+/// make sense there.
+fn fetch_via_transfer(url: &str, path: &Path, opts: &mut DownloadOptions) -> Result<u64> {
+    let mut parsed = crate::url::Url::parse(url)?;
+    parsed.set_idn(true)?;
+    let n = {
+        let mut file = std::fs::File::create(path).map_err(Error::Io)?;
+        crate::transfer::transfer_url_to_with(
+            &parsed,
+            &crate::net::NetConfig::default(),
+            &mut file,
+        )?
+    };
+    if let Some(max) = opts.max_size {
+        if n > max {
+            let _ = std::fs::remove_file(path);
+            return Err(Error::BadResponse("maximum file size exceeded".into()));
+        }
+    }
+    if let Some(want) = opts.expected_sha256 {
+        match hash_prefix(path, n) {
+            Ok(got) if got == want => {}
+            Ok(_) => {
+                let _ = std::fs::remove_file(path);
+                return Err(Error::BadResponse(
+                    "downloaded file failed SHA-256 verification".into(),
+                ));
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    if let Some(cb) = opts.progress.as_mut() {
+        cb(n, Some(n));
+    }
+    Ok(n)
+}
+
 /// Decode a `data:` URI (RFC 2397) into its bytes. Returns `None` if `url` is
 /// not a `data:` URI (so the caller falls through to a network fetch), or
 /// `Some(Err(..))` if it is one but malformed.
@@ -1867,6 +1952,51 @@ mod tests {
         // Missing comma → malformed data URI.
         assert!(matches!(
             download("data:text/plain", &out, no_backoff()),
+            Err(Error::InvalidUrl(_))
+        ));
+        cleanup(&out);
+    }
+
+    #[test]
+    fn front_door_dispatches_data_http_and_file() {
+        // data:
+        let out = tmp("fd_data");
+        fetch_to_file("data:;base64,aGVsbG8=", &out, no_backoff()).expect("data");
+        assert_eq!(std::fs::read(&out).unwrap(), b"hello");
+        cleanup(&out);
+
+        // http(s): → resumable engine.
+        let body = make_body(3_000, 0xF00D);
+        let origin = Origin::shared(body.clone(), "fd");
+        let port = start(origin);
+        let out = tmp("fd_http");
+        let outcome =
+            fetch_to_file(&format!("http://127.0.0.1:{port}/f"), &out, no_backoff()).expect("http");
+        assert_eq!(outcome.bytes_written, 3_000);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        cleanup(&out);
+
+        // file:// → streamed via the transfer dispatcher.
+        let src = tmp("fd_src");
+        std::fs::write(&src, b"local file contents").unwrap();
+        let out = tmp("fd_file");
+        let url = format!("file://{}", src.display());
+        let outcome = fetch_to_file(&url, &out, no_backoff()).expect("file");
+        assert_eq!(outcome.bytes_written, 19);
+        assert_eq!(std::fs::read(&out).unwrap(), b"local file contents");
+        cleanup(&out);
+        cleanup(&src);
+    }
+
+    #[test]
+    fn front_door_rejects_magnet_and_bad_scheme() {
+        let out = tmp("fd_bad");
+        assert!(matches!(
+            fetch_to_file("magnet:?xt=urn:btih:abc", &out, no_backoff()),
+            Err(Error::UnsupportedScheme(_))
+        ));
+        assert!(matches!(
+            fetch_to_file("not a url", &out, no_backoff()),
             Err(Error::InvalidUrl(_))
         ));
         cleanup(&out);

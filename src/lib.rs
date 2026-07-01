@@ -60,7 +60,7 @@ pub mod ffi;
 
 pub use crate::cancel::CancelToken;
 pub use crate::cookie::{Cookie, CookieJar, SameSite};
-pub use crate::download::{download, DownloadOptions, DownloadOutcome};
+pub use crate::download::{download, fetch_to_file, DownloadOptions, DownloadOutcome};
 pub use crate::error::{Error, Result};
 pub use crate::http::{
     send_multiplexed, send_multiplexed_traced, BodyReader, HttpVersionPref, Priority, ProxyConfig,
