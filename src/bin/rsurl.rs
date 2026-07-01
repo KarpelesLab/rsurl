@@ -51,11 +51,9 @@
 //!     -V, --version            print version
 
 use std::fs::File;
-use std::io::{self, IsTerminal, Read, Seek, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use rsurl::{CookieJar, HttpVersionPref, Request, Response, Url};
@@ -2119,19 +2117,49 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // no status-gated body suppression. This is the path that enforces
     // --limit-rate, -# progress, and an early --max-filesize abort.
     if streams_to_file(args) {
-        // `-C -`: resumable paths. A resumable parallel download is used when
-        // segments are requested and there's no cookie jar; otherwise (or if the
-        // server isn't range-capable) fall through to single-stream resume.
-        if args.continue_resume {
-            if parallel_segments_eligible(args) && jar.is_none() {
-                if let Some(code) = run_parallel_resume(&req, &parsed_url, args) {
-                    return code;
+        // Resolve the concrete output file the library download engine needs.
+        let name = if args.remote_name {
+            match remote_name_from_url(&parsed_url) {
+                Ok(n) => n,
+                Err(e) => {
+                    if show_errors(args) {
+                        eprintln!("rsurl: {e}");
+                    }
+                    return 23;
                 }
             }
-            return run_http_download(req, &parsed_url, args, jar);
+        } else {
+            args.output.clone().unwrap_or_default()
+        };
+        let concrete = !name.is_empty() && name != "-";
+        let workers = args.parallel_segments.unwrap_or(1).min(MAX_SEGMENTS);
+        // `-C -` and `--parallel-segments` both run on the library engine (range
+        // + validator handling, retry, streaming chunks, atomic finalize). A
+        // resumable transfer uses fixed chunks; a bare parallel one splits into
+        // N equal segments. Everything else is a plain in-place download.
+        if concrete && args.continue_resume {
+            let plan = if parallel_segments_eligible(args) {
+                SegmentPlan::FixedChunks {
+                    size: RESUME_CHUNK,
+                    workers,
+                }
+            } else {
+                SegmentPlan::Single
+            };
+            return run_library_download(&req, &parsed_url, args, &name, jar, plan);
         }
-        if parallel_segments_eligible(args) {
-            return run_parallel_download(req, &parsed_url, args, jar);
+        if concrete && parallel_segments_eligible(args) {
+            return run_library_download(
+                &req,
+                &parsed_url,
+                args,
+                &name,
+                jar,
+                SegmentPlan::EqualSegments {
+                    count: workers,
+                    workers,
+                },
+            );
         }
         return run_http_download(req, &parsed_url, args, jar);
     }
@@ -4050,18 +4078,6 @@ struct DownloadSink<'a> {
     last_tick: std::time::Instant,
 }
 
-/// Encode the resume validators (final URL, ETag, Last-Modified) as
-/// length-prefixed strings.
-fn http_resume_validators(url: &str, etag: &str, last_modified: &str) -> Vec<u8> {
-    let mut v = Vec::new();
-    for s in [url, etag, last_modified] {
-        let b = s.as_bytes();
-        v.extend_from_slice(&(b.len() as u16).to_le_bytes());
-        v.extend_from_slice(b);
-    }
-    v
-}
-
 impl Write for DownloadSink<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if let Some(max) = self.max {
@@ -4116,30 +4132,11 @@ fn parallel_segments_eligible(args: &Args) -> bool {
         && args.upload_file.is_none()
 }
 
-/// Smallest segment worth a separate connection (don't split tiny files).
-const MIN_SEGMENT_BYTES: u64 = 1 << 20; // 1 MiB
 /// Hard cap on concurrent segments regardless of `--parallel-segments`.
 const MAX_SEGMENTS: usize = 16;
 
-/// A `Write` that tallies bytes into a shared counter — lets the progress
-/// render thread observe each segment's progress as it streams to the file.
-struct CountingWriter<W> {
-    inner: W,
-    counter: Arc<AtomicU64>,
-}
-
-impl<W: Write> Write for CountingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.counter.fetch_add(n as u64, Ordering::Relaxed);
-        Ok(n)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
 /// Format a byte count like `12.3 MiB`.
+#[cfg(feature = "bittorrent")]
 fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = b as f64;
@@ -4155,519 +4152,8 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-/// A fixed-width `[████░░░░]` bar for `got`/`total`.
-fn progress_bar(got: u64, total: u64, width: usize) -> String {
-    let filled = if total == 0 {
-        width
-    } else {
-        ((got as u128 * width as u128 / total as u128) as usize).min(width)
-    };
-    let mut s = String::with_capacity(width + 2);
-    s.push('[');
-    for _ in 0..filled {
-        s.push('\u{2588}'); // █
-    }
-    for _ in filled..width {
-        s.push('\u{2591}'); // ░
-    }
-    s.push(']');
-    s
-}
-
-/// Draw the parallel-download progress. On a TTY: one line per segment plus an
-/// aggregate line, redrawn in place. Off a TTY: a single `\r` aggregate line.
-fn render_parallel(
-    lens: &[u64],
-    counters: &[Arc<AtomicU64>],
-    total: u64,
-    start: std::time::Instant,
-    tty: bool,
-    first: &mut bool,
-) {
-    const BAR_W: usize = 24;
-    let mut err = io::stderr().lock();
-    let done: u64 = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-    let secs = start.elapsed().as_secs_f64();
-    let rate = if secs > 0.0 {
-        (done as f64 / secs) as u64
-    } else {
-        0
-    };
-
-    if tty {
-        let lines = lens.len() + 1; // per-segment lines + aggregate
-        if *first {
-            *first = false;
-        } else {
-            let _ = write!(err, "\x1b[{lines}A");
-        }
-        for (i, (len, ctr)) in lens.iter().zip(counters).enumerate() {
-            let got = ctr.load(Ordering::Relaxed);
-            let _ = writeln!(
-                err,
-                "\r\x1b[2K  seg {:>2}/{:<2} {} {}/{}",
-                i + 1,
-                lens.len(),
-                progress_bar(got, *len, BAR_W),
-                human_bytes(got),
-                human_bytes(*len),
-            );
-        }
-        let _ = writeln!(
-            err,
-            "\r\x1b[2K  total     {} {}/{}  {}/s",
-            progress_bar(done, total, BAR_W),
-            human_bytes(done),
-            human_bytes(total),
-            human_bytes(rate),
-        );
-    } else {
-        let _ = write!(
-            err,
-            "\rrsurl: {}/{} ({}/s)   ",
-            human_bytes(done),
-            human_bytes(total),
-            human_bytes(rate),
-        );
-    }
-    let _ = err.flush();
-}
-
 /// Size of a resumable parallel download's fixed chunk (the bitmap unit).
 const RESUME_CHUNK: u64 = 4 * 1024 * 1024;
-
-fn bit_get(map: &[u8], i: usize) -> bool {
-    map[i / 8] & (1 << (i % 8)) != 0
-}
-fn bit_set(map: &mut [u8], i: usize) {
-    map[i / 8] |= 1 << (i % 8);
-}
-
-/// Encode an `http-ranged` resume meta block: `[chunk_size:u32][total:u64]`,
-/// the validator tail, then the chunk bitmap.
-fn http_ranged_meta(chunk: u32, total: u64, validators: &[u8], bitmap: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(12 + validators.len() + bitmap.len());
-    m.extend_from_slice(&chunk.to_le_bytes());
-    m.extend_from_slice(&total.to_le_bytes());
-    m.extend_from_slice(&(validators.len() as u32).to_le_bytes());
-    m.extend_from_slice(validators);
-    m.extend_from_slice(bitmap);
-    m
-}
-
-/// Parse an `http-ranged` meta block, returning the chunk bitmap only if the
-/// chunk size / total / url / etag still match the current resource.
-fn http_ranged_parse(
-    meta: &[u8],
-    chunk: u32,
-    total: u64,
-    url: &str,
-    etag: &str,
-) -> Option<Vec<u8>> {
-    if meta.len() < 16 {
-        return None;
-    }
-    if u32::from_le_bytes(meta[0..4].try_into().unwrap()) != chunk {
-        return None;
-    }
-    if u64::from_le_bytes(meta[4..12].try_into().unwrap()) != total {
-        return None;
-    }
-    let vlen = u32::from_le_bytes(meta[12..16].try_into().unwrap()) as usize;
-    let rest = meta.get(16..)?;
-    let validators = rest.get(..vlen)?;
-    let bitmap = rest.get(vlen..)?.to_vec();
-    if !validators_match(validators, url, etag) {
-        return None;
-    }
-    Some(bitmap)
-}
-
-/// Compare stored validators against the current url/etag, ignoring the
-/// (possibly differing) Last-Modified field.
-fn validators_match(stored: &[u8], url: &str, etag: &str) -> bool {
-    // Decode the three length-prefixed strings.
-    let mut p = stored;
-    let mut take = || -> Option<String> {
-        if p.len() < 2 {
-            return None;
-        }
-        let n = u16::from_le_bytes([p[0], p[1]]) as usize;
-        let s = String::from_utf8_lossy(p.get(2..2 + n)?).into_owned();
-        p = &p[2 + n..];
-        Some(s)
-    };
-    let (Some(su), Some(se), Some(_lm)) = (take(), take(), take()) else {
-        return false;
-    };
-    su == url && (etag.is_empty() || se.is_empty() || se == etag)
-}
-
-/// `-C -` resumable parallel download: split the file into fixed chunks, fetch
-/// the not-yet-done ones concurrently via Range requests into `<name>.rsurlpart`
-/// (persisting a chunk bitmap), and finalise on completion. Returns `None` to
-/// fall back to single-stream resume (server not range-capable / not seekable /
-/// no concrete output file).
-fn run_parallel_resume(req: &rsurl::Request, url: &Url, args: &Args) -> Option<u8> {
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::Mutex;
-
-    let name = if args.remote_name {
-        remote_name_from_url(url).ok()?
-    } else {
-        args.output.clone().unwrap_or_default()
-    };
-    if name.is_empty() || name == "-" {
-        return None;
-    }
-
-    let probe = req.clone().method("HEAD").send().ok()?;
-    if probe.status >= 400 {
-        return None;
-    }
-    let total = probe
-        .header("content-length")
-        .and_then(|v| v.trim().parse::<u64>().ok())?;
-    if total == 0
-        || !probe
-            .header("accept-ranges")
-            .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
-    {
-        return None;
-    }
-    if let Some(max) = args.max_filesize {
-        if total > max {
-            if show_errors(args) {
-                eprintln!("rsurl: Maximum file size exceeded");
-            }
-            return Some(63);
-        }
-    }
-    let etag = probe.header("etag").unwrap_or("").to_string();
-    let last_mod = probe.header("last-modified").unwrap_or("").to_string();
-    let url_s = format!("{}://{}:{}{}", url.scheme, url.host, url.port, url.path);
-
-    let final_path = resolve_output_path(&name, args);
-    if args.create_dirs {
-        if let Some(p) = final_path.parent() {
-            let _ = std::fs::create_dir_all(p);
-        }
-    } else if let Some(dir) = &args.output_dir {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let part = rsurl::resume::part_path(&final_path);
-
-    let num_chunks = total.div_ceil(RESUME_CHUNK) as usize;
-    let map_len = num_chunks.div_ceil(8);
-    let validators = http_resume_validators(&url_s, &etag, &last_mod);
-    let mut bitmap = vec![0u8; map_len];
-    if let Ok(Some(st)) = rsurl::resume::read_state(&part) {
-        if st.kind == rsurl::resume::Kind::HttpRanged {
-            if let Some(bm) = http_ranged_parse(&st.meta, RESUME_CHUNK as u32, total, &url_s, &etag)
-            {
-                if bm.len() == map_len {
-                    bitmap = bm;
-                }
-            }
-        }
-    }
-
-    // Size the data region and stamp the initial state.
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&part)
-    {
-        Ok(f) => {
-            if f.set_len(total).is_err() {
-                return None; // not a seekable regular file
-            }
-        }
-        Err(_) => return None,
-    }
-    let _ = rsurl::resume::write_state(
-        &part,
-        total,
-        rsurl::resume::Kind::HttpRanged,
-        &http_ranged_meta(RESUME_CHUNK as u32, total, &validators, &bitmap),
-    );
-
-    let n_workers = args
-        .parallel_segments
-        .unwrap_or(1)
-        .min(MAX_SEGMENTS)
-        .min(num_chunks.max(1));
-    if args.verbose {
-        let done = (0..num_chunks).filter(|&i| bit_get(&bitmap, i)).count();
-        eprintln!(
-            "* resumable parallel: {num_chunks} chunks ({done} already done), {n_workers} workers"
-        );
-    }
-
-    let bitmap = Arc::new(Mutex::new(bitmap));
-    let next = Arc::new(AtomicUsize::new(0));
-    let failed = Arc::new(AtomicBool::new(false));
-    let mut handles = Vec::with_capacity(n_workers);
-    for _ in 0..n_workers {
-        let req = req.clone();
-        let part = part.clone();
-        let bitmap = Arc::clone(&bitmap);
-        let next = Arc::clone(&next);
-        let failed = Arc::clone(&failed);
-        let validators = validators.clone();
-        handles.push(std::thread::spawn(move || {
-            while !failed.load(Ordering::Relaxed) {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= num_chunks {
-                    break;
-                }
-                if bit_get(&bitmap.lock().unwrap(), i) {
-                    continue; // already have this chunk
-                }
-                let start = i as u64 * RESUME_CHUNK;
-                let end = (start + RESUME_CHUNK).min(total) - 1;
-                let r = req.clone().header("Range", &format!("bytes={start}-{end}"));
-                let mut f = match std::fs::OpenOptions::new().write(true).open(&part) {
-                    Ok(f) => f,
-                    Err(_) => {
-                        failed.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                };
-                if f.seek(io::SeekFrom::Start(start)).is_err() {
-                    failed.store(true, Ordering::Relaxed);
-                    break;
-                }
-                match r.send_download(&mut f, None, &mut io::sink()) {
-                    Ok(resp) if resp.status == 206 => {}
-                    _ => {
-                        failed.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-                // Mark done and persist the bitmap (serialised on the lock).
-                let mut bm = bitmap.lock().unwrap();
-                bit_set(&mut bm, i);
-                let _ = rsurl::resume::write_state(
-                    &part,
-                    total,
-                    rsurl::resume::Kind::HttpRanged,
-                    &http_ranged_meta(RESUME_CHUNK as u32, total, &validators, &bm),
-                );
-            }
-        }));
-    }
-    for h in handles {
-        let _ = h.join();
-    }
-
-    if failed.load(Ordering::Relaxed) {
-        if show_errors(args) {
-            eprintln!("rsurl: parallel resume incomplete; re-run to continue");
-        }
-        return Some(18); // CURLE_PARTIAL_FILE
-    }
-
-    drop(bitmap);
-    if let Err(e) = rsurl::resume::finalize(&part, &final_path, total) {
-        if show_errors(args) {
-            eprintln!("rsurl: finalize {}: {e}", final_path.display());
-        }
-        return Some(23);
-    }
-    if args.remote_time {
-        set_remote_time(&probe, &name);
-    }
-    Some(0)
-}
-
-/// Download a single file over `n` concurrent HTTP range requests. Probes with
-/// HEAD; if the server doesn't support ranges, the size is unknown/small, or
-/// anything goes wrong, falls back to the normal single-stream download
-/// ([`run_http_download`]) so behavior is never worse than without the flag.
-fn run_parallel_download(
-    req: rsurl::Request,
-    url: &Url,
-    args: &Args,
-    jar: Option<&mut CookieJar>,
-) -> u8 {
-    // Cookies aren't shared across segment threads; keep cookie semantics by
-    // falling back to the single-stream path when a jar is in use.
-    if jar.is_some() {
-        return run_http_download(req, url, args, jar);
-    }
-
-    // HEAD probe carries the request's auth/headers/proxy and (if --location)
-    // follows redirects to the final resource.
-    let probe = match req.clone().method("HEAD").send() {
-        Ok(r) => r,
-        Err(_) => return run_http_download(req, url, args, None),
-    };
-    let size = probe
-        .header("content-length")
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let ranges_ok = probe
-        .header("accept-ranges")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
-    let (Some(size), true) = (size, ranges_ok && probe.status < 400) else {
-        return run_http_download(req, url, args, None);
-    };
-
-    if let Some(max) = args.max_filesize {
-        if size > max {
-            if show_errors(args) {
-                eprintln!("rsurl: Maximum file size exceeded");
-            }
-            return 63;
-        }
-    }
-
-    let requested = args.parallel_segments.unwrap_or(1).min(MAX_SEGMENTS);
-    let by_size = size.div_ceil(MIN_SEGMENT_BYTES).max(1) as usize;
-    let n = requested.min(by_size);
-    if n < 2 {
-        // Too small to benefit — one stream is just as good.
-        return run_http_download(req, url, args, None);
-    }
-
-    let name = if args.remote_name {
-        match remote_name_from_url(url) {
-            Ok(nm) => nm,
-            Err(e) => {
-                if show_errors(args) {
-                    eprintln!("rsurl: {e}");
-                }
-                return 23;
-            }
-        }
-    } else {
-        args.output.clone().unwrap_or_default()
-    };
-    let (file, out_path) = match create_output_file_tracked(&name, args) {
-        Ok(pair) => pair,
-        Err(e) => {
-            if show_errors(args) {
-                eprintln!("rsurl: open {name}: {e}");
-            }
-            return 23;
-        }
-    };
-    // Preallocate so each segment can seek to its offset and write in place.
-    if file.set_len(size).is_err() {
-        // Not a regular seekable file — fall back (recreates/truncates it).
-        drop(file);
-        return run_http_download(req, url, args, None);
-    }
-    drop(file);
-
-    if args.verbose {
-        eprintln!("* Parallel download: {n} segments, {size} bytes");
-    }
-
-    let seg = size / n as u64;
-    let now = std::time::Instant::now();
-
-    // Per-segment byte counters drive the live display without depending on any
-    // one segment's write cadence.
-    let counters: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
-    let mut lens = Vec::with_capacity(n);
-
-    let mut handles = Vec::with_capacity(n);
-    for (i, counter_slot) in counters.iter().enumerate() {
-        let start = i as u64 * seg;
-        let end = if i == n - 1 {
-            size - 1
-        } else {
-            (i as u64 + 1) * seg - 1
-        };
-        lens.push(end - start + 1);
-        let seg_req = req.clone().header("Range", &format!("bytes={start}-{end}"));
-        let path = out_path.clone();
-        let counter = Arc::clone(counter_slot);
-        handles.push(std::thread::spawn(move || -> Result<u64, String> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .map_err(|e| e.to_string())?;
-            f.seek(io::SeekFrom::Start(start))
-                .map_err(|e| e.to_string())?;
-            // Count bytes as they land so the render thread can show progress.
-            let mut w = CountingWriter { inner: f, counter };
-            let mut trace = io::sink();
-            let resp = seg_req
-                .send_download(&mut w, None, &mut trace)
-                .map_err(|e| e.to_string())?;
-            if resp.status != 206 {
-                return Err(format!(
-                    "server did not honor Range (status {})",
-                    resp.status
-                ));
-            }
-            Ok(end - start + 1)
-        }));
-    }
-
-    // Live progress display (with `-#`): a render thread redraws every ~120 ms.
-    let show_progress = args.progress_bar && !args.silent;
-    let render = if show_progress {
-        let lens = lens.clone();
-        let counters: Vec<Arc<AtomicU64>> = counters.iter().map(Arc::clone).collect();
-        let done = Arc::new(AtomicBool::new(false));
-        let done_w = Arc::clone(&done);
-        let tty = io::stderr().is_terminal();
-        let handle = std::thread::spawn(move || {
-            let mut first = true;
-            while !done_w.load(Ordering::Relaxed) {
-                render_parallel(&lens, &counters, size, now, tty, &mut first);
-                std::thread::sleep(std::time::Duration::from_millis(120));
-            }
-            render_parallel(&lens, &counters, size, now, tty, &mut first);
-            eprintln!();
-        });
-        Some((done, handle))
-    } else {
-        None
-    };
-
-    let mut total = 0u64;
-    let mut failure: Option<String> = None;
-    for h in handles {
-        match h.join() {
-            Ok(Ok(written)) => total += written,
-            Ok(Err(e)) => {
-                failure.get_or_insert(e);
-            }
-            Err(_) => {
-                failure.get_or_insert_with(|| "segment thread panicked".to_string());
-            }
-        }
-    }
-    if let Some((done, handle)) = render {
-        done.store(true, Ordering::Relaxed);
-        let _ = handle.join();
-    }
-
-    if failure.is_none() && total == size {
-        let elapsed = now.elapsed();
-        if args.remote_time {
-            set_remote_time(&probe, &name);
-        }
-        run_write_out(&probe, url, args, elapsed, size);
-        return 0;
-    }
-
-    // Something went wrong mid-stream — retry as a single stream, which
-    // recreates (truncates) the file via the normal path.
-    if args.verbose {
-        eprintln!(
-            "* Parallel download incomplete ({}); retrying as a single stream",
-            failure.as_deref().unwrap_or("size mismatch")
-        );
-    }
-    run_http_download(req, url, args, None)
-}
 
 /// Lower-hex encoding of bytes.
 #[cfg(feature = "bittorrent")]
@@ -5264,18 +4750,31 @@ fn low_speed_params(args: &Args) -> (Option<u64>, u64) {
     }
 }
 
-/// `-C -` resumable download: fetch `<name>` into `<name>.rsurlpart` and
-/// finalise on success, delegating to the library's [`rsurl::download`] engine
-/// (range + validator handling, transient-fault retry with backoff, atomic
-/// finalize). Returns `Some(exit_code)`; the caller only reaches this for a
-/// concrete output file (not stdout).
-fn http_resume(
+/// How the library download engine should chunk a `-o <file>` transfer.
+enum SegmentPlan {
+    /// One continuous resumable stream (plain `-C -`).
+    Single,
+    /// Fixed-size chunks fetched by `workers` parallel connections — the
+    /// resumable parallel model (`-C - --parallel-segments`).
+    FixedChunks { size: u64, workers: usize },
+    /// Split into `count` equal segments fetched by `workers` connections
+    /// (`--parallel-segments` without `-C -`).
+    EqualSegments { count: usize, workers: usize },
+}
+
+/// Download `<name>` into `<name>.rsurlpart` and finalise on success, delegating
+/// to the library's [`rsurl::download`] engine (range + validator handling,
+/// transient-fault retry with backoff, streaming chunks to disk, atomic
+/// finalize). Backs `-C -` and `--parallel-segments`. Returns a curl exit code;
+/// only reached for a concrete output file (not stdout).
+fn run_library_download(
     req: &rsurl::Request,
     url: &Url,
     args: &Args,
     name: &str,
     jar: Option<&mut CookieJar>,
-) -> Option<u8> {
+    plan: SegmentPlan,
+) -> u8 {
     let final_path = resolve_output_path(name, args);
     if args.create_dirs {
         if let Some(p) = final_path.parent() {
@@ -5285,8 +4784,8 @@ fn http_resume(
         let _ = std::fs::create_dir_all(dir);
     }
 
-    // Carry cookie-jar cookies on the resume request; the library download
-    // path streams the raw body and does not consult the jar itself.
+    // Carry cookie-jar cookies on the request; the library download path streams
+    // the raw body and does not consult the jar itself.
     let mut greq = req.clone();
     if let Some(j) = jar.as_deref() {
         if let Some(h) = j.cookie_header(url) {
@@ -5307,6 +4806,8 @@ fn http_resume(
     let mut opts = rsurl::DownloadOptions {
         max_retries: args.retry,
         segment_size: None,
+        segments: None,
+        parallelism: 1,
         // Force HTTP/1.1 (dodges H2 RST_STREAM and keeps the body streaming to
         // disk) unless the user explicitly asked for another version.
         prefer_http11: matches!(
@@ -5322,6 +4823,17 @@ fn http_resume(
         max_backoff: fixed_delay.unwrap_or(Duration::from_secs(30)),
         progress: None,
     };
+    match plan {
+        SegmentPlan::Single => {}
+        SegmentPlan::FixedChunks { size, workers } => {
+            opts.segment_size = Some(size);
+            opts.parallelism = workers;
+        }
+        SegmentPlan::EqualSegments { count, workers } => {
+            opts.segments = Some(count);
+            opts.parallelism = workers;
+        }
+    }
     if args.progress_bar && !args.silent {
         let mut last = std::time::Instant::now();
         opts.progress = Some(Box::new(move |n, _total| {
@@ -5346,7 +4858,7 @@ fn http_resume(
                 }
                 run_write_out(resp, url, args, now.elapsed(), o.bytes_written);
             }
-            Some(0)
+            0
         }
         Err(e) => {
             let msg = e.to_string();
@@ -5354,7 +4866,7 @@ fn http_resume(
                 if show_errors(args) {
                     eprintln!("rsurl: Maximum file size exceeded");
                 }
-                return Some(63);
+                return 63;
             }
             if msg.contains("low-speed") {
                 if show_errors(args) {
@@ -5364,12 +4876,12 @@ fn http_resume(
                         speed_limit.unwrap_or(1)
                     );
                 }
-                return Some(28);
+                return 28;
             }
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
-            Some(transfer_exit_code(&e))
+            transfer_exit_code(&e)
         }
     }
 }
@@ -5378,7 +4890,7 @@ fn run_http_download(
     req: rsurl::Request,
     url: &Url,
     args: &Args,
-    mut jar: Option<&mut CookieJar>,
+    jar: Option<&mut CookieJar>,
 ) -> u8 {
     let name = if args.remote_name {
         match remote_name_from_url(url) {
@@ -5393,14 +4905,6 @@ fn run_http_download(
     } else {
         args.output.clone().unwrap_or_default()
     };
-    // `-C -`: resume into <name>.rsurlpart via a Range request when the server
-    // supports it. Returns None (fall through to a normal download) if the
-    // target isn't a concrete file or the server isn't range-capable.
-    if args.continue_resume && !name.is_empty() && name != "-" {
-        if let Some(code) = http_resume(&req, url, args, &name, jar.as_deref_mut()) {
-            return code;
-        }
-    }
     let (file, out_path) = match create_output_file_tracked(&name, args) {
         Ok(pair) => pair,
         Err(e) => {

@@ -8,7 +8,8 @@
 //! (`<name>.rsurlpart`): a second invocation continues from the persisted
 //! offset with a `Range` request.
 //!
-//! Two modes (see [`DownloadOptions::segment_size`]):
+//! Two modes (see [`DownloadOptions::segment_size`] /
+//! [`segments`](DownloadOptions::segments)):
 //!
 //! * **single-stream** (default) — one open-ended `Range: bytes=<have>-` GET
 //!   streamed to disk. Partial bytes are persisted as they arrive, so a
@@ -17,11 +18,15 @@
 //!   body streaming off the socket so a reset leaves the received prefix on
 //!   disk; on HTTP/2 the body is buffered, so forward progress there comes from
 //!   resuming across attempts.
-//! * **segmented** — the file is split into fixed-size chunks, each fetched by
-//!   its own bounded `Range` request and tracked in a chunk bitmap. A chunk
-//!   that fails is retried on its own without discarding the chunks that
-//!   already landed. This is the most robust mode on a flaky link and works
-//!   uniformly over HTTP/1.1 and HTTP/2.
+//! * **segmented** — the file is split into chunks (a fixed `segment_size`, or
+//!   `segments` equal parts), each fetched by its own `Range` request,
+//!   **streamed straight to disk** (never buffered in memory, so a chunk may be
+//!   any size), and tracked in a chunk bitmap. Chunks are fetched over up to
+//!   [`parallelism`](DownloadOptions::parallelism) concurrent connections. A
+//!   chunk that fails is retried on its own — resuming from wherever its stream
+//!   broke — without discarding the chunks that already landed. Even a resource
+//!   that fits in a single chunk is a valid (resumable) segmented download.
+//!   This mode works uniformly over HTTP/1.1 and HTTP/2.
 //!
 //! Both modes capture the resource's validators (URL, `ETag`, `Last-Modified`,
 //! total size) in the resume state and send `If-Range`, so a resource that
@@ -34,6 +39,8 @@
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use purecrypto::hash::{Digest, Sha256};
@@ -58,8 +65,20 @@ pub struct DownloadOptions {
     pub max_retries: u32,
     /// `Some(size)` selects segmented mode with fixed `size`-byte chunks;
     /// `None` (default) selects single-stream mode. A server without range
-    /// support falls back to a single retrying full download either way.
+    /// support falls back to a single retrying full download either way. A
+    /// resource that fits in one chunk is downloaded as a single (resumable)
+    /// chunk — segmented mode does not require more than one.
     pub segment_size: Option<u64>,
+    /// Segmented mode alternative to [`segment_size`](Self::segment_size): split
+    /// the resource into this many equal chunks (computed after its size is
+    /// probed), the classic "N parallel connections" model. Takes precedence
+    /// over `segment_size`. A resource too small to split usefully is fetched as
+    /// a single resumable stream instead.
+    pub segments: Option<usize>,
+    /// Number of concurrent workers in segmented mode — chunks are fetched in
+    /// parallel over that many connections, sharing the chunk bitmap. Default 1
+    /// (sequential). Ignored in single-stream mode.
+    pub parallelism: usize,
     /// Force HTTP/1.1 to dodge HTTP/2 `RST_STREAM` and keep the body streaming
     /// to disk (so a mid-stream reset preserves the received prefix).
     /// Default: `true`.
@@ -89,6 +108,8 @@ impl Default for DownloadOptions {
         DownloadOptions {
             max_retries: 5,
             segment_size: None,
+            segments: None,
+            parallelism: 1,
             prefer_http11: true,
             expected_sha256: None,
             max_size: None,
@@ -107,6 +128,8 @@ impl std::fmt::Debug for DownloadOptions {
         f.debug_struct("DownloadOptions")
             .field("max_retries", &self.max_retries)
             .field("segment_size", &self.segment_size)
+            .field("segments", &self.segments)
+            .field("parallelism", &self.parallelism)
             .field("prefer_http11", &self.prefer_http11)
             .field("expected_sha256", &self.expected_sha256.is_some())
             .field("max_size", &self.max_size)
@@ -230,8 +253,10 @@ impl Downloader {
     }
 
     fn run(mut self) -> Result<DownloadOutcome> {
-        if let Some(seg) = self.opts.segment_size.filter(|s| *s > 0) {
-            match self.run_segmented(seg) {
+        let segmented =
+            self.opts.segments.is_some() || self.opts.segment_size.is_some_and(|s| s > 0);
+        if segmented {
+            match self.run_segmented() {
                 Ok(outcome) => return Ok(outcome),
                 Err(SegErr::Fatal(e)) => return Err(e),
                 Err(SegErr::Fallback) => { /* single-stream below */ }
@@ -495,12 +520,11 @@ impl Downloader {
 
     // ---- segmented mode ----------------------------------------------------
 
-    fn run_segmented(&mut self, chunk: u64) -> std::result::Result<DownloadOutcome, SegErr> {
-        // Probe with a one-byte range to learn the total and confirm range
-        // support in a single round trip (fewer server quirks than HEAD).
-        let (total, validators) = self.probe_ranged()?;
+    fn run_segmented(&mut self) -> std::result::Result<DownloadOutcome, SegErr> {
+        // HEAD probe: total size + range support + validators. Not counted as a
+        // ranged GET, and mirrors what a server reliably answers for a download.
+        let (total, validators) = self.probe_head()?;
         if total == 0 {
-            // Empty resource: just create the file.
             std::fs::write(&self.final_path, b"").map_err(|e| SegErr::Fatal(Error::Io(e)))?;
             let _ = std::fs::remove_file(&self.part);
             return Ok(DownloadOutcome {
@@ -517,10 +541,13 @@ impl Downloader {
             }
         }
 
-        let num_chunks = total.div_ceil(chunk) as usize;
+        // A chunk plan is one or more (start, end) ranges. Even a single chunk
+        // is a valid resumable download.
+        let (chunk_key, plan) = self.chunk_plan(total)?;
+        let num_chunks = plan.len();
         let map_len = num_chunks.div_ceil(8);
-        let mut bitmap = self.load_ranged_bitmap(chunk, total, &validators, map_len);
-        let resumed_from = bits_set(&bitmap, num_chunks) as u64 * chunk;
+        let bitmap = self.load_ranged_bitmap(chunk_key, total, &validators, map_len);
+        let resumed_from = plan_done_bytes(&plan, &bitmap);
 
         // Size the data region and stamp initial state.
         match OpenOptions::new()
@@ -533,21 +560,9 @@ impl Downloader {
             Ok(f) => f.set_len(total).map_err(|e| SegErr::Fatal(Error::Io(e)))?,
             Err(e) => return Err(SegErr::Fatal(Error::Io(e))),
         }
-        self.persist_ranged(chunk, total, &validators, &bitmap);
+        self.persist_ranged(chunk_key, total, &validators, &bitmap);
 
-        for i in 0..num_chunks {
-            if bit_get(&bitmap, i) {
-                continue;
-            }
-            let start = i as u64 * chunk;
-            let end = (start + chunk).min(total) - 1;
-            self.fetch_chunk(start, end)?;
-            bit_set(&mut bitmap, i);
-            self.persist_ranged(chunk, total, &validators, &bitmap);
-            if let Some(cb) = self.opts.progress.as_mut() {
-                cb((end + 1).min(total), Some(total));
-            }
-        }
+        self.run_chunks(&plan, total, chunk_key, &validators, bitmap)?;
 
         self.verify_and_finalize(total, Some(total))
             .map_err(SegErr::Fatal)?;
@@ -558,104 +573,188 @@ impl Downloader {
         })
     }
 
-    /// One `bytes=start-end` GET with per-chunk retry, written at `start`.
-    /// A `200` (server ignored the range) aborts to single-stream fallback.
-    fn fetch_chunk(&mut self, start: u64, end: u64) -> std::result::Result<(), SegErr> {
-        let mut budget = self.opts.max_retries;
-        let mut attempt_no = 0u32;
-        loop {
-            let req = self
-                .base
-                .clone()
-                .header("Range", &format!("bytes={start}-{end}"));
-            let attempt = self.write_chunk(req, start, end);
-            match attempt {
-                Ok(()) => return Ok(()),
-                Err(ChunkErr::Fallback) => return Err(SegErr::Fallback),
-                Err(ChunkErr::Fatal(e)) => return Err(SegErr::Fatal(e)),
-                Err(ChunkErr::Transient(e)) => {
-                    if budget == 0 {
-                        return Err(SegErr::Fatal(e));
-                    }
-                    budget -= 1;
-                    attempt_no += 1;
-                    self.backoff(attempt_no);
-                }
+    /// Build the chunk layout. [`segments`](DownloadOptions::segments) (N equal
+    /// parts, last takes the remainder) wins over a fixed
+    /// [`segment_size`](DownloadOptions::segment_size). Returns the chunk key
+    /// stored in the resume meta and the `(start, end)` ranges. A resource too
+    /// small to split into the requested number of parts falls back to a single
+    /// resumable stream.
+    fn chunk_plan(&self, total: u64) -> std::result::Result<(u32, Vec<(u64, u64)>), SegErr> {
+        if let Some(n_req) = self.opts.segments {
+            let by_size = total.div_ceil(MIN_SEGMENT_BYTES).max(1) as usize;
+            let upper = by_size.clamp(1, MAX_SEGMENT_WORKERS);
+            let n = n_req.clamp(1, upper);
+            if n < 2 {
+                // Not worth splitting — a single resumable stream is as good.
+                return Err(SegErr::Fallback);
             }
+            let seg = total / n as u64;
+            let plan = (0..n)
+                .map(|i| {
+                    let start = i as u64 * seg;
+                    let end = if i == n - 1 {
+                        total - 1
+                    } else {
+                        (i as u64 + 1) * seg - 1
+                    };
+                    (start, end)
+                })
+                .collect();
+            Ok((seg.min(u32::MAX as u64) as u32, plan))
+        } else if let Some(size) = self.opts.segment_size.filter(|s| *s > 0) {
+            let n = total.div_ceil(size) as usize;
+            let plan = (0..n)
+                .map(|i| {
+                    let start = i as u64 * size;
+                    let end = (start + size).min(total) - 1;
+                    (start, end)
+                })
+                .collect();
+            Ok((size.min(u32::MAX as u64) as u32, plan))
+        } else {
+            Err(SegErr::Fallback)
         }
     }
 
-    fn write_chunk(&self, req: Request, start: u64, end: u64) -> std::result::Result<(), ChunkErr> {
-        let reader = match req.send_reader() {
-            Ok(r) => r,
-            Err(e) if is_transient(&e) => return Err(ChunkErr::Transient(e)),
-            Err(e) => return Err(ChunkErr::Fatal(e)),
-        };
-        match reader.status() {
-            206 => {}
-            200 => return Err(ChunkErr::Fallback),
-            416 => {
-                return Err(ChunkErr::Fatal(Error::BadResponse(
-                    "server rejected chunk range (416)".into(),
-                )))
-            }
-            s if (400..500).contains(&s) => return Err(ChunkErr::Fatal(status_error(s, &reader))),
-            s if s >= 500 => return Err(ChunkErr::Transient(status_error(s, &reader))),
-            s => {
-                return Err(ChunkErr::Fatal(Error::BadResponse(format!(
-                    "unexpected status {s}"
-                ))))
-            }
+    /// Drive the plan's chunks to completion with up to
+    /// [`parallelism`](DownloadOptions::parallelism) workers sharing the chunk
+    /// bitmap. Each chunk streams straight to disk and is retried independently
+    /// (resuming from where its stream broke); a chunk the server answers `200`
+    /// for (no range support) aborts to a single-stream fallback.
+    fn run_chunks(
+        &mut self,
+        plan: &[(u64, u64)],
+        total: u64,
+        chunk_key: u32,
+        validators: &Validators,
+        bitmap: Vec<u8>,
+    ) -> std::result::Result<(), SegErr> {
+        let num_chunks = plan.len();
+        let workers = self
+            .opts
+            .parallelism
+            .clamp(1, num_chunks.max(1))
+            .min(MAX_SEGMENT_WORKERS);
+
+        let plan: Arc<Vec<(u64, u64)>> = Arc::new(plan.to_vec());
+        let bitmap = Arc::new(Mutex::new(bitmap));
+        let next = Arc::new(AtomicUsize::new(0));
+        let failed: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
+        let fallback = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(self.opts.progress.take()));
+        let part = Arc::new(self.part.clone());
+        let validators = Arc::new(validators.clone());
+        let max_retries = self.opts.max_retries;
+        let initial = self.opts.initial_backoff;
+        let max_backoff = self.opts.max_backoff;
+
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let plan = Arc::clone(&plan);
+            let bitmap = Arc::clone(&bitmap);
+            let next = Arc::clone(&next);
+            let failed = Arc::clone(&failed);
+            let fallback = Arc::clone(&fallback);
+            let progress = Arc::clone(&progress);
+            let part = Arc::clone(&part);
+            let validators = Arc::clone(&validators);
+            let base = self.base.clone();
+            handles.push(std::thread::spawn(move || loop {
+                if failed.lock().unwrap().is_some() || fallback.load(Ordering::Relaxed) {
+                    break;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= num_chunks {
+                    break;
+                }
+                if bit_get(&bitmap.lock().unwrap(), i) {
+                    continue;
+                }
+                let (start, end) = plan[i];
+                match fetch_chunk_streaming(
+                    &base,
+                    &part,
+                    start,
+                    end,
+                    max_retries,
+                    initial,
+                    max_backoff,
+                ) {
+                    ChunkResult::Ok => {
+                        let mut bm = bitmap.lock().unwrap();
+                        bit_set(&mut bm, i);
+                        let meta = ranged_meta(chunk_key as u64, total, &validators, &bm);
+                        let _ = resume::write_state(&part, total, Kind::HttpRanged, &meta);
+                        if let Some(cb) = progress.lock().unwrap().as_mut() {
+                            cb(plan_done_bytes(&plan, &bm), Some(total));
+                        }
+                    }
+                    ChunkResult::Fallback => fallback.store(true, Ordering::Relaxed),
+                    ChunkResult::Fatal(e) => *failed.lock().unwrap() = Some(e),
+                }
+            }));
         }
-        let want = (end - start + 1) as usize;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&self.part)
-            .map_err(|e| ChunkErr::Fatal(Error::Io(e)))?;
-        file.seek(SeekFrom::Start(start))
-            .map_err(|e| ChunkErr::Fatal(Error::Io(e)))?;
-        // Buffer the (bounded) chunk, then commit it in one write so a partial
-        // chunk never marks the bit as done.
-        let mut body = Vec::with_capacity(want);
-        if let Err(e) = reader.take(want as u64 + 1).read_to_end(&mut body) {
-            return Err(ChunkErr::Transient(Error::Io(e)));
+        for h in handles {
+            let _ = h.join();
         }
-        if body.len() != want {
-            return Err(ChunkErr::Transient(Error::BadResponse(format!(
-                "short chunk: got {} of {want} bytes",
-                body.len()
-            ))));
+        // Return the progress callback to the downloader (for a single-stream
+        // fallback, or just to leave `self` consistent).
+        self.opts.progress = Arc::try_unwrap(progress)
+            .ok()
+            .and_then(|m| m.into_inner().ok())
+            .flatten();
+
+        if let Some(e) = Arc::try_unwrap(failed)
+            .ok()
+            .and_then(|m| m.into_inner().ok())
+            .flatten()
+        {
+            return Err(SegErr::Fatal(e));
         }
-        file.write_all(&body)
-            .map_err(|e| ChunkErr::Transient(Error::Io(e)))?;
+        if fallback.load(Ordering::Relaxed) {
+            return Err(SegErr::Fallback);
+        }
         Ok(())
     }
 
-    fn probe_ranged(&self) -> std::result::Result<(u64, Validators), SegErr> {
+    /// HEAD probe for total size + range support + validators, with retry.
+    fn probe_head(&self) -> std::result::Result<(u64, Validators), SegErr> {
         let mut budget = self.opts.max_retries;
         let mut attempt_no = 0u32;
         loop {
-            let req = self.base.clone().header("Range", "bytes=0-0");
-            match req.send_reader() {
-                Ok(reader) => {
-                    let status = reader.status();
-                    if status == 206 {
-                        let validators = self.validators_from(&reader);
-                        match parse_content_range(reader.header("content-range")) {
-                            Some((_, Some(total))) => return Ok((total, validators)),
-                            // 206 without a usable total → can't segment.
-                            _ => return Err(SegErr::Fallback),
+            match self.base.clone().method("HEAD").send() {
+                Ok(resp) => {
+                    let status = resp.status;
+                    if (400..500).contains(&status) {
+                        return Err(SegErr::Fatal(Error::Status {
+                            code: status,
+                            reason: resp.reason,
+                        }));
+                    }
+                    if status >= 500 {
+                        if budget == 0 {
+                            return Err(SegErr::Fatal(Error::Status {
+                                code: status,
+                                reason: resp.reason,
+                            }));
                         }
-                    } else if status == 200 || status == 416 {
-                        return Err(SegErr::Fallback);
-                    } else if (400..500).contains(&status) {
-                        return Err(SegErr::Fatal(status_error(status, &reader)));
-                    } else if status >= 500 && budget > 0 {
                         budget -= 1;
                         attempt_no += 1;
                         self.backoff(attempt_no);
-                    } else {
-                        return Err(SegErr::Fatal(status_error(status, &reader)));
+                        continue;
+                    }
+                    let accepts = resp
+                        .header("accept-ranges")
+                        .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
+                    let total = resp
+                        .header("content-length")
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    match (accepts, total) {
+                        (true, Some(t)) => {
+                            return Ok((t, self.validators_from_headers(&resp.headers)))
+                        }
+                        // No usable size or no range support → single-stream.
+                        _ => return Err(SegErr::Fallback),
                     }
                 }
                 Err(e) if is_transient(&e) && budget > 0 => {
@@ -663,21 +762,22 @@ impl Downloader {
                     attempt_no += 1;
                     self.backoff(attempt_no);
                 }
-                Err(e) => return Err(SegErr::Fatal(e)),
+                // A server that won't answer HEAD at all → try a single stream.
+                Err(_) => return Err(SegErr::Fallback),
             }
         }
     }
 
     fn load_ranged_bitmap(
         &self,
-        chunk: u64,
+        chunk: u32,
         total: u64,
         validators: &Validators,
         map_len: usize,
     ) -> Vec<u8> {
         if let Ok(Some(st)) = resume::read_state(&self.part) {
             if st.kind == Kind::HttpRanged {
-                if let Some(bm) = parse_ranged_meta(&st.meta, chunk, total, validators) {
+                if let Some(bm) = parse_ranged_meta(&st.meta, chunk as u64, total, validators) {
                     if bm.len() == map_len {
                         return bm;
                     }
@@ -687,8 +787,8 @@ impl Downloader {
         vec![0u8; map_len]
     }
 
-    fn persist_ranged(&self, chunk: u64, total: u64, validators: &Validators, bitmap: &[u8]) {
-        let meta = ranged_meta(chunk, total, validators, bitmap);
+    fn persist_ranged(&self, chunk: u32, total: u64, validators: &Validators, bitmap: &[u8]) {
+        let meta = ranged_meta(chunk as u64, total, validators, bitmap);
         let _ = resume::write_state(&self.part, total, Kind::HttpRanged, &meta);
     }
 
@@ -699,6 +799,21 @@ impl Downloader {
             url: self.url_key.clone(),
             etag: reader.header("etag").unwrap_or("").to_string(),
             last_modified: reader.header("last-modified").unwrap_or("").to_string(),
+        }
+    }
+
+    fn validators_from_headers(&self, headers: &[(String, String)]) -> Validators {
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        Validators {
+            url: self.url_key.clone(),
+            etag: get("etag"),
+            last_modified: get("last-modified"),
         }
     }
 
@@ -739,12 +854,152 @@ impl Downloader {
     }
 }
 
-/// Per-chunk attempt error in segmented mode.
-enum ChunkErr {
-    Transient(Error),
-    Fatal(Error),
-    /// The server served a full body for a ranged request — no range support.
+/// Don't split a resource into pieces smaller than this (curl's segment floor).
+const MIN_SEGMENT_BYTES: u64 = 1 << 20; // 1 MiB
+/// Hard cap on concurrent segment workers regardless of `parallelism`.
+const MAX_SEGMENT_WORKERS: usize = 16;
+
+/// Outcome of fetching one chunk (with its own retry budget).
+enum ChunkResult {
+    /// The chunk's bytes are all on disk.
+    Ok,
+    /// The server answered a ranged request with `200` — no range support.
     Fallback,
+    /// A permanent failure (retries exhausted or a non-retryable status).
+    Fatal(Error),
+}
+
+/// Fetch `[start, end]` into `part`, **streaming straight to disk** (never
+/// buffering the chunk in memory, so a chunk may be any size). On a transient
+/// break it retries, resuming from wherever the stream stopped — byte-level
+/// resume *within* the chunk. `Ok` only once every byte is written, so a
+/// partial chunk never marks its bitmap bit done.
+fn fetch_chunk_streaming(
+    base: &Request,
+    part: &Path,
+    start: u64,
+    end: u64,
+    max_retries: u32,
+    initial: Duration,
+    max_backoff: Duration,
+) -> ChunkResult {
+    let want = end - start + 1;
+    let mut got = 0u64;
+    let mut budget = max_retries;
+    let mut attempt_no = 0u32;
+    loop {
+        let from = start + got;
+        let req = base.clone().header("Range", &format!("bytes={from}-{end}"));
+        match stream_chunk_once(req, part, from, want - got) {
+            StreamOnce::Fallback => return ChunkResult::Fallback,
+            StreamOnce::Fatal(e) => return ChunkResult::Fatal(e),
+            StreamOnce::Advanced { wrote, err } => {
+                got += wrote;
+                if got >= want {
+                    return ChunkResult::Ok;
+                }
+                // Progress stalled short of the chunk end (a mid-stream break or
+                // a short read); retry the remainder unless the budget is spent.
+                let err = err.unwrap_or(Error::UnexpectedEof);
+                if budget == 0 {
+                    return ChunkResult::Fatal(err);
+                }
+                budget -= 1;
+                attempt_no += 1;
+                sleep_backoff(attempt_no, initial, max_backoff);
+            }
+        }
+    }
+}
+
+/// One request/response for a chunk range, streamed to `part` at `at`.
+enum StreamOnce {
+    /// Wrote `wrote` bytes; `err` is `Some` if the stream broke mid-chunk,
+    /// `None` on a clean end (which, for a length-framed range, means complete).
+    Advanced { wrote: u64, err: Option<Error> },
+    /// The server ignored the range (`200`) — fall back to single-stream.
+    Fallback,
+    /// A permanent failure.
+    Fatal(Error),
+}
+
+fn stream_chunk_once(req: Request, part: &Path, at: u64, want: u64) -> StreamOnce {
+    let mut reader = match req.send_reader() {
+        Ok(r) => r,
+        Err(e) if is_transient(&e) => {
+            return StreamOnce::Advanced {
+                wrote: 0,
+                err: Some(e),
+            }
+        }
+        Err(e) => return StreamOnce::Fatal(e),
+    };
+    match reader.status() {
+        206 => {}
+        200 => return StreamOnce::Fallback,
+        s if (400..500).contains(&s) => return StreamOnce::Fatal(status_error(s, &reader)),
+        s if s >= 500 => {
+            return StreamOnce::Advanced {
+                wrote: 0,
+                err: Some(status_error(s, &reader)),
+            }
+        }
+        s => return StreamOnce::Fatal(Error::BadResponse(format!("unexpected status {s}"))),
+    }
+    let mut file = match OpenOptions::new().write(true).open(part) {
+        Ok(f) => f,
+        Err(e) => return StreamOnce::Fatal(Error::Io(e)),
+    };
+    if let Err(e) = file.seek(SeekFrom::Start(at)) {
+        return StreamOnce::Fatal(Error::Io(e));
+    }
+    let mut wrote = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        // Never write past the requested chunk length (a server that ignores the
+        // range end and streams the whole file must not overrun into the next
+        // chunk's region).
+        if wrote >= want {
+            return StreamOnce::Advanced { wrote, err: None };
+        }
+        let cap = (want - wrote).min(buf.len() as u64) as usize;
+        match reader.read(&mut buf[..cap]) {
+            Ok(0) => return StreamOnce::Advanced { wrote, err: None },
+            Ok(n) => {
+                if let Err(e) = file.write_all(&buf[..n]) {
+                    return StreamOnce::Advanced {
+                        wrote,
+                        err: Some(Error::Io(e)),
+                    };
+                }
+                wrote += n as u64;
+            }
+            Err(e) => {
+                return StreamOnce::Advanced {
+                    wrote,
+                    err: Some(Error::Io(e)),
+                }
+            }
+        }
+    }
+}
+
+/// Bounded exponential backoff sleep before retry number `attempt_no`.
+fn sleep_backoff(attempt_no: u32, initial: Duration, max_backoff: Duration) {
+    let shift = attempt_no.saturating_sub(1).min(20);
+    let delay = initial.saturating_mul(1u32 << shift).min(max_backoff);
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
+/// Total bytes already on disk, summing the plan's completed chunks.
+fn plan_done_bytes(plan: &[(u64, u64)], bitmap: &[u8]) -> u64 {
+    plan.iter()
+        .enumerate()
+        .filter(|(i, _)| bit_get(bitmap, *i))
+        .map(|(_, (s, e))| e - s + 1)
+        .sum()
 }
 
 /// Classify an error raised before any body byte was read (offset unchanged).
@@ -927,9 +1182,6 @@ fn bit_get(map: &[u8], i: usize) -> bool {
 fn bit_set(map: &mut [u8], i: usize) {
     map[i / 8] |= 1 << (i % 8);
 }
-fn bits_set(map: &[u8], num_chunks: usize) -> usize {
-    (0..num_chunks).filter(|&i| bit_get(map, i)).count()
-}
 
 #[cfg(test)]
 mod tests {
@@ -1037,12 +1289,32 @@ mod tests {
         if head.is_empty() {
             return;
         }
+        let is_head = head.split_whitespace().next() == Some("HEAD");
         let mut o = origin.lock().unwrap();
         let range = header_val(&head, "range").map(|s| s.to_string());
         let if_range = header_val(&head, "if-range").map(|s| s.to_string());
         o.ranges.push(range.clone().unwrap_or_default());
 
         let len = o.body.len() as u64;
+
+        // A HEAD probe: headers only (size + range support + validators), no
+        // body and no fault injection (kills apply to the real GET transfers).
+        if is_head {
+            let ar = if o.accept_ranges {
+                "Accept-Ranges: bytes\r\n"
+            } else {
+                ""
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n{ar}ETag: {}\r\nConnection: close\r\n\r\n",
+                o.etag
+            );
+            drop(o);
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.shutdown(Shutdown::Write);
+            return;
+        }
+
         // If-Range mismatch forces a full 200 (resource changed).
         let if_range_ok = if_range.as_deref().map(|v| v == o.etag).unwrap_or(true);
         let use_range = range.is_some() && o.accept_ranges && !o.ignore_range && if_range_ok;
@@ -1349,5 +1621,81 @@ mod tests {
         assert_eq!(outcome.resumed_from, 0);
         assert_eq!(std::fs::read(&out).unwrap(), body);
         cleanup(&out);
+    }
+
+    #[test]
+    fn segmented_single_chunk_streams_and_resumes_within_chunk() {
+        // segment_size larger than the file → exactly one chunk. It must still
+        // download (single-chunk resumable), stream to disk, and — when the
+        // stream breaks mid-chunk — resume from the byte it stopped at rather
+        // than refetching the chunk from zero.
+        let body = make_body(50_000, 0xC0DE);
+        let origin = Origin::shared(body.clone(), "one");
+        {
+            let mut o = origin.lock().unwrap();
+            o.kill_after = Some(20_000);
+            o.kill_range_start = Some(0); // break the (single) chunk once
+            o.kills_left = 1;
+        }
+        let port = start(origin.clone());
+        let out = tmp("onechunk");
+
+        let mut opts = no_backoff();
+        opts.segment_size = Some(1_000_000); // >> file → one chunk
+        let outcome = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect("single-chunk download");
+        assert_eq!(outcome.bytes_written, 50_000);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+
+        // The retry resumed from offset 20000 (byte-level within the chunk).
+        let ranges = origin.lock().unwrap().ranges.clone();
+        assert!(
+            ranges.iter().any(|r| r == "bytes=20000-49999"),
+            "expected an in-chunk resume from 20000: {ranges:?}"
+        );
+        cleanup(&out);
+    }
+
+    #[test]
+    fn segmented_parallel_fetches_every_chunk_once() {
+        let body = make_body(10_000, 0xBEEF);
+        let origin = Origin::shared(body.clone(), "par");
+        let port = start(origin.clone());
+        let out = tmp("parallel");
+
+        let mut opts = no_backoff();
+        opts.segment_size = Some(1000); // 10 chunks
+        opts.parallelism = 4; // fetched concurrently
+        let outcome = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect("parallel download");
+        assert_eq!(outcome.bytes_written, 10_000);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+
+        // Every chunk fetched exactly once (10 ranged GETs; HEAD is not ranged).
+        let ranges = origin.lock().unwrap().ranges.clone();
+        let range_gets = ranges.iter().filter(|r| r.starts_with("bytes=")).count();
+        assert_eq!(range_gets, 10, "one GET per chunk: {ranges:?}");
+    }
+
+    #[test]
+    fn segments_mode_splits_into_n_equal_parts() {
+        // `segments = N` divides the resource into N parts (post-probe), the
+        // "N parallel connections" model the CLI's --parallel-segments uses.
+        let body = make_body(4_200_000, 0x5EED);
+        let origin = Origin::shared(body.clone(), "seg");
+        let port = start(origin.clone());
+        let out = tmp("segments");
+
+        let mut opts = no_backoff();
+        opts.segments = Some(4);
+        opts.parallelism = 4;
+        let outcome = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect("segments download");
+        assert_eq!(outcome.bytes_written, 4_200_000);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+
+        let ranges = origin.lock().unwrap().ranges.clone();
+        let range_gets = ranges.iter().filter(|r| r.starts_with("bytes=")).count();
+        assert_eq!(range_gets, 4, "split into 4 segments: {ranges:?}");
     }
 }
