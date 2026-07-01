@@ -4847,11 +4847,13 @@ fn run_library_download(
 
     let now = std::time::Instant::now();
     let outcome = greq.download_resumable(&final_path, opts);
-    if args.progress_bar && !args.silent {
-        eprintln!();
-    }
     match outcome {
         Ok(o) => {
+            // Final progress line (the throttled in-transfer callback may not
+            // have fired for a fast transfer); then end the progress line.
+            if args.progress_bar && !args.silent {
+                eprintln!("\rrsurl: {} bytes received", o.bytes_written);
+            }
             if let Some(resp) = &probe {
                 if args.remote_time {
                     set_remote_time(resp, name);
@@ -4861,6 +4863,9 @@ fn run_library_download(
             0
         }
         Err(e) => {
+            if args.progress_bar && !args.silent {
+                eprintln!();
+            }
             let msg = e.to_string();
             if msg.contains("maximum file size") {
                 if show_errors(args) {
