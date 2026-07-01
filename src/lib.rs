@@ -12,6 +12,7 @@ mod cancel;
 mod compress;
 mod cookie;
 mod digest;
+pub mod download;
 mod error;
 mod http;
 mod idn;
@@ -59,6 +60,7 @@ pub mod ffi;
 
 pub use crate::cancel::CancelToken;
 pub use crate::cookie::{Cookie, CookieJar, SameSite};
+pub use crate::download::{download, DownloadOptions, DownloadOutcome};
 pub use crate::error::{Error, Result};
 pub use crate::http::{
     send_multiplexed, send_multiplexed_traced, BodyReader, HttpVersionPref, Priority, ProxyConfig,

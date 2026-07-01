@@ -3628,7 +3628,6 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
         progress: args.progress_bar,
         silent: args.silent,
         last_tick: now,
-        resume: None,
     };
     let result = client.transfer_url_to(url, &mut sink);
     let time_total = now.elapsed();
@@ -4049,28 +4048,6 @@ struct DownloadSink<'a> {
     progress: bool,
     silent: bool,
     last_tick: std::time::Instant,
-    /// `-C -` resume: periodically persist the partial state to `.rsurlpart`.
-    resume: Option<ResumeCtx>,
-}
-
-/// State for periodically rewriting a `.rsurlpart` trailer during a resumable
-/// HTTP download.
-struct ResumeCtx {
-    part: std::path::PathBuf,
-    total: u64,
-    /// Pre-encoded validator tail (url/etag/last-modified); the trailer meta is
-    /// `total + done` followed by this.
-    validators: Vec<u8>,
-    last_save: std::time::Instant,
-}
-
-/// Build the `http-stream` resume meta block: `[total][done] + validators`.
-fn http_resume_meta(total: u64, done: u64, validators: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(16 + validators.len());
-    m.extend_from_slice(&total.to_le_bytes());
-    m.extend_from_slice(&done.to_le_bytes());
-    m.extend_from_slice(validators);
-    m
 }
 
 /// Encode the resume validators (final URL, ETag, Last-Modified) as
@@ -4083,43 +4060,6 @@ fn http_resume_validators(url: &str, etag: &str, last_modified: &str) -> Vec<u8>
         v.extend_from_slice(b);
     }
     v
-}
-
-/// Parse an `http-stream` meta block, returning `done` only if the stored
-/// total/url/etag match the current resource (otherwise the partial is stale).
-fn http_resume_parse(meta: &[u8], total: u64, url: &str, etag: &str) -> Option<u64> {
-    if meta.len() < 16 {
-        return None;
-    }
-    let stored_total = u64::from_le_bytes(meta[0..8].try_into().unwrap());
-    let done = u64::from_le_bytes(meta[8..16].try_into().unwrap());
-    if stored_total != total {
-        return None;
-    }
-    let mut p = &meta[16..];
-    let mut take = || -> Option<String> {
-        if p.len() < 2 {
-            return None;
-        }
-        let n = u16::from_le_bytes([p[0], p[1]]) as usize;
-        if p.len() < 2 + n {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&p[2..2 + n]).into_owned();
-        p = &p[2 + n..];
-        Some(s)
-    };
-    let stored_url = take()?;
-    let stored_etag = take()?;
-    let _stored_lm = take()?;
-    if stored_url != url {
-        return None;
-    }
-    // If both sides have an ETag, they must agree (resource unchanged).
-    if !etag.is_empty() && !stored_etag.is_empty() && etag != stored_etag {
-        return None;
-    }
-    Some(done)
 }
 
 impl Write for DownloadSink<'_> {
@@ -4153,20 +4093,6 @@ impl Write for DownloadSink<'_> {
             eprint!("\rrsurl: {} bytes received", self.written);
             let _ = io::stderr().flush();
             self.last_tick = std::time::Instant::now();
-        }
-        // Persist resume state about once a second (bounded I/O).
-        let written = self.written;
-        if let Some(rc) = &mut self.resume {
-            if rc.last_save.elapsed() >= std::time::Duration::from_secs(1) {
-                let meta = http_resume_meta(rc.total, written, &rc.validators);
-                let _ = rsurl::resume::write_state(
-                    &rc.part,
-                    rc.total,
-                    rsurl::resume::Kind::HttpStream,
-                    &meta,
-                );
-                rc.last_save = std::time::Instant::now();
-            }
         }
         Ok(buf.len())
     }
@@ -5338,46 +5264,18 @@ fn low_speed_params(args: &Args) -> (Option<u64>, u64) {
     }
 }
 
-/// `-C -` resume for a single HTTP stream. Probes with HEAD; if the server
-/// reports a size and `Accept-Ranges: bytes`, downloads into `<name>.rsurlpart`
-/// (continuing any valid prior partial via `Range: bytes=done-`), periodically
-/// persisting the resume trailer, and finalises (truncate + rename) on success.
-/// Returns `Some(exit_code)` when it handled the transfer, or `None` to fall
-/// back to a normal in-place download.
+/// `-C -` resumable download: fetch `<name>` into `<name>.rsurlpart` and
+/// finalise on success, delegating to the library's [`rsurl::download`] engine
+/// (range + validator handling, transient-fault retry with backoff, atomic
+/// finalize). Returns `Some(exit_code)`; the caller only reaches this for a
+/// concrete output file (not stdout).
 fn http_resume(
     req: &rsurl::Request,
     url: &Url,
     args: &Args,
     name: &str,
-    mut jar: Option<&mut CookieJar>,
+    jar: Option<&mut CookieJar>,
 ) -> Option<u8> {
-    // HEAD probe for size + range support + validators.
-    let probe = req.clone().method("HEAD").send().ok()?;
-    if probe.status >= 400 {
-        return None;
-    }
-    let total = probe
-        .header("content-length")
-        .and_then(|v| v.trim().parse::<u64>().ok())?;
-    if !probe
-        .header("accept-ranges")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"))
-    {
-        return None;
-    }
-    if let Some(max) = args.max_filesize {
-        if total > max {
-            if show_errors(args) {
-                eprintln!("rsurl: Maximum file size exceeded");
-            }
-            return Some(63);
-        }
-    }
-    let etag = probe.header("etag").unwrap_or("").to_string();
-    let last_mod = probe.header("last-modified").unwrap_or("").to_string();
-    // A stable per-resource validator string (deterministic across runs).
-    let url_s = format!("{}://{}:{}{}", url.scheme, url.host, url.port, url.path);
-
     let final_path = resolve_output_path(name, args);
     if args.create_dirs {
         if let Some(p) = final_path.parent() {
@@ -5386,134 +5284,94 @@ fn http_resume(
     } else if let Some(dir) = &args.output_dir {
         let _ = std::fs::create_dir_all(dir);
     }
-    let part = rsurl::resume::part_path(&final_path);
 
-    // Resume offset from any matching prior partial.
-    let mut done = match rsurl::resume::read_state(&part) {
-        Ok(Some(st)) if st.kind == rsurl::resume::Kind::HttpStream => {
-            http_resume_parse(&st.meta, total, &url_s, &etag).unwrap_or(0)
+    // Carry cookie-jar cookies on the resume request; the library download
+    // path streams the raw body and does not consult the jar itself.
+    let mut greq = req.clone();
+    if let Some(j) = jar.as_deref() {
+        if let Some(h) = j.cookie_header(url) {
+            greq = greq.header("Cookie", &h);
         }
-        _ => 0,
+    }
+
+    // --write-out / --remote-time need response metadata the download engine
+    // doesn't return; fetch it best-effort with a HEAD.
+    let probe = if args.write_out.is_some() || args.remote_time {
+        greq.clone().method("HEAD").send().ok()
+    } else {
+        None
     };
-    if done > total {
-        done = 0;
-    }
-    if done == total {
-        if let Err(e) = rsurl::resume::finalize(&part, &final_path, total) {
-            if show_errors(args) {
-                eprintln!("rsurl: finalize {}: {e}", final_path.display());
-            }
-            return Some(23);
-        }
-        return Some(0);
-    }
 
     let (speed_limit, speed_time) = low_speed_params(args);
-    let validators = http_resume_validators(&url_s, &etag, &last_mod);
-
-    // At most two attempts: if a ranged GET comes back 200 (range ignored), we
-    // restart once from offset 0.
-    for _ in 0..2 {
-        let from = done;
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&part)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                if show_errors(args) {
-                    eprintln!("rsurl: open {}: {e}", part.display());
-                }
-                return Some(23);
+    let fixed_delay = args.retry_delay.map(Duration::from_secs);
+    let mut opts = rsurl::DownloadOptions {
+        max_retries: args.retry,
+        segment_size: None,
+        // Force HTTP/1.1 (dodges H2 RST_STREAM and keeps the body streaming to
+        // disk) unless the user explicitly asked for another version.
+        prefer_http11: matches!(
+            args.http_version,
+            None | Some(rsurl::HttpVersionPref::Http11Only)
+        ),
+        expected_sha256: None,
+        max_size: args.max_filesize,
+        max_time: None, // already applied to `req`
+        limit_rate: args.limit_rate.as_deref().and_then(parse_rate),
+        low_speed: speed_limit.map(|l| (l, speed_time)),
+        initial_backoff: fixed_delay.unwrap_or(Duration::from_millis(500)),
+        max_backoff: fixed_delay.unwrap_or(Duration::from_secs(30)),
+        progress: None,
+    };
+    if args.progress_bar && !args.silent {
+        let mut last = std::time::Instant::now();
+        opts.progress = Some(Box::new(move |n, _total| {
+            if last.elapsed() >= Duration::from_millis(100) {
+                eprint!("\rrsurl: {n} bytes received");
+                let _ = io::stderr().flush();
+                last = std::time::Instant::now();
             }
-        };
-        // Size the data region to `total` (drops any stale trailer), then append
-        // from `from`.
-        if file.set_len(total).is_err() {
-            return None; // not a seekable regular file — fall back
-        }
-        let mut f = file;
-        if f.seek(io::SeekFrom::Start(from)).is_err() {
-            return None;
-        }
+        }));
+    }
 
-        let now = std::time::Instant::now();
-        let mut sink = DownloadSink {
-            inner: Box::new(f),
-            written: from,
-            max: args.max_filesize,
-            rate: args.limit_rate.as_deref().and_then(parse_rate),
-            speed_limit,
-            speed_time,
-            started: now,
-            progress: args.progress_bar,
-            silent: args.silent,
-            last_tick: now,
-            resume: Some(ResumeCtx {
-                part: part.clone(),
-                total,
-                validators: validators.clone(),
-                last_save: now,
-            }),
-        };
-        let mut greq = req.clone();
-        if from > 0 {
-            greq = greq.header("Range", &format!("bytes={from}-"));
-        }
-        let result = if args.verbose {
-            let mut err = io::stderr().lock();
-            greq.send_download(&mut sink, jar.as_deref_mut(), &mut err)
-        } else {
-            greq.send_download(&mut sink, jar.as_deref_mut(), &mut io::sink())
-        };
-        if args.progress_bar && !args.silent {
-            eprintln!();
-        }
-        match result {
-            Ok(resp) => {
-                if from > 0 && resp.status == 200 {
-                    // Server ignored the Range — restart cleanly from scratch.
-                    if args.verbose {
-                        eprintln!("* server ignored Range; restarting from 0");
-                    }
-                    done = 0;
-                    continue;
-                }
-                drop(sink); // close the handle before renaming (Windows)
-                if let Err(e) = rsurl::resume::finalize(&part, &final_path, total) {
-                    if show_errors(args) {
-                        eprintln!("rsurl: finalize {}: {e}", final_path.display());
-                    }
-                    return Some(23);
-                }
+    let now = std::time::Instant::now();
+    let outcome = greq.download_resumable(&final_path, opts);
+    if args.progress_bar && !args.silent {
+        eprintln!();
+    }
+    match outcome {
+        Ok(o) => {
+            if let Some(resp) = &probe {
                 if args.remote_time {
-                    set_remote_time(&resp, name);
+                    set_remote_time(resp, name);
                 }
-                run_write_out(&resp, url, args, now.elapsed(), total);
-                return Some(0);
+                run_write_out(resp, url, args, now.elapsed(), o.bytes_written);
             }
-            Err(e) => {
-                // Persist the latest offset so a re-run can resume.
-                let written = sink.written;
-                drop(sink);
-                let meta = http_resume_meta(total, written, &validators);
-                let _ = rsurl::resume::write_state(
-                    &part,
-                    total,
-                    rsurl::resume::Kind::HttpStream,
-                    &meta,
-                );
+            Some(0)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("maximum file size") {
                 if show_errors(args) {
-                    eprintln!("rsurl: {e}");
+                    eprintln!("rsurl: Maximum file size exceeded");
                 }
-                return Some(transfer_exit_code(&e));
+                return Some(63);
             }
+            if msg.contains("low-speed") {
+                if show_errors(args) {
+                    eprintln!(
+                        "rsurl: Operation too slow. Less than {} bytes/sec transferred \
+                         the last {speed_time} seconds",
+                        speed_limit.unwrap_or(1)
+                    );
+                }
+                return Some(28);
+            }
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            Some(transfer_exit_code(&e))
         }
     }
-    Some(0)
 }
 
 fn run_http_download(
@@ -5565,7 +5423,6 @@ fn run_http_download(
         progress: args.progress_bar,
         silent: args.silent,
         last_tick: now,
-        resume: None,
     };
     let result = if args.verbose {
         let mut err = io::stderr().lock();
