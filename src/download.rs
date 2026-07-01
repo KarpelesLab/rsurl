@@ -159,9 +159,98 @@ pub struct DownloadOutcome {
 
 /// Fetch `url` into `path`, resuming and retrying on transient faults.
 ///
-/// Convenience wrapper over [`Request::download_resumable`] for a plain GET.
-pub fn download(url: &str, path: &Path, opts: DownloadOptions) -> Result<DownloadOutcome> {
+/// For `http(s)://` this is a convenience wrapper over
+/// [`Request::download_resumable`]. A `data:` URI (RFC 2397) is decoded inline
+/// and written to `path` — there is no network transfer to resume, so it is
+/// handled here rather than in `download_resumable` (a `data:` URI cannot be a
+/// [`Request`]). `max_size` / `expected_sha256` / `progress` still apply.
+pub fn download(url: &str, path: &Path, mut opts: DownloadOptions) -> Result<DownloadOutcome> {
+    if let Some(decoded) = decode_data_uri(url) {
+        let bytes = decoded?;
+        let n = bytes.len() as u64;
+        if let Some(max) = opts.max_size {
+            if n > max {
+                return Err(Error::BadResponse("maximum file size exceeded".into()));
+            }
+        }
+        if let Some(want) = opts.expected_sha256 {
+            if Sha256::digest(&bytes) != want {
+                return Err(Error::BadResponse(
+                    "data URI failed SHA-256 verification".into(),
+                ));
+            }
+        }
+        std::fs::write(path, &bytes).map_err(Error::Io)?;
+        if let Some(cb) = opts.progress.as_mut() {
+            cb(n, Some(n));
+        }
+        return Ok(DownloadOutcome {
+            bytes_written: n,
+            total: Some(n),
+            resumed_from: 0,
+        });
+    }
     Request::get(url)?.download_resumable(path, opts)
+}
+
+/// Decode a `data:` URI (RFC 2397) into its bytes. Returns `None` if `url` is
+/// not a `data:` URI (so the caller falls through to a network fetch), or
+/// `Some(Err(..))` if it is one but malformed.
+///
+/// Grammar: `data:[<mediatype>][;base64],<data>` — a `;base64` marker selects
+/// base64, otherwise the data is percent-decoded.
+fn decode_data_uri(url: &str) -> Option<Result<Vec<u8>>> {
+    let b = url.as_bytes();
+    if b.len() < 5 || !b[..5].eq_ignore_ascii_case(b"data:") {
+        return None;
+    }
+    let rest = &url[5..];
+    let Some((meta, data)) = rest.split_once(',') else {
+        return Some(Err(Error::InvalidUrl(
+            "data URI missing ',' separator".into(),
+        )));
+    };
+    let is_base64 = meta
+        .split(';')
+        .any(|token| token.trim().eq_ignore_ascii_case("base64"));
+    let bytes = if is_base64 {
+        match crate::tls::client_auth::base64_decode(data) {
+            Some(b) => b,
+            None => return Some(Err(Error::InvalidUrl("invalid base64 in data URI".into()))),
+        }
+    } else {
+        percent_decode_to_bytes(data)
+    };
+    Some(Ok(bytes))
+}
+
+/// Percent-decode `s` into raw bytes (a `data:` URI's non-base64 payload can
+/// encode arbitrary octets via `%XX`).
+fn percent_decode_to_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            if let (Some(h), Some(l)) = (hex_nibble(b[i + 1]), hex_nibble(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl Request {
@@ -1725,6 +1814,73 @@ mod tests {
             "malformed header".into()
         )));
         assert!(!is_transient(&Error::Cancelled));
+    }
+
+    #[test]
+    fn data_uri_base64_is_written() {
+        let out = tmp("data_b64");
+        // "Hello, data!" base64-encoded.
+        let outcome = download(
+            "data:text/plain;base64,SGVsbG8sIGRhdGEh",
+            &out,
+            no_backoff(),
+        )
+        .expect("data uri");
+        assert_eq!(outcome.bytes_written, 12);
+        assert_eq!(std::fs::read(&out).unwrap(), b"Hello, data!");
+        cleanup(&out);
+    }
+
+    #[test]
+    fn data_uri_percent_encoded_and_plain() {
+        let out = tmp("data_pct");
+        download("data:,a%20b%2Fc%00d", &out, no_backoff()).expect("data uri");
+        assert_eq!(std::fs::read(&out).unwrap(), b"a b/c\0d");
+        // No mediatype, no encoding: the payload is used verbatim.
+        download("data:,plain", &out, no_backoff()).expect("data uri");
+        assert_eq!(std::fs::read(&out).unwrap(), b"plain");
+        cleanup(&out);
+    }
+
+    #[test]
+    fn data_uri_sha256_and_size_and_malformed() {
+        let out = tmp("data_meta");
+        let body = b"verify me";
+        let want = Sha256::digest(body);
+
+        let mut opts = no_backoff();
+        opts.expected_sha256 = Some(want);
+        let outcome = download("data:,verify me", &out, opts).expect("sha ok");
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+
+        let mut opts = no_backoff();
+        opts.expected_sha256 = Some([0u8; 32]);
+        assert!(
+            download("data:,verify me", &out, opts).is_err(),
+            "sha mismatch"
+        );
+
+        let mut opts = no_backoff();
+        opts.max_size = Some(3);
+        assert!(download("data:,too long", &out, opts).is_err(), "size cap");
+
+        // Missing comma → malformed data URI.
+        assert!(matches!(
+            download("data:text/plain", &out, no_backoff()),
+            Err(Error::InvalidUrl(_))
+        ));
+        cleanup(&out);
+    }
+
+    #[test]
+    fn decode_data_uri_recognition() {
+        assert!(decode_data_uri("http://x/").is_none());
+        assert!(decode_data_uri("DATA:,x").is_some()); // scheme is case-insensitive
+        assert_eq!(decode_data_uri("data:,hi").unwrap().unwrap(), b"hi");
+        assert_eq!(
+            decode_data_uri("data:;base64,aGk=").unwrap().unwrap(),
+            b"hi"
+        );
     }
 
     #[test]

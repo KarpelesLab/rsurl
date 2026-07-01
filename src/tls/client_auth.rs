@@ -366,7 +366,7 @@ pub fn parse_signing_key_der(der: &[u8], pass: Option<&str>) -> Result<SigningKe
 /// optional trailing `=` pad. Returns `None` on any invalid character or a
 /// truncated final group. Small and self-contained so the pin parser has no
 /// new dependency.
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
         match c {
             b'A'..=b'Z' => Some(c - b'A'),
