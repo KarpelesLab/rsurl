@@ -226,7 +226,10 @@ impl Client {
     fn host_bypassed(&self, host: &str) -> bool {
         let host = host.to_ascii_lowercase();
         self.no_proxy.iter().any(|e| {
-            let e = e.trim().to_ascii_lowercase();
+            // A leading dot on an entry is cosmetic (`.example.com` ==
+            // `example.com`); strip it so this matches curl and the env-var
+            // path (`EnvProxyResolver::resolve`), which both do the same.
+            let e = e.trim().trim_start_matches('.').to_ascii_lowercase();
             e == "*" || host == e || host.ends_with(&format!(".{e}"))
         })
     }
@@ -360,6 +363,12 @@ impl Client {
         crate::smtp::send(url, body, &opts, &self.net_config_for(&url.host))
     }
 
+    /// Publish `payload` to an `mqtt`/`mqtts` `url` (curl `-d`/`-T` on an MQTT
+    /// URL), honoring this client's proxy / custom connector.
+    pub fn mqtt_publish(&self, url: &Url, payload: &[u8], qos: u8) -> Result<()> {
+        crate::mqtt::publish_with(url, payload, qos, &self.net_config_for(&url.host))
+    }
+
     /// TELNET: send `input`, return the received data (curl `telnet://`).
     pub fn telnet(&self, url: &Url, input: &[u8]) -> Result<Vec<u8>> {
         crate::telnet::run(url, input, &self.net_config_for(&url.host))
@@ -376,5 +385,26 @@ mod tests {
     fn client_is_send_sync_and_clone() {
         fn assert_send_sync<T: Send + Sync + Clone>() {}
         assert_send_sync::<Client>();
+    }
+
+    /// `host_bypassed` must treat a leading dot on a no-proxy entry as cosmetic
+    /// (`.example.com` == `example.com`), matching curl and the env-var path.
+    /// Regression test: a leading-dot entry used to fail to bypass subdomains.
+    #[test]
+    fn no_proxy_matches_leading_dot_apex_suffix_and_wildcard() {
+        let c = Client::new().no_proxy([".example.com"]);
+        assert!(c.host_bypassed("foo.example.com"));
+        assert!(c.host_bypassed("example.com"));
+        assert!(c.host_bypassed("EXAMPLE.COM")); // case-insensitive
+        assert!(!c.host_bypassed("notexample.com"));
+        assert!(!c.host_bypassed("example.com.evil.com"));
+
+        // Entry without a leading dot behaves the same.
+        let c = Client::new().no_proxy(["example.com"]);
+        assert!(c.host_bypassed("foo.example.com"));
+        assert!(c.host_bypassed("example.com"));
+
+        // Wildcard bypasses everything.
+        assert!(Client::new().no_proxy(["*"]).host_bypassed("anything.test"));
     }
 }

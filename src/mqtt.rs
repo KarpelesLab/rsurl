@@ -18,7 +18,6 @@
 //! flags, last-will, and MQTT v5 are not implemented.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 
 use purecrypto::rng::{OsRng, RngCore};
 
@@ -78,6 +77,17 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
 /// `/` stripped and is validated to be a legal *publish* topic (no wildcards,
 /// no NUL/control bytes). `qos` must be 0 or 1; QoS 2 is not implemented.
 pub fn publish(url: &Url, payload: &[u8], qos: u8) -> Result<()> {
+    publish_with(url, payload, qos, &crate::net::NetConfig::default())
+}
+
+/// [`publish`] with an explicit network configuration, so a configured proxy /
+/// custom connector is honoured (mirrors [`fetch_with`] on the subscribe side).
+pub(crate) fn publish_with(
+    url: &Url,
+    payload: &[u8],
+    qos: u8,
+    cfg: &crate::net::NetConfig,
+) -> Result<()> {
     let topic = url.path.strip_prefix('/').unwrap_or(&url.path);
     if topic.is_empty() {
         return Err(Error::InvalidUrl(format!(
@@ -94,8 +104,7 @@ pub fn publish(url: &Url, payload: &[u8], qos: u8) -> Result<()> {
 
     let (user, pass) = split_userinfo(url.userinfo.as_deref());
 
-    let addr = format!("{}:{}", url.host, url.port);
-    let tcp = TcpStream::connect(&addr)?;
+    let tcp = cfg.connect(&url.host, url.port)?;
     if url.is_tls() {
         let mut stream = crate::tls::connect_over(tcp, &url.host)?;
         run_publish(&mut stream, topic, payload, qos, user, pass)

@@ -160,7 +160,8 @@ fn is_safe_quoted(v: &str) -> bool {
         .any(|b| b == b'"' || b == b'\\' || b == b'\r' || b == b'\n' || b == 0)
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Lowercase hex encoding, shared with `sigv4`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));

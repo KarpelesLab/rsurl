@@ -68,11 +68,9 @@ const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 // Frame types (RFC 9113 §6).
 const F_DATA: u8 = 0x0;
 const F_HEADERS: u8 = 0x1;
-#[allow(dead_code)]
 const F_PRIORITY: u8 = 0x2;
 const F_RST_STREAM: u8 = 0x3;
 const F_SETTINGS: u8 = 0x4;
-#[allow(dead_code)]
 const F_PUSH_PROMISE: u8 = 0x5;
 const F_PING: u8 = 0x6;
 const F_GOAWAY: u8 = 0x7;

@@ -5,6 +5,7 @@
 //! (the minimal set AWS requires). Query strings are canonicalised by sorting
 //! already-encoded `key=value` pairs.
 
+use crate::digest::hex;
 use purecrypto::hash::{sha256, HmacSha256};
 
 /// Current UTC time as an AWS `YYYYMMDDTHHMMSSZ` timestamp.
@@ -44,14 +45,6 @@ pub(crate) struct SigV4<'a> {
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     HmacSha256::mac(key, data).as_ref().to_vec()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// Canonical query string: sort the (already percent-encoded) `k=v` pairs.

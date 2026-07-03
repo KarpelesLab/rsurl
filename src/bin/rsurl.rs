@@ -3136,9 +3136,20 @@ fn run_mqtt_publish(url: &Url, args: &Args) -> u8 {
         }
     };
 
+    // Build a client so `-x`/`--noproxy` are honoured, matching the subscribe
+    // path (`run_transfer`) and every other non-HTTP scheme.
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: --proxy: {e}");
+            }
+            return 5;
+        }
+    };
     // curl publishes at QoS 0 by default. The protocol layer supports QoS 1
     // (PUBLISH then wait for PUBACK); there is no CLI flag to select it yet.
-    match rsurl::mqtt::publish(url, &payload, 0) {
+    match client.mqtt_publish(url, &payload, 0) {
         Ok(()) => 0,
         Err(e) => {
             if show_errors(args) {
@@ -3630,20 +3641,7 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
             return 23;
         }
     };
-    let (speed_limit, speed_time) = {
-        let lim = args
-            .speed_limit
-            .as_deref()
-            .and_then(|s| s.parse::<u64>().ok());
-        let tim = args
-            .speed_time
-            .as_deref()
-            .and_then(|s| s.parse::<u64>().ok());
-        match (lim, tim) {
-            (None, None) => (None, 30),
-            (l, t) => (Some(l.unwrap_or(1)), t.unwrap_or(30)),
-        }
-    };
+    let (speed_limit, speed_time) = low_speed_params(args);
     let now = std::time::Instant::now();
     let mut sink = DownloadSink {
         inner: Box::new(file),
