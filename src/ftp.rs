@@ -634,12 +634,7 @@ fn send<R: Read + Write>(r: &mut BufReader<R>, line: &str) -> Result<()> {
 /// control byte before it's interpolated into an FTP control command. `what`
 /// names the field for the error message.
 fn reject_ctl(s: &str, what: &str) -> Result<()> {
-    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
-        return Err(Error::BadResponse(format!(
-            "ftp: {what} contains illegal control byte {b:#04x}"
-        )));
-    }
-    Ok(())
+    crate::url::reject_ctl("ftp", what, s)
 }
 
 /// Read a (possibly multi-line) FTP reply. Returns `(code, text)` where

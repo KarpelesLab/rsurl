@@ -317,12 +317,7 @@ fn percent_decode(s: &str) -> String {
 /// wire format, but they have no legitimate place in a DN / bind value /
 /// filter and rejecting them is cheap defense-in-depth. `what` names the field.
 fn reject_ctl(s: &str, what: &str) -> Result<()> {
-    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
-        return Err(Error::BadResponse(format!(
-            "ldap: {what} contains illegal control byte {b:#04x}"
-        )));
-    }
-    Ok(())
+    crate::url::reject_ctl("ldap", what, s)
 }
 
 fn hex_val(b: u8) -> Option<u8> {

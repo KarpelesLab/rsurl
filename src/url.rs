@@ -293,6 +293,29 @@ pub(crate) fn split_userinfo(s: &str) -> (&str, &str) {
     }
 }
 
+/// The first illegal control byte in `s`, if any: an ASCII control (`< 0x20`,
+/// which covers CR, LF, and NUL) or `DEL` (`0x7f`). The single definition of
+/// "illegal control byte" shared by the line-oriented protocol backends, which
+/// must reject such bytes in URL-derived fields before interpolating them into
+/// a command (request-smuggling / header-injection guard).
+pub(crate) fn first_control_byte(s: &str) -> Option<u8> {
+    s.bytes().find(|b| *b < 0x20 || *b == 0x7f)
+}
+
+/// Reject `s` if it carries an illegal control byte (see [`first_control_byte`]),
+/// with a `proto: what contains ...` [`Error::BadResponse`]. `proto` names the
+/// scheme (e.g. `"ftp"`) and `what` the field, for the error message. Protocols
+/// using a different error variant (e.g. SSH) call [`first_control_byte`]
+/// directly.
+pub(crate) fn reject_ctl(proto: &str, what: &str, s: &str) -> Result<()> {
+    match first_control_byte(s) {
+        Some(b) => Err(Error::BadResponse(format!(
+            "{proto}: {what} contains illegal control byte {b:#04x}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -79,7 +79,8 @@ fn ssh_err(e: puressh::Error) -> Error {
 /// or anything `< 0x20`). Mirrors the guard in `ftp`/`imap`: a control byte in
 /// the user or remote path could corrupt the SSH/SFTP/SCP request framing.
 fn reject_ctl(s: &str, what: &str) -> Result<()> {
-    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+    // SSH reports via its own error variant, but shares the illegal-byte set.
+    if let Some(b) = crate::url::first_control_byte(s) {
         return Err(Error::Ssh(format!(
             "{what} contains illegal control byte {b:#04x}"
         )));

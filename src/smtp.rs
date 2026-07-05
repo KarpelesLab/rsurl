@@ -57,12 +57,7 @@ impl Write for Stream {
 /// Reject CR/LF/NUL and other control bytes in a URL/envelope-derived value so
 /// it can't smuggle extra SMTP commands onto the control connection.
 fn reject_ctl(s: &str, what: &str) -> Result<()> {
-    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
-        return Err(Error::BadResponse(format!(
-            "smtp: {what} contains illegal control byte {b:#04x}"
-        )));
-    }
-    Ok(())
+    crate::url::reject_ctl("smtp", what, s)
 }
 
 /// Send a message. The default operation for an `smtp(s)://` URL with a body.

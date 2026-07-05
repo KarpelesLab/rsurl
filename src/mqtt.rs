@@ -286,12 +286,7 @@ fn hex_nibble(n: u8) -> char {
 /// the imap/pop3 modules and avoids smuggling framing bytes onto the wire.
 /// `what` names the field for the error message (credentials are not echoed).
 fn reject_ctl(s: &str, what: &str) -> Result<()> {
-    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
-        return Err(Error::BadResponse(format!(
-            "mqtt: {what} contains illegal control byte {b:#04x}"
-        )));
-    }
-    Ok(())
+    crate::url::reject_ctl("mqtt", what, s)
 }
 
 /// Append `s` to `out` prefixed by its UTF-8 byte length as a big-endian u16.

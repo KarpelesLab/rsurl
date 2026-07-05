@@ -552,12 +552,7 @@ fn require_ok(resp: &str, tag: &str, what: &str) -> Result<()> {
 /// the field for the error message — note credentials themselves are never
 /// echoed.
 fn reject_ctl(s: &str, what: &str) -> Result<()> {
-    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
-        return Err(Error::BadResponse(format!(
-            "imap: {what} contains illegal control byte {b:#04x}"
-        )));
-    }
-    Ok(())
+    crate::url::reject_ctl("imap", what, s)
 }
 
 /// Return every untagged response line whose data item matches `kind`

@@ -163,12 +163,7 @@ enum Action {
 /// control byte before it's interpolated into a POP3 command. `what` names the
 /// field for the error message.
 fn reject_ctl(s: &str, what: &str) -> Result<()> {
-    if let Some(b) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
-        return Err(Error::BadResponse(format!(
-            "pop3: {what} contains illegal control byte {b:#04x}"
-        )));
-    }
-    Ok(())
+    crate::url::reject_ctl("pop3", what, s)
 }
 
 /// Decide between LIST and RETR based on the URL path. Returns `None` for
