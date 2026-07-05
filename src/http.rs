@@ -1525,6 +1525,62 @@ fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
+/// Cap on the total decoded header-list size (sum of name+value octets) for
+/// HPACK (HTTP/2) and QPACK (HTTP/3). Bounds decompression-bomb memory.
+pub(crate) const MAX_DECODED_HEADER_LIST: usize = 256 * 1024;
+
+/// Validate a decoded HPACK/QPACK header field per RFC 9113 §8.2.1 /
+/// RFC 9114 §10.3 / RFC 7230 token rules. Shared by the HTTP/2 and HTTP/3
+/// decoders.
+///
+/// Returns `false` (caller rejects with `Error::BadResponse`) when:
+/// - the name is empty,
+/// - the name contains an uppercase ASCII letter or any byte outside the
+///   RFC 7230 token set, EXCEPT that a single leading `:` is permitted so
+///   pseudo-headers like `:status` pass,
+/// - the value contains `NUL` (0x00), `LF` (0x0a), or `CR` (0x0d).
+///
+/// Values may otherwise carry any printable byte, spaces, and tabs.
+pub(crate) fn header_octets_ok(name: &[u8], value: &[u8]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // A leading `:` marks a pseudo-header; the remainder must still be a token.
+    let name_rest = if name[0] == b':' { &name[1..] } else { name };
+    if name_rest.is_empty() {
+        return false;
+    }
+    if !name_rest.iter().all(|&c| is_token_char(c)) {
+        return false;
+    }
+    !value.iter().any(|&c| c == 0x00 || c == 0x0a || c == 0x0d)
+}
+
+/// RFC 7230 token char: `!#$%&'*+-.^_`|~`, digits, and lowercase letters.
+/// Uppercase letters are deliberately excluded (HTTP/2 and HTTP/3 field
+/// names are lowercase).
+fn is_token_char(c: u8) -> bool {
+    c.is_ascii_digit()
+        || c.is_ascii_lowercase()
+        || matches!(
+            c,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 /// If `cancel` is set and cancelled, report `r` as [`Error::Cancelled`]
 /// regardless of the underlying error (a socket shut down by `cancel()` surfaces
 /// as a connection reset). A successful result is left untouched even if a

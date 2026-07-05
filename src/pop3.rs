@@ -34,7 +34,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
         .userinfo
         .as_deref()
         .ok_or_else(|| Error::BadResponse("pop3: missing userinfo".into()))?;
-    let (user, pass) = split_userinfo(userinfo);
+    let (user, pass) = crate::url::split_userinfo(userinfo);
 
     let action = parse_path(&url.path)
         .ok_or_else(|| Error::InvalidUrl(format!("pop3 path: {}", url.path)))?;
@@ -158,15 +158,6 @@ enum Action {
     Retr(u32),
 }
 
-/// Split `"user[:pass]"` on the first `:`. Missing password becomes empty,
-/// matching what curl does — RFC 1939's USER/PASS commands always need both
-/// arguments, so we still send `PASS ""` for a userinfo with no colon.
-fn split_userinfo(s: &str) -> (&str, &str) {
-    match s.find(':') {
-        Some(i) => (&s[..i], &s[i + 1..]),
-        None => (s, ""),
-    }
-}
 
 /// Reject a URL-derived string containing CR, LF, NUL, or any other ASCII
 /// control byte before it's interpolated into a POP3 command. `what` names the
@@ -470,14 +461,6 @@ mod tests {
         assert_eq!(parse_path("/1?x=1"), None);
         assert_eq!(parse_path("/-1"), None);
         assert_eq!(parse_path("/1.0"), None);
-    }
-
-    #[test]
-    fn split_userinfo_splits_on_first_colon() {
-        assert_eq!(split_userinfo("alice:secret"), ("alice", "secret"));
-        assert_eq!(split_userinfo("alice"), ("alice", ""));
-        assert_eq!(split_userinfo("alice:s:e:c"), ("alice", "s:e:c"));
-        assert_eq!(split_userinfo(":pass"), ("", "pass"));
     }
 
     #[test]

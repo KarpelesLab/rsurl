@@ -199,7 +199,7 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
     // Authenticate, if we have credentials and aren't already PREAUTH.
     if !preauth {
         if let Some(userinfo) = url.userinfo.as_deref() {
-            let (user, pass) = split_userinfo(userinfo);
+            let (user, pass) = crate::url::split_userinfo(userinfo);
             // Security: never interpolate URL-derived control bytes into a
             // command (CRLF injection / command smuggling). Credentials are
             // never logged.
@@ -600,14 +600,6 @@ fn quote_imap_string(s: &str) -> String {
     out
 }
 
-/// Split `user[:pass]` into `(user, pass)`. Missing password is empty string.
-fn split_userinfo(s: &str) -> (&str, &str) {
-    match s.find(':') {
-        Some(i) => (&s[..i], &s[i + 1..]),
-        None => (s, ""),
-    }
-}
-
 /// Parse the IMAP URL path (RFC 5092 subset) into `(mailbox, uid)`.
 ///
 /// Accepts:
@@ -900,14 +892,6 @@ mod tests {
     }
 
     // -- userinfo split ----------------------------------------------------
-
-    #[test]
-    fn userinfo_with_and_without_password() {
-        assert_eq!(split_userinfo("alice:secret"), ("alice", "secret"));
-        assert_eq!(split_userinfo("alice"), ("alice", ""));
-        assert_eq!(split_userinfo("alice:"), ("alice", ""));
-        assert_eq!(split_userinfo(":only-pass"), ("", "only-pass"));
-    }
 
     // -- control-byte rejection --------------------------------------------
 

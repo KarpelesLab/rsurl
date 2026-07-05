@@ -283,9 +283,28 @@ fn default_port(scheme: &str) -> Option<u16> {
     })
 }
 
+/// Split a `user[:pass]` userinfo string on the first `:` into `(user, pass)`.
+/// A missing password becomes an empty string. Shared by the protocol modules
+/// that take credentials from the URL userinfo (imap, pop3).
+pub(crate) fn split_userinfo(s: &str) -> (&str, &str) {
+    match s.find(':') {
+        Some(i) => (&s[..i], &s[i + 1..]),
+        None => (s, ""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_userinfo_splits_on_first_colon() {
+        assert_eq!(split_userinfo("alice:secret"), ("alice", "secret"));
+        assert_eq!(split_userinfo("alice"), ("alice", ""));
+        assert_eq!(split_userinfo("alice:"), ("alice", ""));
+        assert_eq!(split_userinfo(":only-pass"), ("", "only-pass"));
+        assert_eq!(split_userinfo("alice:s:e:c"), ("alice", "s:e:c"));
+    }
 
     #[test]
     fn parses_http() {

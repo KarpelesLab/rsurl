@@ -221,11 +221,7 @@ impl Frame {
 // QPACK header compression (RFC 9204) via compcol
 // ============================================================================
 
-/// Cap on the *decoded* header-list size (sum of `name + value + 32` per
-/// header, the RFC 7541 §4.1 accounting). Bounds a QPACK decompression bomb: a
-/// small compressed field section can otherwise expand into a huge header list
-/// and exhaust memory.
-const MAX_DECODED_HEADER_LIST: usize = 256 * 1024;
+use crate::http::{header_octets_ok, MAX_DECODED_HEADER_LIST};
 
 /// A decoded HTTP/3 header list as `(name, value)` pairs.
 type Fields = Vec<(String, String)>;
@@ -307,55 +303,6 @@ fn encode_header_block(fields: &[(String, String)]) -> Vec<u8> {
 /// decoder then owes the peer a Section Acknowledgement.
 fn block_references_dynamic_table(block: &[u8]) -> bool {
     !block.is_empty() && block[0] != 0
-}
-
-/// Validate a decoded QPACK field per RFC 9114 §10.3 / RFC 7230 token rules.
-///
-/// Returns `false` (caller rejects with `Error::BadResponse`) when:
-/// - the name is empty,
-/// - the name contains an uppercase ASCII letter or any byte outside the
-///   RFC 7230 token set, EXCEPT that a single leading `:` is permitted so
-///   pseudo-headers like `:status` pass,
-/// - the value contains `NUL` (0x00), `LF` (0x0a), or `CR` (0x0d).
-///
-/// Values may otherwise carry any printable byte, spaces, and tabs.
-fn header_octets_ok(name: &[u8], value: &[u8]) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    // A leading `:` marks a pseudo-header; the rest must still be a token.
-    let name_rest = if name[0] == b':' { &name[1..] } else { name };
-    if name_rest.is_empty() {
-        return false;
-    }
-    if !name_rest.iter().all(|&c| is_token_char(c)) {
-        return false;
-    }
-    !value.iter().any(|&c| c == 0x00 || c == 0x0a || c == 0x0d)
-}
-
-/// RFC 7230 token char: `!#$%&'*+-.^_`|~`, digits, and lowercase letters.
-/// Uppercase letters are deliberately excluded (HTTP/3 names are lowercase).
-fn is_token_char(c: u8) -> bool {
-    c.is_ascii_digit()
-        || c.is_ascii_lowercase()
-        || matches!(
-            c,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
 }
 
 /// Encode `value` as an RFC 7541 §5.1 `n`-bit-prefix integer, OR-ing the fixed

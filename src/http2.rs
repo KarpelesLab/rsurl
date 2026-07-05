@@ -109,10 +109,7 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 /// this is a sane fixed ceiling on the on-the-wire block.
 const MAX_HEADERS_BUF: usize = 256 * 1024;
 
-/// Cap on the *decoded* header-list size (sum of `name + value + 32` per
-/// header, the RFC 7541 §4.1 accounting). Bounds HPACK decompression bombs:
-/// a small compressed block can otherwise expand into a huge header list.
-const MAX_DECODED_HEADER_LIST: usize = 256 * 1024;
+use crate::http::{header_octets_ok, MAX_DECODED_HEADER_LIST};
 
 // ---------------------------------------------------------------------------
 // Flood / no-progress budgets.
@@ -1186,55 +1183,6 @@ impl Decoder {
         }
         Ok(out)
     }
-}
-
-/// Validate a decoded HPACK field per RFC 9113 §8.2.1 / RFC 7230 token rules.
-///
-/// Returns `false` (caller rejects with `Error::BadResponse`) when:
-/// - the name is empty,
-/// - the name contains an uppercase ASCII letter or any byte outside the
-///   RFC 7230 token set, EXCEPT that a single leading `:` is permitted so
-///   pseudo-headers like `:status` pass,
-/// - the value contains `NUL` (0x00), `LF` (0x0a), or `CR` (0x0d).
-///
-/// Values may otherwise carry any printable byte, spaces, and tabs.
-fn header_octets_ok(name: &[u8], value: &[u8]) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    // A leading `:` marks a pseudo-header; the remainder must still be a token.
-    let name_rest = if name[0] == b':' { &name[1..] } else { name };
-    if name_rest.is_empty() {
-        return false;
-    }
-    if !name_rest.iter().all(|&c| is_token_char(c)) {
-        return false;
-    }
-    !value.iter().any(|&c| c == 0x00 || c == 0x0a || c == 0x0d)
-}
-
-/// RFC 7230 token char: `!#$%&'*+-.^_`|~`, digits, and lowercase letters.
-/// Uppercase letters are deliberately excluded (HTTP/2 names are lowercase).
-fn is_token_char(c: u8) -> bool {
-    c.is_ascii_digit()
-        || c.is_ascii_lowercase()
-        || matches!(
-            c,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
 }
 
 /// Huffman-encode `input` per RFC 7541 §5.2: concatenate the per-symbol
