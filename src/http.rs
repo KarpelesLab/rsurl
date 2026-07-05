@@ -1003,7 +1003,7 @@ impl Request {
                         )));
                     }
                     hops_left -= 1;
-                    req = redirect_request(req, &head, &loc)?;
+                    req = redirect_request(req, head.status, &loc, trace)?;
                     continue;
                 }
             }
@@ -1275,61 +1275,8 @@ impl Request {
                             req.max_redirs
                         )));
                     }
-                    let mut next_url = crate::url::resolve(&req.url, &location)?;
-                    // Only http/https are drivable here; reject e.g. a
-                    // `gopher://`/`ftp://` Location rather than silently
-                    // treating it as plaintext HTTP (mirrors `send_once`).
-                    if next_url.scheme != "http" && next_url.scheme != "https" {
-                        return Err(Error::UnsupportedScheme(next_url.scheme.clone()));
-                    }
-                    next_url.set_idn(req.idn)?;
-                    let _ = writeln!(
-                        trace,
-                        "* Following redirect to {}",
-                        url_to_string(&next_url)
-                    );
-                    let host_changed = next_url.host != req.url.host
-                        || next_url.port != req.url.port
-                        || next_url.scheme != req.url.scheme;
-                    let prev_method = req.method.clone();
-                    let prev_url = url_to_string(&req.url);
-                    let prev_body = std::mem::take(&mut req.body);
-                    let status = head.status;
-                    let mut next = req;
-                    next.url = next_url;
-                    if next.auto_referer {
-                        next.headers
-                            .retain(|(k, _)| !k.eq_ignore_ascii_case("referer"));
-                        next.headers.push(("Referer".to_string(), prev_url));
-                    }
-                    if host_changed && !next.redirect_trusted {
-                        next.headers.retain(|(k, _)| {
-                            !k.eq_ignore_ascii_case("authorization")
-                                && !k.eq_ignore_ascii_case("cookie")
-                        });
-                        next.basic_auth = None;
-                    }
-                    let keep_post = if (301..=303).contains(&status) {
-                        next.keep_post[(status - 301) as usize]
-                    } else {
-                        false
-                    };
-                    if (301..=303).contains(&status)
-                        && !keep_post
-                        && !prev_method.eq_ignore_ascii_case("GET")
-                        && !prev_method.eq_ignore_ascii_case("HEAD")
-                    {
-                        next.method = "GET".to_string();
-                        next.headers.retain(|(k, _)| {
-                            !k.eq_ignore_ascii_case("content-type")
-                                && !k.eq_ignore_ascii_case("content-length")
-                                && !k.eq_ignore_ascii_case("transfer-encoding")
-                        });
-                    } else {
-                        next.body = prev_body;
-                    }
                     hops_left -= 1;
-                    req = next;
+                    req = redirect_request(req, head.status, &location, trace)?;
                     first_hop = false;
                     continue;
                 }
@@ -1567,70 +1514,8 @@ impl Request {
                     return Ok(resp);
                 }
             };
-            let mut next_url = crate::url::resolve(&req.url, &location)?;
-            // Apply the same IDN normalisation to the redirect target so the
-            // host-change check below and all downstream use compare/operate on
-            // the ASCII form (an absolute `Location` may carry a Unicode host).
-            next_url.set_idn(req.idn)?;
-            let _ = writeln!(
-                trace,
-                "* Following redirect to {}",
-                url_to_string(&next_url)
-            );
-
-            // RFC 9110: drop sensitive headers on cross-host redirects.
-            let host_changed = next_url.host != req.url.host
-                || next_url.port != req.url.port
-                || next_url.scheme != req.url.scheme;
-
-            let prev_method = req.method.clone();
-            let prev_url = url_to_string(&req.url);
-            let prev_body = std::mem::take(&mut req.body);
-            let mut next = req;
-            next.url = next_url;
-            // -e ';auto': set Referer to the URL we are coming from.
-            if next.auto_referer {
-                next.headers
-                    .retain(|(k, _)| !k.eq_ignore_ascii_case("referer"));
-                next.headers.push(("Referer".to_string(), prev_url));
-            }
-            // --location-trusted keeps credentials across hosts.
-            if host_changed && !next.redirect_trusted {
-                next.headers.retain(|(k, _)| {
-                    !k.eq_ignore_ascii_case("authorization") && !k.eq_ignore_ascii_case("cookie")
-                });
-                next.basic_auth = None;
-            }
-
-            // Method/body rewriting per RFC 9110 §15.4 plus curl's default
-            // backward-compat behaviour: 301/302/303 rewrite POST/PUT/etc
-            // to GET and drop the body; 307/308 preserve method + body.
-            // --post301/302/303 opt out of the downgrade for that status.
-            let keep_post = if (301..=303).contains(&resp.status) {
-                next.keep_post[(resp.status - 301) as usize]
-            } else {
-                false
-            };
-            if (301..=303).contains(&resp.status)
-                && !keep_post
-                && !prev_method.eq_ignore_ascii_case("GET")
-                && !prev_method.eq_ignore_ascii_case("HEAD")
-            {
-                next.method = "GET".to_string();
-                // body left empty; drop request-body framing headers since
-                // we no longer have a body to describe.
-                next.headers.retain(|(k, _)| {
-                    !k.eq_ignore_ascii_case("content-type")
-                        && !k.eq_ignore_ascii_case("content-length")
-                        && !k.eq_ignore_ascii_case("transfer-encoding")
-                });
-            } else {
-                // 307/308, or 301/302/303 on a GET/HEAD: preserve method
-                // and restore the body verbatim.
-                next.body = prev_body;
-            }
             hops_left -= 1;
-            req = next;
+            req = redirect_request(req, resp.status, &location, trace)?;
             first_hop = false;
         }
     }
@@ -2128,24 +2013,30 @@ fn buffered_body_reader(mut req: Request, trace: &mut dyn Write) -> Result<BodyR
     })
 }
 
-/// Transform `req` into the next-hop request for a `3xx Location`, applying the
-/// same rules as the buffered redirect loop: resolve + IDN-normalise the target,
-/// reject non-HTTP(S) schemes, drop `Authorization`/`Cookie` (and Basic creds)
-/// on a cross-host hop unless `--location-trusted`, set `Referer` for
-/// `-e ;auto`, and downgrade POST→GET (dropping the body + framing headers) on
-/// 301/302/303 except where `--post30x` opts out.
-fn redirect_request(req: Request, head: &Head, location: &str) -> Result<Request> {
+/// Transform `req` into the next-hop request for a `3xx Location` with the given
+/// response `status`, applying the redirect rules shared by every HTTP path:
+/// resolve + IDN-normalise the target, reject non-HTTP(S) schemes, emit the
+/// `* Following redirect to` trace line, drop `Authorization`/`Cookie` (and
+/// Basic creds) on a cross-host hop unless `--location-trusted`, set `Referer`
+/// for `-e ;auto`, and downgrade POST→GET (dropping the body + framing headers)
+/// on 301/302/303 except where `--post30x` opts out.
+fn redirect_request(
+    req: Request,
+    status: u16,
+    location: &str,
+    trace: &mut dyn Write,
+) -> Result<Request> {
     let mut next_url = crate::url::resolve(&req.url, location)?;
     if next_url.scheme != "http" && next_url.scheme != "https" {
         return Err(Error::UnsupportedScheme(next_url.scheme.clone()));
     }
     next_url.set_idn(req.idn)?;
+    let _ = writeln!(trace, "* Following redirect to {}", url_to_string(&next_url));
     let host_changed = next_url.host != req.url.host
         || next_url.port != req.url.port
         || next_url.scheme != req.url.scheme;
     let prev_method = req.method.clone();
     let prev_url = url_to_string(&req.url);
-    let status = head.status;
 
     let mut next = req;
     next.url = next_url;
@@ -5523,5 +5414,86 @@ mod tests {
         let resp = send_https_via_core(&req, &mut io::sink()).expect("callback Accept succeeds");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"hi");
+    }
+
+    // `redirect_request` is the single transform shared by every HTTP redirect
+    // path (buffered `send_to_inner`, streaming `stream_h1`, and reader
+    // `send_reader`). These lock in its security-critical rules directly.
+
+    /// Case-insensitive lookup into a `Request`'s header list.
+    fn req_header<'a>(r: &'a Request, name: &str) -> Option<&'a str> {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn redirect_cross_host_302_drops_creds_and_downgrades_post_to_get() {
+        let req = Request::new("POST", "https://a.example/one")
+            .unwrap()
+            .header("Authorization", "Bearer secret")
+            .header("Cookie", "sid=1")
+            .header("Content-Type", "text/plain")
+            .body(b"payload".to_vec());
+        let next = redirect_request(req, 302, "https://b.example/two", &mut io::sink()).unwrap();
+        assert_eq!(next.method, "GET");
+        assert!(next.body.is_empty());
+        assert!(req_header(&next, "authorization").is_none());
+        assert!(req_header(&next, "cookie").is_none());
+        assert!(req_header(&next, "content-type").is_none());
+        assert_eq!(next.url.host, "b.example");
+    }
+
+    #[test]
+    fn redirect_same_host_307_preserves_method_body_and_creds() {
+        let req = Request::new("POST", "https://a.example/one")
+            .unwrap()
+            .header("Authorization", "Bearer secret")
+            .body(b"payload".to_vec());
+        let next = redirect_request(req, 307, "https://a.example/two", &mut io::sink()).unwrap();
+        assert_eq!(next.method, "POST");
+        assert_eq!(next.body, b"payload");
+        assert_eq!(req_header(&next, "authorization"), Some("Bearer secret"));
+    }
+
+    #[test]
+    fn redirect_same_host_302_keeps_creds_but_still_downgrades_post() {
+        let req = Request::new("POST", "https://a.example/one")
+            .unwrap()
+            .header("Authorization", "Bearer secret")
+            .body(b"payload".to_vec());
+        let next = redirect_request(req, 302, "https://a.example/two", &mut io::sink()).unwrap();
+        assert_eq!(next.method, "GET");
+        assert!(next.body.is_empty());
+        // Same host, so credentials survive.
+        assert_eq!(req_header(&next, "authorization"), Some("Bearer secret"));
+    }
+
+    #[test]
+    fn redirect_trusted_keeps_creds_cross_host() {
+        let req = Request::get("https://a.example/one")
+            .unwrap()
+            .redirect_trusted(true)
+            .header("Authorization", "Bearer secret");
+        let next = redirect_request(req, 302, "https://b.example/two", &mut io::sink()).unwrap();
+        assert_eq!(req_header(&next, "authorization"), Some("Bearer secret"));
+    }
+
+    #[test]
+    fn redirect_to_non_http_scheme_is_rejected() {
+        let req = Request::get("https://a.example/one").unwrap();
+        let err = redirect_request(req, 302, "ftp://a.example/two", &mut io::sink());
+        assert!(matches!(err, Err(Error::UnsupportedScheme(_))));
+    }
+
+    #[test]
+    fn redirect_emits_trace_line() {
+        let req = Request::get("https://a.example/one").unwrap();
+        let mut trace = Vec::new();
+        let _ = redirect_request(req, 302, "https://b.example/two", &mut trace).unwrap();
+        let s = String::from_utf8(trace).unwrap();
+        assert!(s.contains("Following redirect to"));
+        assert!(s.contains("b.example"));
     }
 }
