@@ -12,7 +12,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 
 use crate::error::{Error, Result};
 use crate::net::{NetConfig, NetStream};
-use crate::tls::{connect_over, TlsStream};
+use crate::tls::{connect_over, reject_pipelined_plaintext, TlsStream};
 use crate::url::Url;
 use crate::websocket::base64_encode;
 
@@ -101,11 +101,7 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
         }
         // Security (CVE-2011-0411 class): any bytes buffered after the 220 are
         // a plaintext-injection attempt — reject before the TLS handshake.
-        if !io.buffer().is_empty() {
-            return Err(Error::BadResponse(
-                "smtp: server sent data after STARTTLS before TLS (injection)".into(),
-            ));
-        }
+        reject_pipelined_plaintext("smtp", io.buffer().is_empty())?;
         let plain = match io.into_inner() {
             Stream::Plain(s) => s,
             _ => {

@@ -31,7 +31,7 @@ use crate::net::NetStream;
 use std::io::{self, Read, Write};
 
 use crate::error::{Error, Result};
-use crate::tls::{connect_over, TlsStream};
+use crate::tls::{connect_over, reject_pipelined_plaintext, TlsStream};
 use crate::url::Url;
 use crate::websocket::base64_encode;
 
@@ -173,17 +173,11 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
         sock.flush()?;
         let resp = buf.read_response(&mut sock, &tag)?;
         require_ok(&resp, &tag, "STARTTLS")?;
-        // Security (CVE-2011-0411 class STARTTLS plaintext injection): the
-        // `LineReader` buffers socket reads in chunks, so any bytes a MITM
-        // pipelines *after* the STARTTLS `OK` line are still sitting in the
-        // buffer. They were received as PLAINTEXT before the handshake; reading
-        // them after the upgrade would treat attacker-staged data as trusted
-        // post-TLS server responses. Discarding is unsafe — abort instead.
-        if !buf.is_clear() {
-            return Err(Error::BadResponse(
-                "STARTTLS: server pipelined data before TLS handshake".into(),
-            ));
-        }
+        // Security (CVE-2011-0411 class): the `LineReader` buffers socket reads
+        // in chunks, so any bytes a MITM pipelined after the STARTTLS `OK` are
+        // still buffered plaintext — abort before the handshake rather than
+        // trust them post-TLS. (Shared guard; `is_clear()` is the buffer state.)
+        reject_pipelined_plaintext("imap", buf.is_clear())?;
         // Tagged OK means the server is ready; everything after is TLS.
         sock.start_tls(&url.host)?;
         // RFC 2595: discard the pre-TLS capability list and re-probe, since

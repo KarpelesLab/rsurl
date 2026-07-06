@@ -60,6 +60,27 @@ pub use backend::{
     load_roots_from_file, RootCertStore, TlsConn, TlsOpts, TlsStream,
 };
 
+/// CVE-2011-0411-class STARTTLS plaintext-injection guard, shared by the mail
+/// protocols (imap/smtp/pop3). After the server's STARTTLS/STLS `OK` and
+/// *before* the TLS handshake ([`connect_over`]), the client's read buffer must
+/// be empty. Any bytes already buffered were pipelined by a MITM as plaintext
+/// in the same flight; trusting them as server responses once TLS is up is the
+/// vulnerability, and discarding them is also unsafe — so we abort. The reader
+/// buffer type differs per protocol, so the caller passes its emptiness as
+/// `buffer_empty`; `proto` names the scheme for the error.
+pub(crate) fn reject_pipelined_plaintext(
+    proto: &str,
+    buffer_empty: bool,
+) -> crate::error::Result<()> {
+    if buffer_empty {
+        Ok(())
+    } else {
+        Err(crate::error::Error::BadResponse(format!(
+            "{proto}: server pipelined plaintext before the TLS handshake (STARTTLS injection)"
+        )))
+    }
+}
+
 /// Build a socket-free sans-IO TLS client engine for the active backend,
 /// configured from `sni` and `opts`. The blocking/async drivers drive the
 /// returned engine via [`crate::proto::tls::TlsClient`]; this is the
@@ -85,4 +106,26 @@ pub(crate) fn build_client_engine(
     opts: &mut TlsOpts,
 ) -> crate::error::Result<crate::proto::tls::PurecryptoEngine> {
     crate::proto::tls::PurecryptoEngine::new(backend::build_client_conn(sni, opts)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_pipelined_plaintext;
+    use crate::error::Error;
+
+    #[test]
+    fn pipelined_guard_passes_on_empty_buffer() {
+        assert!(reject_pipelined_plaintext("imap", true).is_ok());
+    }
+
+    #[test]
+    fn pipelined_guard_rejects_buffered_plaintext() {
+        match reject_pipelined_plaintext("pop3", false) {
+            Err(Error::BadResponse(m)) => {
+                assert!(m.contains("pop3"));
+                assert!(m.contains("STARTTLS injection"));
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
 }

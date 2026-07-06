@@ -11,7 +11,7 @@ use crate::net::NetStream;
 use std::io::{BufRead, BufReader, Read, Write};
 
 use crate::error::{Error, Result};
-use crate::tls::{connect_over, TlsStream};
+use crate::tls::{connect_over, reject_pipelined_plaintext, TlsStream};
 use crate::url::Url;
 
 /// Upper bound on a multi-line POP3 response body (LIST output or a RETR'd
@@ -143,11 +143,7 @@ fn stls_negotiate<R: Read + Write>(io: &mut BufReader<R>) -> Result<bool> {
     }
     // Injection guard: any bytes buffered after the +OK were received as
     // plaintext before the handshake — reject rather than trust them post-TLS.
-    if !io.buffer().is_empty() {
-        return Err(Error::BadResponse(
-            "pop3: server sent data after STLS before TLS (injection)".into(),
-        ));
-    }
+    reject_pipelined_plaintext("pop3", io.buffer().is_empty())?;
     Ok(true)
 }
 
