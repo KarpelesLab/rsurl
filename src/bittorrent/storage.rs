@@ -238,13 +238,9 @@ impl Storage {
         if begin as u64 + length as u64 > psize {
             return Err(serr("read past end of piece"));
         }
-        let mut out = vec![0u8; length as usize];
         let offset = self.piece_length * index as u64 + begin as u64;
-        self.rw(offset, length as u64, |file, file_off, span| {
-            file.seek(SeekFrom::Start(file_off)).map_err(Error::Io)?;
-            file.read_exact(&mut out[span.clone()]).map_err(Error::Io)
-        })?;
-        Ok(out)
+        // Same seek+read_exact across the covering files as `read_at`.
+        self.read_at(offset, length as u64)
     }
 
     /// Walk the file(s) covering global range `[offset, offset+len)`, invoking

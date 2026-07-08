@@ -41,11 +41,21 @@ pub use picker::{Bitfield, Picker};
 pub use storage::Storage;
 pub use tracker::{announce, AnnounceParams, AnnounceResponse, Event};
 
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 use purecrypto::rng::{OsRng, RngCore};
 
 use crate::error::{Error, Result};
+
+/// Decode a 6-byte BitTorrent compact peer address: 4-byte IPv4 followed by a
+/// 2-byte big-endian port. Shared by the tracker and DHT compact-peer parsers.
+/// `c` must be at least 6 bytes (callers pass exact 6-byte chunks).
+pub(crate) fn compact_v4(c: &[u8]) -> SocketAddr {
+    let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
+    let port = u16::from_be_bytes([c[4], c[5]]);
+    SocketAddr::V4(SocketAddrV4::new(ip, port))
+}
 
 /// Resolve each file in `meta` to an absolute path under `base` (the file
 /// `path`s already carry the torrent's top directory for multi-file torrents).

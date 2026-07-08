@@ -190,7 +190,7 @@ fn parse_response(buf: &[u8], txn: &[u8]) -> Option<Reply> {
         for v in vals {
             if let Some(b) = v.as_bytes() {
                 if b.len() == 6 {
-                    peers.push(compact_v4(b));
+                    peers.push(super::compact_v4(b));
                 }
             }
         }
@@ -206,12 +206,6 @@ fn parse_response(buf: &[u8], txn: &[u8]) -> Option<Reply> {
         }
     }
     Some(Reply { peers, nodes })
-}
-
-fn compact_v4(c: &[u8]) -> SocketAddr {
-    let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
-    let port = u16::from_be_bytes([c[4], c[5]]);
-    SocketAddr::V4(SocketAddrV4::new(ip, port))
 }
 
 #[cfg(test)]

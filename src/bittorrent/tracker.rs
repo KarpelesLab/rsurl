@@ -4,7 +4,7 @@
 //! and the re-announce interval. HTTP uses the crate's own HTTP client;
 //! UDP uses the crate's `net::udp` socket.
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -144,13 +144,7 @@ fn parse_http_response(body: &[u8]) -> Result<AnnounceResponse> {
 }
 
 fn parse_compact_v4(b: &[u8]) -> Vec<SocketAddr> {
-    b.chunks_exact(6)
-        .map(|c| {
-            let ip = Ipv4Addr::new(c[0], c[1], c[2], c[3]);
-            let port = u16::from_be_bytes([c[4], c[5]]);
-            SocketAddr::V4(SocketAddrV4::new(ip, port))
-        })
-        .collect()
+    b.chunks_exact(6).map(super::compact_v4).collect()
 }
 
 fn parse_compact_v6(b: &[u8]) -> Vec<SocketAddr> {
