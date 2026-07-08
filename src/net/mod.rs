@@ -29,4 +29,5 @@ pub use connector::{
 pub use proxy_resolver::{from_env, EnvProxyResolver, ProxyChoice, ProxyResolver};
 pub use resolver::{Resolver, StdResolver};
 pub use stream::NetStream;
+pub(crate) use stream::MaybeTlsStream;
 pub use udp::UdpProxy;

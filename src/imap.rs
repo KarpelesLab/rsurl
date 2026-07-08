@@ -27,11 +27,10 @@
 //! quoted string promotion), multi-line continuation requests, SASL mechanisms
 //! beyond PLAIN/LOGIN (CRAM-MD5, SCRAM, XOAUTH2, ...).
 
-use crate::net::NetStream;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
-use crate::tls::{connect_over, reject_pipelined_plaintext, TlsStream};
+use crate::tls::{connect_over, reject_pipelined_plaintext};
 use crate::url::Url;
 use crate::websocket::base64_encode;
 
@@ -70,75 +69,10 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     }
 }
 
-/// Read+Write transport, either plain TCP or TLS-wrapped. Modelling it as an
-/// enum (rather than a generic `S: Read + Write`) is what lets STARTTLS upgrade
-/// the connection *in place*: we `std::mem::replace` the `Plain` arm with a
-/// `Tls` arm wrapping the very same `TcpStream`.
-///
-/// `Tls` is boxed because the active TLS backend can be either purecrypto
-/// (small) or rustls (~1 KiB), and clippy flags the resulting variant-size
-/// mismatch against the bare `TcpStream` arm (mirrors `pop3::IoAdapter`).
-enum Stream {
-    Plain(Box<dyn NetStream>),
-    Tls(Box<TlsStream<Box<dyn NetStream>>>),
-    /// Transient state only ever observed inside [`Stream::start_tls`] while we
-    /// move the inner stream out to hand it to the TLS handshake.
-    Poisoned,
-}
-
-impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.read(buf),
-            Stream::Tls(s) => s.read(buf),
-            Stream::Poisoned => Err(io::Error::other("imap: stream poisoned")),
-        }
-    }
-}
-
-impl Write for Stream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.write(buf),
-            Stream::Tls(s) => s.write(buf),
-            Stream::Poisoned => Err(io::Error::other("imap: stream poisoned")),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.flush(),
-            Stream::Tls(s) => s.flush(),
-            Stream::Poisoned => Err(io::Error::other("imap: stream poisoned")),
-        }
-    }
-}
-
-impl Stream {
-    /// True for a plaintext (non-TLS) transport.
-    fn is_plain(&self) -> bool {
-        matches!(self, Stream::Plain(_))
-    }
-
-    /// Upgrade a plaintext connection to TLS in place (RFC 2595 STARTTLS). The
-    /// existing TCP stream is handed to [`connect_over`] verifying `host` as the
-    /// SNI / certificate name, exactly as `imaps://` does. No-op (and an error)
-    /// if the connection is already TLS.
-    fn start_tls(&mut self, host: &str) -> Result<()> {
-        let plain = match std::mem::replace(self, Stream::Poisoned) {
-            Stream::Plain(s) => s,
-            // Restore and bail: nothing to upgrade.
-            other => {
-                *self = other;
-                return Err(Error::BadResponse(
-                    "imap: STARTTLS requested on a non-plaintext connection".into(),
-                ));
-            }
-        };
-        let tls = connect_over(plain, host)?;
-        *self = Stream::Tls(Box::new(tls));
-        Ok(())
-    }
-}
+/// Read+Write transport, either plain TCP or TLS-wrapped, with in-place
+/// STARTTLS upgrade — the shared transport enum (see
+/// [`crate::net::MaybeTlsStream`]).
+use crate::net::MaybeTlsStream as Stream;
 
 fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
     let mut buf = LineReader::new();
@@ -179,7 +113,7 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
         // trust them post-TLS. (Shared guard; `is_clear()` is the buffer state.)
         reject_pipelined_plaintext("imap", buf.is_clear())?;
         // Tagged OK means the server is ready; everything after is TLS.
-        sock.start_tls(&url.host)?;
+        sock.upgrade(&url.host)?;
         // RFC 2595: discard the pre-TLS capability list and re-probe, since
         // capabilities (e.g. LOGINDISABLED, AUTH=*) commonly change post-TLS.
         caps = request_capability(&mut sock, &mut buf, &mut tagger)?;
@@ -855,6 +789,7 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     // -- string quoting ----------------------------------------------------
 

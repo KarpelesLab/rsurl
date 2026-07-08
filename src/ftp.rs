@@ -28,39 +28,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 use crate::error::{Error, Result};
 use crate::net::{NetConfig, NetStream};
-use crate::tls::TlsStream;
 use crate::url::Url;
 
 /// A duplex byte stream that's either a plain (possibly proxied) socket or a
-/// TLS-wrapped one. Lets us drive the same FTP state machine over both schemes.
-enum Stream {
-    Plain(Box<dyn NetStream>),
-    Tls(Box<TlsStream<Box<dyn NetStream>>>),
-}
-
-impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.read(buf),
-            Stream::Tls(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for Stream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.write(buf),
-            Stream::Tls(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.flush(),
-            Stream::Tls(s) => s.flush(),
-        }
-    }
-}
+/// TLS-wrapped one — the shared transport enum. Lets us drive the same FTP
+/// state machine over both schemes. (FTPS is implicit here, so the transport's
+/// in-place upgrade is unused.)
+use crate::net::MaybeTlsStream as Stream;
 
 /// A logged-in FTP control channel, set to binary mode, ready for a transfer
 /// command. Carries the control connection's peer IP so the data connection

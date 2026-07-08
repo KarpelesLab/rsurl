@@ -89,3 +89,75 @@ impl NetStream for std::os::unix::net::UnixStream {
 // since `dyn NetStream: Read + Write`. The `NetStream` methods are reachable
 // on a `Box<dyn NetStream>` value through auto-deref, so no forwarding impl is
 // required here.
+
+/// A protocol transport that is either plaintext or TLS-wrapped, with support
+/// for an in-place STARTTLS-style upgrade. Shared by the line-oriented protocol
+/// backends (ftp, imap, smtp, pop3, ldap): modelling the transport as an enum
+/// (rather than a generic `S: Read + Write`) is what lets [`upgrade`] swap a
+/// `Plain` connection for a `Tls` one wrapping the very same socket in place.
+///
+/// `Tls` is boxed because the active TLS backend's stream is much larger than a
+/// bare `Box<dyn NetStream>`, and clippy flags the variant-size mismatch.
+///
+/// [`upgrade`]: MaybeTlsStream::upgrade
+pub(crate) enum MaybeTlsStream {
+    Plain(Box<dyn NetStream>),
+    Tls(Box<crate::tls::TlsStream<Box<dyn NetStream>>>),
+    /// Transient placeholder held only while [`upgrade`](MaybeTlsStream::upgrade)
+    /// moves the inner socket out to hand it to the TLS handshake; reads and
+    /// writes error out. In steady state a transport is only `Plain` or `Tls`.
+    Upgrading,
+}
+
+impl MaybeTlsStream {
+    /// True for a plaintext (non-TLS) transport.
+    pub(crate) fn is_plain(&self) -> bool {
+        matches!(self, Self::Plain(_))
+    }
+
+    /// Upgrade a plaintext transport to TLS in place (RFC 2595 / RFC 3207
+    /// STARTTLS), verifying `host` as the SNI / certificate name — exactly as an
+    /// implicit-TLS scheme does. Errors, leaving the transport unchanged, if it
+    /// is not currently plaintext.
+    pub(crate) fn upgrade(&mut self, host: &str) -> crate::error::Result<()> {
+        let plain = match std::mem::replace(self, Self::Upgrading) {
+            Self::Plain(s) => s,
+            other => {
+                *self = other;
+                return Err(crate::error::Error::BadResponse(
+                    "STARTTLS requested on a non-plaintext connection".into(),
+                ));
+            }
+        };
+        let tls = crate::tls::connect_over(plain, host)?;
+        *self = Self::Tls(Box::new(tls));
+        Ok(())
+    }
+}
+
+impl Read for MaybeTlsStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+            Self::Upgrading => Err(io::Error::other("tls upgrade in progress")),
+        }
+    }
+}
+
+impl Write for MaybeTlsStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+            Self::Upgrading => Err(io::Error::other("tls upgrade in progress")),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+            Self::Upgrading => Err(io::Error::other("tls upgrade in progress")),
+        }
+    }
+}

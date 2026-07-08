@@ -18,8 +18,8 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::net::{NetConfig, NetStream};
-use crate::tls::{connect_over, TlsStream};
+use crate::net::NetConfig;
+use crate::tls::connect_over;
 use crate::url::Url;
 
 // =============================================================================
@@ -800,36 +800,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 /// 64 MiB matches the crate's other body caps (e.g. `rtsp`, `websocket`).
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Wrap a Read+Write transport so we can hold either a raw TCP stream or a
-/// TLS-wrapped one behind the same code path.
-enum Transport {
-    Plain(Box<dyn NetStream>),
-    Tls(Box<TlsStream<Box<dyn NetStream>>>),
-}
-
-impl Read for Transport {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Transport::Plain(s) => s.read(buf),
-            Transport::Tls(s) => s.read(buf),
-        }
-    }
-}
-
-impl Write for Transport {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Transport::Plain(s) => s.write(buf),
-            Transport::Tls(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Transport::Plain(s) => s.flush(),
-            Transport::Tls(s) => s.flush(),
-        }
-    }
-}
+/// Hold either a raw TCP stream or a TLS-wrapped one behind the same code path
+/// — the shared transport enum. (LDAPS is implicit here, so the in-place
+/// upgrade is unused.)
+use crate::net::MaybeTlsStream as Transport;
 
 /// Read exactly one LDAP message off the wire and return its contents as a
 /// new Vec (the SEQUENCE body bytes — i.e. messageID, protocolOp, [controls]).

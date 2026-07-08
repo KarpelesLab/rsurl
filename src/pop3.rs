@@ -7,11 +7,10 @@
 //! For POP3S, connect with TLS from the start via
 //! [`crate::tls::connect_over`].
 
-use crate::net::NetStream;
 use std::io::{BufRead, BufReader, Read, Write};
 
 use crate::error::{Error, Result};
-use crate::tls::{connect_over, reject_pipelined_plaintext, TlsStream};
+use crate::tls::{connect_over, reject_pipelined_plaintext};
 use crate::url::Url;
 
 /// Upper bound on a multi-line POP3 response body (LIST output or a RETR'd
@@ -107,19 +106,8 @@ fn try_stls(io: &mut BufReader<IoAdapter>, host: &str) -> Result<bool> {
     if !stls_negotiate(io)? {
         return Ok(false);
     }
-    // Upgrade the transport in place: pull the plain stream out of the
-    // BufReader, wrap it in TLS, and swap the BufReader's inner stream.
-    let plain = match std::mem::replace(io.get_mut(), IoAdapter::Poisoned) {
-        IoAdapter::Plain(s) => s,
-        other => {
-            *io.get_mut() = other;
-            return Err(Error::BadResponse(
-                "pop3: STLS on non-plaintext connection".into(),
-            ));
-        }
-    };
-    let tls = connect_over(plain, host)?;
-    *io.get_mut() = IoAdapter::Tls(Box::new(tls));
+    // Upgrade the BufReader's inner transport to TLS in place.
+    io.get_mut().upgrade(host)?;
     Ok(true)
 }
 
@@ -202,46 +190,9 @@ fn un_dot_stuff(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Read+Write transport, either plain or TLS-wrapped. Enum keeps the rest
-/// of the protocol code monomorphic and lets us treat both legs the same.
-/// `Tls` is boxed because the active TLS backend can be either purecrypto
-/// (small) or rustls (~1 KiB), and clippy flags the resulting variant-size
-/// mismatch against the bare `TcpStream` arm.
-enum IoAdapter {
-    Plain(Box<dyn NetStream>),
-    Tls(Box<TlsStream<Box<dyn NetStream>>>),
-    /// Transient state only ever observed inside [`try_stls`] while the inner
-    /// stream is moved out to hand it to the TLS handshake (mirrors
-    /// `imap::Stream::Poisoned`).
-    Poisoned,
-}
-
-impl Read for IoAdapter {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            IoAdapter::Plain(s) => s.read(buf),
-            IoAdapter::Tls(s) => s.read(buf),
-            IoAdapter::Poisoned => Err(std::io::Error::other("pop3: stream poisoned")),
-        }
-    }
-}
-
-impl Write for IoAdapter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            IoAdapter::Plain(s) => s.write(buf),
-            IoAdapter::Tls(s) => s.write(buf),
-            IoAdapter::Poisoned => Err(std::io::Error::other("pop3: stream poisoned")),
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            IoAdapter::Plain(s) => s.flush(),
-            IoAdapter::Tls(s) => s.flush(),
-            IoAdapter::Poisoned => Err(std::io::Error::other("pop3: stream poisoned")),
-        }
-    }
-}
+/// Read+Write transport, either plain or TLS-wrapped, with in-place STLS
+/// upgrade — the shared transport enum (see [`crate::net::MaybeTlsStream`]).
+use crate::net::MaybeTlsStream as IoAdapter;
 
 /// Buffered POP3 conversation. Wraps a transport in a `BufReader` so we can
 /// pull whole CRLF-terminated lines without an extra allocation per byte.

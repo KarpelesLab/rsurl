@@ -8,11 +8,12 @@
 //! from `-T file` or `-d` (curl's model). This is a deliberately small subset:
 //! EHLO, optional STARTTLS, optional AUTH PLAIN/LOGIN, then MAIL/RCPT/DATA.
 
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 
 use crate::error::{Error, Result};
-use crate::net::{NetConfig, NetStream};
-use crate::tls::{connect_over, reject_pipelined_plaintext, TlsStream};
+use crate::net::NetConfig;
+use crate::net::MaybeTlsStream as Stream;
+use crate::tls::{connect_over, reject_pipelined_plaintext};
 use crate::url::Url;
 use crate::websocket::base64_encode;
 
@@ -22,36 +23,6 @@ pub struct SmtpOptions<'a> {
     pub rcpts: &'a [String],
     pub user: Option<&'a str>,
     pub pass: Option<&'a str>,
-}
-
-/// Read+Write transport, plain or TLS, with in-place STARTTLS upgrade
-/// (mirrors `imap::Stream`).
-enum Stream {
-    Plain(Box<dyn NetStream>),
-    Tls(Box<TlsStream<Box<dyn NetStream>>>),
-}
-
-impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.read(buf),
-            Stream::Tls(s) => s.read(buf),
-        }
-    }
-}
-impl Write for Stream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Stream::Plain(s) => s.write(buf),
-            Stream::Tls(s) => s.write(buf),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Stream::Plain(s) => s.flush(),
-            Stream::Tls(s) => s.flush(),
-        }
-    }
 }
 
 /// Reject CR/LF/NUL and other control bytes in a URL/envelope-derived value so
@@ -317,6 +288,7 @@ fn dot_stuff(body: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
 
     #[test]
     fn dot_stuffing_and_crlf() {
