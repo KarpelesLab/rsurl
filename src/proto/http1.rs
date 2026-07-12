@@ -180,7 +180,7 @@ impl ClientExchange {
                     };
                     let head_bytes: Vec<u8> = self.rx.drain(..end).collect();
                     let head = parse_head(&head_bytes)?;
-                    let mode = body_mode(&self.method, &head)?;
+                    let mode = body_mode(&self.method, &head, self.streaming)?;
                     self.head = Some(head);
                     self.state = match mode {
                         BodyMode::None => self.finish(),
@@ -211,8 +211,11 @@ impl ClientExchange {
                     }
                 }
                 State::Eof => {
-                    // Accumulate; completion happens on handle_eof.
-                    if self.body_total + (self.rx.len() as u64) > MAX_BODY_BYTES as u64 {
+                    // Accumulate; completion happens on handle_eof. Streaming
+                    // drains `body` to the sink each batch (O(1) memory), so the
+                    // in-memory cap doesn't apply.
+                    if !self.streaming && self.body_total + (self.rx.len() as u64) > MAX_BODY_BYTES as u64
+                    {
                         return Err(Error::BadResponse("body too large".into()));
                     }
                     self.body_total += self.rx.len() as u64;
@@ -285,7 +288,9 @@ impl ClientExchange {
             };
             let line: Vec<u8> = self.rx.drain(..=nl).collect();
             let size = parse_chunk_size(&line)?;
-            if self.body_total.saturating_add(size) > MAX_BODY_BYTES as u64 {
+            // Streaming drains `body` to the sink each batch, so a large
+            // aggregate is fine there; buffered mode still caps memory.
+            if !self.streaming && self.body_total.saturating_add(size) > MAX_BODY_BYTES as u64 {
                 return Err(Error::BadResponse("body too large".into()));
             }
             if size == 0 {
@@ -439,8 +444,11 @@ fn parse_head(block: &[u8]) -> Result<Http1Head> {
 }
 
 /// Decide body framing from method + head, applying RFC 9110/9112 rules
-/// identically to [`crate::http`]'s `read_body`.
-fn body_mode(method: &str, head: &Http1Head) -> Result<BodyMode> {
+/// identically to [`crate::http`]'s `read_body`. `streaming` relaxes the
+/// [`MAX_BODY_BYTES`] up-front Content-Length cap: a streaming exchange drains
+/// the body to the caller's sink in O(1) memory, so the in-memory guard does
+/// not apply (matching `send_streaming`'s documented contract).
+fn body_mode(method: &str, head: &Http1Head, streaming: bool) -> Result<BodyMode> {
     let status = head.status;
     if method.eq_ignore_ascii_case("HEAD")
         || (100..200).contains(&status)
@@ -476,7 +484,7 @@ fn body_mode(method: &str, head: &Http1Head) -> Result<BodyMode> {
 
     match parse_content_length(headers)? {
         Some(len) => {
-            if len > MAX_BODY_BYTES as u64 {
+            if !streaming && len > MAX_BODY_BYTES as u64 {
                 return Err(Error::BadResponse(format!("body too large: {len}")));
             }
             Ok(BodyMode::Length(len))
@@ -569,6 +577,33 @@ mod tests {
         assert!(matches!(x.poll_event(), Some(Event::End)));
         assert!(x.poll_event().is_none());
         assert!(x.is_finished());
+    }
+
+    #[test]
+    fn streaming_accepts_content_length_over_buffered_cap() {
+        // Regression: `send_streaming` drains the body to the caller's sink in
+        // O(1) memory, so the buffered MAX_BODY_BYTES cap must NOT reject a
+        // Content-Length larger than it (this used to fail up front).
+        let huge = MAX_BODY_BYTES as u64 + 1;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {huge}\r\n\r\n");
+        let mut x = ClientExchange::new_streaming("GET", Vec::new());
+        x.handle_input(head.as_bytes())
+            .expect("streaming must not reject a large Content-Length");
+        assert!(matches!(x.poll_event(), Some(Event::Head(h)) if h.status == 200));
+        x.handle_input(b"abc").unwrap();
+        assert!(matches!(x.poll_event(), Some(Event::Body(b)) if b == b"abc"));
+        assert!(!x.is_finished());
+    }
+
+    #[test]
+    fn buffered_still_rejects_content_length_over_cap() {
+        // The buffered path accumulates the whole body in memory, so the cap
+        // must still fire there.
+        let huge = MAX_BODY_BYTES as u64 + 1;
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {huge}\r\n\r\n");
+        let mut x = ClientExchange::new("GET", Vec::new());
+        let err = x.handle_input(head.as_bytes());
+        assert!(matches!(err, Err(Error::BadResponse(m)) if m.contains("body too large")));
     }
 
     #[test]
