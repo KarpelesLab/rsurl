@@ -257,10 +257,19 @@ impl PeerSettings {
 /// Hard cap on either window: RFC 9113 §6.9.1.
 const WINDOW_MAX: i64 = 0x7fff_ffff;
 
-/// Our advertised receive window for new streams. We don't currently send
-/// `SETTINGS_INITIAL_WINDOW_SIZE`, so the peer sees the RFC default of 65,535;
-/// keep this value in sync with whatever we advertise.
+/// The RFC 9113 §6.9.2 default flow-control window: the connection receive
+/// window starts here before we raise it with a `WINDOW_UPDATE`, and it is the
+/// per-stream default a peer assumes until our `SETTINGS_INITIAL_WINDOW_SIZE`
+/// arrives.
 const OUR_INITIAL_WINDOW: i64 = 65_535;
+
+/// Default receive window (connection and per-stream) we advertise, unless the
+/// caller overrides it via [`crate::Request::recv_window`]. The RFC default of
+/// 64 KiB caps throughput at `window / RTT` (~0.6 MB/s at 100 ms) because the
+/// peer can never have more than one window in flight; 8 MiB lifts that ceiling
+/// to ~80 MB/s at the same RTT while bounding per-stream buffering. curl/nghttp2
+/// use comparable multi-MiB defaults.
+pub(crate) const DEFAULT_RECV_WINDOW: u32 = 8 * 1024 * 1024;
 
 /// Connection-level outbound flow-control window: how many DATA bytes we are
 /// still allowed to send across *any* stream on this connection before the
@@ -370,10 +379,13 @@ struct ConnRecvWindow {
 }
 
 impl ConnRecvWindow {
-    fn new() -> Self {
+    /// `initial` is the window we advertise (RFC default raised by the
+    /// `WINDOW_UPDATE` [`Connection::new`] sends on stream 0); `replenish` tops
+    /// back up to it.
+    fn new(initial: i64) -> Self {
         ConnRecvWindow {
-            available: OUR_INITIAL_WINDOW,
-            initial: OUR_INITIAL_WINDOW,
+            available: initial,
+            initial,
         }
     }
 
@@ -404,10 +416,12 @@ struct StreamRecvWindow {
 }
 
 impl StreamRecvWindow {
-    fn new() -> Self {
+    /// `initial` is the per-stream window we advertise via
+    /// `SETTINGS_INITIAL_WINDOW_SIZE`; new streams open at it.
+    fn new(initial: i64) -> Self {
         StreamRecvWindow {
-            available: OUR_INITIAL_WINDOW,
-            initial: OUR_INITIAL_WINDOW,
+            available: initial,
+            initial,
         }
     }
 
@@ -1559,12 +1573,12 @@ struct PendingBody {
 }
 
 impl Stream {
-    fn new(id: u32, initial_peer_window: i64) -> Self {
+    fn new(id: u32, initial_peer_window: i64, our_recv_window: i64) -> Self {
         Stream {
             id,
             state: StreamState::Idle,
             send_window: StreamSendWindow::new(initial_peer_window),
-            recv_window: StreamRecvWindow::new(),
+            recv_window: StreamRecvWindow::new(our_recv_window),
             headers_buf: Vec::new(),
             response_headers: None,
             body: Vec::new(),
@@ -1619,6 +1633,9 @@ struct Connection<S: Read + Write> {
     peer: PeerSettings,
     conn_send_window: ConnSendWindow,
     conn_recv_window: ConnRecvWindow,
+    /// The receive window (bytes) we advertise per stream via
+    /// `SETTINGS_INITIAL_WINDOW_SIZE`; new streams open their recv window here.
+    our_recv_window: i64,
     decoder: Decoder,
     encoder: Encoder,
     streams: HashMap<u32, Stream>,
@@ -1749,13 +1766,21 @@ enum DispatchOutcome {
 impl<S: Read + Write> Connection<S> {
     /// Construct a `Connection` from an already-handshaken transport and send
     /// the client preface + initial SETTINGS frame. We advertise
-    /// `ENABLE_PUSH=0` so the server won't send PUSH_PROMISE frames (we
-    /// don't implement them); other parameters stay at RFC defaults.
-    fn new(mut tls: S) -> Result<Self> {
+    /// `ENABLE_PUSH=0` (no PUSH_PROMISE — we don't implement it) and
+    /// `SETTINGS_INITIAL_WINDOW_SIZE=recv_window` to raise the per-stream
+    /// receive window, then a `WINDOW_UPDATE` on stream 0 to raise the
+    /// connection receive window to the same size (SETTINGS does not affect the
+    /// connection window). `recv_window` is clamped to a sane
+    /// `[64 KiB, 2^31-1]` range. See [`DEFAULT_RECV_WINDOW`] for why the RFC
+    /// default is too small for high-bandwidth-delay links.
+    fn new(mut tls: S, recv_window: u32) -> Result<Self> {
+        let recv_window = recv_window.clamp(OUR_INITIAL_WINDOW as u32, INITIAL_WINDOW_SIZE_MAX);
         tls.write_all(PREFACE)?;
-        let mut settings_payload = Vec::with_capacity(6);
+        let mut settings_payload = Vec::with_capacity(12);
         settings_payload.extend_from_slice(&S_ENABLE_PUSH.to_be_bytes());
         settings_payload.extend_from_slice(&0u32.to_be_bytes());
+        settings_payload.extend_from_slice(&S_INITIAL_WINDOW_SIZE.to_be_bytes());
+        settings_payload.extend_from_slice(&recv_window.to_be_bytes());
         let our_settings = Frame {
             typ: F_SETTINGS,
             flags: 0,
@@ -1763,12 +1788,21 @@ impl<S: Read + Write> Connection<S> {
             payload: settings_payload,
         };
         write_frame(&mut tls, &our_settings)?;
+        // Raise the connection-level receive window from the RFC default to
+        // `recv_window` with a stream-0 WINDOW_UPDATE (SETTINGS_INITIAL_WINDOW
+        // covers streams only). Skip it when the caller asked for exactly the
+        // default, since a zero increment is a protocol error.
+        let conn_bump = recv_window - OUR_INITIAL_WINDOW as u32;
+        if conn_bump > 0 {
+            write_frame(&mut tls, &window_update_frame(0, conn_bump))?;
+        }
         tls.flush()?;
         Ok(Connection {
             tls,
             peer: PeerSettings::default(),
             conn_send_window: ConnSendWindow::new(),
-            conn_recv_window: ConnRecvWindow::new(),
+            conn_recv_window: ConnRecvWindow::new(recv_window as i64),
+            our_recv_window: recv_window as i64,
             decoder: Decoder::new(),
             encoder: Encoder::new(),
             streams: HashMap::new(),
@@ -1860,8 +1894,14 @@ impl<S: Read + Write> Connection<S> {
         }
         let id = self.next_stream_id;
         self.next_stream_id = self.next_stream_id.saturating_add(2);
-        self.streams
-            .insert(id, Stream::new(id, self.peer.initial_window_size as i64));
+        self.streams.insert(
+            id,
+            Stream::new(
+                id,
+                self.peer.initial_window_size as i64,
+                self.our_recv_window,
+            ),
+        );
         Ok(id)
     }
 
@@ -3235,7 +3275,7 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
     }
     let _ = writeln!(trace, "* using HTTP/2");
     let tls_info = crate::http::tls_info_from(&tls);
-    let mut conn = Connection::new(tls)?;
+    let mut conn = Connection::new(tls, req.h2_recv_window)?;
     conn.tls_info = Some(tls_info);
     conn.dial_timing = crate::http::Timing {
         namelookup,
@@ -4761,25 +4801,25 @@ mod tests {
     }
 
     #[test]
-    fn recv_window_defaults_match_rfc() {
-        let c = ConnRecvWindow::new();
+    fn recv_window_new_sets_available_and_initial() {
+        let c = ConnRecvWindow::new(OUR_INITIAL_WINDOW);
         assert_eq!(c.available, OUR_INITIAL_WINDOW);
         assert_eq!(c.initial, OUR_INITIAL_WINDOW);
-        let s = StreamRecvWindow::new();
-        assert_eq!(s.available, OUR_INITIAL_WINDOW);
-        assert_eq!(s.initial, OUR_INITIAL_WINDOW);
+        let s = StreamRecvWindow::new(DEFAULT_RECV_WINDOW as i64);
+        assert_eq!(s.available, DEFAULT_RECV_WINDOW as i64);
+        assert_eq!(s.initial, DEFAULT_RECV_WINDOW as i64);
     }
 
     #[test]
     fn recv_window_no_replenish_above_half() {
         // Consume slightly less than half the initial window — no
         // WINDOW_UPDATE should be produced.
-        let mut c = ConnRecvWindow::new();
+        let mut c = ConnRecvWindow::new(OUR_INITIAL_WINDOW);
         c.consume(1000);
         assert!(c.replenish().is_none());
         assert_eq!(c.available, OUR_INITIAL_WINDOW - 1000);
 
-        let mut s = StreamRecvWindow::new();
+        let mut s = StreamRecvWindow::new(OUR_INITIAL_WINDOW);
         s.consume(1000);
         assert!(s.replenish(1).is_none());
         assert_eq!(s.available, OUR_INITIAL_WINDOW - 1000);
@@ -4790,7 +4830,7 @@ mod tests {
         // Two DATA-sized consumes (20_000 each) bring the window to 25_535 —
         // below the 32_767 threshold. Replenish must emit one WINDOW_UPDATE
         // restoring the running window to `initial`.
-        let mut c = ConnRecvWindow::new();
+        let mut c = ConnRecvWindow::new(OUR_INITIAL_WINDOW);
         c.consume(20_000);
         c.consume(20_000);
         assert_eq!(c.available, 25_535);
@@ -4803,7 +4843,7 @@ mod tests {
         // Idempotent: subsequent replenish at full is a no-op.
         assert!(c.replenish().is_none());
 
-        let mut s = StreamRecvWindow::new();
+        let mut s = StreamRecvWindow::new(OUR_INITIAL_WINDOW);
         s.consume(40_000);
         let f = s.replenish(7).expect("stream window expected replenish");
         assert_eq!(f.typ, F_WINDOW_UPDATE);
@@ -4811,6 +4851,50 @@ mod tests {
         let inc = parse_window_update(&f.payload).unwrap();
         assert_eq!(inc, 40_000);
         assert_eq!(s.available, OUR_INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn new_advertises_recv_window_and_bumps_conn_window() {
+        // Bug fix: the client must raise both receive windows above the 64 KiB
+        // RFC default, else h2 download throughput is capped at window/RTT.
+        let recv = 8 * 1024 * 1024u32;
+        let conn = Connection::new(FakeTls::new(), recv).unwrap();
+        let out = conn.tls.wire_out.clone();
+        assert!(out.starts_with(PREFACE), "client preface comes first");
+        let mut cur = Cursor::new(out[PREFACE.len()..].to_vec());
+
+        // SETTINGS carries SETTINGS_INITIAL_WINDOW_SIZE = recv (per stream).
+        let settings = read_frame(&mut cur).unwrap();
+        assert_eq!(settings.typ, F_SETTINGS);
+        let iws = settings
+            .payload
+            .chunks_exact(6)
+            .find(|c| u16::from_be_bytes([c[0], c[1]]) == S_INITIAL_WINDOW_SIZE)
+            .map(|c| u32::from_be_bytes([c[2], c[3], c[4], c[5]]));
+        assert_eq!(iws, Some(recv));
+
+        // A stream-0 WINDOW_UPDATE raises the connection window to the same size.
+        let wu = read_frame(&mut cur).unwrap();
+        assert_eq!(wu.typ, F_WINDOW_UPDATE);
+        assert_eq!(wu.stream_id, 0);
+        assert_eq!(
+            parse_window_update(&wu.payload).unwrap(),
+            recv - OUR_INITIAL_WINDOW as u32
+        );
+
+        // Post-state windows reflect the advertised size.
+        assert_eq!(conn.conn_recv_window.available, recv as i64);
+        assert_eq!(conn.our_recv_window, recv as i64);
+    }
+
+    #[test]
+    fn new_at_rfc_default_emits_no_conn_window_update() {
+        // A recv window equal to the RFC default means a zero connection bump,
+        // which is a protocol error — so no WINDOW_UPDATE must be sent.
+        let conn = Connection::new(FakeTls::new(), OUR_INITIAL_WINDOW as u32).unwrap();
+        let mut cur = Cursor::new(conn.tls.wire_out[PREFACE.len()..].to_vec());
+        assert_eq!(read_frame(&mut cur).unwrap().typ, F_SETTINGS);
+        assert!(read_frame(&mut cur).is_err(), "no frame after SETTINGS");
     }
 
     #[test]
@@ -5060,7 +5144,8 @@ mod tests {
             tls: FakeTls::new(),
             peer: PeerSettings::default(),
             conn_send_window: ConnSendWindow::new(),
-            conn_recv_window: ConnRecvWindow::new(),
+            conn_recv_window: ConnRecvWindow::new(OUR_INITIAL_WINDOW),
+            our_recv_window: OUR_INITIAL_WINDOW,
             decoder: Decoder::new(),
             encoder: Encoder::new(),
             streams: HashMap::new(),

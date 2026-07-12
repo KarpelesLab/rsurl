@@ -179,6 +179,11 @@ pub struct Request {
     /// that wants to run its own content-coding policy sees exactly what the
     /// server sent. See [`Request::decompress`].
     pub(crate) decompress: bool,
+    /// HTTP/2 receive-window size (bytes) advertised for this connection's
+    /// streams and connection window. Larger windows lift the `window / RTT`
+    /// throughput ceiling on high-latency links. Defaults to
+    /// [`crate::http2::DEFAULT_RECV_WINDOW`]; set via [`Request::recv_window`].
+    pub(crate) h2_recv_window: u32,
 }
 
 /// Address-family preference for connecting (curl `-4`/`-6`).
@@ -311,6 +316,7 @@ impl Request {
             proxy_resolver: None,
             priority: Priority::Normal,
             decompress: true,
+            h2_recv_window: crate::http2::DEFAULT_RECV_WINDOW,
         })
     }
 
@@ -318,6 +324,19 @@ impl Request {
     /// priority requests are issued (HEADERS on the wire) first.
     pub fn priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
+        self
+    }
+
+    /// Set the HTTP/2 receive-window size (bytes) this connection advertises,
+    /// both per stream (`SETTINGS_INITIAL_WINDOW_SIZE`) and for the connection
+    /// window. The RFC default of 64 KiB caps download throughput at
+    /// `window / RTT` — ~0.6 MB/s at 100 ms — because the server can never have
+    /// more than one window in flight; the default here is a few MiB. Raise it
+    /// for high-bandwidth-delay links; it costs at most `bytes` of buffering per
+    /// active stream (none for a `send_streaming` sink, which drains on
+    /// arrival). Clamped to `[64 KiB, 2 GiB)`. No effect on HTTP/1.1 or /3.
+    pub fn recv_window(mut self, bytes: u32) -> Self {
+        self.h2_recv_window = bytes;
         self
     }
 
