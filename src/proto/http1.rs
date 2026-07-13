@@ -214,7 +214,8 @@ impl ClientExchange {
                     // Accumulate; completion happens on handle_eof. Streaming
                     // drains `body` to the sink each batch (O(1) memory), so the
                     // in-memory cap doesn't apply.
-                    if !self.streaming && self.body_total + (self.rx.len() as u64) > MAX_BODY_BYTES as u64
+                    if !self.streaming
+                        && self.body_total + (self.rx.len() as u64) > MAX_BODY_BYTES as u64
                     {
                         return Err(Error::BadResponse("body too large".into()));
                     }

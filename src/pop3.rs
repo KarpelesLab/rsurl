@@ -142,7 +142,6 @@ enum Action {
     Retr(u32),
 }
 
-
 /// Reject a URL-derived string containing CR, LF, NUL, or any other ASCII
 /// control byte before it's interpolated into a POP3 command. `what` names the
 /// field for the error message.

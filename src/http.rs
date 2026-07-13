@@ -2106,7 +2106,11 @@ fn redirect_request(
         return Err(Error::UnsupportedScheme(next_url.scheme.clone()));
     }
     next_url.set_idn(req.idn)?;
-    let _ = writeln!(trace, "* Following redirect to {}", url_to_string(&next_url));
+    let _ = writeln!(
+        trace,
+        "* Following redirect to {}",
+        url_to_string(&next_url)
+    );
     let host_changed = next_url.host != req.url.host
         || next_url.port != req.url.port
         || next_url.scheme != req.url.scheme;

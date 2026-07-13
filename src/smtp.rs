@@ -11,8 +11,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 
 use crate::error::{Error, Result};
-use crate::net::NetConfig;
 use crate::net::MaybeTlsStream as Stream;
+use crate::net::NetConfig;
 use crate::tls::{connect_over, reject_pipelined_plaintext};
 use crate::url::Url;
 use crate::websocket::base64_encode;
