@@ -77,14 +77,16 @@ const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// back before inflating (§7.2.2).
 const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
 
-const OPCODE_CONT: u8 = 0x0;
-const OPCODE_TEXT: u8 = 0x1;
-const OPCODE_BINARY: u8 = 0x2;
-const OPCODE_CLOSE: u8 = 0x8;
-const OPCODE_PING: u8 = 0x9;
-const OPCODE_PONG: u8 = 0xA;
+// Frame opcodes and size caps. `pub(crate)` so the async WebSocket in
+// `crate::aio` can share this codec instead of duplicating it.
+pub(crate) const OPCODE_CONT: u8 = 0x0;
+pub(crate) const OPCODE_TEXT: u8 = 0x1;
+pub(crate) const OPCODE_BINARY: u8 = 0x2;
+pub(crate) const OPCODE_CLOSE: u8 = 0x8;
+pub(crate) const OPCODE_PING: u8 = 0x9;
+pub(crate) const OPCODE_PONG: u8 = 0xA;
 
-const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Wall-clock budget for reading the *entire* HTTP/1.1 upgrade-handshake
 /// response header. The per-`read` socket timeout (`set_read_timeout`, ~60 s)
@@ -1776,7 +1778,7 @@ fn accumulate(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
 /// Validate an incoming control frame (opcode ≥ 0x8): RSV1 clear, not
 /// fragmented, payload ≤ 125 bytes (RFC 6455 §5.4/§5.5). Mirrors the inline
 /// checks in [`read_message`]; both must stay in agreement.
-fn validate_control_frame(frame: &Frame) -> Result<()> {
+pub(crate) fn validate_control_frame(frame: &Frame) -> Result<()> {
     if frame.rsv1 {
         return Err(Error::BadResponse("RSV1 set on a WS control frame".into()));
     }
@@ -1798,7 +1800,7 @@ fn validate_control_frame(frame: &Frame) -> Result<()> {
 /// big-endian status code optionally followed by a UTF-8 reason. An empty
 /// payload (no code) yields `None`; a 1-byte payload is malformed and also
 /// yields `None` rather than erroring (we are closing regardless).
-fn parse_close_payload(payload: &[u8]) -> Option<WsClose> {
+pub(crate) fn parse_close_payload(payload: &[u8]) -> Option<WsClose> {
     if payload.len() < 2 {
         return None;
     }
@@ -1915,29 +1917,29 @@ fn read_data_and_close<S: Read + Write>(stream: &mut S, pmd: Option<&mut Pmd>) -
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Frame {
-    fin: bool,
+pub(crate) struct Frame {
+    pub(crate) fin: bool,
     /// RSV1 bit. For data messages this signals a permessage-deflate
     /// compressed payload (RFC 7692 §7.2.2) when set on the first frame.
-    rsv1: bool,
-    opcode: u8,
-    payload: Vec<u8>,
+    pub(crate) rsv1: bool,
+    pub(crate) opcode: u8,
+    pub(crate) payload: Vec<u8>,
 }
 
-/// Parse a single frame off the wire. Server-to-client frames must NOT be
-/// masked per RFC 6455 §5.1; a masked frame is rejected as a protocol error.
+/// Try to parse one frame off the front of `buf` without consuming it.
 ///
-/// RSV2 and RSV3 are always rejected (no extension that uses them is
-/// negotiated). RSV1 is surfaced via [`Frame::rsv1`]; whether it is legal
-/// depends on context (permessage-deflate negotiation + frame type), which is
-/// enforced by the caller in `read_message`.
-fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
-    // All wire bytes land in `rx` first and are only drained once a full frame
-    // is parsed, so a read error part-way through a frame leaves `rx` intact and
-    // the next call resumes from the same offset (no desync on a read timeout).
-    fill_to(stream, rx, 2)?;
-    let h0 = rx[0];
-    let h1 = rx[1];
+/// Returns `Ok(Some((frame, consumed)))` when a whole frame is present (the
+/// caller drops `consumed` bytes), `Ok(None)` when more bytes are needed, and
+/// `Err` on a protocol violation (masked server frame, reserved bits, oversize).
+/// This is the pure, buffer-only core shared by the blocking [`read_frame`] and
+/// the async WebSocket in `crate::aio`; keeping one parser means the two paths
+/// cannot diverge. Server-to-client frames must NOT be masked (RFC 6455 §5.1).
+pub(crate) fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let h0 = buf[0];
+    let h1 = buf[1];
     let fin = (h0 & 0x80) != 0;
     let rsv1 = (h0 & 0x40) != 0;
     // RSV2/RSV3 must always be zero — no extension using them is negotiated.
@@ -1957,24 +1959,25 @@ fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
     let payload_len: u64 = match len7 {
         0..=125 => len7 as u64,
         126 => {
-            fill_to(stream, rx, pos + 2)?;
-            let v = u16::from_be_bytes([rx[pos], rx[pos + 1]]) as u64;
+            if buf.len() < pos + 2 {
+                return Ok(None);
+            }
+            let v = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as u64;
             pos += 2;
             v
         }
         127 => {
-            fill_to(stream, rx, pos + 8)?;
-            let v = u64::from_be_bytes(rx[pos..pos + 8].try_into().unwrap());
+            if buf.len() < pos + 8 {
+                return Ok(None);
+            }
+            let v = u64::from_be_bytes(buf[pos..pos + 8].try_into().unwrap());
             pos += 8;
             v
         }
         _ => unreachable!(),
     };
-    // Control frames (opcode >= 0x8) carry at most 125 bytes (RFC 6455 §5.5).
-    // Enforce that here, before the payload is buffered, so a PING/PONG/CLOSE
-    // declaring a huge length is rejected without first allocating up to
-    // MAX_PAYLOAD_BYTES (64 MiB). The same rule is re-checked by the caller via
-    // `validate_control_frame`; this is the early, allocation-bounding guard.
+    // Control frames (opcode >= 0x8) carry at most 125 bytes (RFC 6455 §5.5);
+    // reject an oversize declaration before allocating up to MAX_PAYLOAD_BYTES.
     if opcode >= 0x8 && payload_len > MAX_CONTROL_PAYLOAD as u64 {
         return Err(Error::BadResponse(format!(
             "control frame payload too large: {payload_len} bytes (max {MAX_CONTROL_PAYLOAD})"
@@ -1986,37 +1989,53 @@ fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
         )));
     }
     let plen = payload_len as usize;
-    fill_to(stream, rx, pos + plen)?;
-    let payload = rx[pos..pos + plen].to_vec();
+    if buf.len() < pos + plen {
+        return Ok(None);
+    }
+    let payload = buf[pos..pos + plen].to_vec();
     pos += plen;
-    rx.drain(..pos); // consume only now that the whole frame is in hand
-    Ok(Frame {
-        fin,
-        rsv1,
-        opcode,
-        payload,
-    })
+    Ok(Some((
+        Frame {
+            fin,
+            rsv1,
+            opcode,
+            payload,
+        },
+        pos,
+    )))
 }
 
-/// Read from `stream` into `rx` until it holds at least `need` bytes. On a read
-/// error (e.g. a timeout) `rx` keeps everything read so far, so a retry resumes
-/// without losing already-consumed wire bytes.
-fn fill_to<S: Read>(stream: &mut S, rx: &mut Vec<u8>, need: usize) -> Result<()> {
+/// Parse a single frame off the wire. Server-to-client frames must NOT be
+/// masked per RFC 6455 §5.1; a masked frame is rejected as a protocol error.
+///
+/// RSV2 and RSV3 are always rejected (no extension that uses them is
+/// negotiated). RSV1 is surfaced via [`Frame::rsv1`]; whether it is legal
+/// depends on context (permessage-deflate negotiation + frame type), which is
+/// enforced by the caller in `read_message`.
+fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
+    // All wire bytes land in `rx` first and are only drained once a full frame
+    // is parsed (by `try_parse_frame`), so a read error part-way through a frame
+    // leaves `rx` intact and the next call resumes from the same offset (no
+    // desync on a read timeout).
     let mut tmp = [0u8; 16 * 1024];
-    while rx.len() < need {
+    loop {
+        if let Some((frame, consumed)) = try_parse_frame(rx)? {
+            rx.drain(..consumed);
+            return Ok(frame);
+        }
+        // Not a whole frame yet — pull more wire bytes and retry.
         let n = stream.read(&mut tmp)?;
         if n == 0 {
             return Err(Error::UnexpectedEof);
         }
         rx.extend_from_slice(&tmp[..n]);
     }
-    Ok(())
 }
 
 /// Build an unfragmented client-to-server frame with the given opcode and
 /// payload. Client frames must be masked (RFC 6455 §5.3), and the mask must
 /// be unpredictable, so this fails if no secure entropy source is available.
-fn build_client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn build_client_frame(opcode: u8, payload: &[u8]) -> Result<Vec<u8>> {
     build_client_frame_inner(true, opcode, payload, false)
 }
 
@@ -2061,7 +2080,7 @@ fn build_client_frame_inner(fin: bool, opcode: u8, payload: &[u8], rsv1: bool) -
 
 /// `base64(sha1(key + WS_GUID))`. Used by both sides of the handshake to
 /// prove the response was generated specifically for this request.
-fn derive_accept(key_b64: &str) -> String {
+pub(crate) fn derive_accept(key_b64: &str) -> String {
     let mut h = Sha1::new();
     h.update(key_b64.as_bytes());
     h.update(WS_GUID.as_bytes());
@@ -2078,7 +2097,7 @@ fn derive_accept(key_b64: &str) -> String {
 /// a connection error rather than either crashing the process or — worse —
 /// falling back to predictable time/PID entropy: a guessable mask weakens the
 /// masking the spec relies on, so failing closed is the secure choice.
-fn random_16() -> Result<[u8; 16]> {
+pub(crate) fn random_16() -> Result<[u8; 16]> {
     use purecrypto::rng::{OsRng, RngCore};
     let mut out = [0u8; 16];
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

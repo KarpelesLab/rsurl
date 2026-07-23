@@ -83,7 +83,9 @@ serde_json = { version = "1", optional = true }
 # 0.6.8 adds the peer-certificate / close_notify accessors we use for HTTP/3
 # public-key pinning + SAN checks and TLS truncation detection; 0.6.14 lowers
 # the declared MSRV to 1.88 (matching this crate — see `rust-version` above).
-purecrypto = "0.6.17"
+# NATIVE-ONLY: purecrypto's `OsRng` is gated to std+unix/windows, so it does not
+# build on `wasm32-unknown-unknown`. Only the (wasm-gated) net/proto/tls stack
+# uses it, so it lives in the `cfg(not(wasm32))` target table below.
 # Embedded CA trust bundle (curated Mozilla-derived roots as static DER). The
 # purecrypto backend reaches it via `RootCertStore::with_embedded_roots()`;
 # the rustls backend needs the raw DER directly, so `cacrt` is pulled in as a
@@ -94,8 +96,8 @@ purecrypto = "0.6.17"
 cacrt = { version = "0.1", optional = true }
 # Zero out client private-key material (the `--key`/`--pass` bytes held in
 # `TlsOpts`) on drop, so a long-lived process doesn't leave decrypted key
-# bytes lingering in freed heap. Pure Rust, no C; always on (tiny crate).
-zeroize = "1"
+# bytes lingering in freed heap. Pure Rust, no C. NATIVE-ONLY (only the gated
+# TLS stack uses it) — see the `cfg(not(wasm32))` target table below.
 # rustls-tls backend. `ring` is selected explicitly so cross-platform builds
 # don't pull in cmake/nasm (which the default `aws-lc-rs` provider needs on
 # Windows). `tls12` is opt-in in rustls 0.23; we want it on for parity with
@@ -111,7 +113,8 @@ rustls-pemfile = { version = "2", optional = true }
 # needed here, so leave default features off and opt in to only what we use.
 # `qpack` (RFC 9204, pulls in `hpack`) is HTTP/3 header compression — the
 # encoder (Huffman + dynamic table) and decoder used by `crate::http3`.
-compcol = { version = "0.6.6", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
+# NATIVE-ONLY (the browser decompresses responses itself) — see the
+# `cfg(not(wasm32))` target table below.
 # Pure-Rust SSH stack (same lab, built on purecrypto) behind the `sftp://` and
 # `scp://` schemes. Optional, gated by the default-on `ssh` feature so HTTP-only
 # consumers can drop it entirely (`--no-default-features`). We take only the
@@ -130,8 +133,8 @@ puressh = { version = "0.0.6", optional = true, default-features = false, featur
 # false` so we use only psl2's `#![no_std]`, allocation-free `lookup` core: no
 # `idna`, no `alloc` convenience layer, and therefore no extra transitive deps.
 # The PSL data is embedded as pure-Rust tables, so the no-C-toolchain /
-# minimal-dependency guarantee stays intact.
-psl2 = { version = "0.1", default-features = false }
+# minimal-dependency guarantee stays intact. NATIVE-ONLY (cookies are
+# browser-managed on wasm) — see the `cfg(not(wasm32))` target table below.
 # IDN / UTS-46 host normalisation (Unicode → punycode), behind the `idn`
 # feature, via the first-party pure-Rust `intl` i18n crate (same lab). We take
 # only its `idna` feature (pulls `normalization` + `bidi` + the BMP property
@@ -147,6 +150,53 @@ intl = { version = "0.4.1", optional = true, default-features = false, features 
 # runtime-agnostic. `macros`/`rt` are needed so the adapter is usable (and
 # testable with `#[tokio::test]`) on its own.
 tokio = { version = "1", optional = true, default-features = false, features = ["net", "time", "io-util", "rt", "macros"] }
+
+# ── Native-only backends ─────────────────────────────────────────────────────
+# The pure-Rust crypto/compression/PSL stack rsurl's own net/proto/tls layer is
+# built on. None of it is reachable on `wasm32-unknown-unknown` (the browser
+# owns TLS, decompression, and cookie scoping), and `purecrypto` in particular
+# does not even compile there (its `OsRng` is std+unix/windows only). Keeping
+# these out of the wasm dependency graph is what lets the crate build for the
+# browser at all. All pure Rust, no C toolchain — see the per-crate notes above.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+purecrypto = "0.6.17"
+zeroize = "1"
+compcol = { version = "0.6.6", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
+psl2 = { version = "0.1", default-features = false }
+
+# ── Browser (wasm32) backend ────────────────────────────────────────────────
+# On `wasm32-unknown-unknown` rsurl cannot open sockets or run its own TLS/HTTP
+# stack — the browser does. The unified async API (`crate::aio`) therefore routes
+# HTTP through the Fetch API and WebSockets through the native `WebSocket`
+# object, via these bindings. Native builds never pull them in (the whole
+# `net`/`proto`/`tls` stack and every socket-bound protocol module is
+# `#[cfg(not(target_arch = "wasm32"))]` instead). All pure Rust, no C.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# The WebSocket receive bridge turns browser `onmessage` callbacks into an async
+# stream; `alloc`-only (no std) keeps these wasm-friendly. `futures-channel`
+# supplies the mpsc/oneshot the closures push into; `futures-util` supplies the
+# `StreamExt::next` the async `recv` awaits.
+# `std` is needed for `mpsc` (the message bridge); `wasm32-unknown-unknown` has
+# std, it just can't do blocking I/O — which the browser event loop never asks
+# of these channels.
+futures-channel = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "WorkerGlobalScope",
+    "Request",
+    "RequestInit",
+    "RequestRedirect",
+    "Response",
+    "Headers",
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "BinaryType",
+] }
 
 [dev-dependencies]
 # Used only by the WebSocket integration test's in-process echo server to

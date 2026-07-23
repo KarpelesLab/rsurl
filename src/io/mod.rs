@@ -18,6 +18,10 @@
 //! [`asyncio`].
 
 pub(crate) mod asyncio;
+// The async TLS duplex stream (persistent `wss://` transport) needs a TLS
+// backend to name its engine; without one there is nothing to wrap.
+#[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+pub(crate) mod asynctls;
 pub(crate) mod blocking;
 pub(crate) mod machine;
 pub(crate) mod runtime;

@@ -22,18 +22,64 @@
 //! resolved synchronously and each request uses a fresh `Connection: close`
 //! socket — connection pooling and streaming (non-buffered) bodies are part of
 //! the ongoing sans-IO cutover and are not yet wired on this async path.
+//!
+//! # On wasm32 (browser)
+//!
+//! `wasm32-unknown-unknown` has no sockets, no threads, and cannot block, so the
+//! native sans-IO/socket path above does not compile there. Instead this module
+//! routes [`request`] through the browser **Fetch API** and offers
+//! [`WebSocket`] over the browser's native `WebSocket` object. The [`Request`] /
+//! [`Response`] types and the `get`/`post`/`request` names are the same on both
+//! targets; the only signature difference is that the wasm entry points take no
+//! [`Runtime`] argument — the browser event loop *is* the runtime.
+//!
+//! Browser-imposed limits you inherit on wasm (none are rsurl bugs):
+//!   * **Forbidden request headers** — the browser silently drops `Host`,
+//!     `Connection`, `Content-Length`, and parts of `User-Agent`; rsurl does not
+//!     synthesise them (fetch sets them itself).
+//!   * **CORS** — cross-origin requests need server opt-in; a `no-cors` fetch
+//!     yields an opaque, unreadable response.
+//!   * **No TLS control**, **redirects/cookies are browser-managed**, and the
+//!     response body arrives already decompressed (its `Content-Encoding` is
+//!     stripped by the browser), so [`Request::decompress`] is a no-op here.
 
+// ─── Native (socket) backend ────────────────────────────────────────────────
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::{SocketAddr, ToSocketAddrs};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use crate::io::runtime::{AsyncConn, Runtime};
-#[cfg(feature = "tokio-rt")]
+#[cfg(all(feature = "tokio-rt", not(target_arch = "wasm32")))]
 pub use crate::io::tokio::TokioRuntime;
 
-use crate::error::{Error, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::io::asyncio;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::proto::http1::{ClientExchange, Event};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::proto::tls::TlsClient;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::error::Error;
+use crate::error::Result;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::url::Url;
+
+// ─── Browser (fetch / WebSocket) backend ────────────────────────────────────
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+#[cfg(target_arch = "wasm32")]
+pub use wasm::{WebSocket, WsSink, WsStream};
+
+// ─── Native async WebSocket ─────────────────────────────────────────────────
+// Same `WebSocket` name/surface as the wasm one, but generic over the runtime's
+// connection and taking a `Runtime` at connect (there is no implicit event loop
+// natively). The thread-split `WsReader`/`WsWriter` of the blocking API is not
+// mirrored here, so there is no `WsSink`/`WsStream` on this target.
+#[cfg(not(target_arch = "wasm32"))]
+mod ws;
+#[cfg(not(target_arch = "wasm32"))]
+pub use ws::WebSocket;
 
 /// A buffered HTTP response from [`get`].
 #[derive(Debug, Clone)]
@@ -133,16 +179,61 @@ impl Request {
     }
 }
 
+/// A message sent or received over an [`aio::WebSocket`](WebSocket): either a
+/// UTF-8 text frame or a binary frame. The async, cross-target analogue of
+/// [`crate::WsMessage`] (which is the native, blocking WebSocket's type).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsMessage {
+    /// A UTF-8 text message.
+    Text(String),
+    /// A binary message.
+    Binary(Vec<u8>),
+}
+
+impl WsMessage {
+    /// The message payload as bytes (the UTF-8 bytes for [`WsMessage::Text`]).
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            WsMessage::Text(s) => s.as_bytes(),
+            WsMessage::Binary(b) => b,
+        }
+    }
+
+    /// The text, if this is a [`WsMessage::Text`].
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            WsMessage::Text(s) => Some(s),
+            WsMessage::Binary(_) => None,
+        }
+    }
+}
+
 /// Perform an HTTP/1.1 `GET` of `url` over `rt`, returning the buffered
 /// [`Response`]. Convenience wrapper over [`request`].
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn get<R: Runtime>(rt: &R, url: &str) -> Result<Response> {
     request(rt, &Request::get(url)).await
 }
 
 /// Perform an HTTP/1.1 `POST` of `body` to `url` over `rt`, returning the
 /// buffered [`Response`]. Convenience wrapper over [`request`].
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn post<R: Runtime>(rt: &R, url: &str, body: impl Into<Vec<u8>>) -> Result<Response> {
     request(rt, &Request::post(url, body)).await
+}
+
+/// Perform a `GET` of `url` via the browser Fetch API. The wasm counterpart of
+/// [`get`] — no [`Runtime`] argument, since the browser event loop is implicit.
+#[cfg(target_arch = "wasm32")]
+pub async fn get(url: &str) -> Result<Response> {
+    request(&Request::get(url)).await
+}
+
+/// Perform a `POST` of `body` to `url` via the browser Fetch API. The wasm
+/// counterpart of [`post`].
+#[cfg(target_arch = "wasm32")]
+pub async fn post(url: &str, body: impl Into<Vec<u8>>) -> Result<Response> {
+    request(&Request::post(url, body)).await
 }
 
 /// Send `req` over `rt`, returning the buffered [`Response`]. `https` builds the
@@ -154,6 +245,7 @@ pub async fn post<R: Runtime>(rt: &R, url: &str, body: impl Into<Vec<u8>>) -> Re
 /// are followed (up to [`MAX_REDIRECTS`] hops, rewriting method/body per the
 /// status). When [`Request::decompress`] is set (the default), the final
 /// response body is decoded per its `Content-Encoding`.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
     let mut url = Url::parse(&req.url)?;
     let mut method = req.method.to_ascii_uppercase();
@@ -187,8 +279,23 @@ pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
     }
 }
 
+/// Send `req` via the browser Fetch API, returning the buffered [`Response`].
+/// The wasm counterpart of [`request`] — no [`Runtime`] argument.
+///
+/// The browser performs DNS, TLS, redirect following, and response
+/// decompression itself, so [`Request::decompress`] is ignored and
+/// [`Request::follow_redirects`] maps to fetch's redirect mode: `true` →
+/// `follow` (the default), `false` → `manual` (a redirect yields an opaque
+/// response you cannot read). Forbidden headers set on `req` are dropped by the
+/// browser, and cross-origin requests are subject to CORS.
+#[cfg(target_arch = "wasm32")]
+pub async fn request(req: &Request) -> Result<Response> {
+    wasm::fetch(req).await
+}
+
 /// One request/response round-trip over a fresh `Connection: close` connection,
 /// with no redirect or decompression handling.
+#[cfg(not(target_arch = "wasm32"))]
 async fn send_once<R: Runtime>(
     rt: &R,
     u: &Url,
@@ -234,11 +341,13 @@ async fn send_once<R: Runtime>(
 }
 
 /// Status codes [`request`] follows when redirects are enabled.
+#[cfg(not(target_arch = "wasm32"))]
 fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
 /// First value for header `name` (case-insensitive), if present.
+#[cfg(not(target_arch = "wasm32"))]
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
         .iter()
@@ -250,6 +359,7 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
 /// `Content-Encoding` and strip the now-stale `Content-Encoding`/`Content-Length`
 /// headers. A decode failure (truncated/corrupt stream) is surfaced as an error
 /// rather than returning a partial body.
+#[cfg(not(target_arch = "wasm32"))]
 fn finish_response(mut resp: Response, decompress: bool) -> Result<Response> {
     if !decompress {
         return Ok(resp);
@@ -270,6 +380,7 @@ fn finish_response(mut resp: Response, decompress: bool) -> Result<Response> {
 /// (case-insensitively); `Content-Length` is added for a non-empty body unless
 /// the caller set `Content-Length` or `Transfer-Encoding`. Caller headers are
 /// then appended verbatim, in order.
+#[cfg(not(target_arch = "wasm32"))]
 fn build_headers(u: &Url, caller: &[(String, String)], body_len: usize) -> Vec<(String, String)> {
     let has = |name: &str| caller.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
 
@@ -294,6 +405,7 @@ fn build_headers(u: &Url, caller: &[(String, String)], body_len: usize) -> Vec<(
 }
 
 /// Resolve `host:port` to a socket address (synchronous DNS for now).
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
     (host, port)
         .to_socket_addrs()
@@ -303,6 +415,7 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 }
 
 /// The `Host` header value: bare host on the default port, `host:port` otherwise.
+#[cfg(not(target_arch = "wasm32"))]
 fn host_header(u: &Url) -> String {
     let default = match u.scheme.as_str() {
         "https" => 443,
@@ -315,7 +428,7 @@ fn host_header(u: &Url) -> String {
     }
 }
 
-#[cfg(all(test, feature = "tokio-rt"))]
+#[cfg(all(test, feature = "tokio-rt", not(target_arch = "wasm32")))]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -625,5 +738,93 @@ mod tests {
         let req = Request::get(format!("http://127.0.0.1:{port}/")).decompress(false);
         let resp = request(&rt, &req).await.unwrap();
         assert_eq!(resp.body, gz, "raw encoded bytes when decompress is off");
+    }
+
+    /// A minimal in-process `ws://` echo server: completes the RFC 6455
+    /// handshake (reusing the crate's own `derive_accept`), then reads one masked
+    /// client frame, unmasks it, and echoes it back as an unmasked server frame.
+    /// Enough to exercise the async client's handshake + masked send + recv.
+    fn ws_echo_once() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            // Read handshake head.
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            let key = loop {
+                let n = sock.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let key = head
+                        .lines()
+                        .find_map(|l| {
+                            l.split_once(':').and_then(|(k, v)| {
+                                k.trim()
+                                    .eq_ignore_ascii_case("sec-websocket-key")
+                                    .then(|| v.trim().to_string())
+                            })
+                        })
+                        .unwrap_or_default();
+                    break key;
+                }
+            };
+            let accept = crate::websocket::derive_accept(&key);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+
+            // Read one masked client frame (small payload; len < 126).
+            let mut f = Vec::new();
+            while f.len() < 2 {
+                let n = sock.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                f.extend_from_slice(&tmp[..n]);
+            }
+            let opcode = f[0] & 0x0F;
+            let len = (f[1] & 0x7F) as usize;
+            let need = 2 + 4 + len; // header + mask + payload
+            while f.len() < need {
+                let n = sock.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                f.extend_from_slice(&tmp[..n]);
+            }
+            let mask = [f[2], f[3], f[4], f[5]];
+            let mut payload = f[6..6 + len].to_vec();
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i & 3];
+            }
+            // Echo back unmasked (server frames must not be masked).
+            let mut out = vec![0x80 | opcode, len as u8];
+            out.extend_from_slice(&payload);
+            sock.write_all(&out).unwrap();
+            // Keep the socket open briefly so the client can read the echo.
+            thread::sleep(std::time::Duration::from_millis(200));
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn async_websocket_handshake_and_echo() {
+        let port = ws_echo_once();
+        let rt = TokioRuntime;
+        let mut ws = WebSocket::connect(&rt, &format!("ws://127.0.0.1:{port}/"))
+            .await
+            .expect("ws connect");
+        ws.send_text("hello ws").await.expect("send");
+        let msg = ws.recv().await.expect("stream open").expect("recv ok");
+        assert_eq!(msg, WsMessage::Text("hello ws".to_string()));
     }
 }

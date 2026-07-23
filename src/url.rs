@@ -1,3 +1,8 @@
+// On wasm the browser parses/resolves URLs itself, so several of these helpers
+// are unused there (only `Url::parse` is reachable via `aio`). They stay for the
+// native protocol backends; silence the dead-code lint on wasm only.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+
 use crate::error::{Error, Result};
 
 /// Minimal parsed URL. Only the fields we need for the protocols we speak.

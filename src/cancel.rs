@@ -11,6 +11,10 @@
 //! * **Cooperative.** The request flow checks [`CancelToken::is_cancelled`] at
 //!   safe points (before connecting, between redirect hops) and, once a transfer
 //!   has been cancelled, its result is reported as [`crate::Error::Cancelled`].
+//! On wasm the socket-registration machinery below is unused (the browser's
+//! own abort path would drive cancellation), so silence dead-code there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+//!
 //! * **Prompt.** When the transport is a TCP socket, the request registers a
 //!   *shutdown hook* (a cloned socket handle); [`cancel`](CancelToken::cancel)
 //!   invokes it to `shutdown` the connection, which unblocks a thread parked in

@@ -108,6 +108,16 @@ pub(crate) fn build_client_engine(
     crate::proto::tls::PurecryptoEngine::new(backend::build_client_conn(sni, opts)?)
 }
 
+/// The concrete [`TlsEngine`](crate::proto::tls::TlsEngine) type
+/// [`build_client_engine`] returns for the active backend — exactly one backend
+/// compiles per build, so this is a single type. Lets callers that must *name*
+/// the engine (e.g. the async TLS stream behind `wss://`) avoid a generic
+/// parameter or a `Box<dyn TlsEngine>`.
+#[cfg(feature = "rustls-tls")]
+pub(crate) type ClientEngine = crate::proto::tls::RustlsEngine;
+#[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+pub(crate) type ClientEngine = crate::proto::tls::PurecryptoEngine;
+
 #[cfg(test)]
 mod tests {
     use super::reject_pipelined_plaintext;
