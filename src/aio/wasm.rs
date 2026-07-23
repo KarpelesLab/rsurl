@@ -151,6 +151,19 @@ pub struct WsStream {
     _handlers: Handlers,
 }
 
+/// Detach every handler from `ws` and close it, so the browser cannot invoke the
+/// (about-to-be-dropped) handler closures after `connect` returns on a failed
+/// dial — which would trap with "closure invoked recursively or after being
+/// dropped". Setting each handler to `None` unregisters it from the JS socket
+/// while the Rust `Closure`s are still alive, so none is called after they drop.
+fn detach_and_close(ws: &web_sys::WebSocket) {
+    ws.set_onopen(None);
+    ws.set_onmessage(None);
+    ws.set_onerror(None);
+    ws.set_onclose(None);
+    let _ = ws.close();
+}
+
 impl WebSocket {
     /// Open a WebSocket to `url` (`ws://` or `wss://`), resolving once the
     /// browser's `open` event fires (or erroring if the handshake fails).
@@ -232,11 +245,19 @@ impl WebSocket {
 
         match open_rx.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                // The `onopen`/`onmessage`/`onerror`/`onclose` closures are about
+                // to drop as this fn returns; detach them from the socket first so
+                // a subsequent browser close/error event cannot invoke a dropped
+                // closure (which traps).
+                detach_and_close(&ws);
+                return Err(e);
+            }
             Err(_) => {
+                detach_and_close(&ws);
                 return Err(Error::BadResponse(
                     "websocket closed before it opened".into(),
-                ))
+                ));
             }
         }
 
