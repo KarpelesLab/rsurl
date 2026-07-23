@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/KarpelesLab/rsurl/compare/v0.1.5...v0.1.6) - 2026-07-23
+
+### Added
+
+- *(aio)* compile for wasm32 (browser) and unify the async WebSocket
+
+### Fixed
+
+- *(aio)* satisfy clippy/docs/rustls-backend CI, add a wasm build job
+- *(http2)* raise receive windows so downloads aren't capped at window/RTT
+- *(http1)* don't apply the buffered body cap to streaming responses
+- *(proxy)* honor NO_PROXY leading-dot entries and route MQTT publish through the connector
+
+### Other
+
+- apply rustfmt to the recent refactor/fix commits
+- *(net)* unify the plain/TLS transport enum across mail/ftp/ldap
+- *(bittorrent)* dedupe compact-peer decode and the storage read path
+- *(tls)* centralize the STARTTLS plaintext-injection guard
+- centralize the control-byte rejection guard shared across protocols
+- hoist duplicated HTTP header validation and userinfo split into shared homes
+- *(http)* route all redirect paths through a single redirect_request
+- stop being a Cargo workspace; curl-compat is a standalone sub-crate
+
 ## [0.1.5](https://github.com/KarpelesLab/rsurl/compare/rsurl-v0.1.4...rsurl-v0.1.5) - 2026-07-01
 
 ### Added
