@@ -14,7 +14,6 @@
 //! thread-split reader/writer of the blocking API (`WsReader`/`WsWriter`) is not
 //! reproduced here; a single [`WebSocket`] owns the connection.
 
-use std::future::Future;
 use std::io;
 
 use crate::error::{Error, Result};
@@ -40,45 +39,41 @@ const MAX_HANDSHAKE_HEAD: usize = 64 * 1024;
 /// is this enum, so the frame loop is transport-agnostic.
 enum Transport<C> {
     Plain(C),
+    // Boxed: the TLS engine is far larger than a bare socket, so an unboxed
+    // variant would bloat every `Plain` connection too (clippy::large_enum_variant).
     #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
-    Tls(AsyncTlsStream<C>),
+    Tls(Box<AsyncTlsStream<C>>),
 }
 
 impl<C: AsyncConn> AsyncConn for Transport<C> {
-    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send {
-        async move {
-            match self {
-                Transport::Plain(c) => c.read(buf).await,
-                #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
-                Transport::Tls(t) => t.read(buf).await,
-            }
+    async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Transport::Plain(c) => c.read(buf).await,
+            #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+            Transport::Tls(t) => t.read(buf).await,
         }
     }
 
-    fn write_all(&mut self, buf: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            match self {
-                Transport::Plain(c) => c.write_all(buf).await,
-                #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
-                Transport::Tls(t) => t.write_all(buf).await,
-            }
+    async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Transport::Plain(c) => c.write_all(buf).await,
+            #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+            Transport::Tls(t) => t.write_all(buf).await,
         }
     }
 
-    fn flush(&mut self) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            match self {
-                Transport::Plain(c) => c.flush().await,
-                #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
-                Transport::Tls(t) => t.flush().await,
-            }
+    async fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Transport::Plain(c) => c.flush().await,
+            #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
+            Transport::Tls(t) => t.flush().await,
         }
     }
 }
 
 /// An async WebSocket client over a [`Runtime`]'s connection. The native
-/// counterpart of the browser [`WebSocket`](super::wasm::WebSocket): same
-/// [`connect`](WebSocket::connect)/[`recv`](WebSocket::recv)/`send`/`close`
+/// counterpart of the browser WebSocket (the wasm build's `aio::WebSocket`):
+/// same [`connect`](WebSocket::connect)/[`recv`](WebSocket::recv)/`send`/`close`
 /// surface, but taking a `Runtime` (there is no implicit event loop natively).
 pub struct WebSocket<C> {
     transport: Transport<C>,
@@ -120,7 +115,7 @@ impl<C: AsyncConn> WebSocket<C> {
                 {
                     let mut opts = crate::tls::TlsOpts::verifying();
                     let tls = AsyncTlsStream::connect(conn, &u.host, &mut opts).await?;
-                    Transport::Tls(tls)
+                    Transport::Tls(Box::new(tls))
                 }
                 #[cfg(not(any(feature = "rustls-tls", feature = "purecrypto-tls")))]
                 {

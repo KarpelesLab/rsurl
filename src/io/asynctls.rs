@@ -11,7 +11,6 @@
 //! WebSocket in `crate::aio`) can run over `wss://` exactly as it runs over a
 //! plain socket.
 
-use std::future::Future;
 use std::io;
 
 use crate::error::Result;
@@ -22,7 +21,7 @@ use crate::tls::ClientEngine;
 /// Map a crate error surfaced by the TLS engine into an [`io::Error`], so the
 /// [`AsyncConn`] surface stays `io`-typed like a real socket.
 fn to_io(e: crate::error::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// An async, plaintext byte stream layered on the encrypted `conn`.
@@ -73,53 +72,47 @@ impl<C: AsyncConn> AsyncTlsStream<C> {
 }
 
 impl<C: AsyncConn> AsyncConn for AsyncTlsStream<C> {
-    fn read(&mut self, dst: &mut [u8]) -> impl Future<Output = io::Result<usize>> + Send {
-        async move {
-            loop {
-                // Drain already-decrypted plaintext first.
-                let n = self.engine.read_plaintext(dst).map_err(to_io)?;
-                if n > 0 {
-                    return Ok(n);
-                }
-                // None buffered — pull more ciphertext and decrypt it.
-                let m = self.conn.read(&mut self.inbuf).await?;
-                if m == 0 {
-                    return Ok(0); // peer closed the underlying connection
-                }
-                let chunk = self.inbuf[..m].to_vec();
-                self.engine.feed_incoming(&chunk).map_err(to_io)?;
-                // Feeding may have produced records to send (e.g. a TLS 1.3
-                // post-handshake message or key update) — flush them.
-                let mut out = Vec::new();
-                self.engine.drain_outgoing(&mut out);
-                if !out.is_empty() {
-                    self.conn.write_all(&out).await?;
-                    self.conn.flush().await?;
-                }
+    async fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        loop {
+            // Drain already-decrypted plaintext first.
+            let n = self.engine.read_plaintext(dst).map_err(to_io)?;
+            if n > 0 {
+                return Ok(n);
             }
-        }
-    }
-
-    fn write_all(&mut self, src: &[u8]) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            self.engine.write_plaintext(src);
+            // None buffered — pull more ciphertext and decrypt it.
+            let m = self.conn.read(&mut self.inbuf).await?;
+            if m == 0 {
+                return Ok(0); // peer closed the underlying connection
+            }
+            let chunk = self.inbuf[..m].to_vec();
+            self.engine.feed_incoming(&chunk).map_err(to_io)?;
+            // Feeding may have produced records to send (e.g. a TLS 1.3
+            // post-handshake message or key update) — flush them.
             let mut out = Vec::new();
             self.engine.drain_outgoing(&mut out);
             if !out.is_empty() {
                 self.conn.write_all(&out).await?;
+                self.conn.flush().await?;
             }
-            Ok(())
         }
     }
 
-    fn flush(&mut self) -> impl Future<Output = io::Result<()>> + Send {
-        async move {
-            let mut out = Vec::new();
-            self.engine.drain_outgoing(&mut out);
-            if !out.is_empty() {
-                self.conn.write_all(&out).await?;
-            }
-            self.conn.flush().await
+    async fn write_all(&mut self, src: &[u8]) -> io::Result<()> {
+        self.engine.write_plaintext(src);
+        let mut out = Vec::new();
+        self.engine.drain_outgoing(&mut out);
+        if !out.is_empty() {
+            self.conn.write_all(&out).await?;
         }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        let mut out = Vec::new();
+        self.engine.drain_outgoing(&mut out);
+        if !out.is_empty() {
+            self.conn.write_all(&out).await?;
+        }
+        self.conn.flush().await
     }
 }

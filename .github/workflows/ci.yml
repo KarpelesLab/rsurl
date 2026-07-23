@@ -175,3 +175,38 @@ jobs:
 
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features
+
+  wasm:
+    name: wasm32 (browser) build & lint
+    runs-on: ubuntu-latest
+    # The browser backend (`crate::aio` over Fetch + the native WebSocket) is a
+    # whole separate compile target the matrix above never exercises: on
+    # `wasm32-unknown-unknown` the entire net/proto/tls socket stack is
+    # cfg'd out and the wasm bindings take over. Build & lint it here so that
+    # gating can't silently rot (e.g. an ungated `std::net` reference sneaking
+    # back into the wasm surface). Tests need a browser harness (wasm-bindgen-test)
+    # and are out of scope for this job — this guards compilation and lints only.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust (with wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - name: Clippy (warnings denied)
+        # The wasm build is HTTP/WebSocket-only: `idn` for host normalisation,
+        # no default features (which would pull the native-only ssh/tls/bittorrent
+        # stack). `--lib` because test/bin targets don't link on bare wasm32.
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features --features idn --lib -- -D warnings
+
+      - name: Build (lib + bin)
+        # Also builds the bin wrapper (an empty `main` on wasm) to prove the whole
+        # crate — not just the lib — compiles for the browser target.
+        run: cargo build --target wasm32-unknown-unknown --no-default-features --features idn

@@ -11,9 +11,6 @@
 //! * **Cooperative.** The request flow checks [`CancelToken::is_cancelled`] at
 //!   safe points (before connecting, between redirect hops) and, once a transfer
 //!   has been cancelled, its result is reported as [`crate::Error::Cancelled`].
-//! On wasm the socket-registration machinery below is unused (the browser's
-//! own abort path would drive cancellation), so silence dead-code there.
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 //!
 //! * **Prompt.** When the transport is a TCP socket, the request registers a
 //!   *shutdown hook* (a cloned socket handle); [`cancel`](CancelToken::cancel)
@@ -24,6 +21,10 @@
 //! One token may be shared across several concurrent transfers (like a single
 //! `AbortSignal` aborting multiple fetches): each registers its own hook and
 //! removes it on completion via a [`CancelGuard`].
+
+// On wasm the socket-registration machinery here is unused (the browser's own
+// abort path would drive cancellation), so silence dead-code on that target.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

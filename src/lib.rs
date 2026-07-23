@@ -28,8 +28,9 @@ mod error;
 mod url;
 
 // Shared, socket-free helper: IDN/UTS-46 host normalisation is pure computation
-// (no I/O), so it builds for wasm unchanged and backs the `aio` fetch/WS shims.
-#[cfg(feature = "idn")]
+// (no I/O), so it builds for wasm unchanged. The module compiles on every target
+// and feature set — it no-ops internally when the `idn` feature is off — so it
+// stays unconditional here (native backends reference `crate::idn` directly).
 mod idn;
 
 // ─── Native-only surface ────────────────────────────────────────────────────
