@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/KarpelesLab/rsurl/compare/v0.1.7...v0.1.8) - 2026-07-27
+
+### Added
+
+- *(aio)* unify the native/wasm async API and harden the browser socket
+
 ## [0.1.7](https://github.com/KarpelesLab/rsurl/compare/v0.1.6...v0.1.7) - 2026-07-23
 
 ### Fixed
