@@ -16,9 +16,12 @@
 //! What remains is the **unified async API** in [`aio`], which compiles on both
 //! targets: on native it drives the sans-IO core over real sockets; on wasm it
 //! routes HTTP through the Fetch API and WebSockets through the browser's native
-//! `WebSocket`. The same [`aio::request`] / [`aio::WebSocket`] calls work in
-//! both places — see the [`aio`] module docs for the browser-imposed limits
-//! (forbidden headers, CORS, no custom WebSocket handshake headers, …).
+//! `WebSocket`. Its types ([`aio::Request`], [`aio::Response`],
+//! [`aio::WsMessage`]) and every method on them are identical across targets;
+//! only naming the runtime differs, since natively you supply one and in the
+//! browser the event loop *is* the runtime. See the [`aio`] module docs for that
+//! seam and for the browser-imposed limits (forbidden headers, CORS, no custom
+//! WebSocket handshake headers, …).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 

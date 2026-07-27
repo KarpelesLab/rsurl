@@ -1362,16 +1362,7 @@ impl WsWriter {
 
     /// Send a close frame with a status code and reason, then mark closed.
     pub fn close_with(&mut self, code: u16, reason: &str) -> Result<()> {
-        let mut payload = Vec::with_capacity(2 + reason.len());
-        payload.extend_from_slice(&code.to_be_bytes());
-        payload.extend_from_slice(reason.as_bytes());
-        if payload.len() > MAX_CONTROL_PAYLOAD {
-            return Err(Error::BadResponse(format!(
-                "websocket: close reason too long: {} bytes (max {})",
-                payload.len(),
-                MAX_CONTROL_PAYLOAD - 2
-            )));
-        }
+        let payload = close_payload(code, reason)?;
         if self.send_closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
@@ -2030,6 +2021,24 @@ fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
         }
         rx.extend_from_slice(&tmp[..n]);
     }
+}
+
+/// Build the payload of a CLOSE frame: the 2-byte status code followed by the
+/// UTF-8 reason (RFC 6455 §5.5.1). Fails if the pair does not fit in a control
+/// frame. Shared by the blocking [`WsWriter::close_with`] and the async
+/// [`crate::aio::WebSocket::close_with`].
+pub(crate) fn close_payload(code: u16, reason: &str) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(2 + reason.len());
+    payload.extend_from_slice(&code.to_be_bytes());
+    payload.extend_from_slice(reason.as_bytes());
+    if payload.len() > MAX_CONTROL_PAYLOAD {
+        return Err(Error::BadResponse(format!(
+            "websocket: close reason too long: {} bytes (max {})",
+            payload.len(),
+            MAX_CONTROL_PAYLOAD - 2
+        )));
+    }
+    Ok(payload)
 }
 
 /// Build an unfragmented client-to-server frame with the given opcode and

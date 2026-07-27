@@ -14,15 +14,16 @@
 //! thread-split reader/writer of the blocking API (`WsReader`/`WsWriter`) is not
 //! reproduced here; a single [`WebSocket`] owns the connection.
 
+use std::fmt;
 use std::io;
 
 use crate::error::{Error, Result};
 use crate::io::runtime::{AsyncConn, Runtime};
 use crate::url::Url;
 use crate::websocket::{
-    base64_encode, build_client_frame, derive_accept, parse_close_payload, random_16,
-    try_parse_frame, validate_control_frame, Frame, OPCODE_BINARY, OPCODE_CLOSE, OPCODE_CONT,
-    OPCODE_PING, OPCODE_PONG, OPCODE_TEXT,
+    base64_encode, build_client_frame, close_payload, derive_accept, parse_close_payload,
+    random_16, try_parse_frame, validate_control_frame, Frame, OPCODE_BINARY, OPCODE_CLOSE,
+    OPCODE_CONT, OPCODE_PING, OPCODE_PONG, OPCODE_TEXT,
 };
 
 use super::WsMessage;
@@ -73,8 +74,13 @@ impl<C: AsyncConn> AsyncConn for Transport<C> {
 
 /// An async WebSocket client over a [`Runtime`]'s connection. The native
 /// counterpart of the browser WebSocket (the wasm build's `aio::WebSocket`):
-/// same [`connect`](WebSocket::connect)/[`recv`](WebSocket::recv)/`send`/`close`
-/// surface, but taking a `Runtime` (there is no implicit event loop natively).
+/// the same `send`/`send_text`/`send_binary`/`recv`/`close`/`close_with`/
+/// `subprotocol`/`is_closed` surface, with the same `async`-ness and receivers,
+/// so only the [`connect`](WebSocket::connect) call — which takes a `Runtime`,
+/// since there is no implicit event loop natively — differs between targets.
+///
+/// Dropping the socket drops the underlying connection without a close
+/// handshake; call [`close`](Self::close) for a polite shutdown.
 pub struct WebSocket<C> {
     transport: Transport<C>,
     /// Unparsed inbound bytes carried between reads (frames are only consumed
@@ -82,6 +88,16 @@ pub struct WebSocket<C> {
     rxbuf: Vec<u8>,
     closed: bool,
     subprotocol: Option<String>,
+}
+
+impl<C> fmt::Debug for WebSocket<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebSocket")
+            .field("closed", &self.closed)
+            .field("subprotocol", &self.subprotocol)
+            .field("buffered", &self.rxbuf.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<C: AsyncConn> WebSocket<C> {
@@ -105,8 +121,7 @@ impl<C: AsyncConn> WebSocket<C> {
         R: Runtime<Conn = C>,
     {
         let u = Url::parse(url)?;
-        let addr = super::resolve(&u.host, u.port)?;
-        let conn = rt.connect(addr).await.map_err(Error::Io)?;
+        let conn = super::native::connect(rt, &u.host, u.port).await?;
 
         let transport = match u.scheme.as_str() {
             "ws" => Transport::Plain(conn),
@@ -177,16 +192,35 @@ impl<C: AsyncConn> WebSocket<C> {
         }
     }
 
-    /// Send a close frame (code 1000) and mark the socket closed.
+    /// Send a close frame (code 1000) and mark the socket closed. Idempotent:
+    /// closing an already-closed socket is a no-op.
     pub async fn close(&mut self) -> Result<()> {
-        let frame = build_client_frame(OPCODE_CLOSE, &[])?;
-        self.transport.write_all(&frame).await.map_err(Error::Io)?;
-        self.transport.flush().await.map_err(Error::Io)?;
-        self.closed = true;
-        Ok(())
+        self.send_close(&[]).await
+    }
+
+    /// Send a close frame carrying a status code and reason (RFC 6455 §5.5.1),
+    /// then mark the socket closed. Idempotent. `code` is typically 1000
+    /// (normal closure); the reason plus the 2-byte code must fit in a control
+    /// frame (≤ 125 bytes).
+    pub async fn close_with(&mut self, code: u16, reason: &str) -> Result<()> {
+        let payload = close_payload(code, reason)?;
+        self.send_close(&payload).await
     }
 
     // ── internals ────────────────────────────────────────────────────────────
+
+    async fn send_close(&mut self, payload: &[u8]) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        // Mark closed up front: a write failure still means this socket is done,
+        // and a retry would only send a second CLOSE.
+        self.closed = true;
+        let frame = build_client_frame(OPCODE_CLOSE, payload)?;
+        self.transport.write_all(&frame).await.map_err(Error::Io)?;
+        self.transport.flush().await.map_err(Error::Io)?;
+        Ok(())
+    }
 
     async fn send_data(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
         let frame = build_client_frame(opcode, payload)?;

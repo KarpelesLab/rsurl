@@ -16,7 +16,7 @@
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 /// A full-duplex async byte stream handed back by a [`Runtime`]. The byte-level
@@ -44,6 +44,22 @@ pub trait Runtime {
 
     /// Open a TCP connection to `addr`.
     fn connect(&self, addr: SocketAddr) -> impl Future<Output = io::Result<Self::Conn>> + Send;
+
+    /// Resolve `host:port` to the addresses to try, in preference order.
+    ///
+    /// The provided implementation calls [`ToSocketAddrs`], which is the
+    /// **blocking** system resolver: it stalls the calling executor thread for
+    /// the duration of the lookup. Every runtime that has a non-blocking
+    /// resolver (or a thread pool to offload onto) should override this — the
+    /// built-in [`TokioRuntime`](super::tokio::TokioRuntime) does, with
+    /// `tokio::net::lookup_host`.
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> impl Future<Output = io::Result<Vec<SocketAddr>>> + Send {
+        async move { (host, port).to_socket_addrs().map(|it| it.collect()) }
+    }
 
     /// Complete after at least `dur` has elapsed (the timer primitive a driver
     /// races a read against to honour a protocol state-machine deadline).

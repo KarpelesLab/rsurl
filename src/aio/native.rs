@@ -1,239 +1,36 @@
-//! Experimental **async** HTTP client over the sans-IO stack.
+//! Native (socket) backend for [`crate::aio`]: HTTP/1.1 over the sans-IO stack,
+//! driven by a caller-supplied [`Runtime`].
 //!
-//! This is the first public entry point onto the runtime-agnostic sans-IO
-//! engine: a protocol state machine driven over an async connection
-//! supplied by a [`Runtime`] you provide (or the built-in [`TokioRuntime`],
-//! behind the `tokio-rt` feature). Unlike the blocking API, this composes with
-//! `async`/`await` and idiomatic concurrency — fan many [`get`] futures out with
-//! `FuturesUnordered` / `JoinSet` instead of a curl-style multi handle.
-//!
-//! ```no_run
-//! # #[cfg(feature = "tokio-rt")]
-//! # async fn ex() -> Result<(), rsurl::Error> {
-//! let rt = rsurl::aio::TokioRuntime;
-//! let resp = rsurl::aio::get(&rt, "https://example.com/").await?;
-//! println!("{} {} bytes", resp.status, resp.body.len());
-//! # Ok(()) }
-//! ```
-//!
-//! Scope (current cut): HTTP/1.1 over `http`/`https` with an arbitrary method,
-//! request body, and caller headers (see [`Request`]); optional redirect
-//! following and automatic response decompression; buffered response. DNS is
-//! resolved synchronously and each request uses a fresh `Connection: close`
-//! socket — connection pooling and streaming (non-buffered) bodies are part of
-//! the ongoing sans-IO cutover and are not yet wired on this async path.
-//!
-//! # On wasm32 (browser)
-//!
-//! `wasm32-unknown-unknown` has no sockets, no threads, and cannot block, so the
-//! native sans-IO/socket path above does not compile there. Instead this module
-//! routes [`request`] through the browser **Fetch API** and offers
-//! [`WebSocket`] over the browser's native `WebSocket` object. The [`Request`] /
-//! [`Response`] types and the `get`/`post`/`request` names are the same on both
-//! targets; the only signature difference is that the wasm entry points take no
-//! [`Runtime`] argument — the browser event loop *is* the runtime.
-//!
-//! Browser-imposed limits you inherit on wasm (none are rsurl bugs):
-//!   * **Forbidden request headers** — the browser silently drops `Host`,
-//!     `Connection`, `Content-Length`, and parts of `User-Agent`; rsurl does not
-//!     synthesise them (fetch sets them itself).
-//!   * **CORS** — cross-origin requests need server opt-in; a `no-cors` fetch
-//!     yields an opaque, unreadable response.
-//!   * **No TLS control**, **redirects/cookies are browser-managed**, and the
-//!     response body arrives already decompressed (its `Content-Encoding` is
-//!     stripped by the browser), so [`Request::decompress`] is a no-op here.
+//! This module only compiles off `wasm32-unknown-unknown`; the browser
+//! counterpart is [`wasm`](super::wasm). [`request`] is the entry point,
+//! [`connect`] the shared resolve-and-dial helper the async
+//! [`WebSocket`](super::ws::WebSocket) uses too.
 
-// ─── Native (socket) backend ────────────────────────────────────────────────
-#[cfg(not(target_arch = "wasm32"))]
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::future::{poll_fn, Future};
+use std::io;
+use std::pin::pin;
+use std::task::Poll;
+use std::time::Duration;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use crate::io::runtime::{AsyncConn, Runtime};
-#[cfg(all(feature = "tokio-rt", not(target_arch = "wasm32")))]
-pub use crate::io::tokio::TokioRuntime;
-
-#[cfg(not(target_arch = "wasm32"))]
+use crate::error::{Error, Result};
 use crate::io::asyncio;
-#[cfg(not(target_arch = "wasm32"))]
+use crate::io::runtime::Runtime;
 use crate::proto::http1::{ClientExchange, Event};
-#[cfg(not(target_arch = "wasm32"))]
 use crate::proto::tls::TlsClient;
-
-#[cfg(not(target_arch = "wasm32"))]
-use crate::error::Error;
-use crate::error::Result;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::url::Url;
 
-// ─── Browser (fetch / WebSocket) backend ────────────────────────────────────
-#[cfg(target_arch = "wasm32")]
-mod wasm;
-#[cfg(target_arch = "wasm32")]
-pub use wasm::{WebSocket, WsSink, WsStream};
-
-// ─── Native async WebSocket ─────────────────────────────────────────────────
-// Same `WebSocket` name/surface as the wasm one, but generic over the runtime's
-// connection and taking a `Runtime` at connect (there is no implicit event loop
-// natively). The thread-split `WsReader`/`WsWriter` of the blocking API is not
-// mirrored here, so there is no `WsSink`/`WsStream` on this target.
-#[cfg(not(target_arch = "wasm32"))]
-mod ws;
-#[cfg(not(target_arch = "wasm32"))]
-pub use ws::WebSocket;
-
-/// A buffered HTTP response from [`get`].
-#[derive(Debug, Clone)]
-pub struct Response {
-    /// HTTP status code (e.g. 200).
-    pub status: u16,
-    /// Reason phrase (may be empty on HTTP/2-style status lines).
-    pub reason: String,
-    /// Response headers, in received order.
-    pub headers: Vec<(String, String)>,
-    /// The response body. Decoded by default when the server applied a
-    /// `Content-Encoding` (gzip / deflate / zstd / br); the
-    /// `Content-Encoding`/`Content-Length` headers are stripped to match. Set
-    /// [`Request::decompress(false)`](Request::decompress) to receive the raw
-    /// encoded bytes instead.
-    pub body: Vec<u8>,
-}
-
-/// An async HTTP request: a method, a URL, caller headers, and a body.
-///
-/// Build one with [`Request::new`] (or the [`Request::get`] / [`Request::post`]
-/// shortcuts) and send it with [`request`]. rsurl fills in the mandatory
-/// framing headers the caller did not set — `Host`, `User-Agent`, `Accept`,
-/// `Connection: close`, and a `Content-Length` matching the body — but never
-/// overrides or de-duplicates a header the caller supplied, so passing any of
-/// those yourself takes precedence.
-#[derive(Debug, Clone)]
-pub struct Request {
-    /// HTTP method (e.g. `GET`, `POST`). Sent verbatim.
-    pub method: String,
-    /// Absolute request URL (`http`/`https`).
-    pub url: String,
-    /// Caller headers, sent in order after rsurl's defaults.
-    pub headers: Vec<(String, String)>,
-    /// Request body. An empty body sends no payload.
-    pub body: Vec<u8>,
-    /// Follow `3xx` redirects (default `false`, matching the blocking API). On
-    /// 301/302/303 a non-GET/HEAD request becomes a bodyless `GET`; 307/308
-    /// preserve method and body. Capped at [`MAX_REDIRECTS`] hops.
-    pub follow_redirects: bool,
-    /// Decode the response body per its `Content-Encoding` (default `true`).
-    pub decompress: bool,
-}
-
-/// Maximum number of redirects [`request`] follows when
-/// [`Request::follow_redirects`] is on, before failing with an
-/// [`Error::BadResponse`].
-pub const MAX_REDIRECTS: usize = 10;
-
-impl Request {
-    /// A request with the given method and URL, no extra headers, an empty
-    /// body, redirects off, and response decompression on.
-    pub fn new(method: impl Into<String>, url: impl Into<String>) -> Request {
-        Request {
-            method: method.into(),
-            url: url.into(),
-            headers: Vec::new(),
-            body: Vec::new(),
-            follow_redirects: false,
-            decompress: true,
-        }
-    }
-
-    /// A `GET` request for `url`.
-    pub fn get(url: impl Into<String>) -> Request {
-        Request::new("GET", url)
-    }
-
-    /// A `POST` request for `url` carrying `body`.
-    pub fn post(url: impl Into<String>, body: impl Into<Vec<u8>>) -> Request {
-        Request::new("POST", url).with_body(body)
-    }
-
-    /// Append a header. Call repeatedly to set several; order is preserved.
-    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Request {
-        self.headers.push((name.into(), value.into()));
-        self
-    }
-
-    /// Set the request body.
-    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Request {
-        self.body = body.into();
-        self
-    }
-
-    /// Follow `3xx` redirects (off by default). See
-    /// [`follow_redirects`](Self::follow_redirects).
-    pub fn follow_redirects(mut self, on: bool) -> Request {
-        self.follow_redirects = on;
-        self
-    }
-
-    /// Decode the response body per its `Content-Encoding` (on by default).
-    pub fn decompress(mut self, on: bool) -> Request {
-        self.decompress = on;
-        self
-    }
-}
-
-/// A message sent or received over an [`aio::WebSocket`](WebSocket): either a
-/// UTF-8 text frame or a binary frame. The async, cross-target analogue of
-/// [`crate::WsMessage`] (which is the native, blocking WebSocket's type).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WsMessage {
-    /// A UTF-8 text message.
-    Text(String),
-    /// A binary message.
-    Binary(Vec<u8>),
-}
-
-impl WsMessage {
-    /// The message payload as bytes (the UTF-8 bytes for [`WsMessage::Text`]).
-    pub fn as_bytes(&self) -> &[u8] {
-        match self {
-            WsMessage::Text(s) => s.as_bytes(),
-            WsMessage::Binary(b) => b,
-        }
-    }
-
-    /// The text, if this is a [`WsMessage::Text`].
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            WsMessage::Text(s) => Some(s),
-            WsMessage::Binary(_) => None,
-        }
-    }
-}
+use super::{Request, Response, MAX_REDIRECTS};
 
 /// Perform an HTTP/1.1 `GET` of `url` over `rt`, returning the buffered
 /// [`Response`]. Convenience wrapper over [`request`].
-#[cfg(not(target_arch = "wasm32"))]
 pub async fn get<R: Runtime>(rt: &R, url: &str) -> Result<Response> {
     request(rt, &Request::get(url)).await
 }
 
 /// Perform an HTTP/1.1 `POST` of `body` to `url` over `rt`, returning the
 /// buffered [`Response`]. Convenience wrapper over [`request`].
-#[cfg(not(target_arch = "wasm32"))]
 pub async fn post<R: Runtime>(rt: &R, url: &str, body: impl Into<Vec<u8>>) -> Result<Response> {
     request(rt, &Request::post(url, body)).await
-}
-
-/// Perform a `GET` of `url` via the browser Fetch API. The wasm counterpart of
-/// [`get`] — no [`Runtime`] argument, since the browser event loop is implicit.
-#[cfg(target_arch = "wasm32")]
-pub async fn get(url: &str) -> Result<Response> {
-    request(&Request::get(url)).await
-}
-
-/// Perform a `POST` of `body` to `url` via the browser Fetch API. The wasm
-/// counterpart of [`post`].
-#[cfg(target_arch = "wasm32")]
-pub async fn post(url: &str, body: impl Into<Vec<u8>>) -> Result<Response> {
-    request(&Request::post(url, body)).await
 }
 
 /// Send `req` over `rt`, returning the buffered [`Response`]. `https` builds the
@@ -244,16 +41,22 @@ pub async fn post(url: &str, body: impl Into<Vec<u8>>) -> Result<Response> {
 /// When [`Request::follow_redirects`] is set, `3xx` responses with a `Location`
 /// are followed (up to [`MAX_REDIRECTS`] hops, rewriting method/body per the
 /// status). When [`Request::decompress`] is set (the default), the final
-/// response body is decoded per its `Content-Encoding`.
-#[cfg(not(target_arch = "wasm32"))]
+/// response body is decoded per its `Content-Encoding`. [`Request::timeout`]
+/// bounds the whole thing, redirect hops included.
 pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
+    with_timeout(rt, req.timeout, exchange(rt, req)).await
+}
+
+/// [`request`] without the timeout wrapper: the redirect loop itself.
+async fn exchange<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
     let mut url = Url::parse(&req.url)?;
     let mut method = req.method.to_ascii_uppercase();
-    let mut body = req.body.clone();
+    // Borrowed from the caller until a redirect drops it — no per-request copy.
+    let mut body: &[u8] = &req.body;
     let mut hops = 0usize;
 
     loop {
-        let resp = send_once(rt, &url, &method, &req.headers, &body).await?;
+        let resp = send_once(rt, &url, &method, &req.headers, body).await?;
 
         // Follow a redirect, or fall through to return this response.
         if req.follow_redirects && is_redirect(resp.status) {
@@ -269,7 +72,7 @@ pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
                 // 307/308 preserve method and body (RFC 9110 §15.4).
                 if (301..=303).contains(&resp.status) && method != "GET" && method != "HEAD" {
                     method = "GET".to_string();
-                    body.clear();
+                    body = &[];
                 }
                 continue;
             }
@@ -279,23 +82,64 @@ pub async fn request<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
     }
 }
 
-/// Send `req` via the browser Fetch API, returning the buffered [`Response`].
-/// The wasm counterpart of [`request`] — no [`Runtime`] argument.
+/// Race `fut` against `rt`'s timer, failing with [`std::io::ErrorKind::TimedOut`]
+/// if `dur` elapses first. `None` runs `fut` unbounded.
 ///
-/// The browser performs DNS, TLS, redirect following, and response
-/// decompression itself, so [`Request::decompress`] is ignored and
-/// [`Request::follow_redirects`] maps to fetch's redirect mode: `true` →
-/// `follow` (the default), `false` → `manual` (a redirect yields an opaque
-/// response you cannot read). Forbidden headers set on `req` are dropped by the
-/// browser, and cross-origin requests are subject to CORS.
-#[cfg(target_arch = "wasm32")]
-pub async fn request(req: &Request) -> Result<Response> {
-    wasm::fetch(req).await
+/// Hand-rolled rather than pulled from `futures-util`: the async core
+/// deliberately depends on no async-ecosystem crate (see
+/// [`crate::io::runtime`]), and a two-way select is a dozen lines of safe,
+/// stable `poll_fn`.
+async fn with_timeout<R, F, T>(rt: &R, dur: Option<Duration>, fut: F) -> Result<T>
+where
+    R: Runtime,
+    F: Future<Output = Result<T>>,
+{
+    let Some(dur) = dur else { return fut.await };
+
+    let mut fut = pin!(fut);
+    let mut timer = pin!(rt.sleep(dur));
+    poll_fn(move |cx| {
+        // Poll the transfer first: a future that is already done wins a tie
+        // against a timer that expired in the same wakeup.
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(out);
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Err(Error::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("aio: request timed out after {dur:?}"),
+            ))));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Resolve `host:port` through `rt` and dial the addresses in turn, returning
+/// the first connection that comes up.
+///
+/// Trying every address (not just the first) is what makes a dual-stack host
+/// with an unreachable AAAA record work, and matches what `TcpStream::connect`
+/// does for the blocking path.
+pub(super) async fn connect<R: Runtime>(rt: &R, host: &str, port: u16) -> Result<R::Conn> {
+    let addrs = rt.resolve(host, port).await.map_err(Error::Io)?;
+    let mut last: Option<io::Error> = None;
+    for addr in addrs {
+        match rt.connect(addr).await {
+            Ok(conn) => return Ok(conn),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(Error::Io(last.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("could not resolve {host}:{port}"),
+        )
+    })))
 }
 
 /// One request/response round-trip over a fresh `Connection: close` connection,
 /// with no redirect or decompression handling.
-#[cfg(not(target_arch = "wasm32"))]
 async fn send_once<R: Runtime>(
     rt: &R,
     u: &Url,
@@ -303,8 +147,7 @@ async fn send_once<R: Runtime>(
     caller_headers: &[(String, String)],
     body: &[u8],
 ) -> Result<Response> {
-    let addr = resolve(&u.host, u.port)?;
-    let mut conn = rt.connect(addr).await.map_err(Error::Io)?;
+    let mut conn = connect(rt, &u.host, u.port).await?;
 
     let target = if u.path.is_empty() {
         "/".to_string()
@@ -341,13 +184,11 @@ async fn send_once<R: Runtime>(
 }
 
 /// Status codes [`request`] follows when redirects are enabled.
-#[cfg(not(target_arch = "wasm32"))]
 fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
 /// First value for header `name` (case-insensitive), if present.
-#[cfg(not(target_arch = "wasm32"))]
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
         .iter()
@@ -359,7 +200,6 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
 /// `Content-Encoding` and strip the now-stale `Content-Encoding`/`Content-Length`
 /// headers. A decode failure (truncated/corrupt stream) is surfaced as an error
 /// rather than returning a partial body.
-#[cfg(not(target_arch = "wasm32"))]
 fn finish_response(mut resp: Response, decompress: bool) -> Result<Response> {
     if !decompress {
         return Ok(resp);
@@ -380,7 +220,6 @@ fn finish_response(mut resp: Response, decompress: bool) -> Result<Response> {
 /// (case-insensitively); `Content-Length` is added for a non-empty body unless
 /// the caller set `Content-Length` or `Transfer-Encoding`. Caller headers are
 /// then appended verbatim, in order.
-#[cfg(not(target_arch = "wasm32"))]
 fn build_headers(u: &Url, caller: &[(String, String)], body_len: usize) -> Vec<(String, String)> {
     let has = |name: &str| caller.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
 
@@ -404,18 +243,7 @@ fn build_headers(u: &Url, caller: &[(String, String)], body_len: usize) -> Vec<(
     headers
 }
 
-/// Resolve `host:port` to a socket address (synchronous DNS for now).
-#[cfg(not(target_arch = "wasm32"))]
-fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(Error::Io)?
-        .next()
-        .ok_or_else(|| Error::BadResponse(format!("could not resolve {host}:{port}")))
-}
-
 /// The `Host` header value: bare host on the default port, `host:port` otherwise.
-#[cfg(not(target_arch = "wasm32"))]
 fn host_header(u: &Url) -> String {
     let default = match u.scheme.as_str() {
         "https" => 443,
@@ -428,13 +256,15 @@ fn host_header(u: &Url) -> String {
     }
 }
 
-#[cfg(all(test, feature = "tokio-rt", not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "tokio-rt"))]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
 
+    use super::super::{WebSocket, WsMessage};
     use super::*;
+    use crate::io::tokio::TokioRuntime;
 
     fn serve(body: &'static [u8]) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -576,7 +406,7 @@ mod tests {
         let req = Request::new("PUT", format!("http://127.0.0.1:{port}/x"))
             .header("X-Custom", "abc")
             .header("User-Agent", "mine/1.0")
-            .with_body(b"hi".to_vec());
+            .body(b"hi".to_vec());
         let resp = request(&rt, &req).await.unwrap();
         assert_eq!(resp.status, 200);
 
@@ -740,6 +570,46 @@ mod tests {
         assert_eq!(resp.body, gz, "raw encoded bytes when decompress is off");
     }
 
+    #[tokio::test]
+    async fn async_request_times_out() {
+        // A listener that accepts but never answers: only the timeout can end
+        // this request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let held = listener.accept();
+            thread::sleep(std::time::Duration::from_secs(30));
+            drop(held);
+        });
+        let rt = TokioRuntime;
+        let req =
+            Request::get(format!("http://127.0.0.1:{port}/")).timeout(Duration::from_millis(150));
+        let err = request(&rt, &req).await.expect_err("should time out");
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}"),
+            other => panic!("expected a TimedOut io error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_timeout_not_hit_when_request_is_fast() {
+        let port = serve(b"quick");
+        let rt = TokioRuntime;
+        let req =
+            Request::get(format!("http://127.0.0.1:{port}/")).timeout(Duration::from_secs(30));
+        let resp = request(&rt, &req).await.unwrap();
+        assert_eq!(resp.body, b"quick");
+    }
+
+    #[tokio::test]
+    async fn connect_reports_unresolvable_host() {
+        let rt = TokioRuntime;
+        let err = get(&rt, "http://no-such-host.invalid./")
+            .await
+            .expect_err("should not resolve");
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+    }
+
     /// A minimal in-process `ws://` echo server: completes the RFC 6455
     /// handshake (reusing the crate's own `derive_accept`), then reads one masked
     /// client frame, unmasks it, and echoes it back as an unmasked server frame.
@@ -823,8 +693,41 @@ mod tests {
         let mut ws = WebSocket::connect(&rt, &format!("ws://127.0.0.1:{port}/"))
             .await
             .expect("ws connect");
+        assert!(!ws.is_closed());
+        assert_eq!(ws.subprotocol(), None);
         ws.send_text("hello ws").await.expect("send");
         let msg = ws.recv().await.expect("stream open").expect("recv ok");
         assert_eq!(msg, WsMessage::Text("hello ws".to_string()));
+    }
+
+    #[tokio::test]
+    async fn async_websocket_close_with_is_idempotent() {
+        let port = ws_echo_once();
+        let rt = TokioRuntime;
+        let mut ws = WebSocket::connect(&rt, &format!("ws://127.0.0.1:{port}/"))
+            .await
+            .expect("ws connect");
+        ws.close_with(1000, "bye").await.expect("close");
+        assert!(ws.is_closed());
+        // A second close sends nothing and still succeeds.
+        ws.close().await.expect("second close is a no-op");
+        // Receiving on a closed socket ends the stream rather than reading on.
+        assert!(ws.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn async_websocket_close_reason_must_fit_a_control_frame() {
+        let port = ws_echo_once();
+        let rt = TokioRuntime;
+        let mut ws = WebSocket::connect(&rt, &format!("ws://127.0.0.1:{port}/"))
+            .await
+            .expect("ws connect");
+        let err = ws
+            .close_with(1000, &"x".repeat(200))
+            .await
+            .expect_err("reason too long");
+        assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
+        // The rejected close must not have marked the socket closed.
+        assert!(!ws.is_closed());
     }
 }

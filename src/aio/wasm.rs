@@ -3,11 +3,13 @@
 //!
 //! This module only compiles on `wasm32-unknown-unknown`, where rsurl cannot
 //! open sockets or run its own TLS/HTTP stack — the browser owns all of that.
-//! [`fetch`] backs [`crate::aio::request`]; [`WebSocket`] is the async WebSocket
-//! client. See the [`crate::aio`] module docs for the browser-imposed limits
-//! (forbidden headers, CORS, no custom WebSocket handshake headers, …).
+//! [`request`] backs the module's HTTP entry points; [`WebSocket`] is the async
+//! WebSocket client. See the [`crate::aio`] module docs for the browser-imposed
+//! limits (forbidden headers, CORS, no custom WebSocket handshake headers, …)
+//! and for which parts of the surface are portable across targets.
 
 use std::cell::RefCell;
+use std::fmt;
 use std::rc::Rc;
 
 use futures_channel::mpsc::{self, UnboundedReceiver};
@@ -34,8 +36,30 @@ fn js_err(v: JsValue) -> Error {
 
 // ─── Fetch (HTTP) ────────────────────────────────────────────────────────────
 
-/// Perform `req` via the browser Fetch API and buffer the whole response.
-pub async fn fetch(req: &Request) -> Result<Response> {
+/// Perform a `GET` of `url` via the browser Fetch API. The wasm counterpart of
+/// the native `get` — no `Runtime` argument, since the browser event loop is
+/// implicit.
+pub async fn get(url: &str) -> Result<Response> {
+    request(&Request::get(url)).await
+}
+
+/// Perform a `POST` of `body` to `url` via the browser Fetch API. The wasm
+/// counterpart of the native `post`.
+pub async fn post(url: &str, body: impl Into<Vec<u8>>) -> Result<Response> {
+    request(&Request::post(url, body)).await
+}
+
+/// Send `req` via the browser Fetch API, returning the buffered [`Response`].
+/// The wasm counterpart of the native `request` — no `Runtime` argument.
+///
+/// The browser performs DNS, TLS, redirect following, and response
+/// decompression itself, so [`Request::decompress`] is ignored and
+/// [`Request::follow_redirects`] maps to fetch's redirect mode: `true` →
+/// `follow` (the default), `false` → `manual` (a redirect yields an opaque
+/// response you cannot read). [`Request::timeout`] becomes an
+/// `AbortSignal.timeout()`. Forbidden headers set on `req` are dropped by the
+/// browser, and cross-origin requests are subject to CORS.
+pub async fn request(req: &Request) -> Result<Response> {
     let init = web_sys::RequestInit::new();
     init.set_method(&req.method);
     init.set_redirect(if req.follow_redirects {
@@ -43,6 +67,14 @@ pub async fn fetch(req: &Request) -> Result<Response> {
     } else {
         web_sys::RequestRedirect::Manual
     });
+
+    // Whole-request deadline. `AbortSignal.timeout` takes whole milliseconds and
+    // is saturated rather than wrapped, so an absurd Duration just means "no
+    // practical limit" instead of a surprise near-instant abort.
+    if let Some(dur) = req.timeout {
+        let ms = u32::try_from(dur.as_millis()).unwrap_or(u32::MAX);
+        init.set_signal(Some(&web_sys::AbortSignal::timeout_with_u32(ms)));
+    }
 
     // Body — an empty body sends no payload (a GET/HEAD must not carry one).
     if !req.body.is_empty() {
@@ -114,8 +146,8 @@ fn read_headers(headers: &web_sys::Headers) -> Vec<(String, String)> {
 
 // ─── WebSocket ───────────────────────────────────────────────────────────────
 
-/// Owns the JS event-handler closures for a `WebSocket` so they outlive the
-/// connection; dropping this detaches them and lets the socket be reclaimed.
+/// The JS event-handler closures for a `WebSocket`, kept alive for as long as
+/// they are registered on it.
 struct Handlers {
     _onopen: Closure<dyn FnMut(web_sys::Event)>,
     _onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
@@ -123,45 +155,110 @@ struct Handlers {
     _onclose: Closure<dyn FnMut(web_sys::CloseEvent)>,
 }
 
+/// The browser socket plus the closures registered on it, owned jointly by
+/// every handle to the connection ([`WebSocket`], or the [`WsSink`] /
+/// [`WsStream`] it splits into) via an [`Rc`].
+///
+/// Its [`Drop`] is the safety-critical part: the closures are about to be freed,
+/// and a browser event delivered to a freed `Closure` traps with "closure
+/// invoked recursively or after being dropped". Detaching every handler *before*
+/// the `Handlers` field drops makes that impossible; closing the socket in the
+/// same breath is what stops a dropped connection from leaking (the browser
+/// keeps a `WebSocket` open until it is closed, reachable from Rust or not).
+struct Inner {
+    ws: web_sys::WebSocket,
+    _handlers: Handlers,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Field drops (the `Closure`s) run after this body, so no handler can
+        // still be registered when they are freed.
+        self.ws.set_onopen(None);
+        self.ws.set_onmessage(None);
+        self.ws.set_onerror(None);
+        self.ws.set_onclose(None);
+        let _ = self.ws.close();
+    }
+}
+
 /// An async WebSocket client over the browser's native `WebSocket`.
 ///
 /// The browser owns framing, masking, permessage-deflate, ping/pong keepalive,
-/// and the close handshake, so this is a thin async surface over it. Notable
-/// browser limits (not rsurl bugs): the handshake takes **no custom headers**
-/// (no `Authorization`; only subprotocols via
+/// and the close handshake, so this is a thin async surface over it. It mirrors
+/// the native [`aio::WebSocket`](crate::aio::WebSocket) method for method — same
+/// names, receivers, `async`-ness, and return types — so only the
+/// [`connect`](WebSocket::connect) call differs between targets.
+///
+/// Notable browser limits (not rsurl bugs): the handshake takes **no custom
+/// headers** (no `Authorization`; only subprotocols, via
 /// [`connect_with_subprotocols`](WebSocket::connect_with_subprotocols)), and
 /// ping/pong control frames are inaccessible.
+///
+/// Dropping the last handle to the connection detaches the browser event
+/// handlers and closes the socket.
 pub struct WebSocket {
-    ws: web_sys::WebSocket,
+    inner: Rc<Inner>,
     rx: UnboundedReceiver<Result<WsMessage>>,
-    _handlers: Handlers,
+    subprotocol: Option<String>,
 }
 
-/// The send half of a [`WebSocket`] after [`split`](WebSocket::split); cheap to
-/// clone, safe to hold alongside the [`WsStream`] on the same event loop.
+/// The send half of a [`WebSocket`] after [`split`](WebSocket::split). Cheap to
+/// clone — every clone shares one browser socket — and safe to hold alongside
+/// the [`WsStream`] on the same event loop.
+#[derive(Clone)]
 pub struct WsSink {
-    ws: web_sys::WebSocket,
+    inner: Rc<Inner>,
 }
 
 /// The receive half of a [`WebSocket`] after [`split`](WebSocket::split): an
-/// async stream of incoming [`WsMessage`]s. Owns the event-handler closures, so
-/// dropping it stops delivery.
+/// async stream of incoming [`WsMessage`]s.
 pub struct WsStream {
+    inner: Rc<Inner>,
     rx: UnboundedReceiver<Result<WsMessage>>,
-    _handlers: Handlers,
 }
 
-/// Detach every handler from `ws` and close it, so the browser cannot invoke the
-/// (about-to-be-dropped) handler closures after `connect` returns on a failed
-/// dial — which would trap with "closure invoked recursively or after being
-/// dropped". Setting each handler to `None` unregisters it from the JS socket
-/// while the Rust `Closure`s are still alive, so none is called after they drop.
-fn detach_and_close(ws: &web_sys::WebSocket) {
-    ws.set_onopen(None);
-    ws.set_onmessage(None);
-    ws.set_onerror(None);
-    ws.set_onclose(None);
-    let _ = ws.close();
+impl fmt::Debug for WebSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WebSocket")
+            .field("url", &self.inner.ws.url())
+            .field("ready_state", &self.inner.ws.ready_state())
+            .field("subprotocol", &self.subprotocol)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for WsSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WsSink")
+            .field("url", &self.inner.ws.url())
+            .field("ready_state", &self.inner.ws.ready_state())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for WsStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WsStream")
+            .field("url", &self.inner.ws.url())
+            .field("ready_state", &self.inner.ws.ready_state())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether `ws` is CLOSING or CLOSED.
+fn is_closed(ws: &web_sys::WebSocket) -> bool {
+    ws.ready_state() >= web_sys::WebSocket::CLOSING
+}
+
+/// Send one message over `ws`, mapping a JS exception (e.g. sending on a closed
+/// socket) to an [`Error`].
+fn send_msg(ws: &web_sys::WebSocket, msg: &WsMessage) -> Result<()> {
+    match msg {
+        WsMessage::Text(t) => ws.send_with_str(t),
+        WsMessage::Binary(b) => ws.send_with_u8_array(b),
+    }
+    .map_err(js_err)
 }
 
 impl WebSocket {
@@ -243,34 +340,47 @@ impl WebSocket {
         };
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
-        match open_rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                // The `onopen`/`onmessage`/`onerror`/`onclose` closures are about
-                // to drop as this fn returns; detach them from the socket first so
-                // a subsequent browser close/error event cannot invoke a dropped
-                // closure (which traps).
-                detach_and_close(&ws);
-                return Err(e);
-            }
-            Err(_) => {
-                detach_and_close(&ws);
-                return Err(Error::BadResponse(
-                    "websocket closed before it opened".into(),
-                ));
-            }
-        }
-
-        Ok(WebSocket {
+        // From here on the socket and its closures are owned together: a failed
+        // dial returns early and `Inner::drop` detaches the handlers before they
+        // are freed, so the browser cannot invoke a dropped closure.
+        let inner = Rc::new(Inner {
             ws,
-            rx: msg_rx,
             _handlers: Handlers {
                 _onopen: onopen,
                 _onmessage: onmessage,
                 _onerror: onerror,
                 _onclose: onclose,
             },
+        });
+
+        match open_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(Error::BadResponse(
+                    "websocket closed before it opened".into(),
+                ))
+            }
+        }
+
+        // The browser exposes the negotiated subprotocol only once open; it is
+        // the empty string when none was selected.
+        let subprotocol = Some(inner.ws.protocol()).filter(|p| !p.is_empty());
+        Ok(WebSocket {
+            inner,
+            rx: msg_rx,
+            subprotocol,
         })
+    }
+
+    /// The subprotocol the server selected, or `None`.
+    pub fn subprotocol(&self) -> Option<&str> {
+        self.subprotocol.as_deref()
+    }
+
+    /// Whether the connection is closing or closed.
+    pub fn is_closed(&self) -> bool {
+        is_closed(&self.inner.ws)
     }
 
     /// Receive the next message, or `None` once the connection has closed.
@@ -278,78 +388,94 @@ impl WebSocket {
         self.rx.next().await
     }
 
-    /// Send a text message.
-    pub fn send_text(&self, text: &str) -> Result<()> {
-        self.ws.send_with_str(text).map_err(js_err)
+    /// Send a text message. `async` for parity with the native socket; the
+    /// browser buffers the frame itself, so this never actually yields.
+    pub async fn send_text(&mut self, text: &str) -> Result<()> {
+        self.inner.ws.send_with_str(text).map_err(js_err)
     }
 
-    /// Send a binary message.
-    pub fn send_binary(&self, data: &[u8]) -> Result<()> {
-        self.ws.send_with_u8_array(data).map_err(js_err)
+    /// Send a binary message. See [`send_text`](Self::send_text) on the `async`.
+    pub async fn send_binary(&mut self, data: &[u8]) -> Result<()> {
+        self.inner.ws.send_with_u8_array(data).map_err(js_err)
     }
 
     /// Send a [`WsMessage`].
-    pub fn send(&self, msg: &WsMessage) -> Result<()> {
-        match msg {
-            WsMessage::Text(t) => self.send_text(t),
-            WsMessage::Binary(b) => self.send_binary(b),
-        }
+    pub async fn send(&mut self, msg: &WsMessage) -> Result<()> {
+        send_msg(&self.inner.ws, msg)
     }
 
-    /// Initiate a normal close (code 1000).
-    pub fn close(&self) -> Result<()> {
-        self.ws.close().map_err(js_err)
+    /// Initiate a normal close (code 1000). Idempotent.
+    pub async fn close(&mut self) -> Result<()> {
+        self.inner.ws.close().map_err(js_err)
     }
 
-    /// Initiate a close with a specific code and reason.
-    pub fn close_with(&self, code: u16, reason: &str) -> Result<()> {
-        self.ws
+    /// Initiate a close with a specific code and reason. Idempotent.
+    pub async fn close_with(&mut self, code: u16, reason: &str) -> Result<()> {
+        self.inner
+            .ws
             .close_with_code_and_reason(code, reason)
             .map_err(js_err)
     }
 
     /// Split into an independent [`WsSink`] (send) and [`WsStream`] (receive),
-    /// both living on the same browser event loop. The single-threaded analogue
-    /// of the native [`crate::WebSocket::split`].
+    /// both living on the same browser event loop and sharing one socket, which
+    /// closes when the last of them drops. The single-threaded analogue of the
+    /// blocking [`crate::WebSocket::split`]; the native async socket has no
+    /// counterpart.
     pub fn split(self) -> (WsSink, WsStream) {
         (
             WsSink {
-                ws: self.ws.clone(),
+                inner: Rc::clone(&self.inner),
             },
             WsStream {
+                inner: self.inner,
                 rx: self.rx,
-                _handlers: self._handlers,
             },
         )
     }
 }
 
 impl WsSink {
+    /// Whether the connection is closing or closed.
+    pub fn is_closed(&self) -> bool {
+        is_closed(&self.inner.ws)
+    }
+
     /// Send a text message.
-    pub fn send_text(&self, text: &str) -> Result<()> {
-        self.ws.send_with_str(text).map_err(js_err)
+    pub async fn send_text(&self, text: &str) -> Result<()> {
+        self.inner.ws.send_with_str(text).map_err(js_err)
     }
 
     /// Send a binary message.
-    pub fn send_binary(&self, data: &[u8]) -> Result<()> {
-        self.ws.send_with_u8_array(data).map_err(js_err)
+    pub async fn send_binary(&self, data: &[u8]) -> Result<()> {
+        self.inner.ws.send_with_u8_array(data).map_err(js_err)
     }
 
     /// Send a [`WsMessage`].
-    pub fn send(&self, msg: &WsMessage) -> Result<()> {
-        match msg {
-            WsMessage::Text(t) => self.send_text(t),
-            WsMessage::Binary(b) => self.send_binary(b),
-        }
+    pub async fn send(&self, msg: &WsMessage) -> Result<()> {
+        send_msg(&self.inner.ws, msg)
     }
 
-    /// Initiate a normal close (code 1000).
-    pub fn close(&self) -> Result<()> {
-        self.ws.close().map_err(js_err)
+    /// Initiate a normal close (code 1000). Idempotent.
+    pub async fn close(&self) -> Result<()> {
+        self.inner.ws.close().map_err(js_err)
+    }
+
+    /// Initiate a close with a specific code and reason. Idempotent.
+    pub async fn close_with(&self, code: u16, reason: &str) -> Result<()> {
+        self.inner
+            .ws
+            .close_with_code_and_reason(code, reason)
+            .map_err(js_err)
     }
 }
 
 impl WsStream {
+    /// Whether the connection is closing or closed.
+    pub fn is_closed(&self) -> bool {
+        is_closed(&self.inner.ws)
+    }
+
     /// Receive the next message, or `None` once the connection has closed.
     pub async fn recv(&mut self) -> Option<Result<WsMessage>> {
         self.rx.next().await

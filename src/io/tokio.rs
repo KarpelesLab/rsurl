@@ -17,7 +17,11 @@ use crate::io::runtime::{AsyncConn, Runtime};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TokioRuntime;
 
-/// A Tokio [`TcpStream`] adapted to [`AsyncConn`].
+/// A Tokio [`TcpStream`] adapted to [`AsyncConn`]. This is
+/// [`TokioRuntime::Conn`], i.e. the `C` in the async
+/// [`WebSocket<C>`](crate::aio::WebSocket) a `TokioRuntime` produces — see
+/// [`crate::aio::TokioWebSocket`].
+#[derive(Debug)]
 pub struct TokioConn(TcpStream);
 
 impl AsyncConn for TokioConn {
@@ -39,6 +43,12 @@ impl Runtime for TokioRuntime {
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TokioConn> {
         Ok(TokioConn(TcpStream::connect(addr).await?))
+    }
+
+    /// Non-blocking DNS: Tokio runs the system resolver on its blocking pool,
+    /// so the executor thread is never stalled (unlike the trait's default).
+    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        Ok(tokio::net::lookup_host((host, port)).await?.collect())
     }
 
     async fn sleep(&self, dur: Duration) {
