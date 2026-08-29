@@ -104,6 +104,16 @@ pub struct DownloadOptions {
     pub limit_rate: Option<u64>,
     /// Abort if the average rate stays below `min` bytes/sec once `secs` have
     /// elapsed (curl `-Y`/`-y`); the download's retry loop then re-attempts.
+    ///
+    /// In segmented mode this is measured **per connection**, not across the
+    /// transfer: a single segment that falls behind is cut and retried on a
+    /// fresh connection, which usually lands somewhere healthier and rescues
+    /// the transfer. Only if the replacements are just as slow does the
+    /// segment's retry budget run out and the download give up — a low-speed
+    /// cut deliberately does not refresh that budget, so a link that is simply
+    /// slow still fails the way `-Y` promises. `secs` doubles as the socket
+    /// read timeout, so a connection that stalls outright is cut within the
+    /// window rather than after the default 60s.
     pub low_speed: Option<(u64, u64)>,
     /// First backoff delay; doubles each failed retry up to `max_backoff`.
     pub initial_backoff: Duration,
@@ -443,6 +453,13 @@ impl Downloader {
         if let Some(t) = opts.max_time {
             base = base.max_time(t);
         }
+        // A `-y` window is also how long we are willing to sit on a silent
+        // socket: cap the read timeout at it so a connection that stalls
+        // outright is cut and retried inside the window instead of after the
+        // default 60s.
+        if let Some((_, secs)) = opts.low_speed {
+            base = base.read_timeout(Some(Duration::from_secs(secs.max(1))));
+        }
         Downloader {
             base,
             final_path: path.to_path_buf(),
@@ -673,10 +690,7 @@ impl Downloader {
                     return Attempt::Transient {
                         written,
                         resumable,
-                        err: Error::Io(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "transfer below low-speed limit",
-                        )),
+                        err: low_speed_error(),
                     };
                 }
             }
@@ -729,6 +743,7 @@ impl Downloader {
         let meter = Arc::new(ByteMeter::new(
             self.opts.progress.take(),
             self.opts.limit_rate,
+            self.opts.low_speed,
         ));
         let out = self.run_segmented_metered(&meter);
         meter.report(true);
@@ -848,26 +863,26 @@ impl Downloader {
                 if let Some(t) = total {
                     meter.set_total(t);
                 }
-                let (wrote, err) = pump_to_file(
+                let p = pump_to_file(
                     &mut reader,
                     &self.part,
                     0,
                     total.unwrap_or(u64::MAX),
                     Some(meter),
                 );
-                if let Some(e) = err {
+                if let Some(e) = p.err {
                     if budget == 0 {
                         return Err(SegErr::Fatal(e));
                     }
                     // This path retries the whole body from offset 0, so the
                     // bytes it just wrote are about to be written again.
-                    meter.rewind(wrote);
+                    meter.rewind(p.wrote);
                     budget -= 1;
                     attempt_no += 1;
                     self.backoff(attempt_no);
                     continue;
                 }
-                return Ok(Bootstrap::Full(wrote));
+                return Ok(Bootstrap::Full(p.wrote));
             }
             if status == 416 {
                 // Empty resource.
@@ -915,19 +930,19 @@ impl Downloader {
                 // Too small to split: this open 206 stream is the whole file.
                 Err(SegErr::Fallback) => {
                     self.prepare_part(Some(total))?;
-                    let (wrote, err) = pump_to_file(&mut reader, &self.part, 0, total, Some(meter));
-                    if let Some(e) = err {
+                    let p = pump_to_file(&mut reader, &self.part, 0, total, Some(meter));
+                    if let Some(e) = p.err {
                         if budget == 0 {
                             return Err(SegErr::Fatal(e));
                         }
                         // Retried from offset 0; un-count the partial attempt.
-                        meter.rewind(wrote);
+                        meter.rewind(p.wrote);
                         budget -= 1;
                         attempt_no += 1;
                         self.backoff(attempt_no);
                         continue;
                     }
-                    return Ok(Bootstrap::Full(wrote));
+                    return Ok(Bootstrap::Full(p.wrote));
                 }
                 Err(e) => return Err(e),
             };
@@ -940,7 +955,7 @@ impl Downloader {
             // resume within the chunk) if the stream broke early.
             let (_, end0) = plan[0];
             let want0 = end0 + 1;
-            let (got0, _err0) = pump_to_file(&mut reader, &self.part, 0, want0, Some(meter));
+            let got0 = pump_to_file(&mut reader, &self.part, 0, want0, Some(meter)).wrote;
             drop(reader);
             if got0 < want0 {
                 match fetch_chunk_streaming(
@@ -1214,19 +1229,23 @@ struct ByteMeter {
     /// Total size once known; 0 while it is still unknown.
     total: AtomicU64,
     limit_rate: Option<u64>,
+    /// The `-Y`/`-y` policy. Held here so it reaches every pump, but applied by
+    /// each pump to *its own* connection — see [`DownloadOptions::low_speed`].
+    low_speed: Option<(u64, u64)>,
     started: Instant,
     /// The callback and the last time it was invoked, locked together.
     sink: Mutex<(Option<ProgressFn>, Instant)>,
 }
 
 impl ByteMeter {
-    fn new(cb: Option<ProgressFn>, limit_rate: Option<u64>) -> Self {
+    fn new(cb: Option<ProgressFn>, limit_rate: Option<u64>, low_speed: Option<(u64, u64)>) -> Self {
         let now = Instant::now();
         ByteMeter {
             done: AtomicU64::new(0),
             moved: AtomicU64::new(0),
             total: AtomicU64::new(0),
             limit_rate: limit_rate.filter(|r| *r > 0),
+            low_speed: low_speed.filter(|(min, _)| *min > 0),
             started: now,
             sink: Mutex::new((cb, now)),
         }
@@ -1340,7 +1359,11 @@ fn fetch_chunk_streaming(
         match stream_chunk_once(req, part, from, want - got, meter) {
             StreamOnce::Fallback => return ChunkResult::Fallback,
             StreamOnce::Fatal(e) => return ChunkResult::Fatal(e),
-            StreamOnce::Advanced { wrote, err } => {
+            StreamOnce::Advanced {
+                wrote,
+                err,
+                too_slow,
+            } => {
                 got += wrote;
                 if got >= want {
                     return ChunkResult::Ok;
@@ -1348,13 +1371,18 @@ fn fetch_chunk_streaming(
                 // Progress stalled short of the chunk end (a mid-stream break or
                 // a short read); retry the remainder unless the budget is spent.
                 let err = err.unwrap_or(Error::UnexpectedEof);
-                if wrote > 0 {
+                if wrote > 0 && !too_slow {
                     // Durable forward progress — the next attempt resumes from
                     // the new offset. Refresh the budget the way the
                     // single-stream loop does (and as `max_retries` documents),
                     // so a chunk that keeps advancing over a flaky link is not
                     // abandoned after `max` breaks. `got` only ever grows toward
                     // `want`, so this still terminates.
+                    //
+                    // A connection we cut for being too slow is the exception:
+                    // it did advance, but refreshing on it would retry forever
+                    // instead of ever honouring `-Y`. Each replacement costs a
+                    // retry, so a genuinely slow link still gives up.
                     budget = retry.max;
                     attempt_no = 0;
                 }
@@ -1373,7 +1401,13 @@ fn fetch_chunk_streaming(
 enum StreamOnce {
     /// Wrote `wrote` bytes; `err` is `Some` if the stream broke mid-chunk,
     /// `None` on a clean end (which, for a length-framed range, means complete).
-    Advanced { wrote: u64, err: Option<Error> },
+    /// `too_slow` marks a break that was *our* doing — the connection fell
+    /// below the `-Y`/`-y` floor and we cut it.
+    Advanced {
+        wrote: u64,
+        err: Option<Error>,
+        too_slow: bool,
+    },
     /// The server ignored the range (`200`) — fall back to single-stream.
     Fallback,
     /// A permanent failure.
@@ -1393,6 +1427,7 @@ fn stream_chunk_once(
             return StreamOnce::Advanced {
                 wrote: 0,
                 err: Some(e),
+                too_slow: false,
             }
         }
         Err(e) => return StreamOnce::Fatal(e),
@@ -1408,14 +1443,19 @@ fn stream_chunk_once(
             return StreamOnce::Advanced {
                 wrote: 0,
                 err: Some(status_error(s, &reader)),
+                too_slow: false,
             }
         }
         s => return StreamOnce::Fatal(Error::BadResponse(format!("unexpected status {s}"))),
     }
-    let (wrote, err) = pump_to_file(&mut reader, part, at, want, Some(meter));
-    match err {
+    let p = pump_to_file(&mut reader, part, at, want, Some(meter));
+    match p.err {
         Some(Error::Io(e)) if pump_open_failed(&e) => StreamOnce::Fatal(Error::Io(e)),
-        _ => StreamOnce::Advanced { wrote, err },
+        err => StreamOnce::Advanced {
+            wrote: p.wrote,
+            err,
+            too_slow: p.too_slow,
+        },
     }
 }
 
@@ -1428,48 +1468,105 @@ fn pump_open_failed(e: &io::Error) -> bool {
     )
 }
 
-/// Stream up to `want` bytes from `reader` into `part` at absolute offset `at`,
-/// returning the count written and any error that stopped it early. Never
-/// writes past `want` (so an over-long response can't overrun the next chunk).
+/// What a [`pump_to_file`] call ended on.
+struct Pumped {
+    /// Bytes this pump landed in the part file.
+    wrote: u64,
+    /// The error that stopped it short of `want`, if any.
+    err: Option<Error>,
+    /// The stream was cut because *this connection* fell below the `-Y`/`-y`
+    /// floor, rather than breaking on its own. The caller retries on a fresh
+    /// connection, but must not let the bytes this one did land refresh the
+    /// retry budget: if the replacements are equally slow the link is slow, and
+    /// `-Y` is supposed to give up.
+    too_slow: bool,
+}
+
+impl Pumped {
+    /// Ended without an error — either `want` bytes landed or the stream closed.
+    fn clean(wrote: u64) -> Self {
+        Pumped {
+            wrote,
+            err: None,
+            too_slow: false,
+        }
+    }
+
+    fn broke(wrote: u64, err: Error) -> Self {
+        Pumped {
+            wrote,
+            err: Some(err),
+            too_slow: false,
+        }
+    }
+}
+
+/// Stream up to `want` bytes from `reader` into `part` at absolute offset `at`.
+/// Never writes past `want` (so an over-long response can't overrun the next
+/// chunk).
 ///
-/// Bytes are reported to `meter` as they land, which is both how a chunk still
-/// in flight shows up in the progress callback and how the transfer-wide rate
-/// limit is applied.
+/// Bytes are reported to `meter` as they land, which is how a chunk still in
+/// flight shows up in the progress callback and how the transfer-wide rate
+/// limit is paced. The meter also carries the `-Y`/`-y` floor, which this
+/// applies to its own connection alone: this pump's bytes over this pump's
+/// elapsed time, so one slow segment is cut and retried rather than dragging
+/// the verdict onto the healthy ones.
 fn pump_to_file(
     reader: &mut crate::http::BodyReader,
     part: &Path,
     at: u64,
     want: u64,
     meter: Option<&ByteMeter>,
-) -> (u64, Option<Error>) {
+) -> Pumped {
     let mut file = match OpenOptions::new().write(true).open(part) {
         Ok(f) => f,
-        Err(e) => return (0, Some(Error::Io(e))),
+        Err(e) => return Pumped::broke(0, Error::Io(e)),
     };
     if let Err(e) = file.seek(SeekFrom::Start(at)) {
-        return (0, Some(Error::Io(e)));
+        return Pumped::broke(0, Error::Io(e));
     }
+    let low_speed = meter.and_then(|m| m.low_speed);
+    let started = Instant::now();
     let mut wrote = 0u64;
     let mut buf = [0u8; 64 * 1024];
     loop {
         if wrote >= want {
-            return (wrote, None);
+            return Pumped::clean(wrote);
+        }
+        if let Some((min, secs)) = low_speed {
+            let el = started.elapsed().as_secs();
+            if el >= secs && wrote / el.max(1) < min {
+                return Pumped {
+                    wrote,
+                    err: Some(low_speed_error()),
+                    too_slow: true,
+                };
+            }
         }
         let cap = (want - wrote).min(buf.len() as u64) as usize;
         match reader.read(&mut buf[..cap]) {
-            Ok(0) => return (wrote, None),
+            Ok(0) => return Pumped::clean(wrote),
             Ok(n) => {
                 if let Err(e) = file.write_all(&buf[..n]) {
-                    return (wrote, Some(Error::Io(e)));
+                    return Pumped::broke(wrote, Error::Io(e));
                 }
                 wrote += n as u64;
                 if let Some(m) = meter {
                     m.add(n as u64);
                 }
             }
-            Err(e) => return (wrote, Some(Error::Io(e))),
+            Err(e) => return Pumped::broke(wrote, Error::Io(e)),
         }
     }
+}
+
+/// The `-Y`/`-y` abort. The message is load-bearing: the CLI matches on it to
+/// return curl's exit code 28.
+fn low_speed_error() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "transfer below low-speed limit",
+    ))
 }
 
 /// Bounded exponential backoff sleep before retry number `attempt_no`.
@@ -1697,6 +1794,11 @@ mod tests {
         kill_range_start: Option<u64>,
         /// Remaining injected kills.
         kills_left: usize,
+        /// Trickle the body on this many more requests: a connection that is
+        /// alive but far below any sane `-Y` floor.
+        slow_left: usize,
+        /// ...but only for a request whose range starts here (None = any).
+        slow_range_start: Option<u64>,
         /// Range header value of every request received, in order.
         ranges: Vec<String>,
     }
@@ -1711,10 +1813,18 @@ mod tests {
                 kill_after: None,
                 kill_range_start: None,
                 kills_left: 0,
+                slow_left: 0,
+                slow_range_start: None,
                 ranges: Vec::new(),
             }))
         }
     }
+
+    /// Trickle shape for a deliberately slow connection: ~20 KiB/s, which is
+    /// well under the floors the low-speed tests set.
+    const SLOW_PIECE: usize = 1024;
+    const SLOW_PIECES: usize = 64;
+    const SLOW_GAP: Duration = Duration::from_millis(50);
 
     fn start(origin: Arc<Mutex<Origin>>) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1722,7 +1832,10 @@ mod tests {
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut sock) = conn else { continue };
-                handle(&mut sock, &origin);
+                // A connection per thread: a deliberately slow response must
+                // not hold up the retry that is meant to replace it.
+                let origin = Arc::clone(&origin);
+                thread::spawn(move || handle(&mut sock, &origin));
             }
         });
         port
@@ -1843,11 +1956,31 @@ mod tests {
         } else {
             slice.len()
         };
+        // Decide whether to answer this one at a crawl instead.
+        let slow_here = o.slow_left > 0 && o.slow_range_start.map(|st| st == start).unwrap_or(true);
+        if slow_here {
+            o.slow_left -= 1;
+        }
         let payload = slice[..send_n].to_vec();
         drop(o); // release the lock before the (possibly slow) write
 
         let _ = sock.write_all(head_bytes.as_bytes());
-        let _ = sock.write_all(&payload);
+        if slow_here {
+            // Dribble it out so the client's *per-connection* rate check is
+            // what cuts the stream, not a read timeout. Bounded, and it stops
+            // early once the client hangs up, so a client that never gives up
+            // still can't hang the test.
+            let _ = sock.flush();
+            for piece in payload.chunks(SLOW_PIECE).take(SLOW_PIECES) {
+                if sock.write_all(piece).is_err() {
+                    break;
+                }
+                let _ = sock.flush();
+                thread::sleep(SLOW_GAP);
+            }
+        } else {
+            let _ = sock.write_all(&payload);
+        }
         let _ = sock.flush();
         // Half-close so the client reliably reads what we sent (then sees EOF —
         // a truncated body when we killed early), avoiding a RST race.
@@ -2430,6 +2563,83 @@ mod tests {
             origin.lock().unwrap().kills_left,
             0,
             "the injected breaks should all have been spent"
+        );
+        cleanup(&out);
+    }
+
+    /// `-Y`/`-y` is measured per connection in segmented mode: one segment that
+    /// falls below the floor is cut and retried on a *fresh* connection, which
+    /// usually lands somewhere healthier. Killing the whole transfer instead
+    /// would throw away three healthy connections over one bad one.
+    #[test]
+    fn slow_connection_is_cut_and_retried_on_a_fresh_one() {
+        const TOTAL: usize = 256 * 1024;
+        const CHUNK: u64 = 64 * 1024;
+
+        let body = make_body(TOTAL, 0x5107);
+        let origin = Origin::shared(body.clone(), "slow");
+        {
+            let mut o = origin.lock().unwrap();
+            // Only the first request for the second chunk crawls; the retry
+            // asks from a later offset, so it is served at full speed.
+            o.slow_range_start = Some(CHUNK);
+            o.slow_left = 1;
+        }
+        let port = start(origin.clone());
+        let out = tmp("slow_conn");
+
+        let mut opts = no_backoff();
+        opts.segment_size = Some(CHUNK);
+        opts.parallelism = 2;
+        opts.low_speed = Some((100_000, 1)); // 100 KB/s over a 1s window
+        let outcome = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect("a slow connection should be replaced, not fatal");
+        assert_eq!(outcome.bytes_written, TOTAL as u64);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+
+        let ranges = origin.lock().unwrap().ranges.clone();
+        let gets = ranges.iter().filter(|r| r.starts_with("bytes=")).count();
+        assert!(
+            gets > TOTAL / CHUNK as usize,
+            "the cut chunk should have been re-requested: {ranges:?}"
+        );
+        assert!(
+            ranges.iter().any(|r| {
+                r.strip_prefix("bytes=")
+                    .and_then(|r| r.split('-').next())
+                    .and_then(|st| st.parse::<u64>().ok())
+                    .is_some_and(|st| st > CHUNK && st < 2 * CHUNK)
+            }),
+            "the retry should resume inside the cut chunk, not restart it: {ranges:?}"
+        );
+        cleanup(&out);
+    }
+
+    /// ...but when every replacement is just as slow it is the link, not the
+    /// connection. A low-speed cut deliberately does not refresh the retry
+    /// budget, so the transfer still gives up with the error the CLI turns into
+    /// curl's exit 28 — otherwise `-Y` would never fire in segmented mode.
+    #[test]
+    fn persistently_slow_transfer_still_gives_up() {
+        const TOTAL: usize = 256 * 1024;
+        const CHUNK: u64 = 64 * 1024;
+
+        let body = make_body(TOTAL, 0x5108);
+        let origin = Origin::shared(body.clone(), "slower");
+        origin.lock().unwrap().slow_left = usize::MAX; // every connection crawls
+        let port = start(origin.clone());
+        let out = tmp("slow_all");
+
+        let mut opts = no_backoff();
+        opts.segment_size = Some(CHUNK);
+        opts.parallelism = 1;
+        opts.max_retries = 1;
+        opts.low_speed = Some((100_000, 1));
+        let err = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect_err("a persistently slow link must give up");
+        assert!(
+            err.to_string().contains("low-speed"),
+            "expected the -Y abort the CLI maps to exit 28, got {err}"
         );
         cleanup(&out);
     }
