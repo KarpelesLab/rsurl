@@ -144,11 +144,17 @@ fn parse_http_response(body: &[u8]) -> Result<AnnounceResponse> {
 }
 
 fn parse_compact_v4(b: &[u8]) -> Vec<SocketAddr> {
-    b.chunks_exact(6).map(super::compact_v4).collect()
+    b.as_chunks::<6>()
+        .0
+        .iter()
+        .map(|c| super::compact_v4(c))
+        .collect()
 }
 
 fn parse_compact_v6(b: &[u8]) -> Vec<SocketAddr> {
-    b.chunks_exact(18)
+    b.as_chunks::<18>()
+        .0
+        .iter()
         .map(|c| {
             let mut o = [0u8; 16];
             o.copy_from_slice(&c[..16]);

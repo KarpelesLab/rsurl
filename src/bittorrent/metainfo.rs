@@ -97,14 +97,7 @@ impl Metainfo {
         if pieces_raw.is_empty() || pieces_raw.len() % 20 != 0 {
             return Err(terr("info.pieces is not a multiple of 20 bytes"));
         }
-        let pieces: Vec<[u8; 20]> = pieces_raw
-            .chunks_exact(20)
-            .map(|c| {
-                let mut a = [0u8; 20];
-                a.copy_from_slice(c);
-                a
-            })
-            .collect();
+        let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
 
         // Single-file (`length`) vs multi-file (`files`).
         let (files, total_length) = if let Some(len) = info.get(b"length").and_then(Value::as_int) {

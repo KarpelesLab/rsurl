@@ -195,7 +195,7 @@ impl PeerSettings {
                 payload.len()
             )));
         }
-        for chunk in payload.chunks_exact(6) {
+        for chunk in payload.as_chunks::<6>().0 {
             let id = u16::from_be_bytes([chunk[0], chunk[1]]);
             let val = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
             match id {
@@ -1133,12 +1133,11 @@ impl Decoder {
         let mut list_size: usize = 0;
         while pos < buf.len() {
             let b = buf[pos];
-            let entry: (String, String);
-            if b & 0x80 != 0 {
+            let entry: (String, String) = if b & 0x80 != 0 {
                 // Indexed header field (RFC 7541 §6.1).
                 let (idx, n) = decode_int(&buf[pos..], 7)?;
                 pos += n;
-                entry = self.lookup(idx)?;
+                self.lookup(idx)?
             } else if b & 0x40 != 0 {
                 // Literal header field with incremental indexing (§6.2.1).
                 let (idx, n) = decode_int(&buf[pos..], 6)?;
@@ -1150,7 +1149,7 @@ impl Decoder {
                 };
                 let value = self.read_string(buf, &mut pos)?;
                 self.insert(name.clone(), value.clone());
-                entry = (name, value);
+                (name, value)
             } else if b & 0x20 != 0 {
                 // Dynamic table size update (§6.3).
                 let (new_size, n) = decode_int(&buf[pos..], 5)?;
@@ -1172,8 +1171,8 @@ impl Decoder {
                     self.lookup_name(idx)?
                 };
                 let value = self.read_string(buf, &mut pos)?;
-                entry = (name, value);
-            }
+                (name, value)
+            };
             // Reject malformed/forbidden octets in field names and values
             // (RFC 9113 §8.2.1). This covers every code path — indexed,
             // literal, and table-sourced — so a malicious peer can't smuggle
@@ -4868,7 +4867,9 @@ mod tests {
         assert_eq!(settings.typ, F_SETTINGS);
         let iws = settings
             .payload
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .find(|c| u16::from_be_bytes([c[0], c[1]]) == S_INITIAL_WINDOW_SIZE)
             .map(|c| u32::from_be_bytes([c[2], c[3], c[4], c[5]]));
         assert_eq!(iws, Some(recv));

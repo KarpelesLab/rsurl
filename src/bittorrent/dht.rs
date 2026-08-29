@@ -197,7 +197,7 @@ fn parse_response(buf: &[u8], txn: &[u8]) -> Option<Reply> {
     }
     let mut nodes = Vec::new();
     if let Some(b) = r.get(b"nodes").and_then(Value::as_bytes) {
-        for c in b.chunks_exact(26) {
+        for c in b.as_chunks::<26>().0 {
             let mut id = [0u8; 20];
             id.copy_from_slice(&c[..20]);
             let ip = Ipv4Addr::new(c[20], c[21], c[22], c[23]);
