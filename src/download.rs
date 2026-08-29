@@ -42,7 +42,7 @@
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,13 @@ pub struct DownloadOptions {
     /// probed), the classic "N parallel connections" model. Takes precedence
     /// over `segment_size`. A resource too small to split usefully is fetched as
     /// a single resumable stream instead.
+    ///
+    /// This is independent of [`parallelism`](Self::parallelism), and setting it
+    /// *higher* than the worker count is usually what you want: chunks are
+    /// claimed dynamically, so a plan with spare chunks lets a fast connection
+    /// pick up more work while a slow one is still busy. With exactly one chunk
+    /// per worker there is nothing left to rebalance and the transfer can only
+    /// finish as fast as its slowest segment.
     pub segments: Option<usize>,
     /// Number of concurrent workers in segmented mode — chunks are fetched in
     /// parallel over that many connections, sharing the chunk bitmap. Default 1
@@ -714,40 +721,63 @@ impl Downloader {
     // ---- segmented mode ----------------------------------------------------
 
     fn run_segmented(&mut self) -> std::result::Result<DownloadOutcome, SegErr> {
+        // The meter owns the progress callback for the duration of the
+        // segmented run: it aggregates the bytes every worker lands (including
+        // the chunks still in flight) and enforces the transfer-wide rate
+        // limit. Hand the callback back on the way out so a single-stream
+        // fallback keeps reporting.
+        let meter = Arc::new(ByteMeter::new(
+            self.opts.progress.take(),
+            self.opts.limit_rate,
+        ));
+        let out = self.run_segmented_metered(&meter);
+        meter.report(true);
+        self.opts.progress = meter.take_cb();
+        out
+    }
+
+    fn run_segmented_metered(
+        &mut self,
+        meter: &Arc<ByteMeter>,
+    ) -> std::result::Result<DownloadOutcome, SegErr> {
         // There is NO HEAD probe. Everything we need — total size, range
         // support, validators — is learned either from the on-disk `.rsurlpart`
         // (resume) or from the first chunk's own GET (fresh). The first GET is
         // real data, not a wasted round trip.
-        let (total, validators, chunk_key, plan, bitmap) = if let Some(state) = self.resume_ranged()
-        {
-            // Resume: the total + validators + chunk bitmap are on disk.
-            state
-        } else {
-            // Fresh: the first GET reveals the total and downloads chunk 0.
-            match self.bootstrap()? {
-                Bootstrap::Full(written) => {
-                    // No range support (or a resource that fits in one open
-                    // stream): the whole body is already on disk.
-                    self.verify_and_finalize(written, Some(written))
-                        .map_err(SegErr::Fatal)?;
-                    return Ok(DownloadOutcome {
-                        bytes_written: written,
-                        total: Some(written),
-                        resumed_from: 0,
-                    });
+        let (total, validators, chunk_key, plan, bitmap, resumed_from) =
+            if let Some((total, validators, chunk_key, plan, bitmap)) = self.resume_ranged() {
+                // Resume: the total + validators + chunk bitmap are on disk.
+                let done = plan_done_bytes(&plan, &bitmap);
+                meter.set_total(total);
+                meter.seed(done);
+                (total, validators, chunk_key, plan, bitmap, done)
+            } else {
+                // Fresh: the first GET reveals the total and downloads chunk 0.
+                match self.bootstrap(meter)? {
+                    Bootstrap::Full(written) => {
+                        // No range support (or a resource that fits in one open
+                        // stream): the whole body is already on disk.
+                        self.verify_and_finalize(written, Some(written))
+                            .map_err(SegErr::Fatal)?;
+                        return Ok(DownloadOutcome {
+                            bytes_written: written,
+                            total: Some(written),
+                            resumed_from: 0,
+                        });
+                    }
+                    // A fresh download resumed nothing: the bootstrap chunk is
+                    // progress made *this* run, not bytes off a prior partial.
+                    Bootstrap::Ranged {
+                        total,
+                        validators,
+                        chunk_key,
+                        plan,
+                        bitmap,
+                    } => (total, validators, chunk_key, plan, bitmap, 0),
                 }
-                Bootstrap::Ranged {
-                    total,
-                    validators,
-                    chunk_key,
-                    plan,
-                    bitmap,
-                } => (total, validators, chunk_key, plan, bitmap),
-            }
-        };
+            };
 
-        let resumed_from = plan_done_bytes(&plan, &bitmap);
-        self.run_chunks(&plan, total, chunk_key, &validators, bitmap)?;
+        self.run_chunks(&plan, total, chunk_key, &validators, bitmap, meter)?;
         self.verify_and_finalize(total, Some(total))
             .map_err(SegErr::Fatal)?;
         Ok(DownloadOutcome {
@@ -783,7 +813,7 @@ impl Downloader {
     /// Start a fresh segmented download: a single GET whose response reveals the
     /// total (from `Content-Range`) and carries the first chunk's bytes. A `200`
     /// (no range support) streams the whole body instead.
-    fn bootstrap(&mut self) -> std::result::Result<Bootstrap, SegErr> {
+    fn bootstrap(&mut self, meter: &ByteMeter) -> std::result::Result<Bootstrap, SegErr> {
         let mut budget = self.opts.max_retries;
         let mut attempt_no = 0u32;
         loop {
@@ -815,12 +845,23 @@ impl Downloader {
                     }
                 }
                 self.prepare_part(total)?;
-                let (wrote, err) =
-                    pump_to_file(&mut reader, &self.part, 0, total.unwrap_or(u64::MAX));
+                if let Some(t) = total {
+                    meter.set_total(t);
+                }
+                let (wrote, err) = pump_to_file(
+                    &mut reader,
+                    &self.part,
+                    0,
+                    total.unwrap_or(u64::MAX),
+                    Some(meter),
+                );
                 if let Some(e) = err {
                     if budget == 0 {
                         return Err(SegErr::Fatal(e));
                     }
+                    // This path retries the whole body from offset 0, so the
+                    // bytes it just wrote are about to be written again.
+                    meter.rewind(wrote);
                     budget -= 1;
                     attempt_no += 1;
                     self.backoff(attempt_no);
@@ -867,17 +908,20 @@ impl Downloader {
                     )));
                 }
             }
+            meter.set_total(total);
             let validators = self.validators_from(&reader);
             let (chunk_key, plan) = match self.chunk_plan(total) {
                 Ok(x) => x,
                 // Too small to split: this open 206 stream is the whole file.
                 Err(SegErr::Fallback) => {
                     self.prepare_part(Some(total))?;
-                    let (wrote, err) = pump_to_file(&mut reader, &self.part, 0, total);
+                    let (wrote, err) = pump_to_file(&mut reader, &self.part, 0, total, Some(meter));
                     if let Some(e) = err {
                         if budget == 0 {
                             return Err(SegErr::Fatal(e));
                         }
+                        // Retried from offset 0; un-count the partial attempt.
+                        meter.rewind(wrote);
                         budget -= 1;
                         attempt_no += 1;
                         self.backoff(attempt_no);
@@ -896,7 +940,7 @@ impl Downloader {
             // resume within the chunk) if the stream broke early.
             let (_, end0) = plan[0];
             let want0 = end0 + 1;
-            let (got0, _err0) = pump_to_file(&mut reader, &self.part, 0, want0);
+            let (got0, _err0) = pump_to_file(&mut reader, &self.part, 0, want0, Some(meter));
             drop(reader);
             if got0 < want0 {
                 match fetch_chunk_streaming(
@@ -906,6 +950,7 @@ impl Downloader {
                     end0,
                     &validators.etag,
                     self.retry(),
+                    meter,
                 ) {
                     ChunkResult::Ok => {}
                     ChunkResult::Fallback => return Err(SegErr::Fallback),
@@ -914,6 +959,7 @@ impl Downloader {
             }
             bit_set(&mut bitmap, 0);
             self.persist_ranged(chunk_key, total, &validators, &bitmap);
+            meter.report(true);
             return Ok(Bootstrap::Ranged {
                 total,
                 validators,
@@ -949,7 +995,7 @@ impl Downloader {
     fn chunk_plan(&self, total: u64) -> std::result::Result<(u32, Vec<(u64, u64)>), SegErr> {
         if let Some(n_req) = self.opts.segments {
             let by_size = total.div_ceil(MIN_SEGMENT_BYTES).max(1) as usize;
-            let upper = by_size.clamp(1, MAX_SEGMENT_WORKERS);
+            let upper = by_size.clamp(1, MAX_SEGMENT_CHUNKS);
             let n = n_req.clamp(1, upper);
             if n < 2 {
                 // Not worth splitting — a single resumable stream is as good.
@@ -995,6 +1041,7 @@ impl Downloader {
         chunk_key: u32,
         validators: &Validators,
         bitmap: Vec<u8>,
+        meter: &Arc<ByteMeter>,
     ) -> std::result::Result<(), SegErr> {
         let num_chunks = plan.len();
         let workers = self
@@ -1008,7 +1055,6 @@ impl Downloader {
         let next = Arc::new(AtomicUsize::new(0));
         let failed: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
         let fallback = Arc::new(AtomicBool::new(false));
-        let progress = Arc::new(Mutex::new(self.opts.progress.take()));
         let part = Arc::new(self.part.clone());
         let validators = Arc::new(validators.clone());
         // `If-Range` guards every chunk request: if the resource changed since
@@ -1024,7 +1070,7 @@ impl Downloader {
             let next = Arc::clone(&next);
             let failed = Arc::clone(&failed);
             let fallback = Arc::clone(&fallback);
-            let progress = Arc::clone(&progress);
+            let meter = Arc::clone(meter);
             let part = Arc::clone(&part);
             let validators = Arc::clone(&validators);
             let if_range = Arc::clone(&if_range);
@@ -1041,15 +1087,14 @@ impl Downloader {
                     continue;
                 }
                 let (start, end) = plan[i];
-                match fetch_chunk_streaming(&base, &part, start, end, &if_range, retry) {
+                match fetch_chunk_streaming(&base, &part, start, end, &if_range, retry, &meter) {
                     ChunkResult::Ok => {
                         let mut bm = bitmap.lock().unwrap();
                         bit_set(&mut bm, i);
                         let meta = ranged_meta(chunk_key as u64, total, &validators, &bm);
                         let _ = resume::write_state(&part, total, Kind::HttpRanged, &meta);
-                        if let Some(cb) = progress.lock().unwrap().as_mut() {
-                            cb(plan_done_bytes(&plan, &bm), Some(total));
-                        }
+                        drop(bm);
+                        meter.report(true);
                     }
                     ChunkResult::Fallback => fallback.store(true, Ordering::Relaxed),
                     ChunkResult::Fatal(e) => *failed.lock().unwrap() = Some(e),
@@ -1059,12 +1104,6 @@ impl Downloader {
         for h in handles {
             let _ = h.join();
         }
-        // Return the progress callback to the downloader (for a single-stream
-        // fallback, or just to leave `self` consistent).
-        self.opts.progress = Arc::try_unwrap(progress)
-            .ok()
-            .and_then(|m| m.into_inner().ok())
-            .flatten();
 
         if let Some(e) = Arc::try_unwrap(failed)
             .ok()
@@ -1144,6 +1183,117 @@ impl Downloader {
 const MIN_SEGMENT_BYTES: u64 = 1 << 20; // 1 MiB
 /// Hard cap on concurrent segment workers regardless of `parallelism`.
 const MAX_SEGMENT_WORKERS: usize = 16;
+/// Hard cap on how many chunks a plan may hold. Deliberately far above the
+/// worker cap: chunks are claimed dynamically, so a plan with more chunks than
+/// workers is what lets a fast connection keep pulling work while a slow one is
+/// still grinding. One chunk per worker leaves nothing to rebalance, and the
+/// transfer finishes no sooner than its slowest segment — the classic "last few
+/// percent crawl" at the tail of a parallel download.
+const MAX_SEGMENT_CHUNKS: usize = 1024;
+
+/// Don't invoke the progress callback more often than this.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Shared byte accounting for a segmented download.
+///
+/// Every byte a worker lands on disk is added here, so progress reflects the
+/// chunks still *in flight* rather than only the ones that have completed.
+/// Counting whole chunks instead makes a transfer with one chunk per worker
+/// report almost nothing until the very end (the chunks all finish at once),
+/// which reads as a download frozen just short of done.
+///
+/// It also carries the rate limit, which is a cap on the transfer as a whole
+/// and so has to be enforced across every worker at once rather than per
+/// connection.
+struct ByteMeter {
+    /// Bytes on disk: chunks a previous run completed, plus everything pumped
+    /// this run.
+    done: AtomicU64,
+    /// Bytes pumped this run — the basis for the rate limit.
+    moved: AtomicU64,
+    /// Total size once known; 0 while it is still unknown.
+    total: AtomicU64,
+    limit_rate: Option<u64>,
+    started: Instant,
+    /// The callback and the last time it was invoked, locked together.
+    sink: Mutex<(Option<ProgressFn>, Instant)>,
+}
+
+impl ByteMeter {
+    fn new(cb: Option<ProgressFn>, limit_rate: Option<u64>) -> Self {
+        let now = Instant::now();
+        ByteMeter {
+            done: AtomicU64::new(0),
+            moved: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            limit_rate: limit_rate.filter(|r| *r > 0),
+            started: now,
+            sink: Mutex::new((cb, now)),
+        }
+    }
+
+    fn set_total(&self, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    /// Seed the counter with bytes a previous run already landed.
+    fn seed(&self, done: u64) {
+        self.done.store(done, Ordering::Relaxed);
+    }
+
+    /// Account for `n` freshly written bytes, then sleep if a rate limit is set
+    /// and the transfer is running ahead of it.
+    fn add(&self, n: u64) {
+        self.done.fetch_add(n, Ordering::Relaxed);
+        let moved = self.moved.fetch_add(n, Ordering::Relaxed) + n;
+        self.report(false);
+        if let Some(rate) = self.limit_rate {
+            let target = Duration::from_secs_f64(moved as f64 / rate as f64);
+            let elapsed = self.started.elapsed();
+            if target > elapsed {
+                std::thread::sleep(target - elapsed);
+            }
+        }
+    }
+
+    /// Un-count an attempt that is about to be redone from its start (the
+    /// bootstrap's whole-body paths retry from offset 0).
+    fn rewind(&self, n: u64) {
+        self.done.fetch_sub(n, Ordering::Relaxed);
+        self.moved.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// Invoke the progress callback, throttled to [`PROGRESS_INTERVAL`] unless
+    /// `force`. A throttled call that finds the lock held just returns: another
+    /// worker is already reporting the same counter.
+    fn report(&self, force: bool) {
+        let mut sink = match if force {
+            self.sink.lock().ok()
+        } else {
+            self.sink.try_lock().ok()
+        } {
+            Some(g) => g,
+            None => return,
+        };
+        if sink.0.is_none() || (!force && sink.1.elapsed() < PROGRESS_INTERVAL) {
+            return;
+        }
+        let done = self.done.load(Ordering::Relaxed);
+        let total = match self.total.load(Ordering::Relaxed) {
+            0 => None,
+            t => Some(t),
+        };
+        sink.1 = Instant::now();
+        if let Some(cb) = sink.0.as_mut() {
+            cb(done, total);
+        }
+    }
+
+    /// Hand the callback back to the owning [`DownloadOptions`].
+    fn take_cb(&self) -> Option<ProgressFn> {
+        self.sink.lock().ok().and_then(|mut s| s.0.take())
+    }
+}
 
 /// Outcome of fetching one chunk (with its own retry budget).
 enum ChunkResult {
@@ -1175,6 +1325,7 @@ fn fetch_chunk_streaming(
     end: u64,
     if_range: &str,
     retry: Retry,
+    meter: &ByteMeter,
 ) -> ChunkResult {
     let want = end - start + 1;
     let mut got = 0u64;
@@ -1186,7 +1337,7 @@ fn fetch_chunk_streaming(
         if !if_range.is_empty() {
             req = req.header("If-Range", if_range);
         }
-        match stream_chunk_once(req, part, from, want - got) {
+        match stream_chunk_once(req, part, from, want - got, meter) {
             StreamOnce::Fallback => return ChunkResult::Fallback,
             StreamOnce::Fatal(e) => return ChunkResult::Fatal(e),
             StreamOnce::Advanced { wrote, err } => {
@@ -1197,6 +1348,16 @@ fn fetch_chunk_streaming(
                 // Progress stalled short of the chunk end (a mid-stream break or
                 // a short read); retry the remainder unless the budget is spent.
                 let err = err.unwrap_or(Error::UnexpectedEof);
+                if wrote > 0 {
+                    // Durable forward progress — the next attempt resumes from
+                    // the new offset. Refresh the budget the way the
+                    // single-stream loop does (and as `max_retries` documents),
+                    // so a chunk that keeps advancing over a flaky link is not
+                    // abandoned after `max` breaks. `got` only ever grows toward
+                    // `want`, so this still terminates.
+                    budget = retry.max;
+                    attempt_no = 0;
+                }
                 if budget == 0 {
                     return ChunkResult::Fatal(err);
                 }
@@ -1219,7 +1380,13 @@ enum StreamOnce {
     Fatal(Error),
 }
 
-fn stream_chunk_once(req: Request, part: &Path, at: u64, want: u64) -> StreamOnce {
+fn stream_chunk_once(
+    req: Request,
+    part: &Path,
+    at: u64,
+    want: u64,
+    meter: &ByteMeter,
+) -> StreamOnce {
     let mut reader = match req.send_reader() {
         Ok(r) => r,
         Err(e) if is_transient(&e) => {
@@ -1245,7 +1412,7 @@ fn stream_chunk_once(req: Request, part: &Path, at: u64, want: u64) -> StreamOnc
         }
         s => return StreamOnce::Fatal(Error::BadResponse(format!("unexpected status {s}"))),
     }
-    let (wrote, err) = pump_to_file(&mut reader, part, at, want);
+    let (wrote, err) = pump_to_file(&mut reader, part, at, want, Some(meter));
     match err {
         Some(Error::Io(e)) if pump_open_failed(&e) => StreamOnce::Fatal(Error::Io(e)),
         _ => StreamOnce::Advanced { wrote, err },
@@ -1264,11 +1431,16 @@ fn pump_open_failed(e: &io::Error) -> bool {
 /// Stream up to `want` bytes from `reader` into `part` at absolute offset `at`,
 /// returning the count written and any error that stopped it early. Never
 /// writes past `want` (so an over-long response can't overrun the next chunk).
+///
+/// Bytes are reported to `meter` as they land, which is both how a chunk still
+/// in flight shows up in the progress callback and how the transfer-wide rate
+/// limit is applied.
 fn pump_to_file(
     reader: &mut crate::http::BodyReader,
     part: &Path,
     at: u64,
     want: u64,
+    meter: Option<&ByteMeter>,
 ) -> (u64, Option<Error>) {
     let mut file = match OpenOptions::new().write(true).open(part) {
         Ok(f) => f,
@@ -1291,6 +1463,9 @@ fn pump_to_file(
                     return (wrote, Some(Error::Io(e)));
                 }
                 wrote += n as u64;
+                if let Some(m) = meter {
+                    m.add(n as u64);
+                }
             }
             Err(e) => return (wrote, Some(Error::Io(e))),
         }
@@ -2184,9 +2359,143 @@ mod tests {
             .expect("segments download");
         assert_eq!(outcome.bytes_written, 4_200_000);
         assert_eq!(std::fs::read(&out).unwrap(), body);
+        // Nothing was resumed: the bootstrap chunk is progress made this run,
+        // not bytes recovered from a prior partial.
+        assert_eq!(outcome.resumed_from, 0, "fresh download resumed nothing");
 
         let ranges = origin.lock().unwrap().ranges.clone();
         let range_gets = ranges.iter().filter(|r| r.starts_with("bytes=")).count();
         assert_eq!(range_gets, 4, "split into 4 segments: {ranges:?}");
+        cleanup(&out);
+    }
+
+    #[test]
+    fn segments_plan_is_capped_independently_of_the_worker_pool() {
+        // Chunks are claimed dynamically, so a plan with more chunks than
+        // workers is what lets a fast connection keep taking work while a slow
+        // one is still busy. Capping the plan at the *worker* limit instead
+        // pins the transfer to its slowest segment and the tail crawls, so
+        // `segments` above that limit must really produce that many chunks.
+        // Comfortably above the worker cap, and above the engine's 1 MiB
+        // chunk floor at one MiB per chunk.
+        const CHUNKS: usize = MAX_SEGMENT_WORKERS + 4;
+
+        let body = make_body(CHUNKS << 20, 0xC0FFEE);
+        let origin = Origin::shared(body.clone(), "wide");
+        let port = start(origin.clone());
+        let out = tmp("wide");
+
+        let mut opts = no_backoff();
+        opts.segments = Some(CHUNKS);
+        opts.parallelism = 4;
+        let outcome = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect("wide segments download");
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+
+        let ranges = origin.lock().unwrap().ranges.clone();
+        let range_gets = ranges.iter().filter(|r| r.starts_with("bytes=")).count();
+        assert_eq!(
+            range_gets, CHUNKS,
+            "{CHUNKS} chunks over 4 workers: {ranges:?}"
+        );
+        cleanup(&out);
+    }
+
+    #[test]
+    fn chunk_retry_budget_refreshes_on_forward_progress() {
+        // `max_retries` documents a budget that is refreshed whenever a retry
+        // makes durable forward progress — only a unit that cannot advance at
+        // all is abandoned. A segment kept advancing by ~400 KiB a shot must
+        // therefore survive far more breaks than the raw budget allows.
+        let body = make_body(3 << 20, 0xFEED);
+        let origin = Origin::shared(body.clone(), "flaky");
+        {
+            let mut o = origin.lock().unwrap();
+            o.kill_after = Some(400_000);
+            o.kills_left = 8;
+        }
+        let port = start(origin.clone());
+        let out = tmp("flaky_seg");
+
+        let mut opts = no_backoff();
+        opts.segments = Some(2);
+        opts.parallelism = 2;
+        opts.max_retries = 1; // far fewer than the 8 breaks injected
+        let outcome = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect("advancing segments must not exhaust the retry budget");
+        assert_eq!(outcome.bytes_written, body.len() as u64);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert_eq!(
+            origin.lock().unwrap().kills_left,
+            0,
+            "the injected breaks should all have been spent"
+        );
+        cleanup(&out);
+    }
+
+    #[test]
+    fn progress_reports_bytes_in_flight_and_honours_the_rate_limit() {
+        // Counting only *completed* chunks makes a transfer with one chunk per
+        // worker report nothing until the very end (they all finish at once),
+        // which reads as a download stuck just short of done. Reports must
+        // track the bytes actually on disk, mid-chunk included. The rate limit
+        // is a cap on the transfer as a whole, so it has to be enforced across
+        // every worker at once rather than per connection.
+        const TOTAL: usize = 2 << 20;
+        const SEG: u64 = (TOTAL / 2) as u64;
+        const RATE: u64 = 4 << 20; // ~0.5s for the whole body
+
+        let body = make_body(TOTAL, 0x1234);
+        let origin = Origin::shared(body.clone(), "prog");
+        let port = start(origin.clone());
+        let out = tmp("prog");
+
+        type Reports = Arc<Mutex<Vec<(u64, Option<u64>)>>>;
+        let seen: Reports = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mut opts = no_backoff();
+        opts.segments = Some(2);
+        opts.parallelism = 2;
+        opts.limit_rate = Some(RATE);
+        opts.progress = Some(Box::new(move |n, total| {
+            sink.lock().unwrap().push((n, total));
+        }));
+
+        let started = Instant::now();
+        let outcome = download(&format!("http://127.0.0.1:{port}/file"), &out, opts)
+            .expect("progress download");
+        let elapsed = started.elapsed();
+        assert_eq!(outcome.bytes_written, TOTAL as u64);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(!seen.is_empty(), "no progress reported");
+        let mut prev = 0;
+        for (n, total) in &seen {
+            assert!(*n >= prev, "progress went backwards: {seen:?}");
+            assert!(*n <= TOTAL as u64, "progress overshot: {seen:?}");
+            assert_eq!(*total, Some(TOTAL as u64));
+            prev = *n;
+        }
+        assert_eq!(
+            seen.last().map(|(n, _)| *n),
+            Some(TOTAL as u64),
+            "the final report should be the whole file: {seen:?}"
+        );
+        // Chunk-granular accounting can only ever report a multiple of the
+        // segment size; byte-granular accounting lands between the boundaries.
+        assert!(
+            seen.iter().any(|(n, _)| *n % SEG != 0),
+            "every report sat on a chunk boundary — in-flight bytes are not \
+             being counted: {seen:?}"
+        );
+        // Generous lower bound (half the ideal time) so the check is about the
+        // limiter running at all, not about scheduler precision.
+        assert!(
+            elapsed >= Duration::from_secs_f64(TOTAL as f64 / RATE as f64 / 2.0),
+            "finished in {elapsed:?} — the rate limit was not applied"
+        );
+        cleanup(&out);
     }
 }

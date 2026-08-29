@@ -2156,7 +2156,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
                 &name,
                 jar,
                 SegmentPlan::EqualSegments {
-                    count: workers,
+                    count: workers.saturating_mul(SEGMENT_OVERSUBSCRIBE),
                     workers,
                 },
             );
@@ -4132,6 +4132,14 @@ fn parallel_segments_eligible(args: &Args) -> bool {
 
 /// Hard cap on concurrent segments regardless of `--parallel-segments`.
 const MAX_SEGMENTS: usize = 16;
+/// Chunks per connection in `--parallel-segments` mode. Splitting into more
+/// chunks than there are connections lets a fast connection pick up extra work
+/// while a slow one is still busy; with exactly one chunk each, the transfer
+/// can only finish as fast as its slowest segment, which shows up as a crawling
+/// last few percent while every other connection sits idle. The download engine
+/// clamps the count so chunks never fall below its 1 MiB floor, so a small file
+/// is still split into just a few parts.
+const SEGMENT_OVERSUBSCRIBE: usize = 4;
 
 /// Format a byte count like `12.3 MiB`.
 #[cfg(feature = "bittorrent")]
@@ -4756,7 +4764,8 @@ enum SegmentPlan {
     /// resumable parallel model (`-C - --parallel-segments`).
     FixedChunks { size: u64, workers: usize },
     /// Split into `count` equal segments fetched by `workers` connections
-    /// (`--parallel-segments` without `-C -`).
+    /// (`--parallel-segments` without `-C -`). `count` is deliberately a
+    /// multiple of `workers` — see [`SEGMENT_OVERSUBSCRIBE`].
     EqualSegments { count: usize, workers: usize },
 }
 
