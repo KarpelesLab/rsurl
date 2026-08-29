@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/KarpelesLab/rsurl/compare/v0.1.8...v0.1.9) - 2026-08-29
+
+### Added
+
+- *(download)* apply -Y/-y per connection in segmented mode
+
+### Fixed
+
+- *(download)* rebalance the tail of a segmented download
+
+### Other
+
+- fix clippy lints from the toolchain bump
+
 ## [0.1.8](https://github.com/KarpelesLab/rsurl/compare/v0.1.7...v0.1.8) - 2026-07-27
 
 ### Added
