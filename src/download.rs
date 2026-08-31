@@ -49,8 +49,8 @@
 //! clean up. Everything else is unchanged — retry, segmentation, parallelism,
 //! `max_size`, `expected_sha256`, progress and rate limiting all work the same,
 //! because the engine only ever writes at absolute offsets through one storage
-//! abstraction ([`PartStore`]) and neither knows nor cares which backing is
-//! underneath.
+//! abstraction (the crate-private `PartStore`) and neither knows nor cares
+//! which backing is underneath.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -253,8 +253,8 @@ fn checked_data_uri(decoded: Result<Vec<u8>>, opts: &mut DownloadOptions) -> Res
 /// The blob is memory-backed while it is small and spills to an anonymous OS
 /// file past [`tmp_spill_threshold`](DownloadOptions::tmp_spill_threshold)
 /// (1 MiB by default), so the caller reads it the same way either way
-/// ([`Read`] + [`Seek`] + [`read_at`](TempBlob::read_at)) without caring which
-/// it got. No `.rsurlpart` sidecar is written: a temp download is scoped to the
+/// ([`Read`] + [`std::io::Seek`] + [`read_at`](TempBlob::read_at)) without
+/// caring which it got. No `.rsurlpart` sidecar is written: a temp download is scoped to the
 /// handle it fills, so cross-process resume has nothing to resume into.
 ///
 /// Retry, segmentation, parallelism, `max_size`, `expected_sha256`, progress
@@ -3043,7 +3043,10 @@ mod tests {
         let mut blob =
             download_to_tmp(&format!("http://127.0.0.1:{port}/file"), opts).expect("tmp download");
 
-        assert!(blob.is_in_memory(), "4 KB is under the 1 MiB spill threshold");
+        assert!(
+            blob.is_in_memory(),
+            "4 KB is under the 1 MiB spill threshold"
+        );
         assert_eq!(blob.len(), 4_000);
         assert_eq!(blob.to_vec().unwrap(), body);
         assert!(stray_entries(&dir).is_empty(), "nothing should be on disk");
@@ -3178,12 +3181,18 @@ mod tests {
         let blob = fetch_to_tmp("data:text/plain;base64,aGVsbG8=", no_backoff()).unwrap();
         assert_eq!(blob.to_vec().unwrap(), b"hello");
 
-        let src = tmp("tmp_front_door");
-        std::fs::write(&src, b"from a local file").unwrap();
-        let url = format!("file://{}", src.to_str().unwrap());
-        let blob = fetch_to_tmp(&url, no_backoff()).unwrap();
-        assert_eq!(blob.to_vec().unwrap(), b"from a local file");
-        cleanup(&src);
+        // `file://` URL formatting is platform-specific (Windows drive letters
+        // / backslashes), so exercise that leg where the path→URL mapping is
+        // trivial — as `front_door_dispatches_file_scheme` does.
+        #[cfg(unix)]
+        {
+            let src = tmp("tmp_front_door");
+            std::fs::write(&src, b"from a local file").unwrap();
+            let url = format!("file://{}", src.display());
+            let blob = fetch_to_tmp(&url, no_backoff()).unwrap();
+            assert_eq!(blob.to_vec().unwrap(), b"from a local file");
+            cleanup(&src);
+        }
 
         let body = make_body(2_000, 0x6677);
         let port = start(Origin::shared(body.clone(), "front"));

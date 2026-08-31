@@ -265,7 +265,14 @@ impl fmt::Debug for TempBlob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TempBlob")
             .field("len", &self.len())
-            .field("backing", &if self.is_in_memory() { "memory" } else { "anonymous file" })
+            .field(
+                "backing",
+                &if self.is_in_memory() {
+                    "memory"
+                } else {
+                    "anonymous file"
+                },
+            )
             .field("spill_threshold", &self.threshold)
             .finish()
     }
