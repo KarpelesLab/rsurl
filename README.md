@@ -155,6 +155,49 @@ let mut buf = [0u8; 64 * 1024];
 let n = body.read(&mut buf)?;
 ```
 
+### Downloads: resumable, segmented, or anonymous-temporary
+
+`rsurl::download` fetches a URL into a file, retrying and *resuming* rather
+than restarting when a transfer breaks. Progress survives process restarts via
+a `<name>.rsurlpart` container, and `segments` / `segment_size` split the
+resource across parallel ranged connections:
+
+```rust
+use std::path::Path;
+use rsurl::DownloadOptions;
+
+let mut opts = DownloadOptions { segments: Some(8), parallelism: 4, ..Default::default() };
+opts.progress = Some(Box::new(|done, total| eprintln!("{done}/{total:?}")));
+let outcome = rsurl::download("https://example.com/big.iso", Path::new("big.iso"), opts)?;
+```
+
+When the bytes are only needed for a moment, `download_to_tmp` skips the file
+system entirely — no path to invent, nothing to clean up, and no `.rsurlpart`
+sidecar. Small payloads stay in memory; larger ones spill to an **anonymous**
+OS file (`O_TMPFILE` on Linux, create-then-unlink elsewhere on Unix,
+`FILE_FLAG_DELETE_ON_CLOSE` on Windows) that has no name in any directory and
+disappears with the handle — even if the process is killed. Callers read it the
+same way either way:
+
+```rust
+use std::io::{Read, Seek, SeekFrom};
+
+let mut tmp = rsurl::download_to_tmp("https://example.com/big.bin", Default::default())?;
+println!("{} bytes, still in memory: {}", tmp.len(), tmp.is_in_memory());
+
+tmp.seek(SeekFrom::Start(512))?;      // Read + Seek …
+let mut buf = [0u8; 64];
+tmp.read_exact(&mut buf)?;
+tmp.read_at(&mut buf, 0)?;            // … plus positional reads (Go's ReaderAt)
+tmp.close()?;                         // or just drop it
+```
+
+Retry, segmentation, parallelism, `max_size`, `expected_sha256`, progress and
+rate limiting work identically for both targets — it is one engine writing at
+absolute offsets, and it doesn't know which backing is underneath.
+`rsurl::fetch_to_file` / `rsurl::fetch_to_tmp` are the same two front doors for
+*any* supported scheme (FTP, `file:`, `data:`, …), not just HTTP.
+
 ### Proxies and custom transport
 
 A `Client` carries network config (proxy, timeouts, TLS/IDN) and applies it to
