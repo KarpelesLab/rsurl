@@ -38,19 +38,33 @@
 //! the size (and [`expected_sha256`](DownloadOptions::expected_sha256), if
 //! given) are verified before the `.rsurlpart` is atomically renamed into
 //! place; a mismatch deletes the partial so the next run starts clean.
+//!
+//! # Downloading without a file
+//!
+//! [`download_to_tmp`] / [`fetch_to_tmp`] fetch into a [`TempBlob`] instead of
+//! a path: small payloads stay in memory, larger ones spill to an *anonymous*
+//! OS file — one with no name in any directory. Nothing is created next to a
+//! final path, in particular no `.rsurlpart` sidecar: a temp blob dies with its
+//! handle, so there is nothing for a later process to resume and nothing to
+//! clean up. Everything else is unchanged — retry, segmentation, parallelism,
+//! `max_size`, `expected_sha256`, progress and rate limiting all work the same,
+//! because the engine only ever writes at absolute offsets through one storage
+//! abstraction ([`PartStore`]) and neither knows nor cares which backing is
+//! underneath.
 
-use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use purecrypto::hash::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::http::Request;
-use crate::resume::{self, Kind};
+use crate::resume::{self, Kind, ResumeState};
+use crate::tmpfile::{write_all_at, TempBlob};
 
 /// Progress callback: invoked with `(bytes_on_disk, total)` as the download
 /// advances. `total` is `None` until the size is known (and stays `None` for a
@@ -121,6 +135,15 @@ pub struct DownloadOptions {
     pub max_backoff: Duration,
     /// Optional progress callback (see [`ProgressFn`]).
     pub progress: Option<ProgressFn>,
+    /// Spill threshold for the temp-blob entry points ([`download_to_tmp`] /
+    /// [`fetch_to_tmp`]): a payload this size or smaller stays in memory, a
+    /// larger one moves to an anonymous file. `None` uses
+    /// [`DEFAULT_SPILL_THRESHOLD`](crate::tmpfile::DEFAULT_SPILL_THRESHOLD)
+    /// (1 MiB). Ignored when downloading to a path.
+    pub tmp_spill_threshold: Option<u64>,
+    /// Directory the temp blob's anonymous file is created in once it spills
+    /// (`None` → the OS temp directory). Ignored when downloading to a path.
+    pub tmp_dir: Option<PathBuf>,
 }
 
 impl Default for DownloadOptions {
@@ -139,6 +162,8 @@ impl Default for DownloadOptions {
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             progress: None,
+            tmp_spill_threshold: None,
+            tmp_dir: None,
         }
     }
 }
@@ -159,6 +184,8 @@ impl std::fmt::Debug for DownloadOptions {
             .field("initial_backoff", &self.initial_backoff)
             .field("max_backoff", &self.max_backoff)
             .field("progress", &self.progress.is_some())
+            .field("tmp_spill_threshold", &self.tmp_spill_threshold)
+            .field("tmp_dir", &self.tmp_dir)
             .finish()
     }
 }
@@ -183,24 +210,9 @@ pub struct DownloadOutcome {
 /// [`Request`]). `max_size` / `expected_sha256` / `progress` still apply.
 pub fn download(url: &str, path: &Path, mut opts: DownloadOptions) -> Result<DownloadOutcome> {
     if let Some(decoded) = decode_data_uri(url) {
-        let bytes = decoded?;
+        let bytes = checked_data_uri(decoded, &mut opts)?;
         let n = bytes.len() as u64;
-        if let Some(max) = opts.max_size {
-            if n > max {
-                return Err(Error::BadResponse("maximum file size exceeded".into()));
-            }
-        }
-        if let Some(want) = opts.expected_sha256 {
-            if Sha256::digest(&bytes) != want {
-                return Err(Error::BadResponse(
-                    "data URI failed SHA-256 verification".into(),
-                ));
-            }
-        }
         std::fs::write(path, &bytes).map_err(Error::Io)?;
-        if let Some(cb) = opts.progress.as_mut() {
-            cb(n, Some(n));
-        }
         return Ok(DownloadOutcome {
             bytes_written: n,
             total: Some(n),
@@ -208,6 +220,65 @@ pub fn download(url: &str, path: &Path, mut opts: DownloadOptions) -> Result<Dow
         });
     }
     Request::get(url)?.download_resumable(path, opts)
+}
+
+/// Apply the options an inline `data:` payload can honour — size cap, hash
+/// check, a single progress tick — to its decoded bytes. There is no transfer
+/// to retry or resume, so the rest of [`DownloadOptions`] doesn't apply.
+fn checked_data_uri(decoded: Result<Vec<u8>>, opts: &mut DownloadOptions) -> Result<Vec<u8>> {
+    let bytes = decoded?;
+    let n = bytes.len() as u64;
+    if let Some(max) = opts.max_size {
+        if n > max {
+            return Err(Error::BadResponse("maximum file size exceeded".into()));
+        }
+    }
+    if let Some(want) = opts.expected_sha256 {
+        if Sha256::digest(&bytes) != want {
+            return Err(Error::BadResponse(
+                "data URI failed SHA-256 verification".into(),
+            ));
+        }
+    }
+    if let Some(cb) = opts.progress.as_mut() {
+        cb(n, Some(n));
+    }
+    Ok(bytes)
+}
+
+/// Fetch `url` into anonymous temporary storage: no path to choose, no file
+/// anyone can open by name, and nothing to clean up — dropping the returned
+/// [`TempBlob`] releases it.
+///
+/// The blob is memory-backed while it is small and spills to an anonymous OS
+/// file past [`tmp_spill_threshold`](DownloadOptions::tmp_spill_threshold)
+/// (1 MiB by default), so the caller reads it the same way either way
+/// ([`Read`] + [`Seek`] + [`read_at`](TempBlob::read_at)) without caring which
+/// it got. No `.rsurlpart` sidecar is written: a temp download is scoped to the
+/// handle it fills, so cross-process resume has nothing to resume into.
+///
+/// Retry, segmentation, parallelism, `max_size`, `expected_sha256`, progress
+/// and rate limiting behave exactly as they do for [`download`].
+pub fn download_to_tmp(url: &str, mut opts: DownloadOptions) -> Result<TempBlob> {
+    if let Some(decoded) = decode_data_uri(url) {
+        let bytes = checked_data_uri(decoded, &mut opts)?;
+        let blob = new_blob(&opts);
+        blob.write_at(0, &bytes).map_err(Error::Io)?;
+        return Ok(blob);
+    }
+    Request::get(url)?.download_to_tmp(opts)
+}
+
+/// An empty [`TempBlob`] configured from `opts`.
+fn new_blob(opts: &DownloadOptions) -> TempBlob {
+    let blob = TempBlob::with_threshold(
+        opts.tmp_spill_threshold
+            .unwrap_or(crate::tmpfile::DEFAULT_SPILL_THRESHOLD),
+    );
+    match &opts.tmp_dir {
+        Some(dir) => blob.in_dir(dir),
+        None => blob,
+    }
 }
 
 /// Fetch any supported URL into `path`, dispatching to the right engine — a
@@ -257,6 +328,38 @@ fn url_scheme(url: &str) -> Option<String> {
     Some(scheme.to_ascii_lowercase())
 }
 
+/// [`fetch_to_file`]'s temp-blob twin: fetch any supported URL into anonymous
+/// temporary storage. Same dispatch and same option coverage per scheme — see
+/// [`download_to_tmp`] for what the temp target does and does not carry.
+pub fn fetch_to_tmp(url: &str, mut opts: DownloadOptions) -> Result<TempBlob> {
+    match url_scheme(url).as_deref() {
+        Some("data") | Some("http") | Some("https") => download_to_tmp(url, opts),
+        Some("magnet") => Err(Error::UnsupportedScheme(
+            "magnet: use the bittorrent module (front door has no peer discovery)".into(),
+        )),
+        Some(_) => {
+            let mut parsed = crate::url::Url::parse(url)?;
+            parsed.set_idn(true)?;
+            let mut blob = new_blob(&opts);
+            let n = crate::transfer::transfer_url_to_with(
+                &parsed,
+                &crate::net::NetConfig::default(),
+                &mut blob,
+            )?;
+            one_shot_checks(
+                n,
+                &mut opts,
+                |len| hash_blob_prefix(&blob, len),
+                || {
+                    let _ = blob.set_len(0);
+                },
+            )?;
+            Ok(blob)
+        }
+        None => Err(Error::InvalidUrl(url.to_string())),
+    }
+}
+
 /// Stream/buffer a non-HTTP scheme to `path` via the universal
 /// [`crate::transfer`] dispatcher, applying the size/hash/progress options that
 /// make sense there.
@@ -271,17 +374,38 @@ fn fetch_via_transfer(url: &str, path: &Path, opts: &mut DownloadOptions) -> Res
             &mut file,
         )?
     };
+    one_shot_checks(
+        n,
+        opts,
+        |len| hash_prefix(path, len),
+        || {
+            let _ = std::fs::remove_file(path);
+        },
+    )?;
+    Ok(n)
+}
+
+/// The post-transfer policy shared by the one-shot (non-range-based) schemes:
+/// size cap, optional SHA-256, and the single progress tick. `discard` throws
+/// away what landed when a check fails, so a rejected transfer leaves nothing
+/// usable behind.
+fn one_shot_checks(
+    n: u64,
+    opts: &mut DownloadOptions,
+    hash: impl FnOnce(u64) -> io::Result<[u8; 32]>,
+    discard: impl FnOnce(),
+) -> Result<()> {
     if let Some(max) = opts.max_size {
         if n > max {
-            let _ = std::fs::remove_file(path);
+            discard();
             return Err(Error::BadResponse("maximum file size exceeded".into()));
         }
     }
     if let Some(want) = opts.expected_sha256 {
-        match hash_prefix(path, n) {
+        match hash(n) {
             Ok(got) if got == want => {}
             Ok(_) => {
-                let _ = std::fs::remove_file(path);
+                discard();
                 return Err(Error::BadResponse(
                     "downloaded file failed SHA-256 verification".into(),
                 ));
@@ -292,7 +416,7 @@ fn fetch_via_transfer(url: &str, path: &Path, opts: &mut DownloadOptions) -> Res
     if let Some(cb) = opts.progress.as_mut() {
         cb(n, Some(n));
     }
-    Ok(n)
+    Ok(())
 }
 
 /// Decode a `data:` URI (RFC 2397) into its bytes. Returns `None` if `url` is
@@ -362,7 +486,178 @@ impl Request {
     /// range/validator handling, forces raw (undecoded) bytes so offsets stay
     /// byte-aligned, and follows redirects. See the [module docs](mod@crate::download).
     pub fn download_resumable(self, path: &Path, opts: DownloadOptions) -> Result<DownloadOutcome> {
-        Downloader::new(self, path, opts).run()
+        Downloader::new(self, Arc::new(FileStore::new(path)), opts).run()
+    }
+
+    /// Perform this request as a download into anonymous temporary storage —
+    /// [`download_to_tmp`]'s `Request`-level form, the way
+    /// [`download_resumable`](Self::download_resumable) is [`download`]'s.
+    pub fn download_to_tmp(self, opts: DownloadOptions) -> Result<TempBlob> {
+        let blob = Arc::new(new_blob(&opts));
+        // The engine holds the only other reference, through the store it is
+        // handed here; it is dropped by the time `run` returns.
+        let store = Arc::new(TmpStore {
+            blob: Arc::clone(&blob),
+        });
+        Downloader::new(self, store, opts).run()?;
+        Arc::try_unwrap(blob)
+            .map_err(|_| Error::Io(io::Error::other("temp blob still shared after download")))
+    }
+}
+
+// ---- where the bytes land ---------------------------------------------------
+
+/// Storage for an in-flight download.
+///
+/// The engine never seeks a shared cursor and never opens anything by name
+/// mid-transfer: it writes at absolute offsets and asks the store to persist,
+/// verify and publish. That is what lets one retry/segmentation implementation
+/// drive both a `.rsurlpart` on disk ([`FileStore`]) and an anonymous
+/// [`TempBlob`] with no name at all ([`TmpStore`]).
+trait PartStore: Send + Sync {
+    /// Write all of `buf` at absolute offset `at`. Called concurrently by
+    /// segment workers, on disjoint ranges.
+    fn write_at(&self, at: u64, buf: &[u8]) -> io::Result<()>;
+
+    /// Size the data region to `n` — sparse where the backing allows, and
+    /// truncating when `n` is smaller than what is held.
+    fn set_len(&self, n: u64) -> io::Result<()>;
+
+    /// Throw away everything written so far (a partial that can't be spliced).
+    fn discard(&self);
+
+    /// SHA-256 over the first `len` bytes held.
+    fn hash_prefix(&self, len: u64) -> io::Result<[u8; 32]>;
+
+    /// Publish the finished download: `real_size` bytes are final.
+    fn finalize(&self, real_size: u64) -> io::Result<()>;
+
+    /// Persist resume state for a *later process*. Stores whose bytes die with
+    /// the handle leave this a no-op — which is exactly why a temp download
+    /// writes no `.rsurlpart` sidecar.
+    fn save_state(&self, real_size: u64, kind: Kind, meta: &[u8]) {
+        let _ = (real_size, kind, meta);
+    }
+
+    /// Resume state left by an earlier run, if this store can carry any.
+    fn load_state(&self) -> Option<ResumeState> {
+        None
+    }
+}
+
+/// The named target: a `<name>.rsurlpart` beside the final path, atomically
+/// renamed into place on completion.
+///
+/// The part file is opened once, lazily, and written positionally from then on
+/// — so a download that fails before its first byte (a `404`, a refused
+/// connection) leaves no stray partial, and segment workers no longer reopen
+/// the file per chunk. The handle is dropped before any rename or unlink, since
+/// Windows will not move or delete a file out from under one.
+struct FileStore {
+    final_path: PathBuf,
+    part: PathBuf,
+    handle: RwLock<Option<File>>,
+}
+
+impl FileStore {
+    fn new(path: &Path) -> Self {
+        FileStore {
+            final_path: path.to_path_buf(),
+            part: resume::part_path(path),
+            handle: RwLock::new(None),
+        }
+    }
+
+    /// Run `f` against the part file, opening (creating) it on first use.
+    fn with_file<R>(&self, f: impl FnOnce(&File) -> io::Result<R>) -> io::Result<R> {
+        {
+            let g = self.handle.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(fh) = g.as_ref() {
+                return f(fh);
+            }
+        }
+        let mut g = self.handle.write().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            *g = Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&self.part)?,
+            );
+        }
+        match g.as_ref() {
+            Some(fh) => f(fh),
+            None => Err(io::Error::other("part file handle vanished")),
+        }
+    }
+
+    /// Release the cached handle so the part file can be renamed or removed.
+    fn close_handle(&self) {
+        *self.handle.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+impl PartStore for FileStore {
+    fn write_at(&self, at: u64, buf: &[u8]) -> io::Result<()> {
+        self.with_file(|f| write_all_at(f, at, buf))
+    }
+
+    fn set_len(&self, n: u64) -> io::Result<()> {
+        self.with_file(|f| f.set_len(n))
+    }
+
+    fn discard(&self) {
+        self.close_handle();
+        let _ = std::fs::remove_file(&self.part);
+    }
+
+    fn hash_prefix(&self, len: u64) -> io::Result<[u8; 32]> {
+        hash_prefix(&self.part, len)
+    }
+
+    fn finalize(&self, real_size: u64) -> io::Result<()> {
+        self.close_handle();
+        resume::finalize(&self.part, &self.final_path, real_size)
+    }
+
+    fn save_state(&self, real_size: u64, kind: Kind, meta: &[u8]) {
+        let _ = resume::write_state(&self.part, real_size, kind, meta);
+    }
+
+    fn load_state(&self) -> Option<ResumeState> {
+        resume::read_state(&self.part).ok().flatten()
+    }
+}
+
+/// The anonymous target: a [`TempBlob`] (memory, or an unnamed OS file once it
+/// grows). Nothing exists on disk to name, resume from, or clean up, so
+/// `save_state`/`load_state` stay at their no-op defaults and "finalize" is
+/// just a truncation to the real size.
+struct TmpStore {
+    blob: Arc<TempBlob>,
+}
+
+impl PartStore for TmpStore {
+    fn write_at(&self, at: u64, buf: &[u8]) -> io::Result<()> {
+        self.blob.write_at(at, buf)
+    }
+
+    fn set_len(&self, n: u64) -> io::Result<()> {
+        self.blob.set_len(n)
+    }
+
+    fn discard(&self) {
+        let _ = self.blob.set_len(0);
+    }
+
+    fn hash_prefix(&self, len: u64) -> io::Result<[u8; 32]> {
+        hash_blob_prefix(&self.blob, len)
+    }
+
+    fn finalize(&self, real_size: u64) -> io::Result<()> {
+        self.blob.set_len(real_size)
     }
 }
 
@@ -393,8 +688,8 @@ struct Downloader {
     /// Prepared request template (redirects on, decompression off, HTTP/1.1 if
     /// preferred). Cloned per attempt.
     base: Request,
-    final_path: PathBuf,
-    part: PathBuf,
+    /// Where the bytes land: a `.rsurlpart` on disk, or a temp blob.
+    store: Arc<dyn PartStore>,
     url_key: String,
     opts: DownloadOptions,
 }
@@ -440,7 +735,7 @@ enum Bootstrap {
 }
 
 impl Downloader {
-    fn new(req: Request, path: &Path, opts: DownloadOptions) -> Self {
+    fn new(req: Request, store: Arc<dyn PartStore>, opts: DownloadOptions) -> Self {
         let url = req.url();
         let url_key = format!("{}://{}:{}{}", url.scheme, url.host, url.port, url.path);
         // Raw bytes (offsets must stay byte-aligned across ranged requests) and
@@ -462,8 +757,7 @@ impl Downloader {
         }
         Downloader {
             base,
-            final_path: path.to_path_buf(),
-            part: resume::part_path(path),
+            store,
             url_key,
             opts,
         }
@@ -573,7 +867,7 @@ impl Downloader {
                 // The server's range doesn't line up with what we hold; discard
                 // and restart from zero on the next attempt.
                 _ => {
-                    let _ = std::fs::remove_file(&self.part);
+                    self.store.discard();
                     return Attempt::Transient {
                         written: 0,
                         resumable: false,
@@ -603,12 +897,12 @@ impl Downloader {
             }
         }
 
-        self.stream_to_disk(reader, offset, total, validators, resumable)
+        self.stream_to_store(reader, offset, total, validators, resumable)
     }
 
-    /// Copy the body reader into the part file starting at `offset`, applying
+    /// Copy the body reader into the store starting at `offset`, applying
     /// rate/size/low-speed policies and persisting resume state periodically.
-    fn stream_to_disk(
+    fn stream_to_store(
         &mut self,
         mut reader: crate::http::BodyReader,
         offset: u64,
@@ -616,27 +910,15 @@ impl Downloader {
         validators: &Validators,
         resumable: bool,
     ) -> Attempt {
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.part)
-        {
-            Ok(f) => f,
-            Err(e) => return Attempt::Fatal(Error::Io(e)),
-        };
-        // Size the data region so the trailer/meta never overlaps real data.
+        // Size the data region so a part file's trailer/meta never overlaps
+        // real data (and so a file-backed target stays sparse until bytes land).
         if let Some(t) = total {
-            if let Err(e) = file.set_len(t) {
+            if let Err(e) = self.store.set_len(t) {
                 return Attempt::Fatal(Error::Io(e));
             }
         } else if offset == 0 {
             // Unknown length, fresh body: drop any stale bytes.
-            let _ = file.set_len(0);
-        }
-        if let Err(e) = file.seek(SeekFrom::Start(offset)) {
-            return Attempt::Fatal(Error::Io(e));
+            let _ = self.store.set_len(0);
         }
 
         let started = Instant::now();
@@ -670,7 +952,7 @@ impl Downloader {
                     std::thread::sleep(target - elapsed);
                 }
             }
-            if let Err(e) = file.write_all(&buf[..n]) {
+            if let Err(e) = self.store.write_at(written, &buf[..n]) {
                 self.persist_stream(total, written, validators);
                 return Attempt::Transient {
                     written,
@@ -713,14 +995,14 @@ impl Downloader {
     fn persist_stream(&self, total: Option<u64>, done: u64, validators: &Validators) {
         if let Some(total) = total {
             let meta = stream_meta(total, done, validators);
-            let _ = resume::write_state(&self.part, total, Kind::HttpStream, &meta);
+            self.store.save_state(total, Kind::HttpStream, &meta);
         }
     }
 
     /// Load a prior single-stream offset + validators, if the partial matches
     /// this resource.
     fn load_stream_state(&self) -> (u64, Validators) {
-        if let Ok(Some(st)) = resume::read_state(&self.part) {
+        if let Some(st) = self.store.load_state() {
             if st.kind == Kind::HttpStream {
                 if let Some((done, v)) = parse_stream_meta(&st.meta) {
                     if v.url == self.url_key && done <= st.real_size {
@@ -807,7 +1089,7 @@ impl Downloader {
     /// matching prior partial for this resource and chunk layout.
     #[allow(clippy::type_complexity)]
     fn resume_ranged(&self) -> Option<(u64, Validators, u32, Vec<(u64, u64)>, Vec<u8>)> {
-        let st = resume::read_state(&self.part).ok()??;
+        let st = self.store.load_state()?;
         if st.kind != Kind::HttpRanged {
             return None;
         }
@@ -863,9 +1145,9 @@ impl Downloader {
                 if let Some(t) = total {
                     meter.set_total(t);
                 }
-                let p = pump_to_file(
+                let p = pump_to_store(
                     &mut reader,
-                    &self.part,
+                    self.store.as_ref(),
                     0,
                     total.unwrap_or(u64::MAX),
                     Some(meter),
@@ -930,7 +1212,7 @@ impl Downloader {
                 // Too small to split: this open 206 stream is the whole file.
                 Err(SegErr::Fallback) => {
                     self.prepare_part(Some(total))?;
-                    let p = pump_to_file(&mut reader, &self.part, 0, total, Some(meter));
+                    let p = pump_to_store(&mut reader, self.store.as_ref(), 0, total, Some(meter));
                     if let Some(e) = p.err {
                         if budget == 0 {
                             return Err(SegErr::Fatal(e));
@@ -955,12 +1237,12 @@ impl Downloader {
             // resume within the chunk) if the stream broke early.
             let (_, end0) = plan[0];
             let want0 = end0 + 1;
-            let got0 = pump_to_file(&mut reader, &self.part, 0, want0, Some(meter)).wrote;
+            let got0 = pump_to_store(&mut reader, self.store.as_ref(), 0, want0, Some(meter)).wrote;
             drop(reader);
             if got0 < want0 {
                 match fetch_chunk_streaming(
                     &self.base,
-                    &self.part,
+                    self.store.as_ref(),
                     got0,
                     end0,
                     &validators.etag,
@@ -985,18 +1267,13 @@ impl Downloader {
         }
     }
 
-    /// Open (creating if needed) the `.rsurlpart` and size its data region to
-    /// `total` so chunk writes can seek to their offsets.
+    /// Size the store's data region to `total` so chunk writes have somewhere
+    /// to land at their offsets.
     fn prepare_part(&self, total: Option<u64>) -> std::result::Result<(), SegErr> {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.part)
-            .map_err(|e| SegErr::Fatal(Error::Io(e)))?;
         if let Some(t) = total {
-            f.set_len(t).map_err(|e| SegErr::Fatal(Error::Io(e)))?;
+            self.store
+                .set_len(t)
+                .map_err(|e| SegErr::Fatal(Error::Io(e)))?;
         }
         Ok(())
     }
@@ -1070,7 +1347,6 @@ impl Downloader {
         let next = Arc::new(AtomicUsize::new(0));
         let failed: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
         let fallback = Arc::new(AtomicBool::new(false));
-        let part = Arc::new(self.part.clone());
         let validators = Arc::new(validators.clone());
         // `If-Range` guards every chunk request: if the resource changed since
         // we learned its size/validators, the server answers `200` instead of
@@ -1086,7 +1362,7 @@ impl Downloader {
             let failed = Arc::clone(&failed);
             let fallback = Arc::clone(&fallback);
             let meter = Arc::clone(meter);
-            let part = Arc::clone(&part);
+            let store = Arc::clone(&self.store);
             let validators = Arc::clone(&validators);
             let if_range = Arc::clone(&if_range);
             let base = self.base.clone();
@@ -1102,12 +1378,20 @@ impl Downloader {
                     continue;
                 }
                 let (start, end) = plan[i];
-                match fetch_chunk_streaming(&base, &part, start, end, &if_range, retry, &meter) {
+                match fetch_chunk_streaming(
+                    &base,
+                    store.as_ref(),
+                    start,
+                    end,
+                    &if_range,
+                    retry,
+                    &meter,
+                ) {
                     ChunkResult::Ok => {
                         let mut bm = bitmap.lock().unwrap();
                         bit_set(&mut bm, i);
                         let meta = ranged_meta(chunk_key as u64, total, &validators, &bm);
-                        let _ = resume::write_state(&part, total, Kind::HttpRanged, &meta);
+                        store.save_state(total, Kind::HttpRanged, &meta);
                         drop(bm);
                         meter.report(true);
                     }
@@ -1135,7 +1419,7 @@ impl Downloader {
 
     fn persist_ranged(&self, chunk: u32, total: u64, validators: &Validators, bitmap: &[u8]) {
         let meta = ranged_meta(chunk as u64, total, validators, bitmap);
-        let _ = resume::write_state(&self.part, total, Kind::HttpRanged, &meta);
+        self.store.save_state(total, Kind::HttpRanged, &meta);
     }
 
     // ---- shared helpers ----------------------------------------------------
@@ -1148,14 +1432,15 @@ impl Downloader {
         }
     }
 
-    /// Verify size + optional SHA-256, then atomically rename into place. On a
-    /// mismatch the partial is deleted so the next run starts clean.
+    /// Verify size + optional SHA-256, then publish the result (an atomic
+    /// rename into place for a file target). On a mismatch the partial is
+    /// discarded so the next run starts clean.
     fn verify_and_finalize(&self, real_size: u64, _total: Option<u64>) -> Result<DownloadOutcome> {
         if let Some(want) = self.opts.expected_sha256 {
-            match hash_prefix(&self.part, real_size) {
+            match self.store.hash_prefix(real_size) {
                 Ok(got) if got == want => {}
                 Ok(_) => {
-                    let _ = std::fs::remove_file(&self.part);
+                    self.store.discard();
                     return Err(Error::BadResponse(
                         "downloaded file failed SHA-256 verification".into(),
                     ));
@@ -1163,7 +1448,7 @@ impl Downloader {
                 Err(e) => return Err(Error::Io(e)),
             }
         }
-        resume::finalize(&self.part, &self.final_path, real_size).map_err(Error::Io)?;
+        self.store.finalize(real_size).map_err(Error::Io)?;
         Ok(DownloadOutcome {
             bytes_written: real_size,
             total: Some(real_size),
@@ -1324,7 +1609,7 @@ enum ChunkResult {
     Fatal(Error),
 }
 
-/// Fetch `[start, end]` into `part`, **streaming straight to disk** (never
+/// Fetch `[start, end]` into `store`, **streaming straight through** (never
 /// buffering the chunk in memory, so a chunk may be any size). On a transient
 /// break it retries, resuming from wherever the stream stopped — byte-level
 /// resume *within* the chunk. `Ok` only once every byte is written, so a
@@ -1339,7 +1624,7 @@ struct Retry {
 
 fn fetch_chunk_streaming(
     base: &Request,
-    part: &Path,
+    store: &dyn PartStore,
     start: u64,
     end: u64,
     if_range: &str,
@@ -1356,7 +1641,7 @@ fn fetch_chunk_streaming(
         if !if_range.is_empty() {
             req = req.header("If-Range", if_range);
         }
-        match stream_chunk_once(req, part, from, want - got, meter) {
+        match stream_chunk_once(req, store, from, want - got, meter) {
             StreamOnce::Fallback => return ChunkResult::Fallback,
             StreamOnce::Fatal(e) => return ChunkResult::Fatal(e),
             StreamOnce::Advanced {
@@ -1397,7 +1682,7 @@ fn fetch_chunk_streaming(
     }
 }
 
-/// One request/response for a chunk range, streamed to `part` at `at`.
+/// One request/response for a chunk range, streamed into `store` at `at`.
 enum StreamOnce {
     /// Wrote `wrote` bytes; `err` is `Some` if the stream broke mid-chunk,
     /// `None` on a clean end (which, for a length-framed range, means complete).
@@ -1416,7 +1701,7 @@ enum StreamOnce {
 
 fn stream_chunk_once(
     req: Request,
-    part: &Path,
+    store: &dyn PartStore,
     at: u64,
     want: u64,
     meter: &ByteMeter,
@@ -1448,7 +1733,7 @@ fn stream_chunk_once(
         }
         s => return StreamOnce::Fatal(Error::BadResponse(format!("unexpected status {s}"))),
     }
-    let p = pump_to_file(&mut reader, part, at, want, Some(meter));
+    let p = pump_to_store(&mut reader, store, at, want, Some(meter));
     match p.err {
         Some(Error::Io(e)) if pump_open_failed(&e) => StreamOnce::Fatal(Error::Io(e)),
         err => StreamOnce::Advanced {
@@ -1459,8 +1744,9 @@ fn stream_chunk_once(
     }
 }
 
-/// A sentinel: `pump_to_file` couldn't even open/seek the file (0 bytes written
-/// and a non-transport error) — treat that as fatal, not a retryable break.
+/// A sentinel: the store rejected the write outright (a missing directory, no
+/// permission) rather than the transfer breaking — treat that as fatal, not a
+/// retryable break.
 fn pump_open_failed(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -1468,9 +1754,9 @@ fn pump_open_failed(e: &io::Error) -> bool {
     )
 }
 
-/// What a [`pump_to_file`] call ended on.
+/// What a [`pump_to_store`] call ended on.
 struct Pumped {
-    /// Bytes this pump landed in the part file.
+    /// Bytes this pump landed in the store.
     wrote: u64,
     /// The error that stopped it short of `want`, if any.
     err: Option<Error>,
@@ -1501,9 +1787,9 @@ impl Pumped {
     }
 }
 
-/// Stream up to `want` bytes from `reader` into `part` at absolute offset `at`.
-/// Never writes past `want` (so an over-long response can't overrun the next
-/// chunk).
+/// Stream up to `want` bytes from `reader` into `store` at absolute offset
+/// `at`. Never writes past `want` (so an over-long response can't overrun the
+/// next chunk).
 ///
 /// Bytes are reported to `meter` as they land, which is how a chunk still in
 /// flight shows up in the progress callback and how the transfer-wide rate
@@ -1511,20 +1797,13 @@ impl Pumped {
 /// applies to its own connection alone: this pump's bytes over this pump's
 /// elapsed time, so one slow segment is cut and retried rather than dragging
 /// the verdict onto the healthy ones.
-fn pump_to_file(
+fn pump_to_store(
     reader: &mut crate::http::BodyReader,
-    part: &Path,
+    store: &dyn PartStore,
     at: u64,
     want: u64,
     meter: Option<&ByteMeter>,
 ) -> Pumped {
-    let mut file = match OpenOptions::new().write(true).open(part) {
-        Ok(f) => f,
-        Err(e) => return Pumped::broke(0, Error::Io(e)),
-    };
-    if let Err(e) = file.seek(SeekFrom::Start(at)) {
-        return Pumped::broke(0, Error::Io(e));
-    }
     let low_speed = meter.and_then(|m| m.low_speed);
     let started = Instant::now();
     let mut wrote = 0u64;
@@ -1547,7 +1826,7 @@ fn pump_to_file(
         match reader.read(&mut buf[..cap]) {
             Ok(0) => return Pumped::clean(wrote),
             Ok(n) => {
-                if let Err(e) = file.write_all(&buf[..n]) {
+                if let Err(e) = store.write_at(at + wrote, &buf[..n]) {
                     return Pumped::broke(wrote, Error::Io(e));
                 }
                 wrote += n as u64;
@@ -1648,6 +1927,27 @@ fn parse_content_range(v: Option<&str>) -> Option<(u64, Option<u64>)> {
         t => Some(t.parse::<u64>().ok()?),
     };
     Some((start, total))
+}
+
+/// Stream the first `len` bytes of `blob` through SHA-256 — [`hash_prefix`]'s
+/// temp-blob twin, reading positionally so it never disturbs a cursor.
+fn hash_blob_prefix(blob: &TempBlob, len: u64) -> io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut at = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    while at < len {
+        let cap = (len - at).min(buf.len() as u64) as usize;
+        let n = blob.read_at(&mut buf[..cap], at)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "temp blob shorter than expected while hashing",
+            ));
+        }
+        hasher.update(&buf[..n]);
+        at += n as u64;
+    }
+    Ok(hasher.finalize())
 }
 
 /// Stream the first `len` bytes of `path` through SHA-256.
@@ -1759,7 +2059,7 @@ fn bit_set(map: &mut [u8], i: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2707,5 +3007,192 @@ mod tests {
             "finished in {elapsed:?} — the rate limit was not applied"
         );
         cleanup(&out);
+    }
+
+    // ---- temp-blob downloads ------------------------------------------------
+
+    /// A scratch directory the temp blob can spill into, so a test can assert
+    /// on exactly what did (or didn't) hit the filesystem.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("rsurl_tmpdl_{}_{tag}_{n}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Entries left in `dir`. On Unix an anonymous file has no name at all; on
+    /// Windows a delete-on-close file still shows one until the handle closes,
+    /// so only the `.rsurlpart` claim is checked there.
+    fn stray_entries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|name| cfg!(unix) || name.contains("rsurlpart"))
+            .collect()
+    }
+
+    #[test]
+    fn tmp_download_small_body_never_touches_the_filesystem() {
+        let body = make_body(4_000, 0x1111);
+        let port = start(Origin::shared(body.clone(), "mem"));
+        let dir = tmp_dir("mem");
+
+        let mut opts = no_backoff();
+        opts.tmp_dir = Some(dir.clone());
+        let mut blob =
+            download_to_tmp(&format!("http://127.0.0.1:{port}/file"), opts).expect("tmp download");
+
+        assert!(blob.is_in_memory(), "4 KB is under the 1 MiB spill threshold");
+        assert_eq!(blob.len(), 4_000);
+        assert_eq!(blob.to_vec().unwrap(), body);
+        assert!(stray_entries(&dir).is_empty(), "nothing should be on disk");
+
+        // The handle reads like a file: cursor, seek, positional reads.
+        let mut head = [0u8; 8];
+        blob.read_exact(&mut head).unwrap();
+        assert_eq!(head, body[..8]);
+        assert_eq!(blob.seek(SeekFrom::End(-4)).unwrap(), 3_996);
+        let mut tail = Vec::new();
+        blob.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, body[3_996..]);
+        let mut mid = [0u8; 16];
+        assert_eq!(blob.read_at(&mut mid, 2_000).unwrap(), 16);
+        assert_eq!(mid, body[2_000..2_016]);
+
+        blob.close().unwrap();
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Past the threshold the bytes go to an anonymous file — and still no
+    /// `.rsurlpart` sidecar, because a temp download has nothing to resume into.
+    #[test]
+    fn tmp_download_spills_to_an_anonymous_file_with_no_sidecar() {
+        let body = make_body(200_000, 0x2222);
+        let port = start(Origin::shared(body.clone(), "spill"));
+        let dir = tmp_dir("spill");
+
+        let mut opts = no_backoff();
+        opts.tmp_dir = Some(dir.clone());
+        opts.tmp_spill_threshold = Some(64 * 1024);
+        let blob =
+            download_to_tmp(&format!("http://127.0.0.1:{port}/file"), opts).expect("tmp download");
+
+        assert!(!blob.is_in_memory(), "200 KB is past the 64 KiB threshold");
+        assert_eq!(blob.len(), 200_000);
+        assert_eq!(blob.to_vec().unwrap(), body);
+        assert!(
+            stray_entries(&dir).is_empty(),
+            "the spilled file must have no name and leave no sidecar: {:?}",
+            stray_entries(&dir)
+        );
+        drop(blob);
+        assert!(stray_entries(&dir).is_empty(), "nothing survives the drop");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The retry/resume machinery is the same one the file path uses: a body cut
+    /// mid-stream is continued with a `Range` against the bytes already held.
+    #[test]
+    fn tmp_download_resumes_after_a_midbody_disconnect() {
+        let body = make_body(120_000, 0x3333);
+        let origin = Origin::shared(body.clone(), "v1");
+        {
+            let mut o = origin.lock().unwrap();
+            o.kill_after = Some(45_000);
+            o.kills_left = 1;
+        }
+        let port = start(origin.clone());
+        let dir = tmp_dir("resume");
+
+        let mut opts = no_backoff();
+        opts.tmp_dir = Some(dir.clone());
+        opts.tmp_spill_threshold = Some(1024); // exercise the file backing
+        let blob =
+            download_to_tmp(&format!("http://127.0.0.1:{port}/file"), opts).expect("tmp download");
+
+        assert_eq!(blob.to_vec().unwrap(), body);
+        let ranges = origin.lock().unwrap().ranges.clone();
+        assert_eq!(ranges.len(), 2, "ranges: {ranges:?}");
+        assert_eq!(ranges[1], "bytes=45000-", "resumed, not restarted");
+        assert!(stray_entries(&dir).is_empty());
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Segmented + parallel works against a temp target too: chunks land at
+    /// their own offsets in the anonymous file, with the bitmap held in memory
+    /// instead of a sidecar.
+    #[test]
+    fn tmp_download_segmented_parallel_fetches_every_chunk_once() {
+        let body = make_body(40_000, 0x4444);
+        let origin = Origin::shared(body.clone(), "seg");
+        let port = start(origin.clone());
+        let dir = tmp_dir("seg");
+
+        let mut opts = no_backoff();
+        opts.tmp_dir = Some(dir.clone());
+        opts.tmp_spill_threshold = Some(0); // anonymous file from byte zero
+        opts.segment_size = Some(4_000);
+        opts.parallelism = 4;
+        let blob =
+            download_to_tmp(&format!("http://127.0.0.1:{port}/file"), opts).expect("tmp download");
+
+        assert_eq!(blob.len(), 40_000);
+        assert_eq!(blob.to_vec().unwrap(), body);
+        let ranges = origin.lock().unwrap().ranges.clone();
+        assert_eq!(ranges.len(), 10, "one GET per chunk: {ranges:?}");
+        assert!(stray_entries(&dir).is_empty(), "no sidecar, no named spill");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn tmp_download_checks_sha256_and_max_size() {
+        let body = make_body(8_000, 0x5566);
+        let origin = Origin::shared(body.clone(), "h");
+        let port = start(origin);
+        let url = format!("http://127.0.0.1:{port}/file");
+
+        let mut opts = no_backoff();
+        opts.expected_sha256 = Some(Sha256::digest(&body));
+        let blob = download_to_tmp(&url, opts).expect("hash matches");
+        assert_eq!(blob.to_vec().unwrap(), body);
+
+        let mut opts = no_backoff();
+        opts.expected_sha256 = Some([0u8; 32]);
+        assert!(matches!(
+            download_to_tmp(&url, opts).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+
+        let mut opts = no_backoff();
+        opts.max_size = Some(100);
+        assert!(matches!(
+            download_to_tmp(&url, opts).unwrap_err(),
+            Error::BadResponse(_)
+        ));
+    }
+
+    /// The temp front door covers the same schemes `fetch_to_file` does.
+    #[test]
+    fn fetch_to_tmp_dispatches_data_file_and_http() {
+        let blob = fetch_to_tmp("data:text/plain;base64,aGVsbG8=", no_backoff()).unwrap();
+        assert_eq!(blob.to_vec().unwrap(), b"hello");
+
+        let src = tmp("tmp_front_door");
+        std::fs::write(&src, b"from a local file").unwrap();
+        let url = format!("file://{}", src.to_str().unwrap());
+        let blob = fetch_to_tmp(&url, no_backoff()).unwrap();
+        assert_eq!(blob.to_vec().unwrap(), b"from a local file");
+        cleanup(&src);
+
+        let body = make_body(2_000, 0x6677);
+        let port = start(Origin::shared(body.clone(), "front"));
+        let blob = fetch_to_tmp(&format!("http://127.0.0.1:{port}/file"), no_backoff()).unwrap();
+        assert_eq!(blob.to_vec().unwrap(), body);
+
+        assert!(matches!(
+            fetch_to_tmp("magnet:?xt=urn:btih:0000", no_backoff()).unwrap_err(),
+            Error::UnsupportedScheme(_)
+        ));
     }
 }

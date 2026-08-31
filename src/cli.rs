@@ -4829,6 +4829,9 @@ fn run_library_download(
         initial_backoff: fixed_delay.unwrap_or(Duration::from_millis(500)),
         max_backoff: fixed_delay.unwrap_or(Duration::from_secs(30)),
         progress: None,
+        // Temp-blob knobs; the CLI always downloads to a real path.
+        tmp_spill_threshold: None,
+        tmp_dir: None,
     };
     match plan {
         SegmentPlan::Single => {}

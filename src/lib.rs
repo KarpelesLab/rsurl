@@ -67,6 +67,8 @@ mod smtp;
 #[cfg(not(target_arch = "wasm32"))]
 mod telnet;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod tmpfile;
+#[cfg(not(target_arch = "wasm32"))]
 mod transfer;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -123,7 +125,9 @@ pub use crate::url::Url;
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::cookie::{Cookie, CookieJar, SameSite};
 #[cfg(not(target_arch = "wasm32"))]
-pub use crate::download::{download, fetch_to_file, DownloadOptions, DownloadOutcome};
+pub use crate::download::{
+    download, download_to_tmp, fetch_to_file, fetch_to_tmp, DownloadOptions, DownloadOutcome,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::http::{
     send_multiplexed, send_multiplexed_traced, BodyReader, HttpVersionPref, Priority, ProxyConfig,
@@ -133,6 +137,8 @@ pub use crate::http::{
 pub use crate::multi::{EasyId, Multi};
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::net::Client;
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::tmpfile::TempBlob;
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::transfer::{transfer, transfer_url};
 #[cfg(not(target_arch = "wasm32"))]
