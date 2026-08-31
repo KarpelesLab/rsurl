@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/KarpelesLab/rsurl/compare/v0.1.9...v0.1.10) - 2026-08-31
+
+### Added
+
+- *(download)* download to anonymous temp storage (download_to_tmp)
+
+### Other
+
+- fix CI fallout from the temp-download feature
+- *(readme)* document downloads and download_to_tmp
+
 ## [0.1.9](https://github.com/KarpelesLab/rsurl/compare/v0.1.8...v0.1.9) - 2026-08-29
 
 ### Added
