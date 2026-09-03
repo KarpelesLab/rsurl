@@ -341,10 +341,12 @@ cargo build --release --features ffi
 # C header:     include/rsurl.h
 ```
 
-Minimum supported Rust version (MSRV): **1.95**, for every feature
-combination (it is pinned in `Cargo.toml`). The floor was originally raised
-from 1.74 by the `puressh`-backed SSH stack; dropping the `ssh` feature does
-not lower it.
+Minimum supported Rust version (MSRV): **1.88**, for every feature
+combination (it is pinned as `rust-version` in `Cargo.toml`, and the
+`fullrust` CI job builds and tests the whole crate on exactly that release).
+The floor was raised from 1.74 to 1.95 by the `puressh`-backed SSH stack and
+came back down to 1.88 once `purecrypto` and `puressh` lowered theirs;
+dropping the `ssh` feature does not lower it further.
 
 ### TLS backend
 
@@ -388,6 +390,37 @@ Dropping `ssh` also stops the `puressh` dependency (and its `libc`/`nix`
 bindings) from being compiled at all. With either feature off, the
 corresponding URL schemes are rejected with `Error::UnsupportedScheme` (the CLI
 prints `this build has no … support`).
+
+### Static, libc-free Linux binaries (fullrust)
+
+Because the whole dependency graph is pure Rust, `rsurl` builds unmodified for
+[`fullrust`](https://github.com/KarpelesLab/fullrust) — a patched toolchain
+whose `std` reaches the kernel through raw syscalls instead of the platform
+libc. The result is a fully static `x86_64-unknown-linux-fullrust` ELF with no
+`PT_INTERP`, no `.dynamic` section, and no `NEEDED` libraries: the only thing
+it needs to run is the Linux kernel.
+
+```sh
+docker run --rm -v "$PWD":/src ghcr.io/karpeleslab/fullrust:1.88 build --release --bin rsurl
+readelf -d target/x86_64-unknown-linux-fullrust/release/rsurl   # no dynamic section
+```
+
+No source changes, no `fullrust` dependency, no feature flag — the default
+build works as-is, TLS included. The one thing to know is that `fullrust` is
+deliberately *not* a member of the `unix` target family (that is what keeps the
+build graph libc-free), so `cfg(unix)` and `cfg(windows)` are both false there:
+
+* `--unix-socket` is unavailable, exactly as on Windows.
+* Anonymous temp files ([`download_to_tmp`](#downloads-resumable-segmented-or-anonymous-temporary)) use create-then-`unlink`
+  rather than Linux's `O_TMPFILE`, which needs a `unix`-only `OpenOptions`
+  extension.
+* Positional file reads and writes fall back to seek-then-read/write under a
+  mutex, since neither `std::os::unix::fs::FileExt` nor the Windows
+  `seek_read`/`seek_write` pair exists on the target. Parallel segmented
+  downloads still work; their disk I/O just serializes.
+
+The `fullrust` CI job builds the CLI, runs the full test suite on the target,
+and asserts the resulting binary links no libc.
 
 ## License
 

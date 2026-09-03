@@ -8,6 +8,11 @@ invocations, keeping rsurl's defining constraints intact.
 - **No C toolchain / no `*-sys` crates.** Pure-Rust deps only (purecrypto,
   puressh, compcol, psl2, idna). This rules out a few curl features as-is
   (OpenSSL `--engine`, GSSAPI/Kerberos, c-ares) — see *Out of scope / caveats*.
+  The payoff is measurable, not aspirational: the crate builds unmodified on
+  the libc-free [`fullrust`](https://github.com/KarpelesLab/fullrust) target
+  into a fully static ELF with no `NEEDED` libraries, and CI proves it. Keeping
+  that true means every `#[cfg(unix)]` needs a working `not(any(unix, windows))`
+  sibling — `fullrust` is a Linux target that is not in the `unix` family.
 - **curl-compatible CLI and exit codes.** Flags, semantics, and exit codes
   match curl unless explicitly noted.
 - **Security defaults stay strict.** Every new feature ships verified (full CI

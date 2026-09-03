@@ -210,3 +210,52 @@ jobs:
         # Also builds the bin wrapper (an empty `main` on wasm) to prove the whole
         # crate — not just the lib — compiles for the browser target.
         run: cargo build --target wasm32-unknown-unknown --no-default-features --features idn
+
+  fullrust:
+    name: fullrust (libc-free static Linux)
+    runs-on: ubuntu-latest
+    # `x86_64-unknown-linux-fullrust` is a patched toolchain whose std talks to
+    # the kernel through raw syscalls instead of libc, so an ordinary crate
+    # links into a fully static ELF with no interpreter and no NEEDED entries.
+    # rsurl is a natural fit — the whole dependency graph is pure Rust already —
+    # but the target is deliberately NOT in the `unix` family, so `cfg(unix)` is
+    # false while `cfg(windows)` is too: the `#[cfg(not(any(unix, windows)))]`
+    # arms (positional file I/O in src/tmpfile.rs, most of all) are the ones
+    # that actually run there, and no other job in this matrix compiles them
+    # against a real network stack. Build and test here so they can't rot.
+    #
+    # The action's default image is pinned to Rust 1.88, which is also this
+    # crate's `rust-version` — keep the two in step.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the CLI for the fullrust target
+        uses: KarpelesLab/fullrust@master
+        with:
+          args: --release --bin rsurl
+
+      - name: Test (release)
+        uses: KarpelesLab/fullrust@master
+        with:
+          command: test
+          args: --release
+
+      - name: Prove the binary links no libc
+        run: |
+          set -euo pipefail
+          bin=target/x86_64-unknown-linux-fullrust/release/rsurl
+          file "$bin"
+          # A libc-free static ELF has no PT_INTERP and no .dynamic section.
+          readelf -d "$bin" | grep -q 'There is no dynamic section' \
+            || { echo "::error::binary has a dynamic section"; readelf -d "$bin"; exit 1; }
+          # `ldd` exits non-zero on a static binary, so capture rather than pipe
+          # (`pipefail` would read that exit status as the step failing).
+          ldd_out=$(ldd "$bin" 2>&1 || true)
+          case "$ldd_out" in
+            *"not a dynamic executable"*) ;;
+            *) echo "::error::binary is dynamically linked"; echo "$ldd_out"; exit 1 ;;
+          esac
+          # And it runs: version banner plus a real HTTPS fetch through
+          # purecrypto's TLS stack, on a binary whose only ABI is the syscall.
+          "$bin" --version
+          "$bin" -sS -o /dev/null -w 'https fetch: %{http_code}\n' https://example.com/
