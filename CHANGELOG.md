@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/KarpelesLab/rsurl/compare/v0.1.10...v0.1.11) - 2026-09-03
+
+### Fixed
+
+- *(tmpfile)* positional file I/O on non-unix, non-windows targets
+
+### Other
+
+- build and test on the libc-free fullrust target
+- *(deps)* purecrypto 0.6.17 -> 0.7.0, puressh 0.0.6 -> 0.1.4
+- persist the release-plz PAT on the checkout too
+
 ## [0.1.10](https://github.com/KarpelesLab/rsurl/compare/v0.1.9...v0.1.10) - 2026-08-31
 
 ### Added
