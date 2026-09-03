@@ -14,6 +14,9 @@
 //! * **Windows** — `FILE_FLAG_DELETE_ON_CLOSE | FILE_ATTRIBUTE_TEMPORARY`
 //!   (there is no anonymous-file API): the name lives as long as the handle,
 //!   and the file is gone when it closes.
+//! * **Anything else** (notably `fullrust`, a libc-free Linux target that is
+//!   deliberately not in the `unix` family) — the same create-then-`unlink`
+//!   dance as non-Linux Unix, through plain `std::fs`.
 //!
 //! The caller doesn't have to know which backing it got. `TempBlob` is
 //! [`Read`] + [`Seek`] + [`Write`] with a positional
@@ -402,12 +405,14 @@ fn unnamed_file(dir: &Path) -> io::Result<File> {
         let path = dir.join(unique_name(attempt));
         match create_exclusive(&path) {
             Ok(f) => {
-                #[cfg(unix)]
-                {
-                    // The name existed only for these two syscalls; the open
-                    // handle keeps the inode alive with nothing pointing at it.
-                    std::fs::remove_file(&path)?;
-                }
+                // Windows is the one platform that cannot unlink a file with an
+                // open handle; `create_exclusive` asked for DELETE_ON_CLOSE
+                // there instead. Everywhere else — Unix and non-`unix` POSIX-ABI
+                // targets like `fullrust` alike — the name existed only for
+                // these two syscalls; the open handle keeps the inode alive with
+                // nothing pointing at it.
+                #[cfg(not(windows))]
+                std::fs::remove_file(&path)?;
                 return Ok(f);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = e,
@@ -497,12 +502,18 @@ pub(crate) fn write_all_at(f: &File, at: u64, buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Targets with neither `std::os::unix::fs::FileExt` nor the Windows
+/// `seek_write` — `fullrust` (libc-free Linux, not in the `unix` family) is the
+/// one that matters in practice. There is no positional-write primitive to
+/// reach for, so seek-then-write stands in, serialized by [`POSITIONAL`]
+/// because the file cursor it moves is shared state and callers write disjoint
+/// ranges concurrently.
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn write_all_at(_f: &File, _at: u64, _buf: &[u8]) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "positional writes are not supported on this platform",
-    ))
+pub(crate) fn write_all_at(f: &File, at: u64, buf: &[u8]) -> io::Result<()> {
+    let _g = POSITIONAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = f;
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(buf)
 }
 
 #[cfg(unix)]
@@ -517,13 +528,22 @@ fn read_at_file(f: &File, buf: &mut [u8], at: u64) -> io::Result<usize> {
     f.seek_read(buf, at)
 }
 
+/// The read half of the seek-based fallback — see [`write_all_at`].
 #[cfg(not(any(unix, windows)))]
-fn read_at_file(_f: &File, _buf: &mut [u8], _at: u64) -> io::Result<usize> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "positional reads are not supported on this platform",
-    ))
+fn read_at_file(f: &File, buf: &mut [u8], at: u64) -> io::Result<usize> {
+    let _g = POSITIONAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut f = f;
+    f.seek(SeekFrom::Start(at))?;
+    f.read(buf)
 }
+
+/// Serializes the seek-then-read/write pairs above. One lock for the whole
+/// process is stricter than it needs to be (cursors are per open file), but
+/// this path only exists on platforms that offer no positional primitive at
+/// all, and download I/O is bound by the network long before it is bound by
+/// this mutex.
+#[cfg(not(any(unix, windows)))]
+static POSITIONAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
