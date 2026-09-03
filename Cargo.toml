@@ -83,9 +83,14 @@ serde_json = { version = "1", optional = true }
 # 0.6.8 adds the peer-certificate / close_notify accessors we use for HTTP/3
 # public-key pinning + SAN checks and TLS truncation detection; 0.6.14 lowers
 # the declared MSRV to 1.88 (matching this crate — see `rust-version` above).
-# NATIVE-ONLY: purecrypto's `OsRng` is gated to std+unix/windows, so it does not
-# build on `wasm32-unknown-unknown`. Only the (wasm-gated) net/proto/tls stack
-# uses it, so it lives in the `cfg(not(wasm32))` target table below.
+# 0.7.0 is the allocator-free-primitives release; its breaking changes are in
+# `ec`/`mldsa`, neither of which rsurl calls directly. It also carries the
+# `OsRng` backend for the libc-free `fullrust` target — see the `fullrust` CI
+# job, which builds and tests this crate there.
+# NATIVE-ONLY: `OsRng` is defined for std targets with an OS entropy source
+# (unix, windows, fullrust), not for `wasm32-unknown-unknown`. Only the
+# (wasm-gated) net/proto/tls stack uses it, so it lives in the
+# `cfg(not(wasm32))` target table below.
 # Embedded CA trust bundle (curated Mozilla-derived roots as static DER). The
 # purecrypto backend reaches it via `RootCertStore::with_embedded_roots()`;
 # the rustls backend needs the raw DER directly, so `cacrt` is pulled in as a
@@ -126,7 +131,9 @@ rustls-pemfile = { version = "2", optional = true }
 # are pure-Rust FFI *binding* crates (extern decls against the libc that std
 # already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
-puressh = { version = "0.0.6", optional = true, default-features = false, features = ["client", "compress"] }
+# 0.1.4 moved puressh to purecrypto 0.7, so an `ssh`-enabled build links one
+# copy of purecrypto, not two — keep the two crates' purecrypto majors in step.
+puressh = { version = "0.1.4", optional = true, default-features = false, features = ["client", "compress"] }
 # Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
 # `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
 # heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =
@@ -159,7 +166,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # these out of the wasm dependency graph is what lets the crate build for the
 # browser at all. All pure Rust, no C toolchain — see the per-crate notes above.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-purecrypto = "0.6.17"
+purecrypto = "0.7.0"
 zeroize = "1"
 compcol = { version = "0.6.6", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
 psl2 = { version = "0.1", default-features = false }
@@ -205,7 +212,7 @@ web-sys = { version = "0.3", features = [
 [dev-dependencies]
 # Used only by the WebSocket integration test's in-process echo server to
 # compute the `Sec-WebSocket-Accept` SHA-1 (already a normal dependency).
-purecrypto = "0.6.17"
+purecrypto = "0.7.0"
 # Async combinators (FuturesUnordered) for the `tokio-rt` adapter tests that
 # demonstrate concurrent transfer fan-out. Dev-only — never in the library.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
