@@ -282,6 +282,7 @@ struct Args {
     /// as torrent metainfo and download its contents.
     torrent: bool,
     /// `--listen-port <p>`: port advertised to peers/trackers for BitTorrent.
+    /// `0` binds any free port; the chosen one is reported and announced.
     listen_port: Option<u16>,
     /// `--bt-peer <ip:port>` (repeatable): add a peer directly (besides those
     /// from trackers).
@@ -4458,9 +4459,36 @@ fn run_bittorrent(source: &str, args: &Args) -> u8 {
         (None, true) => SeedMode::Forever,
         (None, false) => SeedMode::Off,
     };
+    // Bind the seed socket now, before any tracker announce — not when the
+    // download finishes. Seeding is the only thing that listens, so binding
+    // late leaves the port unowned for the whole download: another process can
+    // take it, and with `--listen-port 0` there is no way to learn the
+    // OS-assigned port in time to announce or report it. Holding it from the
+    // start makes both correct.
+    let seed_listener = if seed == SeedMode::Off {
+        None
+    } else {
+        match std::net::TcpListener::bind(("0.0.0.0", listen_port)) {
+            Ok(l) => Some(std::sync::Arc::new(l)),
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: cannot listen on port {listen_port}: {e}");
+                }
+                return 1;
+            }
+        }
+    };
+    // `--listen-port 0` means "any free port"; the real one is only knowable
+    // now that something is bound. Everything downstream — the announce, the
+    // status line — must use this, not the requested value.
+    let listen_port = match &seed_listener {
+        Some(l) => l.local_addr().map_or(listen_port, |a| a.port()),
+        None => listen_port,
+    };
     let opts = TorrentOptions {
         peer_id,
         listen_port,
+        listener: seed_listener,
         seed,
         verbosity: args.verbosity,
         recheck: args.recheck,
@@ -5292,7 +5320,8 @@ Options:
                                (default 4; add -# for a live progress display)
       --torrent            treat the source (.torrent path/URL or magnet:) as a
                            torrent; downloads its data to -o/--output-dir
-      --listen-port <p>    port advertised to BitTorrent peers/trackers (6881)
+      --listen-port <p>    port advertised to BitTorrent peers/trackers (6881;
+                           0 = any free port, reported once bound)
       --bt-peer <ip:port>  add a torrent peer directly (repeatable)
       --no-dht             disable the DHT peer-discovery fallback
       --seed               keep seeding after the torrent completes

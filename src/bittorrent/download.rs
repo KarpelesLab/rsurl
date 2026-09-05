@@ -8,8 +8,9 @@
 //! the verified-piece bitfield is persisted periodically, and on completion
 //! the single-file partial is truncated + renamed to its final name.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::Result;
@@ -37,8 +38,19 @@ pub enum SeedMode {
 pub struct TorrentOptions {
     /// 20-byte peer id; if all-zero, [`download`] generates a random one.
     pub peer_id: [u8; 20],
-    /// Port we advertise to peers/trackers and listen on when seeding.
+    /// Port we advertise to peers/trackers and listen on when seeding. Ignored
+    /// when [`listener`](Self::listener) is set, which carries the real port.
     pub listen_port: u16,
+    /// A listen socket bound by the caller, seeded on instead of binding
+    /// `listen_port` here.
+    ///
+    /// Seeding starts only after the download completes, so binding at that
+    /// point leaves the port unowned until then — long enough for another
+    /// process to take it, and with `listen_port: 0` there is no way to learn
+    /// the OS-assigned port in time to announce it. Binding up front and
+    /// passing the socket in fixes both: the port is held from the start and
+    /// `local_addr()` reports the real one.
+    pub listener: Option<Arc<TcpListener>>,
     pub connect_timeout: Duration,
     /// Per-read/write socket timeout for a peer connection.
     pub peer_timeout: Duration,
@@ -57,6 +69,7 @@ impl Default for TorrentOptions {
         TorrentOptions {
             peer_id: [0u8; 20],
             listen_port: 6881,
+            listener: None,
             connect_timeout: Duration::from_secs(10),
             peer_timeout: Duration::from_secs(30),
             seed: SeedMode::Off,

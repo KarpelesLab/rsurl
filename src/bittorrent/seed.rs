@@ -53,7 +53,17 @@ pub fn run(
         _ => None,
     };
 
-    let listener = TcpListener::bind(("0.0.0.0", opts.listen_port)).map_err(Error::Io)?;
+    // Prefer a socket the caller already bound (see `TorrentOptions::listener`):
+    // it was taken before the download started, so the port has been held all
+    // along and is the one actually announced to peers.
+    let owned;
+    let listener: &TcpListener = match &opts.listener {
+        Some(l) => l.as_ref(),
+        None => {
+            owned = TcpListener::bind(("0.0.0.0", opts.listen_port)).map_err(Error::Io)?;
+            &owned
+        }
+    };
     listener.set_nonblocking(true).map_err(Error::Io)?;
 
     let mut last_report = Instant::now();

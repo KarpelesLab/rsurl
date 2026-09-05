@@ -5,7 +5,10 @@
 #![cfg(feature = "bittorrent")]
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
+use std::process::Stdio;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -873,14 +876,6 @@ fn cli_downloads_magnet() {
 }
 
 /// Grab a likely-free localhost port by binding then releasing it.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// `--share-ratio`: the binary downloads from a seeder, then seeds on its
 /// listen port; a test leecher drains the whole torrent (ratio 1.0), after
 /// which the binary must exit on its own.
@@ -896,7 +891,6 @@ fn cli_seeds_until_share_ratio() {
 
     // Upstream seeder the binary downloads from.
     let src_port = start_seeder(data.clone(), meta.clone());
-    let listen_port = free_port();
 
     let pid = std::process::id();
     let tdir = std::env::temp_dir();
@@ -905,31 +899,48 @@ fn cli_seeds_until_share_ratio() {
     std::fs::write(&torrent_path, &torrent_bytes).unwrap();
     let _ = std::fs::remove_file(&out);
 
+    // `--listen-port 0`: rsurl binds an ephemeral port up front and reports the
+    // real one. Picking a "free" port here instead would be a guess — binding
+    // :0 and dropping the socket hands the port straight back to the OS, and
+    // nothing holds it until rsurl binds.
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"))
         .arg("--torrent")
         .arg("--bt-peer")
         .arg(format!("127.0.0.1:{src_port}"))
         .arg("--listen-port")
-        .arg(listen_port.to_string())
+        .arg("0")
         .arg("--share-ratio")
         .arg("1.0")
-        .arg("-s")
         .arg("-o")
         .arg(&out)
         .arg(&torrent_path)
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rsurl");
 
-    // Once the download finishes the binary starts listening. Retry until a
-    // handshake with *our* seeder completes -- a successful connect is not
-    // enough to prove we reached it. `free_port()` releases the port before the
-    // child is spawned, and the child only binds it once the whole download has
-    // finished, so for several seconds the port is unbound and any other
-    // listener on the machine can take it (this binary runs its tests in
-    // parallel and several of them bind ephemeral ports). Connecting to such a
-    // stranger and writing a handshake it never reads earns an RST, which is
-    // what made this test flaky with `ConnectionReset` on the first read.
-    // Matching the info_hash proves we are talking to the process under test.
+    // Read the seed port off the status line. The thread keeps draining stderr
+    // afterwards: rsurl reports progress there for the whole run, and a pipe
+    // nobody empties would eventually block the child.
+    let stderr = child.stderr.take().expect("child stderr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut tx = Some(tx);
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Some((_, rest)) = line.split_once("on port ") {
+                if let (Some(tx), Ok(p)) = (tx.take(), rest.trim().parse::<u16>()) {
+                    let _ = tx.send(p);
+                }
+            }
+        }
+    });
+    let listen_port = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("rsurl did not report its seed port");
+
+    // Retry until a handshake completes: the socket is bound from process start
+    // now, so a successful connect only means the port is held, not that
+    // seeding has begun — until the download finishes our connection just sits
+    // in the accept backlog. Handshaking is the only proof the seeder is live.
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut c = None;
     while Instant::now() < deadline {
