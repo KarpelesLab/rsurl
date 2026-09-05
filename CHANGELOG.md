@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/KarpelesLab/rsurl/compare/v0.1.11...v0.1.12) - 2026-09-05
+
+### Fixed
+
+- *(tls)* don't reject a leaf whose SAN carries no dNSName
+
+### Other
+
+- *(deps)* purecrypto 0.7.0 -> 0.8.1, puressh 0.1.4 -> 0.1.5
+
 ## [0.1.11](https://github.com/KarpelesLab/rsurl/compare/v0.1.10...v0.1.11) - 2026-09-03
 
 ### Fixed
