@@ -224,19 +224,23 @@ jobs:
     # that actually run there, and no other job in this matrix compiles them
     # against a real network stack. Build and test here so they can't rot.
     #
-    # The action's default image is pinned to Rust 1.88, which is also this
-    # crate's `rust-version` — keep the two in step.
+    # The image is pinned to Rust 1.89, this crate's `rust-version` (the
+    # action would otherwise default to 1.88, which purecrypto 0.8 no longer
+    # builds on). Keep the two in step: fullrust publishes one image per Rust
+    # minor, 1.88 through 1.95.
     steps:
       - uses: actions/checkout@v6
 
       - name: Build the CLI for the fullrust target
         uses: KarpelesLab/fullrust@master
         with:
+          image: ghcr.io/karpeleslab/fullrust:1.89
           args: --release --bin rsurl
 
       - name: Test (release)
         uses: KarpelesLab/fullrust@master
         with:
+          image: ghcr.io/karpeleslab/fullrust:1.89
           command: test
           args: --release
 
