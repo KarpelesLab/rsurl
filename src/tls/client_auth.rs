@@ -166,12 +166,25 @@ pub fn enforce_pins_then_callback(
 /// SAN-less leaf (which would otherwise fall back to deprecated Common Name
 /// matching — rejected by webpki/browsers and the rustls backend).
 ///
+/// The question is whether the **extension is present**, not whether it holds
+/// any hostname: purecrypto's [`subject_alt_names`] surfaces only the
+/// `dNSName` entries, so a leaf whose SAN carries just `iPAddress` /
+/// `rfc822Name` / `uniformResourceIdentifier` names yields an empty list while
+/// still being SAN-bearing. Asking `subject_alt_names().is_empty()` would call
+/// such a certificate SAN-less and reject it — an IP-address certificate
+/// fetched by IP is perfectly valid. [`has_subject_alt_name`] is the predicate
+/// RFC 6125 §6.4.4 actually attaches the commonName fallback to, so defer to
+/// it rather than re-deriving the rule here.
+///
 /// On a parse failure we return `true` (treat as "has SAN") on purpose: the
 /// chain was already cryptographically verified during the handshake, so a
 /// failure to *re-parse* the same DER here is our bug, not a security hole —
 /// returning `false` would wrongly reject a connection that already passed
-/// verification. Only a cert that parses cleanly AND carries no SAN at all is
-/// reported as SAN-less.
+/// verification. Only a cert that parses cleanly AND carries no SAN extension
+/// at all is reported as SAN-less.
+///
+/// [`subject_alt_names`]: purecrypto::x509::Certificate::subject_alt_names
+/// [`has_subject_alt_name`]: purecrypto::x509::Certificate::has_subject_alt_name
 //
 // Called by the purecrypto TLS backend (the rustls/webpki verifier already
 // rejects SAN-less leaves) AND by the always-compiled HTTP/3 path, which runs
@@ -182,12 +195,10 @@ pub fn leaf_has_san(leaf_der: &[u8]) -> bool {
     let Ok(cert) = purecrypto::x509::Certificate::from_der(leaf_der.to_vec()) else {
         return true; // re-parse failure: don't mask an already-verified chain
     };
-    match cert.subject_alt_names() {
-        Ok(sans) => !sans.is_empty(),
-        // SAN extension present but unparseable is, again, our-bug territory;
-        // don't reject an already-verified connection over it.
-        Err(_) => true,
-    }
+    // An extension block we cannot walk is, again, our-bug territory: don't
+    // reject an already-verified connection over it, so failure reads as
+    // "has SAN".
+    cert.has_subject_alt_name().unwrap_or(true)
 }
 
 /// Map a curl `--ciphers` / `--tls13-ciphers` value (colon-separated cipher
@@ -464,6 +475,31 @@ pub(crate) fn tests_support_ed25519_leaf_no_san() -> Vec<u8> {
     cert.to_der().to_vec()
 }
 
+/// Build a deterministic self-signed Ed25519 leaf whose Subject Alternative
+/// Name holds **only** an `iPAddress` entry — no `dNSName` at all. Such a leaf
+/// is SAN-bearing, but `Certificate::subject_alt_names` (dNSName-only) reports
+/// an empty list for it, which is exactly the case `leaf_has_san` must not
+/// mistake for "no SAN".
+#[cfg(all(test, feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+pub(crate) fn tests_support_ed25519_leaf_ip_san() -> Vec<u8> {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::x509::{
+        extension, CertSigner, Certificate, DistinguishedName, GeneralName, Time, Validity,
+    };
+
+    let key = Ed25519PrivateKey::from_bytes([11u8; 32]);
+    let dn = DistinguishedName::common_name("rsurl-test-ip-san");
+    let validity = Validity::new(
+        Time::utc(2020, 1, 1, 0, 0, 0),
+        Time::utc(2099, 1, 1, 0, 0, 0),
+    );
+    let signer = CertSigner::Ed25519(&key);
+    let san = extension::subject_alt_name(&[GeneralName::IpV4([127, 0, 0, 1])]);
+    let cert = Certificate::self_signed_with_extensions(&signer, &dn, &validity, 1, &[san])
+        .expect("self-signed cert (IP-only SAN)");
+    cert.to_der().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +613,20 @@ mod tests {
 
         let no_san = test_ed25519_leaf_no_san();
         assert!(!leaf_has_san(&no_san));
+
+        // A leaf whose SAN carries only an iPAddress is SAN-bearing even though
+        // it has no dNSName: `subject_alt_names()` returns an empty list for it,
+        // so asking that question instead would reject a valid IP certificate.
+        let ip_san = super::tests_support_ed25519_leaf_ip_san();
+        assert!(
+            purecrypto::x509::Certificate::from_der(ip_san.clone())
+                .unwrap()
+                .subject_alt_names()
+                .unwrap()
+                .is_empty(),
+            "test setup: the IP-only leaf must have no dNSName entries"
+        );
+        assert!(leaf_has_san(&ip_san));
 
         // A re-parse failure must NOT be treated as SAN-less (it would wrongly
         // reject an already-verified chain), so garbage returns `true`.
