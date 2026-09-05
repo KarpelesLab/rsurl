@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use purecrypto::hash::{Digest, Sha1};
 
@@ -920,22 +920,37 @@ fn cli_seeds_until_share_ratio() {
         .spawn()
         .expect("spawn rsurl");
 
-    // Once the download finishes the binary starts listening; retry-connect.
+    // Once the download finishes the binary starts listening. Retry until a
+    // handshake with *our* seeder completes -- a successful connect is not
+    // enough to prove we reached it. `free_port()` releases the port before the
+    // child is spawned, and the child only binds it once the whole download has
+    // finished, so for several seconds the port is unbound and any other
+    // listener on the machine can take it (this binary runs its tests in
+    // parallel and several of them bind ephemeral ports). Connecting to such a
+    // stranger and writing a handshake it never reads earns an RST, which is
+    // what made this test flaky with `ConnectionReset` on the first read.
+    // Matching the info_hash proves we are talking to the process under test.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut c = None;
-    for _ in 0..100 {
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", listen_port)) {
-            c = Some(s);
-            break;
+    while Instant::now() < deadline {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", listen_port)) {
+            // Short probe timeout: a stranger that accepts and never answers
+            // must not burn the whole budget on one attempt.
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let ours = peer::write_handshake(&mut s, &Handshake::new(info_hash, [1u8; 20])).is_ok()
+                && matches!(peer::read_handshake(&mut s), Ok(hs) if hs.info_hash == info_hash);
+            if ours {
+                c = Some(s);
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
-    let mut c = c.expect("connect to seeding rsurl");
+    let mut c = c.expect("handshake with seeding rsurl");
+    // Back to a generous timeout now that the peer is known-good: from here on
+    // an unexpected reset is a real seeder bug and must fail the test.
     c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
 
-    // Leech every piece to push the binary's upload ratio to 1.0.
-    peer::write_handshake(&mut c, &Handshake::new(info_hash, [1u8; 20])).unwrap();
-    let hs = peer::read_handshake(&mut c).unwrap();
-    assert_eq!(hs.info_hash, info_hash);
     // First message is the seeder's bitfield.
     assert!(matches!(
         peer::read_message(&mut c).unwrap(),
