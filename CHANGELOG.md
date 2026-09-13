@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/KarpelesLab/rsurl/compare/v0.1.13...v0.1.14) - 2026-09-13
+
+### Fixed
+
+- *(ssh)* adopt puressh 0.1.7's non-exhaustive client config structs
+
 ## [0.1.13](https://github.com/KarpelesLab/rsurl/compare/v0.1.12...v0.1.13) - 2026-09-13
 
 ### Fixed
