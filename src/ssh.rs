@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use puressh::auth::ClientCredential;
-use puressh::client::{AlgoOverrides, Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
+use puressh::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
 use puressh::sftp::{Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE};
@@ -186,12 +186,13 @@ fn discover_default_keys(ssh_dir: &Path) -> Vec<PathBuf> {
 /// Build the host-key policy `Config` for this connection. `-k` ⇒ accept-any;
 /// otherwise TOFU against known_hosts (accept+persist unknown, reject changed).
 fn build_config(opts: &SshOptions) -> Result<Config> {
+    // puressh marks `Config` / `KnownHostsPolicy` `#[non_exhaustive]` (0.1.7),
+    // so both are built through a constructor and then adjusted by field
+    // assignment rather than with a struct literal.
     if opts.insecure {
-        return Ok(Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: opts.timeout,
-            algorithms: AlgoOverrides::default(),
-        });
+        let mut cfg = Config::insecure();
+        cfg.timeout = opts.timeout;
+        return Ok(cfg);
     }
     let kh_path = opts.known_hosts_path.clone().or_else(default_known_hosts);
     // Load the existing store if present; start empty otherwise (a fresh
@@ -206,18 +207,16 @@ fn build_config(opts: &SshOptions) -> Result<Config> {
             .map_err(|e| Error::Ssh(format!("reading known_hosts {}: {e}", p.display())))?,
         None => KnownHosts::new(),
     };
-    let policy = KnownHostsPolicy {
-        store: Arc::new(Mutex::new(store)),
-        save_path: kh_path,
-        hash_new: false,
-        on_unknown: TofuAction::Accept,
-        on_mismatch: TofuAction::Reject,
-    };
-    Ok(Config {
-        host_key_policy: HostKeyPolicy::KnownHosts(policy),
-        timeout: opts.timeout,
-        algorithms: AlgoOverrides::default(),
-    })
+    // `strict` is reject-unknown / reject-mismatch; curl-style TOFU only
+    // relaxes the *unknown* case (accept and persist). A changed key stays a
+    // hard reject, as does `hash_new: false` (plain-text entries, matching what
+    // `ssh-keygen -F` and a human reader expect).
+    let mut policy = KnownHostsPolicy::strict(Arc::new(Mutex::new(store)));
+    policy.save_path = kh_path;
+    policy.on_unknown = TofuAction::Accept;
+    let mut cfg = Config::new(HostKeyPolicy::KnownHosts(policy));
+    cfg.timeout = opts.timeout;
+    Ok(cfg)
 }
 
 /// Load one identity file into a `ClientCredential::PublicKey`. Encrypted keys
@@ -454,10 +453,8 @@ impl Drop for TempFile {
 fn scp_download(client: &mut Client, path: &str) -> Result<Vec<u8>> {
     let tmp = TempFile::new("recv");
     // We're fetching a single file to a concrete local path, not into a dir.
-    let opts = puressh::scp::ScpRecvOptions {
-        target_is_file: true,
-        ..Default::default()
-    };
+    let mut opts = puressh::scp::ScpRecvOptions::default();
+    opts.target_is_file = true;
     client
         .scp_recv_from(path, &tmp.path, opts)
         .map_err(|e| Error::Ssh(format!("scp recv {path:?}: {e}")))?;
@@ -667,10 +664,8 @@ mod tests {
     fn scp_recv_options_target_is_file() {
         // The SCP download bridge sets `target_is_file` so puressh writes the
         // single remote file to our concrete temp path rather than into a dir.
-        let opts = puressh::scp::ScpRecvOptions {
-            target_is_file: true,
-            ..Default::default()
-        };
+        let mut opts = puressh::scp::ScpRecvOptions::default();
+        opts.target_is_file = true;
         assert!(opts.target_is_file);
         assert!(!opts.recursive);
     }
