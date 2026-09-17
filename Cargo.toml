@@ -141,15 +141,13 @@ rustls-pemfile = { version = "2", optional = true }
 # so the default purecrypto build stays free of any compiled-C dependency.
 # Keep this crate's purecrypto major in step with ours. A mismatch is not a
 # build error — it silently compiles purecrypto twice and leaves the SSH stack
-# on the older crypto. KNOWN MISMATCH: rsurl is on purecrypto 0.9 while puressh
-# 0.1.7 (latest) still tracks 0.8, so `ssh`-enabled builds currently link both;
-# bump puressh as soon as a 0.9-based release ships.
+# on the older crypto. puressh 0.1.8 tracks purecrypto 0.9, matching ours.
 # 0.1.7 is a security-hardening release (client-side: bounded inbound
 # buffering, sanitised remote scp stderr, known_hosts failing closed on
 # `@revoked`); it also marks the caller-built structs `#[non_exhaustive]`, so
 # `src/ssh.rs` builds `Config` / `KnownHostsPolicy` / `ScpRecvOptions` through
 # their constructors instead of struct literals.
-puressh = { version = "0.1.7", optional = true, default-features = false, features = ["client", "compress"] }
+puressh = { version = "0.1.8", optional = true, default-features = false, features = ["client", "compress"] }
 # Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
 # `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
 # heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =
