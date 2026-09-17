@@ -139,10 +139,11 @@ rustls-pemfile = { version = "2", optional = true }
 # are pure-Rust FFI *binding* crates (extern decls against the libc that std
 # already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
-# Keep this crate's purecrypto major in step with ours: puressh 0.1.7 tracks
-# purecrypto 0.8, so an `ssh`-enabled build links one copy, not two. A mismatch
-# is not a build error — it silently compiles purecrypto twice and leaves the
-# SSH stack on the older crypto — so bump the two together.
+# Keep this crate's purecrypto major in step with ours. A mismatch is not a
+# build error — it silently compiles purecrypto twice and leaves the SSH stack
+# on the older crypto. KNOWN MISMATCH: rsurl is on purecrypto 0.9 while puressh
+# 0.1.7 (latest) still tracks 0.8, so `ssh`-enabled builds currently link both;
+# bump puressh as soon as a 0.9-based release ships.
 # 0.1.7 is a security-hardening release (client-side: bounded inbound
 # buffering, sanitised remote scp stderr, known_hosts failing closed on
 # `@revoked`); it also marks the caller-built structs `#[non_exhaustive]`, so
@@ -181,7 +182,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # these out of the wasm dependency graph is what lets the crate build for the
 # browser at all. All pure Rust, no C toolchain — see the per-crate notes above.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-purecrypto = "0.8.3"
+purecrypto = "0.9.0"
 zeroize = "1"
 compcol = { version = "0.6.11", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
 psl2 = { version = "0.1", default-features = false }
@@ -227,7 +228,7 @@ web-sys = { version = "0.3", features = [
 [dev-dependencies]
 # Used only by the WebSocket integration test's in-process echo server to
 # compute the `Sec-WebSocket-Accept` SHA-1 (already a normal dependency).
-purecrypto = "0.8.3"
+purecrypto = "0.9.0"
 # Async combinators (FuturesUnordered) for the `tokio-rt` adapter tests that
 # demonstrate concurrent transfer fan-out. Dev-only — never in the library.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
