@@ -256,6 +256,21 @@ impl TlsSettings {
         super::connect_over_tls(transport, host, self.to_opts(&[])?)
     }
 
+    /// Like [`connect`](Self::connect), but resuming a TLS session stored in `session`
+    /// (and storing the one the server issues back into it). FTPS uses one
+    /// cache per control connection so its data connections resume the
+    /// control session, as servers enforcing session reuse require.
+    pub(crate) fn connect_resuming<S: std::io::Read + std::io::Write>(
+        &self,
+        transport: S,
+        host: &str,
+        session: &super::TlsSessionCache,
+    ) -> Result<super::TlsStream<S>> {
+        let mut opts = self.to_opts(&[])?;
+        opts.session_cache = Some(session.clone());
+        super::connect_over_tls(transport, host, opts)
+    }
+
     /// Post-handshake trust policy for a sans-IO engine built from
     /// [`to_opts`](Self::to_opts): see [`verify_peer_chain`]. `pins` are the
     /// parsed pins from that same `TlsOpts` (`pinned_spki_sha256`), and

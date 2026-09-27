@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-use purecrypto::tls::{Config, Connection, CrlStore, HandshakeStatus};
+use purecrypto::tls::{Config, Connection, CrlStore, HandshakeStatus, ResumptionSession};
 use zeroize::Zeroize;
 
 use super::common::ProtocolVersion;
@@ -62,6 +62,81 @@ pub struct TlsOpts {
     /// Caller-owned certificate-validation hook. When `Some`, rsurl skips its
     /// own chain verification and the callback is the sole trust authority.
     pub verify_callback: Option<super::common::VerifyCallback>,
+    /// Shared TLS session cache. When `Some`, the handshake offers a session
+    /// stored there for the same server (TLS 1.3 PSK or a TLS 1.2 RFC 5077
+    /// ticket) and deposits any session the server issues back into it. Used
+    /// by FTPS so data connections resume the control connection's session.
+    pub session_cache: Option<TlsSessionCache>,
+}
+
+/// A shared, clonable TLS client session cache (clones share one store).
+///
+/// Holds the most recent resumable session (per server name) so a later
+/// handshake can resume it — FTPS servers such as vsftpd
+/// (`require_ssl_reuse=YES`) refuse a data connection whose TLS session does
+/// not resume the control connection's. On this backend a TLS 1.3 session
+/// resumes via PSK and a TLS 1.2 one via an RFC 5077 session ticket.
+/// purecrypto implements no session-ID cache, so a TLS 1.2 server that issues
+/// no tickets cannot be resumed; and its version-spanning (1.2–1.3, the
+/// default) ClientHello does not ask for a ticket, so a TLS 1.2 session is only
+/// obtained when the client is capped at TLS 1.2 (curl `--tls-max 1.2`).
+///
+/// The session secrets (PSK / master secret) are wiped by purecrypto when the
+/// last copy is dropped, and `Debug` never prints them.
+#[derive(Clone, Default)]
+pub struct TlsSessionCache(std::sync::Arc<std::sync::Mutex<Option<CachedSession>>>);
+
+/// One cached session plus what a resumed handshake cannot re-learn: the
+/// resumed handshake carries no `Certificate`, so the originating chain is kept
+/// for pinning / verify-callback checks, and the version is kept because the
+/// resumed handshake must negotiate the same one.
+#[derive(Clone)]
+struct CachedSession {
+    server_name: String,
+    session: ResumptionSession,
+    version: purecrypto::tls::ProtocolVersion,
+    /// Whether the originating handshake verified the chain. A session minted
+    /// without verification is never offered to a verifying connection.
+    verified: bool,
+    peer_chain: Vec<Vec<u8>>,
+}
+
+impl TlsSessionCache {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a resumable session is currently stored.
+    fn has_session(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<CachedSession>> {
+        // A panic while holding the lock leaves at worst a stale session.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The stored session for `server_name`, if one may be offered by a
+    /// connection with verification `verify`.
+    fn lookup(&self, server_name: &str, verify: bool) -> Option<CachedSession> {
+        self.lock()
+            .as_ref()
+            .filter(|c| c.server_name.eq_ignore_ascii_case(server_name) && (c.verified || !verify))
+            .cloned()
+    }
+
+    fn store(&self, entry: CachedSession) {
+        *self.lock() = Some(entry);
+    }
+}
+
+impl std::fmt::Debug for TlsSessionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsSessionCache")
+            .field("has_session", &self.has_session())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TlsOpts {
@@ -83,6 +158,7 @@ impl TlsOpts {
             crl_pem: None,
             cipher_suites: Vec::new(),
             verify_callback: None,
+            session_cache: None,
         }
     }
 }
@@ -150,6 +226,19 @@ pub struct TlsStream<S: Read + Write> {
     /// Wire bytes that `feed` did not consume on the last call.
     pending_wire: Vec<u8>,
     seen_eof: bool,
+    /// Where to deposit a resumable session the server issues, if the caller
+    /// supplied a [`TlsSessionCache`].
+    session: Option<SessionSink>,
+    /// `Some(originating chain)` when this handshake resumed a cached session.
+    resumed_chain: Option<Vec<Vec<u8>>>,
+}
+
+/// The cache a [`TlsStream`] deposits new sessions into, plus the key and
+/// verification state they are stored under.
+struct SessionSink {
+    cache: TlsSessionCache,
+    server_name: String,
+    verified: bool,
 }
 
 /// Establish a TLS 1.2/1.3 connection over an existing transport. The peer
@@ -180,6 +269,15 @@ pub fn connect_over_with_alpn<S: Read + Write>(
 /// blocking handshake. Post-handshake checks (verify callback, SAN-less-leaf,
 /// public-key pinning) remain the caller's responsibility.
 pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connection> {
+    build_client_conn_resuming(sni, opts).map(|(conn, _)| conn)
+}
+
+/// [`build_client_conn`], also returning the cached session it offered for
+/// resumption (from [`TlsOpts::session_cache`]), if any.
+fn build_client_conn_resuming(
+    sni: &str,
+    opts: &mut TlsOpts,
+) -> Result<(Connection, Option<CachedSession>)> {
     // `TlsOpts` has a `Drop` impl (TLS-5: it zeroizes the key material), which
     // forbids moving fields out by value. Take the owned fields we hand to the
     // builder via `Option::take` / `mem::take` so the struct stays whole and
@@ -223,6 +321,28 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connect
     }
     if let Some(v) = opts.max_version {
         builder = builder.max_version(to_pc_version(v));
+    }
+    // Session resumption (FTPS data channels): offer a cached session for this
+    // server when its version lies inside the allowed range, and pin the
+    // handshake to that version. The pin matters for TLS 1.2: purecrypto's
+    // version-spanning client drops its TLS 1.2 offer whenever a session is
+    // primed, so a TLS 1.2 session must go through the TLS 1.2 engine.
+    let offered = opts
+        .session_cache
+        .as_ref()
+        .and_then(|c| c.lookup(super::server_name(sni), effective_verify))
+        .filter(|c| {
+            let v = c.version.as_u16();
+            opts.min_version
+                .is_none_or(|m| to_pc_version(m).as_u16() <= v)
+                && opts
+                    .max_version
+                    .is_none_or(|m| v <= to_pc_version(m).as_u16())
+        });
+    if let Some(c) = &offered {
+        builder = builder
+            .versions(c.version, c.version)
+            .resumption_session(c.session.clone());
     }
     // Cipher-suite restriction (curl `--ciphers`/`--tls13-ciphers`). purecrypto
     // intersects this with the suites it supports, in the given order.
@@ -268,7 +388,7 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connect
         builder = builder.crls(store);
     }
     let cfg = builder.build();
-    Connection::client(&cfg).map_err(tls_err)
+    Ok((Connection::client(&cfg).map_err(tls_err)?, offered))
 }
 
 /// Like [`connect_over_with_alpn`], but takes the full [`TlsOpts`] so callers
@@ -281,15 +401,31 @@ pub fn connect_over_tls<S: Read + Write>(
     // Recomputed here (it is also derived inside `build_client_conn`) for the
     // post-handshake SAN check below, since that runs after construction.
     let effective_verify = opts.verify && opts.verify_callback.is_none();
-    let conn = build_client_conn(sni, &mut opts)?;
+    let (conn, offered) = build_client_conn_resuming(sni, &mut opts)?;
     let mut s = TlsStream {
         conn,
         sock: transport,
         plaintext: Vec::new(),
         pending_wire: Vec::new(),
         seen_eof: false,
+        session: opts.session_cache.clone().map(|cache| SessionSink {
+            cache,
+            server_name: super::server_name(sni).to_string(),
+            verified: effective_verify,
+        }),
+        resumed_chain: None,
     };
     s.run_handshake()?;
+    // A resumed handshake (PSK or ticket) carries no `Certificate` message, so
+    // an empty peer chain after offering a session means the server accepted
+    // it; with a full handshake the chain is always present (verified or not).
+    // The originating chain then stands in for the pin / callback checks below.
+    if let Some(c) = offered {
+        if s.conn.peer_certificates().is_empty() {
+            s.resumed_chain = Some(c.peer_chain);
+        }
+    }
+    s.harvest_session();
     // Post-handshake trust policy (shared with the rustls backend): enforce
     // public-key pinning FIRST and unconditionally — a pin mismatch fails closed
     // even when a verify callback is present — then defer to a caller-owned
@@ -393,8 +529,43 @@ impl<S: Read + Write> TlsStream<S> {
     }
 
     /// Peer certificate chain in wire order (leaf first), each entry DER-encoded.
+    /// On a resumed session this is the chain the originating handshake saw.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
-        self.conn.peer_certificates()
+        match &self.resumed_chain {
+            Some(chain) => chain,
+            None => self.conn.peer_certificates(),
+        }
+    }
+
+    /// Whether this handshake resumed a session from [`TlsOpts::session_cache`].
+    #[cfg(test)]
+    pub(crate) fn resumed(&self) -> bool {
+        self.resumed_chain.is_some()
+    }
+
+    /// Move any session ticket the server has issued so far into the caller's
+    /// [`TlsSessionCache`]. TLS 1.2 tickets arrive during the handshake; TLS 1.3
+    /// ones arrive after it, so this also runs as application data is read.
+    fn harvest_session(&mut self) {
+        let Some(sink) = &self.session else {
+            return;
+        };
+        let Some(version) = self.conn.negotiated_version() else {
+            return;
+        };
+        if let Some(session) = self.conn.take_session() {
+            let peer_chain = match &self.resumed_chain {
+                Some(chain) => chain.clone(),
+                None => self.conn.peer_certificates().to_vec(),
+            };
+            sink.cache.store(CachedSession {
+                server_name: sink.server_name.clone(),
+                session,
+                version,
+                verified: sink.verified,
+                peer_chain,
+            });
+        }
     }
 
     /// TLS-1: whether the transport closed without a TLS `close_notify` (a
@@ -508,6 +679,7 @@ impl<S: Read + Write> Read for TlsStream<S> {
             // before reading more from the socket — a previous feed_all may
             // have parked an entire record we haven't recv'd yet.
             let app = self.conn.recv().map_err(io_tls)?;
+            self.harvest_session();
             if !app.is_empty() {
                 self.plaintext = app;
                 break;
@@ -527,6 +699,7 @@ impl<S: Read + Write> Read for TlsStream<S> {
             // Drain any post-handshake records (e.g. NewSessionTicket) that
             // the SM wants to send back.
             self.drain_outgoing()?;
+            self.harvest_session();
         }
         let take = dst.len().min(self.plaintext.len());
         dst[..take].copy_from_slice(&self.plaintext[..take]);

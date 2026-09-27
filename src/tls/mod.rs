@@ -43,6 +43,10 @@ mod settings;
 #[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
 pub(crate) use settings::{proxy_tls_builder_methods, verify_peer_chain, TlsSettings};
 
+// In-process purecrypto TLS server + session-resumption tests.
+#[cfg(all(test, any(feature = "purecrypto-tls", feature = "rustls-tls")))]
+pub(crate) mod test_server;
+
 #[cfg(feature = "rustls-tls")]
 mod rustls;
 #[cfg(feature = "rustls-tls")]
@@ -64,7 +68,7 @@ compile_error!(
 #[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
 pub use backend::{
     connect_over, connect_over_tls, connect_over_with_alpn, load_roots_from_dir,
-    load_roots_from_file, RootCertStore, TlsConn, TlsOpts, TlsStream,
+    load_roots_from_file, RootCertStore, TlsConn, TlsOpts, TlsSessionCache, TlsStream,
 };
 
 /// The TLS reference identity for a URL host: an IPv6 literal loses its URL

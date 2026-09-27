@@ -75,6 +75,10 @@ struct Control {
     /// The control channel is TLS (implicit `ftps://` or an `AUTH TLS`
     /// upgrade) and `PROT P` was accepted: data connections are TLS-wrapped.
     tls: bool,
+    /// The control connection's TLS session cache. Data connections resume
+    /// from it: servers enforcing session reuse (vsftpd's default
+    /// `require_ssl_reuse=YES`) refuse a data channel that doesn't.
+    tls_session: crate::tls::TlsSessionCache,
 }
 
 /// RFC 1738 `;type=` transfer type selected by the URL.
@@ -176,7 +180,12 @@ fn cwd_path<R: Read + Write>(ctrl: &mut BufReader<R>, dirs: &[String], create: b
 /// `AUTH SSL`, as curl does) and upgrade the control channel in place. Any
 /// refusal is an error — the caller only asks when TLS is *required*, so
 /// falling back to cleartext would leak the credentials.
-fn auth_tls(ctrl: &mut BufReader<Stream>, host: &str, tls: &crate::tls::TlsSettings) -> Result<()> {
+fn auth_tls(
+    ctrl: &mut BufReader<Stream>,
+    host: &str,
+    tls: &crate::tls::TlsSettings,
+    session: &crate::tls::TlsSessionCache,
+) -> Result<()> {
     for mech in ["TLS", "SSL"] {
         send(ctrl, &format!("AUTH {mech}"))?;
         let (c, _) = read_reply(ctrl)?;
@@ -189,7 +198,7 @@ fn auth_tls(ctrl: &mut BufReader<Stream>, host: &str, tls: &crate::tls::TlsSetti
                     "ftp: server sent data after AUTH TLS reply".into(),
                 ));
             }
-            ctrl.get_mut().upgrade(host, tls)?;
+            ctrl.get_mut().upgrade_resuming(host, tls, session)?;
             return Ok(());
         }
     }
@@ -230,8 +239,15 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
         .local_addr()
         .map(|a| a.ip())
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    // One TLS session cache per FTP session: the control handshake fills it,
+    // every data-channel handshake resumes from it.
+    let tls_session = crate::tls::TlsSessionCache::new();
     let control = if url.scheme == "ftps" {
-        Stream::Tls(Box::new(cfg.tls_connect(tcp, &url.host)?))
+        Stream::Tls(Box::new(cfg.tls.connect_resuming(
+            tcp,
+            &url.host,
+            &tls_session,
+        )?))
     } else {
         Stream::Plain(tcp)
     };
@@ -246,7 +262,7 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
     // 2b) Explicit FTPS: `--ssl-reqd` on a plain `ftp://` URL must upgrade
     //     before USER/PASS go out, or fail.
     if url.scheme == "ftp" && cfg.require_tls {
-        auth_tls(&mut ctrl, &url.host, &cfg.tls)?;
+        auth_tls(&mut ctrl, &url.host, &cfg.tls, &tls_session)?;
     }
     let tls = !ctrl.get_ref().is_plain();
 
@@ -312,6 +328,7 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
         ctrl_peer_ip,
         ctrl_local_ip,
         tls,
+        tls_session,
     })
 }
 
@@ -346,6 +363,11 @@ fn accept_with_timeout(
     }
 }
 
+/// What an active-mode data connection needs to TLS-wrap the accepted socket:
+/// the control host (SNI / verified name), the TLS settings, and the control
+/// connection's session cache to resume.
+type DataTls = (String, crate::tls::TlsSettings, crate::tls::TlsSessionCache);
+
 /// A data connection that's either already dialed (passive) or waiting for the
 /// server to connect back (active). In active mode the `accept()` must happen
 /// *after* the transfer command (`RETR`/`STOR`) is sent, so the caller holds
@@ -358,9 +380,10 @@ enum DataConn {
         listener: std::net::TcpListener,
         /// The control peer; the inbound data connection must come from it.
         peer_ip: std::net::IpAddr,
-        /// `Some((host, settings))` wraps the accepted socket in TLS (ftps),
-        /// using `host` as the SNI / verified name; `None` for plain ftp.
-        tls: Option<Box<(String, crate::tls::TlsSettings)>>,
+        /// `Some((host, settings, session))` wraps the accepted socket in TLS
+        /// (ftps), using `host` as the SNI / verified name and resuming the
+        /// control connection's `session`; `None` for plain ftp.
+        tls: Option<Box<DataTls>>,
         /// Per-read timeout for the accepted data socket.
         read_timeout: Option<std::time::Duration>,
         /// The transfer's `-m` deadline, bounding the accept and the socket.
@@ -397,8 +420,8 @@ impl DataConn {
                 let boxed: Box<dyn NetStream> = sock;
                 Ok(match tls {
                     Some(t) => {
-                        let (host, settings) = *t;
-                        Stream::Tls(Box::new(settings.connect(boxed, &host)?))
+                        let (host, settings, session) = *t;
+                        Stream::Tls(Box::new(settings.connect_resuming(boxed, &host, &session)?))
                     }
                     None => Stream::Plain(boxed),
                 })
@@ -416,7 +439,7 @@ fn open_data<R: Read + Write>(
     url: &Url,
     ctrl_peer_ip: std::net::IpAddr,
     ctrl_local_ip: std::net::IpAddr,
-    tls: bool,
+    tls: Option<&crate::tls::TlsSessionCache>,
     cfg: &NetConfig,
 ) -> Result<DataConn> {
     if cfg.ftp_active {
@@ -433,7 +456,7 @@ fn open_data<R: Read + Write>(
         return Ok(DataConn::Active {
             listener,
             peer_ip: ctrl_peer_ip,
-            tls: tls.then(|| Box::new((url.host.clone(), cfg.tls.clone()))),
+            tls: tls.map(|session| Box::new((url.host.clone(), cfg.tls.clone(), session.clone()))),
             read_timeout: cfg.io_timeout(),
             max_deadline: cfg.deadline,
         });
@@ -448,15 +471,14 @@ fn open_data<R: Read + Write>(
     let data_tcp = cfg.connect(&data_host, data_port)?;
     data_tcp.set_read_timeout(cfg.io_timeout())?;
     data_tcp.set_write_timeout(Some(IO_TIMEOUT))?;
-    // Note: the data-channel TLS session is a fresh handshake; the TLS layer
-    // exposes no session-resumption hook, so servers enforcing
-    // `require_ssl_reuse` (vsftpd's default) will refuse it.
-    Ok(DataConn::Ready(if tls {
+    Ok(DataConn::Ready(match tls {
         // Per RFC 4217 §10.2: SNI must be the original hostname, not the
-        // address we got from PASV/EPSV (which is often an IP literal).
-        Stream::Tls(Box::new(cfg.tls_connect(data_tcp, &url.host)?))
-    } else {
-        Stream::Plain(data_tcp)
+        // address we got from PASV/EPSV (which is often an IP literal). The
+        // handshake resumes the control connection's TLS session.
+        Some(session) => Stream::Tls(Box::new(
+            cfg.tls.connect_resuming(data_tcp, &url.host, session)?,
+        )),
+        None => Stream::Plain(data_tcp),
     }))
 }
 
@@ -526,7 +548,7 @@ pub(crate) fn fetch_to_with(url: &Url, cfg: &NetConfig, sink: &mut dyn Write) ->
         url,
         con.ctrl_peer_ip,
         con.ctrl_local_ip,
-        con.tls,
+        con.tls.then_some(&con.tls_session),
         cfg,
     )?;
     let ctrl = &mut con.ctrl;
@@ -705,7 +727,7 @@ fn upload(
         url,
         con.ctrl_peer_ip,
         con.ctrl_local_ip,
-        con.tls,
+        con.tls.then_some(&con.tls_session),
         cfg,
     )?;
     let ctrl = &mut con.ctrl;
@@ -1653,5 +1675,152 @@ mod tests {
             append(&u, b"data"),
             Err(Error::UnsupportedScheme(_))
         ));
+    }
+
+    /// An FTPS mock whose *data* connections present a certificate the client
+    /// does not trust, so a data handshake only succeeds by resuming the
+    /// control connection's TLS session — the observable effect of vsftpd's
+    /// `require_ssl_reuse=YES`. `implicit` selects `ftps://` (TLS from
+    /// connect) over `AUTH TLS`. Serves `RETR f` with `body` over passive
+    /// (`EPSV`) or active (`EPRT`) data connections. The handle yields, per
+    /// data connection, whether the server saw a resumed handshake (`None`
+    /// when the server stack cannot tell).
+    fn mock_ftps(
+        implicit: bool,
+        body: &'static [u8],
+    ) -> (u16, std::thread::JoinHandle<Vec<Option<bool>>>) {
+        use crate::tls::test_server::{ServerTls, TestServer};
+        use crate::tls::ProtocolVersion;
+        use std::net::{TcpListener, TcpStream};
+
+        fn line(s: &mut dyn Read) -> Option<String> {
+            let mut out = Vec::new();
+            let mut b = [0u8; 1];
+            while s.read(&mut b).ok()? == 1 {
+                if b[0] == b'\n' {
+                    return Some(String::from_utf8_lossy(&out).trim_end().to_string());
+                }
+                out.push(b[0]);
+            }
+            None
+        }
+
+        let v = (ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let control_tls = TestServer::new(v.0, v.1, false);
+            let data_tls = std::sync::Arc::new(TestServer::new(v.0, v.1, true));
+            let (sock, _) = listener.accept().unwrap();
+            let mut ctrl: Box<dyn ServerTls> = if implicit {
+                let mut c = control_tls.accept(sock).unwrap();
+                c.write_all(b"220 mock ftps\r\n").unwrap();
+                c
+            } else {
+                // Explicit FTPS: banner and `AUTH TLS` in plaintext.
+                let mut p = sock.try_clone().unwrap();
+                p.write_all(b"220 mock ftp\r\n").unwrap();
+                assert_eq!(line(&mut p).as_deref(), Some("AUTH TLS"));
+                p.write_all(b"234 go\r\n").unwrap();
+                control_tls.accept(sock).unwrap()
+            };
+            let mut resumed = Vec::new();
+            // A passive data connection is TLS-accepted as soon as the client
+            // dials it (the client handshakes before sending RETR).
+            type Accepted = std::io::Result<Box<dyn ServerTls>>;
+            let mut passive: Option<std::thread::JoinHandle<Accepted>> = None;
+            let mut active: Option<std::net::SocketAddr> = None;
+            while let Some(cmd) = line(&mut *ctrl) {
+                let (verb, arg) = cmd.split_once(' ').unwrap_or((&cmd, ""));
+                let reply = match verb {
+                    "USER" => "230 in".to_string(),
+                    "PBSZ" | "PROT" | "TYPE" => "200 ok".to_string(),
+                    "EPSV" => {
+                        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+                        let p = l.local_addr().unwrap().port();
+                        let data_tls = data_tls.clone();
+                        passive = Some(std::thread::spawn(move || {
+                            data_tls.accept(l.accept().unwrap().0)
+                        }));
+                        format!("229 Entering Extended Passive Mode (|||{p}|)")
+                    }
+                    "EPRT" => {
+                        let f: Vec<&str> = arg.split('|').collect();
+                        active = Some(format!("{}:{}", f[2], f[3]).parse().unwrap());
+                        "200 ok".to_string()
+                    }
+                    "RETR" => {
+                        ctrl.write_all(b"150 here\r\n").unwrap();
+                        let data = match (passive.take(), active.take()) {
+                            (Some(h), _) => h.join().unwrap(),
+                            (None, Some(a)) => data_tls.accept(TcpStream::connect(a).unwrap()),
+                            (None, None) => panic!("RETR without a data connection"),
+                        };
+                        match data {
+                            Ok(mut d) => {
+                                resumed.push(d.resumed());
+                                d.write_all(body).unwrap();
+                                let _ = d.close();
+                                "226 done".to_string()
+                            }
+                            // The client refused our certificate: it did a
+                            // full handshake instead of resuming.
+                            Err(_) => "425 TLS session of data connection not resumed".into(),
+                        }
+                    }
+                    "QUIT" => "221 bye".to_string(),
+                    _ => "502 no".to_string(),
+                };
+                if ctrl.write_all(format!("{reply}\r\n").as_bytes()).is_err() {
+                    break;
+                }
+            }
+            resumed
+        });
+        (port, h)
+    }
+
+    /// `NetConfig` trusting the mock's CA, and the CA file to remove after.
+    fn ftps_cfg(active: bool, implicit: bool) -> (NetConfig, std::path::PathBuf) {
+        let ca = crate::tls::test_server::ca_file();
+        let cfg = NetConfig {
+            tls: crate::tls::TlsSettings {
+                ca_bundle: Some(ca.to_str().unwrap().to_string()),
+                ..crate::tls::TlsSettings::default()
+            },
+            ftp_active: active,
+            require_tls: !implicit,
+            ..NetConfig::default()
+        };
+        (cfg, ca)
+    }
+
+    fn assert_data_channel_resumes(implicit: bool, active: bool) {
+        let (port, h) = mock_ftps(implicit, b"resumed payload");
+        let scheme = if implicit { "ftps" } else { "ftp" };
+        let url = Url::parse(&format!("{scheme}://localhost:{port}/f")).unwrap();
+        let (cfg, ca) = ftps_cfg(active, implicit);
+        let got = fetch_with(&url, &cfg);
+        let _ = std::fs::remove_file(&ca);
+        let got = got.expect("the data connection must resume the control TLS session");
+        assert_eq!(got, b"resumed payload");
+        let resumed = h.join().unwrap();
+        assert_eq!(resumed.len(), 1, "{resumed:?}");
+        assert_ne!(resumed[0], Some(false), "server saw a full data handshake");
+    }
+
+    #[test]
+    fn ftps_implicit_passive_data_channel_resumes_control_session() {
+        assert_data_channel_resumes(true, false);
+    }
+
+    #[test]
+    fn ftps_implicit_active_data_channel_resumes_control_session() {
+        assert_data_channel_resumes(true, true);
+    }
+
+    #[test]
+    fn ftps_auth_tls_data_channel_resumes_control_session() {
+        assert_data_channel_resumes(false, false);
     }
 }

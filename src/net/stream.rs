@@ -124,6 +124,28 @@ impl MaybeTlsStream {
         host: &str,
         tls: &crate::tls::TlsSettings,
     ) -> crate::error::Result<()> {
+        self.upgrade_with(|plain| tls.connect(plain, host))
+    }
+
+    /// [`upgrade`](Self::upgrade), resuming (and refreshing) the TLS session in
+    /// `session` — FTPS `AUTH TLS`, whose data connections must later resume
+    /// this control session.
+    pub(crate) fn upgrade_resuming(
+        &mut self,
+        host: &str,
+        tls: &crate::tls::TlsSettings,
+        session: &crate::tls::TlsSessionCache,
+    ) -> crate::error::Result<()> {
+        self.upgrade_with(|plain| tls.connect_resuming(plain, host, session))
+    }
+
+    fn upgrade_with(
+        &mut self,
+        handshake: impl FnOnce(
+            Box<dyn NetStream>,
+        )
+            -> crate::error::Result<crate::tls::TlsStream<Box<dyn NetStream>>>,
+    ) -> crate::error::Result<()> {
         let plain = match std::mem::replace(self, Self::Upgrading) {
             Self::Plain(s) => s,
             other => {
@@ -133,7 +155,7 @@ impl MaybeTlsStream {
                 ));
             }
         };
-        let tls = tls.connect(plain, host)?;
+        let tls = handshake(plain)?;
         *self = Self::Tls(Box::new(tls));
         Ok(())
     }

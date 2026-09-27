@@ -249,7 +249,7 @@ pub fn cipher_names_to_ids(spec: &str) -> Result<Vec<u16>> {
 /// Load a PEM certificate chain (one or more `CERTIFICATE` blocks, leaf first)
 /// into DER, mirroring purecrypto's own `s_client` loader. Used by the
 /// purecrypto backend for `-E`/`--cert` in PEM form.
-#[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
+#[cfg(any(test, all(feature = "purecrypto-tls", not(feature = "rustls-tls"))))]
 pub fn load_cert_chain(pem: &str) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     for block in crate::tls::pc_roots::pem_blocks(pem) {

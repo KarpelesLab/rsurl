@@ -62,6 +62,47 @@ pub struct TlsOpts {
     /// Caller-owned certificate-validation hook. When `Some`, rsurl skips its
     /// own chain verification and the callback is the sole trust authority.
     pub verify_callback: Option<super::common::VerifyCallback>,
+    /// Shared TLS session cache. When `Some`, the handshake resumes a session
+    /// stored there for the same server and stores new ones back into it.
+    /// Used by FTPS so data connections resume the control connection's
+    /// session.
+    pub session_cache: Option<TlsSessionCache>,
+}
+
+/// A shared, clonable TLS client session cache (clones share one store).
+///
+/// rustls only resumes a session between connections that share one
+/// `ClientConfig` (its certificate verifier and client credentials are
+/// compared by pointer), so the cache keeps the configuration built for the
+/// first connection, with its in-memory session store, and every later
+/// connection using the same cache reuses it. Share a cache only between
+/// connections built from the same [`TlsOpts`] — FTPS shares one between its
+/// control and data connections, as servers such as vsftpd
+/// (`require_ssl_reuse=YES`) require. TLS 1.3 resumes via PSK tickets, TLS 1.2
+/// via session IDs or RFC 5077 tickets.
+///
+/// rustls zeroizes the stored secrets when they are dropped; `Debug` never
+/// prints them.
+#[derive(Clone, Default)]
+pub struct TlsSessionCache(Arc<std::sync::Mutex<Option<Arc<ClientConfig>>>>);
+
+impl TlsSessionCache {
+    /// An empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<ClientConfig>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl std::fmt::Debug for TlsSessionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsSessionCache")
+            .field("primed", &self.lock().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TlsOpts {
@@ -81,6 +122,7 @@ impl TlsOpts {
             crl_pem: None,
             cipher_suites: Vec::new(),
             verify_callback: None,
+            session_cache: None,
         }
     }
 }
@@ -262,6 +304,16 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientC
                 .into(),
         ));
     }
+    // An IP literal becomes `ServerName::IpAddress`: verified against the
+    // iPAddress SANs and, per RFC 6066 §3, not sent as SNI.
+    let sni = super::server_name(sni);
+    let server_name: ServerName<'static> = ServerName::try_from(sni.to_string())
+        .map_err(|e| Error::BadResponse(format!("invalid SNI {sni:?}: {e}")))?;
+    // Session resumption: reuse the configuration (and so the session store
+    // and verifier) of the first connection that used this cache.
+    if let Some(config) = opts.session_cache.as_ref().and_then(|c| c.lock().clone()) {
+        return ClientConnection::new(config, server_name).map_err(rustls_err);
+    }
     // Build the ClientConfig. Two paths: the standard webpki verifier
     // (verify=true) or a "trust everything" verifier (verify=false), the
     // latter delegating signature math to the ring CryptoProvider so the
@@ -336,13 +388,11 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientC
         }
     };
     config.alpn_protocols = std::mem::take(&mut opts.alpn);
-
-    // An IP literal becomes `ServerName::IpAddress`: verified against the
-    // iPAddress SANs and, per RFC 6066 §3, not sent as SNI.
-    let sni = super::server_name(sni);
-    let server_name: ServerName<'static> = ServerName::try_from(sni.to_string())
-        .map_err(|e| Error::BadResponse(format!("invalid SNI {sni:?}: {e}")))?;
-    ClientConnection::new(Arc::new(config), server_name).map_err(rustls_err)
+    let config = Arc::new(config);
+    if let Some(cache) = &opts.session_cache {
+        *cache.lock() = Some(config.clone());
+    }
+    ClientConnection::new(config, server_name).map_err(rustls_err)
 }
 
 /// Like [`connect_over_with_alpn`], but takes the full [`TlsOpts`] so
@@ -486,6 +536,12 @@ impl<S: Read + Write> TlsStream<S> {
 
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.peer_certs_der
+    }
+
+    /// Whether this handshake resumed a session from [`TlsOpts::session_cache`].
+    #[cfg(test)]
+    pub(crate) fn resumed(&self) -> bool {
+        self.conn.handshake_kind() == Some(rustls::HandshakeKind::Resumed)
     }
 
     /// TLS-1: `true` if the transport closed without a TLS `close_notify`
