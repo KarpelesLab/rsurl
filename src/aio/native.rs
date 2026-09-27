@@ -35,8 +35,10 @@ pub async fn post<R: Runtime>(rt: &R, url: &str, body: impl Into<Vec<u8>>) -> Re
 
 /// Send `req` over `rt`, returning the buffered [`Response`]. `https` builds the
 /// active TLS backend's engine via [`crate::tls`] and carries the exchange
-/// through the sans-IO TLS layer; `http` drives the request directly. Each
-/// connection is closed after its response (`Connection: close`).
+/// through the sans-IO TLS layer, configured from the request's TLS settings
+/// ([`Request::verify_tls`], [`Request::ca_bundle`], [`Request::tls`], ...);
+/// `http` drives the request directly. Each connection is closed after its
+/// response (`Connection: close`).
 ///
 /// When [`Request::follow_redirects`] is set, `3xx` responses with a `Location`
 /// are followed (up to [`MAX_REDIRECTS`] hops, rewriting method/body per the
@@ -56,7 +58,7 @@ async fn exchange<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
     let mut hops = 0usize;
 
     loop {
-        let resp = send_once(rt, &url, &method, &req.headers, body).await?;
+        let resp = send_once(rt, &url, &method, &req.headers, body, &req.tls.settings).await?;
 
         // Follow a redirect, or fall through to return this response.
         if req.follow_redirects && is_redirect(resp.status) {
@@ -151,6 +153,7 @@ async fn send_once<R: Runtime>(
     method: &str,
     caller_headers: &[(String, String)],
     body: &[u8],
+    tls_settings: &crate::tls::TlsSettings,
 ) -> Result<Response> {
     let mut conn = connect(rt, &u.host, u.port).await?;
 
@@ -168,9 +171,10 @@ async fn send_once<R: Runtime>(
             asyncio::drive(&mut exchange, &mut conn).await?
         }
         "https" => {
+            // Handshake and run the post-handshake trust checks (pins, verify
+            // callback, SAN) *before* the request is encrypted and sent.
+            let engine = crate::io::asynctls::handshake(&mut conn, &u.host, tls_settings).await?;
             let exchange = ClientExchange::new(method, bytes);
-            let mut opts = crate::tls::TlsOpts::verifying();
-            let engine = crate::tls::build_client_engine(&u.host, &mut opts)?;
             let mut tls = TlsClient::new(engine, exchange);
             let events = asyncio::drive(&mut tls, &mut conn).await?;
             // A body framed by the connection close is only complete if the
@@ -814,5 +818,301 @@ mod tests {
         assert!(matches!(err, Error::BadResponse(_)), "got {err:?}");
         // The rejected close must not have marked the socket closed.
         assert!(!ws.is_closed());
+    }
+}
+
+/// Async `https://` / `wss://` against an in-process rustls server presenting a
+/// `localhost` leaf signed by a private test CA: the TLS options of
+/// [`Request`] / [`TlsOptions`](super::TlsOptions) must actually reach the
+/// handshake (they used to be ignored: every async connection hard-coded
+/// default verification).
+///
+/// Driven by a tiny blocking [`Runtime`] (each future completes on its first
+/// poll), so these run without `tokio-rt`, under any feature set that has the
+/// rustls backend the test server needs.
+#[cfg(all(test, feature = "rustls-tls"))]
+mod tls_tests {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Waker};
+    use std::thread;
+    use std::time::Instant;
+
+    use super::super::{TlsOptions, WebSocket, WsMessage};
+    use super::*;
+    use crate::io::runtime::AsyncConn;
+    use crate::proto::tls::rustls_tests::{server_config, CA_CERT_PEM, LEAF_CERT_PEM};
+
+    /// A [`Runtime`] over blocking std sockets: every operation finishes
+    /// synchronously, so its futures are ready on the first poll.
+    struct BlockingRuntime;
+
+    struct BlockingConn(TcpStream);
+
+    impl AsyncConn for BlockingConn {
+        async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+
+        async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            self.0.write_all(buf)
+        }
+
+        async fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl Runtime for BlockingRuntime {
+        type Conn = BlockingConn;
+
+        async fn connect(&self, addr: SocketAddr) -> io::Result<BlockingConn> {
+            let s = TcpStream::connect(addr)?;
+            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            Ok(BlockingConn(s))
+        }
+
+        async fn sleep(&self, dur: Duration) {
+            thread::sleep(dur);
+        }
+
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+    }
+
+    /// Run a [`BlockingRuntime`] future to completion.
+    fn block_on<F: Future>(fut: F) -> F::Output {
+        let mut fut = pin!(fut);
+        match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("blocking-runtime future unexpectedly pending"),
+        }
+    }
+
+    /// Read one HTTP head (through `\r\n\r\n`) from `s`.
+    fn read_head<S: Read>(s: &mut S) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while s.read(&mut byte).ok()? == 1 {
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                return Some(String::from_utf8_lossy(&buf).into_owned());
+            }
+        }
+        None
+    }
+
+    trait ReadWrite: Read + Write {}
+    impl<T: Read + Write> ReadWrite for T {}
+
+    /// Log of the request heads a test server actually received.
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    /// Accept connections forever, terminating TLS with the test `localhost`
+    /// certificate and handing each decrypted stream (and its request head) to
+    /// `serve`. Returns the port and the log of request heads received, so a
+    /// test can prove a rejected connection never sent its request.
+    fn tls_server<F>(serve: F) -> (u16, Seen)
+    where
+        F: Fn(&mut dyn ReadWrite, &str) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Seen::default();
+        let log = Arc::clone(&seen);
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut server = rustls::ServerConnection::new(server_config()).unwrap();
+                {
+                    let mut tls = rustls::Stream::new(&mut server, &mut sock);
+                    // A client that rejects the certificate aborts the
+                    // handshake, so no head ever arrives.
+                    if let Some(head) = read_head(&mut tls) {
+                        log.lock().unwrap().push(head.clone());
+                        serve(&mut tls, &head);
+                    }
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                }
+                crate::test_support::graceful_close(&mut sock);
+            }
+        });
+        (port, seen)
+    }
+
+    /// An HTTPS server answering every request with `200 hello`.
+    fn https_server() -> (u16, Seen) {
+        tls_server(|s, _head| {
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        })
+    }
+
+    /// A WSS server: completes the upgrade, then echoes one small masked
+    /// client frame back unmasked.
+    fn wss_server() -> (u16, Seen) {
+        tls_server(|s, head| {
+            let key = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| v.trim().to_string())
+                })
+                .unwrap_or_default();
+            let accept = crate::websocket::derive_accept(&key);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            );
+            if s.write_all(resp.as_bytes()).is_err() || s.flush().is_err() {
+                return;
+            }
+            let mut hdr = [0u8; 6];
+            if s.read_exact(&mut hdr).is_err() {
+                return;
+            }
+            let len = (hdr[1] & 0x7F) as usize; // tests send < 126 bytes
+            let mut payload = vec![0u8; len];
+            if s.read_exact(&mut payload).is_err() {
+                return;
+            }
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= hdr[2 + (i & 3)];
+            }
+            let mut out = vec![0x80 | (hdr[0] & 0x0F), len as u8];
+            out.extend_from_slice(&payload);
+            let _ = s.write_all(&out);
+            let _ = s.flush();
+        })
+    }
+
+    /// Write the test CA to a per-test temp file, returning (dir, path).
+    fn ca_file(tag: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("rsurl-aio-ca-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, CA_CERT_PEM).unwrap();
+        (dir, ca.to_str().unwrap().to_string())
+    }
+
+    /// The server leaf's real `sha256//` pin.
+    fn right_pin() -> String {
+        let leaf = rustls_pemfile::certs(&mut LEAF_CERT_PEM.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let spki = crate::tls::client_auth::leaf_spki_sha256(&leaf).unwrap();
+        format!("sha256//{}", crate::websocket::base64_encode(&spki))
+    }
+
+    const WRONG_PIN: &str = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn async_https_honours_tls_options() {
+        let (port, seen) = https_server();
+        let url = format!("https://localhost:{port}/");
+        let send = |req: Request| block_on(request(&BlockingRuntime, &req));
+
+        // Default: the private test CA is not in the system trust store.
+        send(Request::get(&url)).expect_err("untrusted CA must be rejected by default");
+
+        // `-k` accepts it.
+        let resp = send(Request::get(&url).verify_tls(false)).expect("verify off");
+        assert_eq!((resp.status, resp.body.as_slice()), (200, &b"hello"[..]));
+
+        // `--cacert` with the test CA accepts it, verification on.
+        let (dir, ca) = ca_file("https");
+        let resp = send(Request::get(&url).ca_bundle(&ca)).expect("custom CA");
+        assert_eq!(resp.body, b"hello");
+        // ...and so does the same setting handed over as a `TlsOptions`,
+        // together with the correct pin.
+        let opts = TlsOptions::new().ca_bundle(&ca).pinned_pubkey(&right_pin());
+        let resp = send(Request::get(&url).tls(opts)).expect("custom CA + right pin");
+        assert_eq!(resp.body, b"hello");
+
+        // A wrong pin fails even with verification off.
+        let err = send(
+            Request::get(&url)
+                .verify_tls(false)
+                .pinned_pubkey(WRONG_PIN),
+        )
+        .expect_err("pin mismatch must fail even with -k");
+        assert!(err.to_string().contains("pinned public key"), "{err}");
+
+        // A missing CA file fails before connecting.
+        send(Request::get(&url).ca_bundle("/nonexistent/rsurl-ca.pem"))
+            .expect_err("missing CA file");
+
+        // One more success so every earlier connection has been fully handled
+        // by the (sequential) server, then check what actually reached it: the
+        // rejected connections (untrusted CA, wrong pin) sent no request.
+        send(Request::get(&url).verify_tls(false)).expect("verify off");
+        assert_eq!(seen.lock().unwrap().len(), 4, "{:?}", seen.lock().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The options apply on every redirect hop, not just the first.
+    #[test]
+    fn async_https_tls_options_apply_to_redirect_hops() {
+        let (port, _seen) = tls_server(|s, head| {
+            let resp: &[u8] = if head.starts_with("GET /final ") {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"
+            } else {
+                b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n"
+            };
+            let _ = s.write_all(resp);
+        });
+        let req = Request::get(format!("https://localhost:{port}/start"))
+            .verify_tls(false)
+            .follow_redirects(true);
+        let resp = block_on(request(&BlockingRuntime, &req)).expect("redirected");
+        assert_eq!(resp.body, b"done");
+    }
+
+    #[test]
+    fn async_wss_honours_tls_options() {
+        let (port, seen) = wss_server();
+        let url = format!("wss://localhost:{port}/");
+        let rt = BlockingRuntime;
+        let connect =
+            |opts: &TlsOptions| block_on(WebSocket::connect_with_tls(&rt, &url, &[], opts));
+        let echo = |mut ws: WebSocket<BlockingConn>| {
+            block_on(ws.send_text("hi")).expect("send");
+            let msg = block_on(ws.recv()).expect("open").expect("recv");
+            assert_eq!(msg, WsMessage::Text("hi".into()));
+        };
+
+        // Default options reject the private CA.
+        block_on(WebSocket::connect(&rt, &url)).expect_err("untrusted CA, plain connect");
+        connect(&TlsOptions::new()).expect_err("untrusted CA, default options");
+
+        echo(connect(&TlsOptions::new().verify_tls(false)).expect("verify off"));
+
+        let (dir, ca) = ca_file("wss");
+        echo(connect(&TlsOptions::new().ca_bundle(&ca)).expect("custom CA"));
+
+        let err = connect(&TlsOptions::new().verify_tls(false).pinned_pubkey(WRONG_PIN))
+            .expect_err("pin mismatch must fail even with -k");
+        assert!(err.to_string().contains("pinned public key"), "{err}");
+
+        echo(connect(&TlsOptions::new().verify_tls(false)).expect("verify off"));
+        // The rejected connections never sent their upgrade request.
+        assert_eq!(seen.lock().unwrap().len(), 3, "{:?}", seen.lock().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tls_options_debug_redacts_the_key_passphrase() {
+        let req = Request::get("https://x/")
+            .verify_tls(false)
+            .client_key_pass("hunter2");
+        let dbg = format!("{req:?}");
+        assert!(dbg.contains("verify: false"), "{dbg}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
     }
 }

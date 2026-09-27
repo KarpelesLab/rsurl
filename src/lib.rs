@@ -11,7 +11,9 @@
 //! — the browser owns DNS, TLS, and the HTTP/WebSocket wire. rsurl's own
 //! `net`/`proto`/`tls` stack, every socket-bound protocol backend (FTP, SSH,
 //! HTTP/2, HTTP/3, BitTorrent, mail, …), and the entire *blocking* API therefore
-//! do not exist on that target — they are `#[cfg(not(target_arch = "wasm32"))]`.
+//! do not exist on that target — they are `#[cfg(not(target_arch = "wasm32"))]`
+//! (only the backend-neutral [`tls`] vocabulary types remain, so the
+//! [`aio`] TLS builders keep one signature across targets).
 //!
 //! What remains is the **unified async API** in [`aio`], which compiles on both
 //! targets: on native it drives the sans-IO core over real sockets; on wasm it
@@ -78,6 +80,16 @@ mod test_support;
 pub mod net;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tls;
+/// Backend-neutral TLS vocabulary only. On wasm the browser owns TLS, so none of
+/// the native stack exists here; these types are kept so the
+/// [`aio::TlsOptions`] / [`aio::Request`] TLS builders (ignored in the browser)
+/// have the same signatures on both targets.
+#[cfg(target_arch = "wasm32")]
+pub mod tls {
+    // `src/tls/common.rs`: plain types with no backend or I/O dependency.
+    mod common;
+    pub use common::{CertVerdict, CertVerify, ProtocolVersion, VerifyCallback};
+}
 
 // Protocol backends — each one owns a single URL scheme family. All socket-bound.
 #[cfg(all(feature = "bittorrent", not(target_arch = "wasm32")))]

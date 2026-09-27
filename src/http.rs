@@ -2583,46 +2583,14 @@ fn verify_core_peer_certificates(
     req: &Request,
     pins: &[[u8; 32]],
 ) -> Result<()> {
-    let leaf = chain.first().map(Vec::as_slice);
-
-    if !pins.is_empty() {
-        match leaf {
-            Some(der) if crate::tls::client_auth::spki_pin_matches(der, pins) => {}
-            _ => {
-                return Err(Error::BadResponse(
-                    "pinned public key does not match server certificate".into(),
-                ))
-            }
-        }
-    }
-
-    if let Some(cb) = &req.tls_verify_callback {
-        let verdict = cb.call(&crate::tls::CertVerify {
-            server_name: &req.url.host,
-            chain_der: chain,
-        });
-        if verdict == crate::tls::CertVerdict::Reject {
-            return Err(Error::BadResponse(
-                "server certificate rejected by verify callback".into(),
-            ));
-        }
-        return Ok(());
-    }
-
-    if req.verify_tls {
-        match leaf {
-            Some(der) if crate::tls::client_auth::leaf_has_san(der) => {}
-            Some(_) => {
-                return Err(Error::BadResponse(
-                    "server certificate has no Subject Alternative Name \
-                     (CN fallback is not accepted)"
-                        .into(),
-                ))
-            }
-            None => {}
-        }
-    }
-    Ok(())
+    // The policy itself is shared with the async (`aio`) https/wss paths.
+    crate::tls::verify_peer_chain(
+        chain,
+        &req.url.host,
+        req.verify_tls,
+        req.tls_verify_callback.as_ref(),
+        pins,
+    )
 }
 
 /// Run one HTTPS HTTP/1.1 exchange over the sans-IO [`TlsClient`] stack on an

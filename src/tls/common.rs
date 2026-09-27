@@ -39,7 +39,7 @@ pub enum CertVerdict {
     Reject,
 }
 
-/// A caller-supplied certificate-validation hook. When set on [`super::TlsOpts`]
+/// A caller-supplied certificate-validation hook. When set on `TlsOpts` (native)
 /// it becomes the **sole** trust authority: rsurl performs the handshake without
 /// its own chain validation and defers the accept/reject decision to this
 /// callback, passing the full peer chain. This lets `argus-security` own trust

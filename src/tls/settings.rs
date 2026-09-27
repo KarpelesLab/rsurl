@@ -255,6 +255,87 @@ impl TlsSettings {
     ) -> Result<super::TlsStream<S>> {
         super::connect_over_tls(transport, host, self.to_opts(&[])?)
     }
+
+    /// Post-handshake trust policy for a sans-IO engine built from
+    /// [`to_opts`](Self::to_opts): see [`verify_peer_chain`]. `pins` are the
+    /// parsed pins from that same `TlsOpts` (`pinned_spki_sha256`), and
+    /// `server_name` the host handed to a verify callback.
+    pub(crate) fn verify_peer(
+        &self,
+        chain: &[Vec<u8>],
+        server_name: &str,
+        pins: &[[u8; 32]],
+    ) -> Result<()> {
+        verify_peer_chain(
+            chain,
+            server_name,
+            self.verify,
+            self.verify_callback.as_ref(),
+            pins,
+        )
+    }
+}
+
+/// The checks a sans-IO TLS engine leaves to its driver, because they need the
+/// peer chain from the completed handshake (the engine itself already verified
+/// the chain against the roots, unless `-k` or a callback owns verification):
+///
+/// 1. **Public-key pinning**: when `pins` is non-empty the leaf's SPKI must
+///    match one of them, *even with verification off* (curl semantics).
+/// 2. A **caller verify callback**, when set, is the sole trust authority: its
+///    verdict decides, and the SAN check is skipped (the callback owns it).
+/// 3. Otherwise, when `verify`ing, a **SAN-required hostname check**: reject a
+///    leaf with no Subject Alternative Name (no deprecated CN fallback).
+///
+/// `chain` is leaf first, DER-encoded. Shared by the blocking HTTPS core and
+/// the async (`aio`) https/wss paths so their trust policy cannot drift.
+pub(crate) fn verify_peer_chain(
+    chain: &[Vec<u8>],
+    server_name: &str,
+    verify: bool,
+    callback: Option<&VerifyCallback>,
+    pins: &[[u8; 32]],
+) -> Result<()> {
+    let leaf = chain.first().map(Vec::as_slice);
+
+    if !pins.is_empty() {
+        match leaf {
+            Some(der) if super::client_auth::spki_pin_matches(der, pins) => {}
+            _ => {
+                return Err(Error::BadResponse(
+                    "pinned public key does not match server certificate".into(),
+                ))
+            }
+        }
+    }
+
+    if let Some(cb) = callback {
+        let verdict = cb.call(&super::CertVerify {
+            server_name,
+            chain_der: chain,
+        });
+        if verdict == super::CertVerdict::Reject {
+            return Err(Error::BadResponse(
+                "server certificate rejected by verify callback".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    if verify {
+        match leaf {
+            Some(der) if super::client_auth::leaf_has_san(der) => {}
+            Some(_) => {
+                return Err(Error::BadResponse(
+                    "server certificate has no Subject Alternative Name \
+                     (CN fallback is not accepted)"
+                        .into(),
+                ))
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

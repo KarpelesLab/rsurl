@@ -19,7 +19,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
-use super::{Request, Response, WsMessage};
+use super::{Request, Response, TlsOptions, WsMessage};
 use crate::error::{Error, Result};
 
 /// Turn a JS exception / rejection value into an [`Error`].
@@ -272,6 +272,20 @@ impl WebSocket {
     /// the `Sec-WebSocket-Protocol` header — the only handshake input the
     /// browser exposes). See [`connect`](WebSocket::connect).
     pub async fn connect_with_subprotocols(url: &str, subprotocols: &[&str]) -> Result<WebSocket> {
+        Self::connect_with_tls(url, subprotocols, &TlsOptions::default()).await
+    }
+
+    /// The browser counterpart of the native `connect_with_tls`, so portable
+    /// code can pass one [`TlsOptions`] on both targets. `tls` is **ignored**:
+    /// the browser owns TLS and `wss://` is always verified by its own policy.
+    /// Otherwise identical to
+    /// [`connect_with_subprotocols`](WebSocket::connect_with_subprotocols).
+    pub async fn connect_with_tls(
+        url: &str,
+        subprotocols: &[&str],
+        tls: &TlsOptions,
+    ) -> Result<WebSocket> {
+        let _ = tls;
         let ws = if subprotocols.is_empty() {
             web_sys::WebSocket::new(url)
         } else {

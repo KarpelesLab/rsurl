@@ -20,7 +20,10 @@
 //! Scope (current cut): HTTP/1.1 over `http`/`https` with an arbitrary method,
 //! request body, and caller headers (see [`Request`]); optional redirect
 //! following, automatic response decompression, and a whole-request
-//! [`timeout`](Request::timeout); buffered response. Each request uses a fresh
+//! [`timeout`](Request::timeout); curl-style TLS options for `https`/`wss`
+//! (`-k`, `--cacert`, `--capath`, `--crlfile`, client certificates,
+//! `--pinnedpubkey`, ciphers, version bounds; see [`TlsOptions`], also settable
+//! directly on a [`Request`]); buffered response. Each request uses a fresh
 //! `Connection: close` socket — connection pooling and streaming (non-buffered)
 //! bodies are part of the ongoing sans-IO cutover and are not yet wired on this
 //! async path.
@@ -38,7 +41,8 @@
 //!
 //!   * [`Request`] and every builder on it, [`Response`] and every accessor on
 //!     it ([`header`](Response::header), [`text`](Response::text),
-//!     [`error_for_status`](Response::error_for_status), …), [`WsMessage`], and
+//!     [`error_for_status`](Response::error_for_status), …), [`WsMessage`],
+//!     [`TlsOptions`] (whose settings the browser ignores), and
 //!     [`crate::Error`] / [`crate::Result`].
 //!   * Every WebSocket *method*: `send` / `send_text` / `send_binary` / `recv` /
 //!     `close` / `close_with` / `subprotocol` / `is_closed` has the same name,
@@ -88,7 +92,8 @@
 //!     synthesise them (fetch sets them itself).
 //!   * **CORS** — cross-origin requests need server opt-in; a `no-cors` fetch
 //!     yields an opaque, unreadable response.
-//!   * **No TLS control**, **redirects/cookies are browser-managed**, and the
+//!   * **No TLS control** (every [`TlsOptions`] / [`Request`] TLS setting is
+//!     accepted and ignored), **redirects/cookies are browser-managed**, and the
 //!     response body arrives already decompressed (its `Content-Encoding` is
 //!     stripped by the browser), so [`Request::decompress`] is a no-op here.
 //!   * **No custom WebSocket handshake headers** (no `Authorization`); only
@@ -271,6 +276,10 @@ pub struct Request {
     /// Whole-request deadline, redirects included (default `None`, i.e. no
     /// limit). See [`Request::timeout`].
     pub timeout: Option<Duration>,
+    /// TLS settings for `https` (every redirect hop included). Set through the
+    /// TLS builders ([`verify_tls`](Request::verify_tls), ...) or wholesale
+    /// with [`tls`](Request::tls).
+    tls: TlsOptions,
 }
 
 /// Maximum number of redirects [`request`] follows when
@@ -280,9 +289,85 @@ pub struct Request {
 /// Native only: on wasm the browser applies its own redirect limit.
 pub const MAX_REDIRECTS: usize = 10;
 
+/// Define the curl-style TLS builder methods (named like the blocking `Client`'s
+/// and `Request`'s) on a type with a native-only
+/// `tls_settings_mut(&mut self) -> &mut TlsSettings`. On wasm each method
+/// compiles, with the same signature, to a documented no-op.
+macro_rules! tls_setters {
+    () => {
+        tls_setters! {
+            /// Verify the server certificate chain and hostname (default
+            /// `true`; `false` is curl's `-k`/`--insecure`). A
+            /// [`pinned_pubkey`](Self::pinned_pubkey) is still enforced when
+            /// this is off.
+            verify_tls(on: bool) => |s| s.verify = on;
+            /// Trust the CA bundle (PEM) at `path` instead of the system roots
+            /// (curl `--cacert`).
+            ca_bundle(path: &str) => |s| s.ca_bundle = Some(path.to_string());
+            /// Additionally trust every CA certificate in the directory `dir`
+            /// (curl `--capath`), on top of the system roots or the
+            /// [`ca_bundle`](Self::ca_bundle).
+            ca_path(dir: &str) => |s| s.ca_path = Some(dir.to_string());
+            /// Check the server chain against the CRL (PEM) at `path` (curl
+            /// `--crlfile`).
+            crl_file(path: &str) => |s| s.crl_file = Some(path.to_string());
+            /// Present the client certificate at `path` (curl `-E`/`--cert`).
+            /// PEM by default, see [`cert_type_der`](Self::cert_type_der); the
+            /// key is read from the same file unless
+            /// [`client_key`](Self::client_key) is set.
+            client_cert(path: &str) => |s| s.client_cert = Some(path.to_string());
+            /// Client private key at `path` (curl `--key`).
+            client_key(path: &str) => |s| s.client_key = Some(path.to_string());
+            /// Passphrase for an encrypted client key (curl `--pass`).
+            client_key_pass(pass: &str) => |s| s.client_key_pass = Some(pass.to_string());
+            /// Treat the client certificate file as DER (curl `--cert-type DER`).
+            cert_type_der(der: bool) => |s| s.cert_is_der = der;
+            /// Treat the client key file as DER (curl `--key-type DER`).
+            key_type_der(der: bool) => |s| s.key_is_der = der;
+            /// Pin the server public key (curl `--pinnedpubkey`,
+            /// `sha256//BASE64[;sha256//BASE64...]`). A mismatch fails the
+            /// connection before any request byte is sent, even with
+            /// [`verify_tls(false)`](Self::verify_tls). A malformed spec fails
+            /// the request up front.
+            pinned_pubkey(spec: &str) => |s| s.pinned_pubkey = Some(spec.to_string());
+            /// Restrict the TLS ≤ 1.2 cipher suites (curl `--ciphers`).
+            ciphers(list: &str) => |s| s.ciphers = Some(list.to_string());
+            /// Restrict the TLS 1.3 cipher suites (curl `--tls13-ciphers`).
+            tls13_ciphers(list: &str) => |s| s.tls13_ciphers = Some(list.to_string());
+            /// Minimum acceptable TLS version (curl `--tlsv1.x`).
+            tls_min_version(v: crate::tls::ProtocolVersion) => |s| s.min_version = Some(v);
+            /// Maximum acceptable TLS version (curl `--tls-max`).
+            tls_max_version(v: crate::tls::ProtocolVersion) => |s| s.max_version = Some(v);
+            /// Hand the trust decision to `cb`: rsurl's own chain validation
+            /// is skipped and the callback's
+            /// [`CertVerdict`](crate::tls::CertVerdict) decides (public-key
+            /// pins are still enforced first). Same semantics as the
+            /// blocking `Request::tls_verify_callback`.
+            tls_verify_callback(cb: crate::tls::VerifyCallback) => |s| s.verify_callback = Some(cb);
+        }
+    };
+    ($($(#[$doc:meta])* $name:ident($arg:ident: $ty:ty) => |$s:ident| $apply:expr;)*) => {$(
+        $(#[$doc])*
+        ///
+        /// Ignored on wasm, where the browser owns TLS.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        pub fn $name(mut self, $arg: $ty) -> Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let $s = self.tls_settings_mut();
+                $apply;
+            }
+            #[cfg(target_arch = "wasm32")]
+            let _ = $arg;
+            self
+        }
+    )*};
+}
+
 impl Request {
     /// A request with the given method and URL, no extra headers, an empty
-    /// body, redirects off, response decompression on, and no timeout.
+    /// body, redirects off, response decompression on, no timeout, and default
+    /// TLS settings (verify against the system trust store; see [`TlsOptions`]).
     pub fn new(method: impl Into<String>, url: impl Into<String>) -> Self {
         Request {
             method: method.into(),
@@ -292,6 +377,7 @@ impl Request {
             follow_redirects: false,
             decompress: true,
             timeout: None,
+            tls: TlsOptions::default(),
         }
     }
 
@@ -349,6 +435,107 @@ impl Request {
     pub fn timeout(mut self, dur: impl Into<Option<Duration>>) -> Self {
         self.timeout = dur.into();
         self
+    }
+
+    /// Replace this request's TLS settings with `opts` wholesale (handy to share
+    /// one [`TlsOptions`] between requests and [`WebSocket`] connects). This
+    /// overwrites anything set earlier through the individual TLS builders
+    /// ([`verify_tls`](Self::verify_tls), [`ca_bundle`](Self::ca_bundle), ...).
+    ///
+    /// Ignored on wasm, where the browser owns TLS.
+    pub fn tls(mut self, opts: TlsOptions) -> Self {
+        self.tls = opts;
+        self
+    }
+
+    /// The TLS settings the builders mutate.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tls_settings_mut(&mut self) -> &mut crate::tls::TlsSettings {
+        &mut self.tls.settings
+    }
+
+    tls_setters!();
+}
+
+/// TLS settings for async `https://` requests and `wss://` WebSockets: the
+/// verification, trust-store, client-certificate, pinning, cipher and version
+/// options of the blocking API, with the same builder names.
+///
+/// `Default` verifies the server against the system trust store, with no client
+/// certificate, pin, CRL, or cipher/version restriction. Hand it to
+/// [`Request::tls`] or [`WebSocket::connect_with_tls`], or set the same options
+/// directly on a [`Request`] ([`Request::verify_tls`], ...).
+///
+/// Files (CA bundle, CA directory, CRL, client certificate and key) are read,
+/// and pins and cipher names parsed, when a connection is made, so a missing
+/// file or a malformed spec fails that request before anything is sent.
+///
+/// ```
+/// let opts = rsurl::aio::TlsOptions::new()
+///     .ca_bundle("/etc/my-ca.pem")
+///     .pinned_pubkey("sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+/// let req = rsurl::aio::Request::get("https://internal.example/").tls(opts);
+/// # let _ = req;
+/// ```
+///
+/// # On wasm32
+///
+/// The browser owns TLS and exposes no knob for it, so every option here is
+/// accepted and **ignored**: certificate verification always follows the
+/// browser's own policy.
+#[derive(Clone, Default)]
+pub struct TlsOptions {
+    #[cfg(not(target_arch = "wasm32"))]
+    settings: crate::tls::TlsSettings,
+}
+
+impl TlsOptions {
+    /// Default settings: verify against the system trust store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The TLS settings the builders mutate.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tls_settings_mut(&mut self) -> &mut crate::tls::TlsSettings {
+        &mut self.settings
+    }
+
+    tls_setters!();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Debug for TlsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = &self.settings;
+        f.debug_struct("TlsOptions")
+            .field("verify", &s.verify)
+            .field("ca_bundle", &s.ca_bundle)
+            .field("ca_path", &s.ca_path)
+            .field("crl_file", &s.crl_file)
+            .field("client_cert", &s.client_cert)
+            .field("client_key", &s.client_key)
+            // Never print the passphrase itself.
+            .field(
+                "client_key_pass",
+                &s.client_key_pass.as_ref().map(|_| "<redacted>"),
+            )
+            .field("cert_is_der", &s.cert_is_der)
+            .field("key_is_der", &s.key_is_der)
+            .field("pinned_pubkey", &s.pinned_pubkey)
+            .field("ciphers", &s.ciphers)
+            .field("tls13_ciphers", &s.tls13_ciphers)
+            .field("min_version", &s.min_version)
+            .field("max_version", &s.max_version)
+            .field("verify_callback", &s.verify_callback)
+            .finish()
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::fmt::Debug for TlsOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsOptions").finish_non_exhaustive()
     }
 }
 

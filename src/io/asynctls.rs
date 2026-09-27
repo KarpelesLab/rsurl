@@ -16,12 +16,59 @@ use std::io;
 use crate::error::Result;
 use crate::io::runtime::AsyncConn;
 use crate::proto::tls::TlsEngine;
-use crate::tls::ClientEngine;
+use crate::tls::{ClientEngine, TlsSettings};
 
 /// Map a crate error surfaced by the TLS engine into an [`io::Error`], so the
 /// [`AsyncConn`] surface stays `io`-typed like a real socket.
 fn to_io(e: crate::error::Error) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// Run a client TLS handshake with server `host` over `conn`, configured from
+/// `tls` (roots, `-k`, client certificate, ciphers, version bounds, ...), and
+/// return the established engine.
+///
+/// The post-handshake checks the engine leaves to its driver (public-key
+/// pinning, the caller verify callback, the SAN-required hostname check; see
+/// [`crate::tls::verify_peer_chain`]) run here, *before* the caller sends any
+/// application data, so a pin mismatch never leaks a request to the wrong
+/// server. Every byte read from `conn` is handed to the engine, so nothing is
+/// left buffered outside it: a caller may keep driving the returned engine
+/// over the same `conn` (e.g. through [`TlsClient`](crate::proto::tls::TlsClient)).
+pub(crate) async fn handshake<C: AsyncConn>(
+    conn: &mut C,
+    host: &str,
+    tls: &TlsSettings,
+) -> Result<ClientEngine> {
+    // Files (CA bundle, client cert/key, CRL) are read and pins parsed here,
+    // so a bad setting fails before the handshake starts.
+    let mut opts = tls.to_opts(&[])?;
+    let pins = opts.pinned_spki_sha256.clone();
+    let mut engine = crate::tls::build_client_engine(host, &mut opts)?;
+    let mut inbuf = vec![0u8; 16 * 1024];
+
+    // Standard sans-IO handshake pump: flush whatever the engine wants to
+    // send, stop once it is no longer handshaking, otherwise feed it the
+    // next inbound flight.
+    loop {
+        let mut out = Vec::new();
+        engine.drain_outgoing(&mut out);
+        if !out.is_empty() {
+            conn.write_all(&out).await?;
+            conn.flush().await?;
+        }
+        if !engine.is_handshaking() {
+            break;
+        }
+        let n = conn.read(&mut inbuf).await?;
+        if n == 0 {
+            return Err(crate::error::Error::UnexpectedEof);
+        }
+        engine.feed_incoming(&inbuf[..n])?;
+    }
+
+    tls.verify_peer(&engine.tls_params().peer_certificates, host, &pins)?;
+    Ok(engine)
 }
 
 /// An async, plaintext byte stream layered on the encrypted `conn`.
@@ -43,40 +90,19 @@ pub(crate) struct AsyncTlsStream<C> {
 }
 
 impl<C: AsyncConn> AsyncTlsStream<C> {
-    /// Wrap `conn`, driving the TLS handshake for server name `sni` to
-    /// completion before returning. `opts` carries verification settings.
+    /// Wrap `conn`, driving the TLS handshake for server name `host` to
+    /// completion (and the post-handshake trust checks, see [`handshake`])
+    /// before returning. `tls` carries the verification / client-auth settings.
     pub(crate) async fn connect(
         mut conn: C,
-        sni: &str,
-        opts: &mut crate::tls::TlsOpts,
+        host: &str,
+        tls: &TlsSettings,
     ) -> Result<AsyncTlsStream<C>> {
-        let mut engine = crate::tls::build_client_engine(sni, opts)?;
-        let mut inbuf = vec![0u8; 16 * 1024];
-
-        // Standard sans-IO handshake pump: flush whatever the engine wants to
-        // send, stop once it is no longer handshaking, otherwise feed it the
-        // next inbound flight.
-        loop {
-            let mut out = Vec::new();
-            engine.drain_outgoing(&mut out);
-            if !out.is_empty() {
-                conn.write_all(&out).await?;
-                conn.flush().await?;
-            }
-            if !engine.is_handshaking() {
-                break;
-            }
-            let n = conn.read(&mut inbuf).await?;
-            if n == 0 {
-                return Err(crate::error::Error::UnexpectedEof);
-            }
-            engine.feed_incoming(&inbuf[..n])?;
-        }
-
+        let engine = handshake(&mut conn, host, tls).await?;
         Ok(AsyncTlsStream {
             conn,
             engine,
-            inbuf,
+            inbuf: vec![0u8; 16 * 1024],
             poisoned: false,
         })
     }

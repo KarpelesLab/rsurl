@@ -40,7 +40,7 @@ use crate::websocket::{
     OPCODE_BINARY, OPCODE_CLOSE, OPCODE_CONT, OPCODE_PING, OPCODE_PONG, OPCODE_TEXT,
 };
 
-use super::WsMessage;
+use super::{TlsOptions, WsMessage};
 
 #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
 use crate::io::asynctls::AsyncTlsStream;
@@ -163,6 +163,28 @@ impl<C: AsyncConn> WebSocket<C> {
     where
         R: Runtime<Conn = C>,
     {
+        Self::connect_with_tls(rt, url, subprotocols, &TlsOptions::default()).await
+    }
+
+    /// Open a WebSocket requesting `subprotocols` (may be empty), with `tls`
+    /// governing a `wss://` handshake: `-k`-style
+    /// [`verify_tls(false)`](TlsOptions::verify_tls), a custom
+    /// [`ca_bundle`](TlsOptions::ca_bundle), a client certificate, a
+    /// [`pinned_pubkey`](TlsOptions::pinned_pubkey), cipher and version bounds.
+    /// `tls` is unused for `ws://`. Otherwise as
+    /// [`connect_with_subprotocols`](Self::connect_with_subprotocols).
+    ///
+    /// Pins and a verify callback are checked right after the TLS handshake,
+    /// before the HTTP Upgrade request is sent.
+    pub async fn connect_with_tls<R>(
+        rt: &R,
+        url: &str,
+        subprotocols: &[&str],
+        tls: &TlsOptions,
+    ) -> Result<WebSocket<C>>
+    where
+        R: Runtime<Conn = C>,
+    {
         let u = Url::parse(url)?;
         let subs: Vec<String> = subprotocols.iter().map(|s| s.to_string()).collect();
         // Validate before touching the network.
@@ -176,13 +198,12 @@ impl<C: AsyncConn> WebSocket<C> {
                 "wss" => {
                     #[cfg(any(feature = "rustls-tls", feature = "purecrypto-tls"))]
                     {
-                        let mut opts = crate::tls::TlsOpts::verifying();
-                        let tls = AsyncTlsStream::connect(conn, &u.host, &mut opts).await?;
+                        let tls = AsyncTlsStream::connect(conn, &u.host, &tls.settings).await?;
                         Transport::Tls(Box::new(tls))
                     }
                     #[cfg(not(any(feature = "rustls-tls", feature = "purecrypto-tls")))]
                     {
-                        let _ = conn;
+                        let _ = (conn, tls);
                         return Err(Error::UnsupportedScheme(
                             "wss (no TLS backend compiled)".into(),
                         ));
