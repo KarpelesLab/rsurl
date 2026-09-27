@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 
 /// Resolve `host` to an IPv4 literal for SOCKS4 (which is IPv4-only).
 fn resolve_ipv4(host: &str, port: u16) -> Result<[u8; 4]> {
+    let host = crate::url::unbracket(host);
     for addr in (host, port).to_socket_addrs()? {
         if let IpAddr::V4(v4) = addr.ip() {
             return Ok(v4.octets());
@@ -32,6 +33,15 @@ pub(crate) fn socks4_connect<S: Read + Write>(
     user: &str,
     remote_dns: bool,
 ) -> Result<()> {
+    // An IP literal needs no proxy-side DNS even under SOCKS4a: send it as
+    // DSTIP (like curl). SOCKS4 cannot carry an IPv6 destination at all.
+    let literal = crate::url::ip_literal_addr(host, port).map(|a| a.ip());
+    if let Some(IpAddr::V6(_)) = literal {
+        return Err(Error::BadResponse(format!(
+            "socks4: cannot reach IPv6 address {host} (SOCKS4 is IPv4-only; use socks5)"
+        )));
+    }
+    let remote_dns = remote_dns && literal.is_none();
     let mut req = Vec::with_capacity(16 + host.len());
     req.push(0x04); // VN = SOCKS4
     req.push(0x01); // CD = CONNECT
@@ -120,7 +130,9 @@ pub(crate) fn socks5_negotiate<S: Read + Write>(
             stream.flush()?;
             let mut ar = [0u8; 2];
             stream.read_exact(&mut ar)?;
-            if ar[0] != 0x01 || ar[1] != 0x00 {
+            // Only the STATUS byte decides (RFC 1929 §2); some proxies echo
+            // 0x05 as the sub-negotiation VER, which curl also tolerates.
+            if ar[1] != 0x00 {
                 return Err(Error::BadResponse(
                     "socks5: username/password authentication failed".into(),
                 ));
@@ -139,7 +151,10 @@ pub(crate) fn socks5_negotiate<S: Read + Write>(
 /// Send a SOCKS5 request (`cmd`: 0x01 CONNECT / 0x03 UDP ASSOCIATE) for
 /// `host:port` and parse the bound address (`BND.ADDR:BND.PORT`) from the
 /// reply, consuming exactly the variable-length address. A domain `BND.ADDR`
-/// (illegal in a reply) is rejected. `remote_dns` sends the host as a domain.
+/// (RFC 1928 allows ATYP=3 in replies) is resolved locally when possible and
+/// otherwise reported as the unspecified address, which callers already treat
+/// as "the proxy's own address". `remote_dns` sends a host name as a domain;
+/// an IP literal (bracketed IPv6 included) always goes as ATYP 1/4.
 pub(crate) fn socks5_request<S: Read + Write>(
     stream: &mut S,
     cmd: u8,
@@ -148,7 +163,19 @@ pub(crate) fn socks5_request<S: Read + Write>(
     remote_dns: bool,
 ) -> Result<SocketAddr> {
     let mut req = vec![0x05u8, cmd, 0x00];
-    if remote_dns {
+    let literal = crate::url::ip_literal_addr(host, port);
+    if let Some(addr) = literal {
+        match addr.ip() {
+            IpAddr::V4(v4) => {
+                req.push(0x01);
+                req.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                req.push(0x04);
+                req.extend_from_slice(&v6.octets());
+            }
+        }
+    } else if remote_dns {
         if host.len() > 255 {
             return Err(Error::BadResponse(
                 "socks5h: hostname exceeds 255 bytes".into(),
@@ -203,9 +230,25 @@ pub(crate) fn socks5_request<S: Read + Write>(
             stream.read_exact(&mut a)?;
             IpAddr::V6(a.into())
         }
+        0x03 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len)?;
+            let mut name = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut name)?;
+            let mut p = [0u8; 2];
+            stream.read_exact(&mut p)?;
+            let port = u16::from_be_bytes(p);
+            let resolved = std::str::from_utf8(&name)
+                .ok()
+                .and_then(|n| (n, port).to_socket_addrs().ok())
+                .and_then(|mut it| it.next());
+            return Ok(resolved.unwrap_or_else(|| {
+                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+            }));
+        }
         other => {
             return Err(Error::BadResponse(format!(
-                "socks5: unexpected ATYP {other:#04x} in reply (domain not allowed)"
+                "socks5: unexpected ATYP {other:#04x} in reply"
             )))
         }
     };
@@ -335,6 +378,60 @@ mod tests {
         assert_eq!(w[9], 0x05);
         assert_eq!(w[12], 0x01); // ATYP IPv4
         assert_eq!(&w[13..17], &[1, 2, 3, 4]);
+    }
+
+    /// RFC 1928 permits a domain-name BND.ADDR in the reply (ATYP=3); it must be
+    /// consumed exactly so the tunnel stays byte-aligned.
+    #[test]
+    fn socks5_reply_with_domain_bnd_addr() {
+        let mut reply = vec![0x05, 0x00];
+        reply.extend_from_slice(&[0x05, 0x00, 0x00, 0x03, 4]);
+        reply.extend_from_slice(b"prox");
+        reply.extend_from_slice(&1080u16.to_be_bytes());
+        reply.extend_from_slice(b"TAIL");
+        let mut m = Mock::new(reply);
+        socks5_connect(&mut m, "example.com", 80, None, true).unwrap();
+        let mut rest = Vec::new();
+        m.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"TAIL");
+    }
+
+    /// Some proxies echo 0x05 as the RFC 1929 sub-negotiation version; only the
+    /// status byte matters (curl behaves the same).
+    #[test]
+    fn socks5_auth_reply_version_is_lenient() {
+        let mut reply = vec![0x05, 0x02, 0x05, 0x00];
+        reply.extend_from_slice(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        let mut m = Mock::new(reply);
+        socks5_connect(&mut m, "h", 1, Some(("u", "p")), true).unwrap();
+    }
+
+    /// An IPv6 literal target (as a URL gives it, bracketed) goes out as
+    /// ATYP=4 even in socks5h mode, never as a `[::1]` domain name.
+    #[test]
+    fn socks5_ipv6_literal_target_uses_atyp_4() {
+        for remote_dns in [true, false] {
+            let mut reply = vec![0x05, 0x00];
+            reply.extend_from_slice(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            let mut m = Mock::new(reply);
+            socks5_connect(&mut m, "[::1]", 443, None, remote_dns).unwrap();
+            let w = &m.written;
+            assert_eq!(w[6], 0x04, "remote_dns={remote_dns}");
+            assert_eq!(&w[7..23], &std::net::Ipv6Addr::LOCALHOST.octets());
+            assert_eq!(&w[23..25], &443u16.to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn socks4_ipv6_target_is_rejected_and_ipv4_literal_skips_4a() {
+        let mut m = Mock::new(vec![0x00, 0x5A, 0, 0, 0, 0, 0, 0]);
+        assert!(socks4_connect(&mut m, "[::1]", 80, "", true).is_err());
+        assert!(m.written.is_empty());
+        // An IPv4 literal under 4a is sent as DSTIP, not as a hostname.
+        let mut m = Mock::new(vec![0x00, 0x5A, 0, 0, 0, 0, 0, 0]);
+        socks4_connect(&mut m, "10.1.2.3", 80, "", true).unwrap();
+        assert_eq!(&m.written[4..8], &[10, 1, 2, 3]);
+        assert_eq!(m.written.len(), 9); // no trailing hostname
     }
 
     #[test]

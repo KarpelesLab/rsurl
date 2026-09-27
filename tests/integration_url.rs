@@ -82,3 +82,67 @@ fn rejects_empty_host() {
 fn rejects_bare_path() {
     assert!(Url::parse("/just/a/path").is_err());
 }
+
+/// One-shot HTTP/1.1 server on `listener`: captures the request head, answers
+/// `200 OK` with body `ok`, and hands the head back through the join handle.
+fn serve_capture(listener: std::net::TcpListener) -> std::thread::JoinHandle<String> {
+    use std::io::{Read, Write};
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && sock.read(&mut byte).unwrap_or(0) == 1 {
+            head.push(byte[0]);
+        }
+        let _ =
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        String::from_utf8_lossy(&head).into_owned()
+    })
+}
+
+/// End to end over an IPv6 literal: the bracketed host must resolve and dial
+/// (it used to fail with "failed to lookup address"), while the `Host:` header
+/// keeps the brackets. Skipped when the machine has no IPv6 loopback.
+#[test]
+fn get_over_ipv6_literal_dials_and_keeps_brackets_in_host_header() {
+    let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+        eprintln!("no IPv6 loopback; skipping");
+        return;
+    };
+    let port = listener.local_addr().unwrap().port();
+    let server = serve_capture(listener);
+    let resp = rsurl::Request::get(&format!("http://[::1]:{port}/v6?x=1"))
+        .unwrap()
+        .send()
+        .expect("GET over [::1] succeeds");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body, b"ok");
+    let head = server.join().unwrap();
+    assert!(head.starts_with("GET /v6?x=1 HTTP/1.1\r\n"), "{head}");
+    assert!(
+        head.to_ascii_lowercase()
+            .contains(&format!("\r\nhost: [::1]:{port}\r\n")),
+        "{head}"
+    );
+}
+
+/// A query-only URL puts `/?q` on the request line (not `GET ?q`), and dot
+/// segments never reach the server.
+#[test]
+fn request_line_has_root_path_and_no_dot_segments() {
+    for (path_part, want) in [("?q=1", "/?q=1"), ("/a/b/../c/./d", "/a/c/d")] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = serve_capture(listener);
+        let resp = rsurl::Request::get(&format!("http://127.0.0.1:{port}{path_part}"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        let head = server.join().unwrap();
+        assert!(
+            head.starts_with(&format!("GET {want} HTTP/1.1\r\n")),
+            "{path_part}: {head}"
+        );
+    }
+}

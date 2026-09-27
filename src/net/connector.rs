@@ -8,13 +8,15 @@
 //! (a pre-established socket, an in-process pipe, a test double, …).
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::net::socks;
 use crate::net::stream::NetStream;
+use crate::net::Resolver;
+use crate::url::percent_decode;
 
 /// Tells the HTTP layer that plain-`http://` traffic through this connector
 /// must use absolute-form request lines and `Proxy-Authorization` (i.e. the
@@ -64,19 +66,12 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Open a TCP connection to `host:port`, honoring `timeout` for the connect
-/// phase. Mirrors the first-address selection in `http::tcp_connect`.
+/// Open a TCP connection to `host:port` (a name, an IP, or a bracketed IPv6
+/// literal), honoring `timeout` for each connect attempt and falling back
+/// through every resolved address in order.
 fn open_tcp(host: &str, port: u16, timeout: Option<Duration>) -> Result<TcpStream> {
-    let addr = format!("{host}:{port}");
-    let first = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::InvalidUrl(host.to_string()))?;
-    let stream = match timeout {
-        Some(t) => TcpStream::connect_timeout(&first, t)?,
-        None => TcpStream::connect(first)?,
-    };
-    Ok(stream)
+    let addrs = crate::net::StdResolver.resolve(host, port)?;
+    Ok(crate::net::connect_any(&addrs, timeout)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,12 +218,17 @@ impl Connector for HttpsProxyConnector {
         timeout: Option<Duration>,
     ) -> Result<Box<dyn NetStream>> {
         let tcp = open_tcp(&self.host, self.port, timeout)?;
-        // Set the socket-level timeout *before* the TLS wrap; it persists for
-        // the lifetime of the fd (TlsProxyStream cannot re-set it later).
+        // A second handle on the same socket: socket options (timeouts) are
+        // per-socket, so it lets `TlsProxyStream` re-arm the read/write
+        // timeouts after the TLS wrap owns the original handle.
+        let ctl = tcp.try_clone()?;
         apply_handshake_timeout(&tcp, timeout)?;
         let mut tls = crate::tls::connect_over(tcp, &self.host)?;
         http_connect(&mut tls, host, port, self.auth.as_ref())?;
-        Ok(Box::new(TlsProxyStream(tls)))
+        // Hand I/O timeouts back to the protocol layer (as the other proxy
+        // connectors do); it re-arms them via `NetStream::set_read_timeout`.
+        clear_handshake_timeout(&ctl)?;
+        Ok(Box::new(TlsProxyStream { tls, ctl }))
     }
 
     fn http_forward_proxy(&self) -> Option<HttpProxyIntent> {
@@ -238,47 +238,43 @@ impl Connector for HttpsProxyConnector {
     }
 }
 
-/// Wraps the TLS stream to an `https://` proxy as a [`NetStream`]. The socket
-/// timeout is fixed at connect time (see [`HttpsProxyConnector::connect`]), so
-/// the per-call timeout setters are no-ops; cloning and address introspection
-/// are unsupported (only the exotic DICT-over-https-proxy combination would
-/// notice).
-struct TlsProxyStream(crate::tls::TlsStream<TcpStream>);
+/// Wraps the TLS stream to an `https://` proxy as a [`NetStream`]. `ctl` is a
+/// cloned handle on the same TCP socket, through which timeouts, address
+/// introspection, and shutdown act on the underlying connection. Cloning the
+/// whole stream is unsupported (the TLS session state cannot be shared).
+struct TlsProxyStream {
+    tls: crate::tls::TlsStream<TcpStream>,
+    ctl: TcpStream,
+}
 
 impl Read for TlsProxyStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        self.tls.read(buf)
     }
 }
 impl Write for TlsProxyStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        self.tls.write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        self.tls.flush()
     }
 }
 impl NetStream for TlsProxyStream {
-    fn set_read_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
-        Ok(()) // socket-level timeout already applied before the TLS wrap
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        self.ctl.set_read_timeout(dur)
     }
-    fn set_write_timeout(&self, _dur: Option<Duration>) -> io::Result<()> {
-        Ok(())
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        self.ctl.set_write_timeout(dur)
     }
     fn peer_addr(&self) -> io::Result<SocketAddr> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "peer_addr unavailable on an https-proxy stream",
-        ))
+        self.ctl.peer_addr()
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "local_addr unavailable on an https-proxy stream",
-        ))
+        self.ctl.local_addr()
     }
-    fn shutdown(&self, _how: Shutdown) -> io::Result<()> {
-        Ok(())
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.ctl.shutdown(how)
     }
     fn try_clone_box(&self) -> io::Result<Box<dyn NetStream>> {
         Err(io::Error::new(
@@ -297,7 +293,7 @@ fn http_connect<S: Read + Write>(
     auth: Option<&(String, String)>,
 ) -> Result<()> {
     const MAX_HEADER_BYTES: usize = 64 * 1024;
-    let host_port = format!("{host}:{port}");
+    let host_port = crate::url::authority(host, port);
     let mut buf = Vec::with_capacity(128);
     write!(&mut buf, "CONNECT {host_port} HTTP/1.1\r\n")?;
     write!(&mut buf, "Host: {host_port}\r\n")?;
@@ -465,6 +461,22 @@ pub fn connector_from_proxy_url(spec: &str) -> Result<Arc<dyn Connector>> {
     Ok(conn)
 }
 
+/// For a plain `http://` (or scheme-less) proxy URL, the equivalent
+/// [`crate::http::ProxyConfig`] — the per-request proxy form, which the HTTP
+/// layer re-checks against the no-proxy list on every redirect hop. `None` for
+/// the other proxy schemes, which only exist as a [`Connector`].
+pub(crate) fn http_proxy_config(spec: &str) -> Result<Option<crate::http::ProxyConfig>> {
+    let p = parse_proxy_spec(spec)?;
+    if p.scheme != "http" {
+        return Ok(None);
+    }
+    Ok(Some(crate::http::ProxyConfig {
+        host: p.host,
+        port: p.port,
+        auth: p.auth,
+    }))
+}
+
 struct ProxySpec {
     scheme: String,
     auth: Option<(String, String)>,
@@ -477,13 +489,21 @@ fn parse_proxy_spec(spec: &str) -> Result<ProxySpec> {
         Some((s, r)) => (s.to_ascii_lowercase(), r),
         None => ("http".to_string(), spec),
     };
+    // The authority ends at the first `/`, `?`, or `#`: `http://proxy:3128/`
+    // (the usual `http_proxy` spelling) carries a path that curl ignores.
+    let rest = match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
     let (userinfo, hostport) = match rest.rfind('@') {
         Some(i) => (Some(&rest[..i]), &rest[i + 1..]),
         None => (None, rest),
     };
+    // Credentials in a proxy URL are percent-encoded (`p%40ss` = `p@ss`),
+    // exactly as curl decodes them before building the auth exchange.
     let auth = userinfo.map(|info| match info.split_once(':') {
-        Some((u, p)) => (u.to_string(), p.to_string()),
-        None => (info.to_string(), String::new()),
+        Some((u, p)) => (percent_decode(u), percent_decode(p)),
+        None => (percent_decode(info), String::new()),
     });
     let (host, port) = parse_hostport(hostport)?;
     Ok(ProxySpec {
@@ -573,6 +593,88 @@ mod tests {
         let p2 = parse_proxy_spec("socks5://[fe80::1]").unwrap();
         assert_eq!(p2.host, "fe80::1");
         assert_eq!(p2.port, 1080);
+    }
+
+    /// `http_proxy=http://proxy:3128/` (trailing slash) is the common spelling;
+    /// the path must be ignored, not break the port parse.
+    #[test]
+    fn proxy_spec_ignores_trailing_path() {
+        let p = parse_proxy_spec("http://proxy:3128/").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("proxy", 3128));
+        let p = parse_proxy_spec("socks5h://u:p@proxy:1080/some/path?x#y").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("proxy", 1080));
+        assert_eq!(p.auth, Some(("u".into(), "p".into())));
+        let p = parse_proxy_spec("http://[::1]:8080/").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("::1", 8080));
+    }
+
+    #[test]
+    fn proxy_spec_percent_decodes_credentials() {
+        let p = parse_proxy_spec("http://us%65r:p%40ss%3Aword@proxy:3128").unwrap();
+        assert_eq!(p.auth, Some(("user".into(), "p@ss:word".into())));
+    }
+
+    #[test]
+    fn http_proxy_config_only_for_http_scheme() {
+        let c = http_proxy_config("http://u:p%21@proxy:3128/")
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.host.as_str(), c.port), ("proxy", 3128));
+        assert_eq!(c.auth, Some(("u".into(), "p!".into())));
+        assert!(http_proxy_config("proxy:8080").unwrap().is_some());
+        assert!(http_proxy_config("socks5://proxy:1080").unwrap().is_none());
+        assert!(http_proxy_config("https://proxy:443").unwrap().is_none());
+    }
+
+    /// The proxy dial must accept an IPv6 proxy host (stored unbracketed) and
+    /// fall back through the resolved addresses.
+    #[test]
+    fn open_tcp_dials_ipv6_and_ipv4_literals() {
+        let l4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p4 = l4.local_addr().unwrap().port();
+        assert!(open_tcp("127.0.0.1", p4, Some(Duration::from_secs(2))).is_ok());
+        if let Ok(l6) = std::net::TcpListener::bind("[::1]:0") {
+            let p6 = l6.local_addr().unwrap().port();
+            assert!(open_tcp("::1", p6, Some(Duration::from_secs(2))).is_ok());
+            assert!(open_tcp("[::1]", p6, Some(Duration::from_secs(2))).is_ok());
+        }
+    }
+
+    /// The CONNECT request line must bracket an IPv6 target.
+    #[test]
+    fn http_connect_brackets_ipv6_target() {
+        struct Mock {
+            reply: std::io::Cursor<Vec<u8>>,
+            written: Vec<u8>,
+        }
+        impl Read for Mock {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reply.read(buf)
+            }
+        }
+        impl Write for Mock {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for host in ["::1", "[::1]"] {
+            let mut m = Mock {
+                reply: std::io::Cursor::new(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()),
+                written: Vec::new(),
+            };
+            http_connect(&mut m, host, 443, None).unwrap();
+            let w = String::from_utf8(m.written).unwrap();
+            assert!(w.starts_with("CONNECT [::1]:443 HTTP/1.1\r\n"), "{w}");
+        }
+        let mut m = Mock {
+            reply: std::io::Cursor::new(b"HTTP/1.1 407 Auth\r\n\r\n".to_vec()),
+            written: Vec::new(),
+        };
+        assert!(http_connect(&mut m, "h", 443, None).is_err());
     }
 
     #[test]

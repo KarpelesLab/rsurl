@@ -11,7 +11,7 @@
 //! fully custom transport.
 
 mod client;
-mod connector;
+pub(crate) mod connector;
 mod proxy_resolver;
 mod resolver;
 mod socks;
@@ -26,7 +26,9 @@ pub use connector::{
     connector_from_proxy_url, Connector, DirectConnector, HttpProxyConnector, HttpProxyIntent,
     HttpsProxyConnector, Socks4Connector, Socks5Connector,
 };
+pub(crate) use proxy_resolver::no_proxy_matches;
 pub use proxy_resolver::{from_env, EnvProxyResolver, ProxyChoice, ProxyResolver};
+pub(crate) use resolver::connect_any;
 pub use resolver::{Resolver, StdResolver};
 pub(crate) use stream::MaybeTlsStream;
 pub use stream::NetStream;

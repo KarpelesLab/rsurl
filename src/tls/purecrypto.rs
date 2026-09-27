@@ -196,10 +196,21 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<Connect
     } else {
         RootCertStore::new()
     };
+    // purecrypto uses one name both as SNI and as the reference identity it
+    // verifies (an IP literal is matched against iPAddress SANs). It emits SNI
+    // whenever the name is non-empty, so an IP literal can only be kept out of
+    // SNI (RFC 6066 §3) when we are not verifying the peer name ourselves.
+    let name = super::server_name(sni);
+    let is_ip_literal = name.parse::<std::net::IpAddr>().is_ok();
+    let name = if is_ip_literal && !effective_verify {
+        ""
+    } else {
+        name
+    };
     let mut builder = Config::builder()
         .tls_only()
         .roots(roots)
-        .server_name(sni.to_string())
+        .server_name(name.to_string())
         .verify_certificates(effective_verify)
         // purecrypto 0.6.17 made the TLS entropy source explicit (it no longer
         // defaults to OsRng); supply the OS CSPRNG, restoring the prior default.

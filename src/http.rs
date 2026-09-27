@@ -2799,21 +2799,11 @@ pub(crate) fn via_plain_http_proxy(req: &Request) -> bool {
     }
 }
 
-/// True iff `req.url.host` matches any entry of `req.no_proxy`. A single
-/// `*` matches everything; otherwise each entry is a case-insensitive host
-/// suffix (matching either the whole host or the part after a `.`).
+/// True iff `req.url.host` matches any entry of `req.no_proxy`, with curl's
+/// `NO_PROXY` semantics (`*`, host-suffix match, exact IP or CIDR for IP
+/// hosts) — see `crate::net::no_proxy_matches`.
 pub(crate) fn proxy_bypassed(req: &Request) -> bool {
-    if req.no_proxy.iter().any(|e| e.trim() == "*") {
-        return true;
-    }
-    let h = req.url.host.to_ascii_lowercase();
-    req.no_proxy.iter().any(|e| {
-        let e = e.trim().trim_start_matches('.').to_ascii_lowercase();
-        if e.is_empty() {
-            return false;
-        }
-        h == e || h.ends_with(&format!(".{e}"))
-    })
+    crate::net::no_proxy_matches(req.no_proxy.iter().map(String::as_str), &req.url.host)
 }
 
 /// The method to put on the wire: the caller's verbatim string when
@@ -3168,33 +3158,34 @@ fn resolve_target(
     host: &str,
     port: u16,
     req: &Request,
-) -> Result<(std::net::SocketAddr, Option<Duration>)> {
+) -> Result<(Vec<std::net::SocketAddr>, Option<Duration>)> {
     // --resolve: a fixed address for this host:port wins (no lookup).
     if let Some((_, _, ip)) = req
         .resolve
         .iter()
         .find(|(h, p, _)| *p == port && h.eq_ignore_ascii_case(host))
     {
-        return Ok((std::net::SocketAddr::new(*ip, port), None));
+        return Ok((vec![std::net::SocketAddr::new(*ip, port)], None));
     }
-    // Otherwise go through the (pluggable) resolver, timing the lookup.
+    // Otherwise go through the (pluggable) resolver, timing the lookup. An
+    // IPv6 literal is handed over without its URL brackets.
     let started = std::time::Instant::now();
-    let addrs = req.resolver.resolve(host, port)?;
+    let addrs = req.resolver.resolve(crate::url::unbracket(host), port)?;
     let dns = started.elapsed();
-    let chosen = match req.ip_family {
-        Some(IpFamily::V4) => addrs
-            .into_iter()
-            .find(|a| a.is_ipv4())
-            .ok_or_else(|| Error::InvalidUrl(format!("{host}: no IPv4 address"))),
-        Some(IpFamily::V6) => addrs
-            .into_iter()
-            .find(|a| a.is_ipv6())
-            .ok_or_else(|| Error::InvalidUrl(format!("{host}: no IPv6 address"))),
-        None => addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::InvalidUrl(host.to_string())),
-    }?;
+    // Every candidate of the wanted family, in resolver order, so the dial can
+    // fall back past an unreachable address.
+    let chosen: Vec<_> = match req.ip_family {
+        Some(IpFamily::V4) => addrs.into_iter().filter(|a| a.is_ipv4()).collect(),
+        Some(IpFamily::V6) => addrs.into_iter().filter(|a| a.is_ipv6()).collect(),
+        None => addrs,
+    };
+    if chosen.is_empty() {
+        return Err(Error::InvalidUrl(match req.ip_family {
+            Some(IpFamily::V4) => format!("{host}: no IPv4 address"),
+            Some(IpFamily::V6) => format!("{host}: no IPv6 address"),
+            None => host.to_string(),
+        }));
+    }
     Ok((chosen, Some(dns)))
 }
 
@@ -3244,13 +3235,10 @@ fn tcp_connect_inner(
     } else {
         apply_connect_to(&req.connect_to, target_host, target_port)
     };
-    let (first, namelookup) = resolve_target(&target_host, target_port, req)?;
-    let _ = writeln!(trace, "*   Trying {first}...");
-    let stream = match req.connect_timeout {
-        Some(t) => TcpStream::connect_timeout(&first, t)?,
-        None => TcpStream::connect(first)?,
-    };
-    let peer = stream.peer_addr().unwrap_or(first);
+    let (addrs, namelookup) = resolve_target(&target_host, target_port, req)?;
+    let _ = writeln!(trace, "*   Trying {}...", addrs[0]);
+    let stream = crate::net::connect_any(&addrs, req.connect_timeout)?;
+    let peer = stream.peer_addr().unwrap_or(addrs[0]);
     if via_proxy_label {
         let _ = writeln!(
             trace,

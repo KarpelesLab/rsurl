@@ -337,6 +337,9 @@ pub(crate) fn build_client_conn(sni: &str, opts: &mut TlsOpts) -> Result<ClientC
     };
     config.alpn_protocols = std::mem::take(&mut opts.alpn);
 
+    // An IP literal becomes `ServerName::IpAddress`: verified against the
+    // iPAddress SANs and, per RFC 6066 §3, not sent as SNI.
+    let sni = super::server_name(sni);
     let server_name: ServerName<'static> = ServerName::try_from(sni.to_string())
         .map_err(|e| Error::BadResponse(format!("invalid SNI {sni:?}: {e}")))?;
     ClientConnection::new(Arc::new(config), server_name).map_err(rustls_err)

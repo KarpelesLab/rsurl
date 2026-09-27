@@ -94,6 +94,10 @@ impl NetConfig {
 #[derive(Clone)]
 pub struct Client {
     connector: Arc<dyn Connector>,
+    /// Set when [`Client::proxy`] configured a plain `http://` proxy: HTTP
+    /// requests then carry it as a per-request proxy (plus the no-proxy list)
+    /// so the bypass decision is re-made for every redirect hop.
+    http_proxy: Option<crate::http::ProxyConfig>,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
     verify: bool,
@@ -110,6 +114,7 @@ impl Default for Client {
     fn default() -> Self {
         Client {
             connector: Arc::new(DirectConnector),
+            http_proxy: None,
             connect_timeout: Some(Duration::from_secs(30)),
             read_timeout: Some(Duration::from_secs(60)),
             verify: true,
@@ -135,12 +140,14 @@ impl Client {
     /// [`connector_from_proxy_url`].
     pub fn proxy(mut self, spec: &str) -> Result<Self> {
         self.connector = connector_from_proxy_url(spec)?;
+        self.http_proxy = crate::net::connector::http_proxy_config(spec)?;
         Ok(self)
     }
 
     /// Use a caller-supplied transport. See [`Connector`].
     pub fn connector(mut self, connector: Arc<dyn Connector>) -> Self {
         self.connector = connector;
+        self.http_proxy = None;
         self
     }
 
@@ -212,7 +219,10 @@ impl Client {
         self
     }
 
-    /// Replace the no-proxy host-suffix list (curl `NO_PROXY`).
+    /// Replace the no-proxy list (curl `NO_PROXY`). Each entry is `*` (every
+    /// host), a host name matching itself and its subdomains
+    /// (case-insensitive; a leading `.` is optional), or — for IP-literal
+    /// hosts — an exact IP or a CIDR block such as `10.0.0.0/8` or `fc00::/7`.
     pub fn no_proxy<I, S>(mut self, entries: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -222,16 +232,9 @@ impl Client {
         self
     }
 
-    /// True if `host` matches the no-proxy list (suffix match, or `*`).
+    /// True if `host` matches the no-proxy list (curl semantics).
     fn host_bypassed(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        self.no_proxy.iter().any(|e| {
-            // A leading dot on an entry is cosmetic (`.example.com` ==
-            // `example.com`); strip it so this matches curl and the env-var
-            // path (`EnvProxyResolver::resolve`), which both do the same.
-            let e = e.trim().trim_start_matches('.').to_ascii_lowercase();
-            e == "*" || host == e || host.ends_with(&format!(".{e}"))
-        })
+        crate::net::no_proxy_matches(self.no_proxy.iter().map(String::as_str), host)
     }
 
     /// The connector to use for `host` — the configured one, or a direct dial
@@ -263,10 +266,20 @@ impl Client {
             .verify_tls(self.verify)
             .idn(self.idn)
             .decompress(self.decompress);
-        let host = r.url().host.clone();
-        r = r
-            .connector(self.effective_connector(&host))
-            .read_timeout(self.read_timeout);
+        r = match &self.http_proxy {
+            // An HTTP proxy travels as the request's own proxy + no-proxy list,
+            // so the bypass is decided per hop: a redirect from a no-proxy host
+            // to an external one still goes through the proxy (and vice versa).
+            Some(p) => {
+                r.proxy = Some(p.clone());
+                r.no_proxy(self.no_proxy.clone())
+            }
+            None => {
+                let host = r.url().host.clone();
+                r.connector(self.effective_connector(&host))
+            }
+        };
+        r = r.read_timeout(self.read_timeout);
         if let Some(t) = self.connect_timeout {
             r = r.connect_timeout(t);
         }
@@ -406,5 +419,35 @@ mod tests {
 
         // Wildcard bypasses everything.
         assert!(Client::new().no_proxy(["*"]).host_bypassed("anything.test"));
+
+        // IP hosts: exact or CIDR only, bracket-insensitive for IPv6.
+        let c = Client::new().no_proxy(["2.3.4", "10.0.0.0/8", "::1"]);
+        assert!(!c.host_bypassed("1.2.3.4"));
+        assert!(c.host_bypassed("10.9.8.7"));
+        assert!(c.host_bypassed("[::1]"));
+    }
+
+    /// With an HTTP proxy, the no-proxy decision must be made per request hop
+    /// (by the `Request`), not frozen from the first URL: the request carries
+    /// the proxy and the list instead of a pre-chosen direct connector.
+    #[test]
+    fn http_proxy_bypass_is_decided_per_hop() {
+        let c = Client::new()
+            .proxy("http://proxy.example:3128")
+            .unwrap()
+            .no_proxy(["internal.example"]);
+        let r = c.request("GET", "http://internal.example/").unwrap();
+        assert!(r.connector.is_direct());
+        let p = r.proxy.as_ref().expect("proxy kept on the request");
+        assert_eq!((p.host.as_str(), p.port), ("proxy.example", 3128));
+        assert!(crate::http::proxy_bypassed(&r));
+        // The same request after a redirect to an external host is proxied.
+        let mut hop = r.clone();
+        hop.url = crate::url::Url::parse("http://external.example/").unwrap();
+        assert!(!crate::http::proxy_bypassed(&hop));
+
+        // A custom connector replaces the HTTP proxy entirely.
+        let c = c.connector(std::sync::Arc::new(crate::net::DirectConnector));
+        assert!(c.request("GET", "http://x/").unwrap().proxy.is_none());
     }
 }

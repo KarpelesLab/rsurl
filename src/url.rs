@@ -46,13 +46,18 @@ impl Url {
         };
 
         // `file://` is special: no host, the path is everything after `file://`.
+        // The only authority accepted is empty or `localhost` (RFC 8089 §2 /
+        // curl), and the scheme matches case-insensitively (`FILE:///x`).
         if scheme == "file" {
-            let path = match s.strip_prefix("file://") {
-                Some(p) if p.starts_with('/') => p.to_string(),
-                Some(_) | None => return Err(Error::InvalidUrl(s.to_string())),
+            let path = match rest.strip_prefix("localhost") {
+                Some(p) if p.starts_with('/') => p,
+                _ => rest,
             };
+            if !path.starts_with('/') {
+                return Err(Error::InvalidUrl(s.to_string()));
+            }
             let path = match path.find('#') {
-                Some(i) => path[..i].to_string(),
+                Some(i) => &path[..i],
                 None => path,
             };
             return Ok(Url {
@@ -60,7 +65,7 @@ impl Url {
                 userinfo: None,
                 host: String::new(),
                 port: 0,
-                path,
+                path: path.to_string(),
             });
         }
 
@@ -68,11 +73,21 @@ impl Url {
             return Err(Error::InvalidUrl(s.to_string()));
         }
 
-        // Strip optional fragment from path.
+        // Strip optional fragment from path. A query- or fragment-only
+        // reference (`http://h?x=1`, `http://h#f`) still needs the root path,
+        // otherwise the request line would read `GET ?x=1` / `GET  HTTP/1.1`.
         let path = match path.find('#') {
             Some(i) => &path[..i],
             None => path,
         };
+        let path = if path.starts_with('/') {
+            // RFC 3986 §5.2.4 / curl (without `--path-as-is`): resolve `.` and
+            // `..` segments so they never reach the server.
+            remove_dot_segments(path)
+        } else {
+            format!("/{path}")
+        };
+        let path = path.as_str();
 
         let default_port =
             default_port(&scheme).ok_or_else(|| Error::UnsupportedScheme(scheme.clone()))?;
@@ -98,10 +113,15 @@ impl Url {
             let port = if after.is_empty() {
                 default_port
             } else if let Some(p) = after.strip_prefix(':') {
-                p.parse().map_err(|_| Error::InvalidUrl(s.to_string()))?
+                parse_port(p, default_port).ok_or_else(|| Error::InvalidUrl(s.to_string()))?
             } else {
                 return Err(Error::InvalidUrl(s.to_string()));
             };
+            // The bracket contents must be a real IPv6 address (optionally with
+            // a `%25`-encoded zone ID); `[evil.com]` is not a host.
+            if ipv6_literal(&hostport[1..close]).is_none() {
+                return Err(Error::InvalidUrl(s.to_string()));
+            }
             (&hostport[..=close], port, true)
         } else if hostport.starts_with('[') {
             // Opening bracket with no closing one — unterminated IPv6 literal.
@@ -110,9 +130,8 @@ impl Url {
             match hostport.rfind(':') {
                 Some(i) => {
                     let h = &hostport[..i];
-                    let p: u16 = hostport[i + 1..]
-                        .parse()
-                        .map_err(|_| Error::InvalidUrl(s.to_string()))?;
+                    let p = parse_port(&hostport[i + 1..], default_port)
+                        .ok_or_else(|| Error::InvalidUrl(s.to_string()))?;
                     (h, p, false)
                 }
                 None => (hostport, default_port, false),
@@ -166,6 +185,14 @@ impl Url {
         })
     }
 
+    /// The host in the form a resolver, socket, or TLS stack expects: an IPv6
+    /// literal loses its URL brackets (`[::1]` → `::1`); every other host is
+    /// returned unchanged. [`Url::host`] keeps the brackets for the `Host:`
+    /// header and request authority.
+    pub fn host_unbracketed(&self) -> &str {
+        unbracket(&self.host)
+    }
+
     /// True if this scheme runs over TLS at the transport layer.
     pub fn is_tls(&self) -> bool {
         matches!(
@@ -185,11 +212,14 @@ impl Url {
     }
 }
 
-/// Resolve a redirect target. `location` may be an absolute URL, a
-/// protocol-relative reference (`//host/...`), an absolute path (`/foo`), or
-/// a relative path (`foo/bar`); we cover the cases that show up in real
-/// `Location:` headers per RFC 9110 §10.2.2. Any fragment on `location` is
-/// stripped before reparsing.
+/// Resolve a redirect target per RFC 3986 §5.2 (the cases that show up in
+/// real `Location:` headers, RFC 9110 §10.2.2): an absolute URL, a
+/// network-path reference (`//host/...`), an absolute path (`/foo`), a
+/// relative path (`foo/bar`, `../x`), a query-only reference (`?q=1`, which
+/// keeps the base path), or a fragment-only reference (the base document).
+/// Fragments are dropped, dot segments are removed (by [`Url::parse`]), and
+/// raw spaces or non-ASCII bytes in the path/query are percent-encoded (as
+/// curl does) instead of failing the redirect.
 pub(crate) fn resolve(base: &Url, location: &str) -> Result<Url> {
     let loc = location.trim();
     if loc.is_empty() {
@@ -204,13 +234,24 @@ pub(crate) fn resolve(base: &Url, location: &str) -> Result<Url> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
         if ok {
-            return Url::parse(loc);
+            let after = idx + 3;
+            let auth_end = loc[after..]
+                .find(['/', '?', '#'])
+                .map_or(loc.len(), |i| after + i);
+            let composed = format!("{}{}", &loc[..auth_end], encode_loose(&loc[auth_end..]));
+            return Url::parse(&composed);
         }
     }
 
-    // Protocol-relative: //host/path — inherit the base scheme.
+    // Network-path reference: //host/path — inherit the base scheme.
     if let Some(rest) = loc.strip_prefix("//") {
-        let composed = format!("{}://{}", base.scheme, rest);
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let composed = format!(
+            "{}://{}{}",
+            base.scheme,
+            &rest[..auth_end],
+            encode_loose(&rest[auth_end..])
+        );
         return Url::parse(&composed);
     }
 
@@ -219,6 +260,7 @@ pub(crate) fn resolve(base: &Url, location: &str) -> Result<Url> {
         Some(i) => &loc[..i],
         None => loc,
     };
+    let loc_no_frag = encode_loose(loc_no_frag);
 
     let default_p = default_port(&base.scheme).unwrap_or(0);
     let needs_port = base.port != default_p;
@@ -228,25 +270,175 @@ pub(crate) fn resolve(base: &Url, location: &str) -> Result<Url> {
         base.host.clone()
     };
 
+    let base_path = base.path.as_str();
+    let base_path_no_query = base_path.split_once('?').map_or(base_path, |(p, _)| p);
+
+    // Fragment-only reference (`#frag`): the base document itself.
+    if loc_no_frag.is_empty() {
+        let composed = format!("{}://{}{}", base.scheme, authority, base_path);
+        return Url::parse(&composed);
+    }
+
+    // Query-only reference (`?q=1`): keep the base path, replace the query
+    // (RFC 3986 §5.2.2 — not the base *directory*).
+    if loc_no_frag.starts_with('?') {
+        let composed = format!(
+            "{}://{}{}{}",
+            base.scheme, authority, base_path_no_query, loc_no_frag
+        );
+        return Url::parse(&composed);
+    }
+
     // Absolute-path reference: /foo?bar
     if loc_no_frag.starts_with('/') {
         let composed = format!("{}://{}{}", base.scheme, authority, loc_no_frag);
         return Url::parse(&composed);
     }
 
-    // Relative path. Drop everything after the last '/' in the base path,
-    // then append. RFC 3986 §5.2.3 — also strip the base's query first.
-    let base_path = base.path.as_str();
-    let base_path_no_query = match base_path.find('?') {
-        Some(i) => &base_path[..i],
-        None => base_path,
-    };
+    // Relative path: merge with the base directory (RFC 3986 §5.2.3); `parse`
+    // then removes dot segments (§5.2.4).
     let dir = match base_path_no_query.rfind('/') {
         Some(i) => &base_path_no_query[..=i],
         None => "/",
     };
     let composed = format!("{}://{}{}{}", base.scheme, authority, dir, loc_no_frag);
     Url::parse(&composed)
+}
+
+/// Percent-encode the bytes a lenient `Location:` may carry raw but a request
+/// line cannot: space and non-ASCII. Control bytes are deliberately left
+/// alone so [`Url::parse`] still rejects them (header-injection guard).
+fn encode_loose(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.bytes().any(|b| b == b' ' || b >= 0x80) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for &b in s.as_bytes() {
+        if b == b' ' || b >= 0x80 {
+            out.push_str(&format!("%{b:02X}"));
+        } else {
+            out.push(b as char);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// RFC 3986 §5.2.4 `remove_dot_segments` for an absolute path (starting with
+/// `/`), leaving any `?query` untouched: `/a/b/../c/./d` → `/a/c/d`. A
+/// trailing `.`/`..` keeps the directory's trailing slash, and `..` never
+/// climbs above the root.
+pub(crate) fn remove_dot_segments(path_and_query: &str) -> String {
+    let (path, query) = match path_and_query.find('?') {
+        Some(i) => path_and_query.split_at(i),
+        None => (path_and_query, ""),
+    };
+    if !path.split('/').any(|seg| seg == "." || seg == "..") {
+        return path_and_query.to_string();
+    }
+    let segs: Vec<&str> = path.split('/').skip(1).collect();
+    let last = segs.len().saturating_sub(1);
+    let mut out: Vec<&str> = Vec::with_capacity(segs.len());
+    for (i, seg) in segs.iter().enumerate() {
+        let dot = *seg == "." || *seg == "..";
+        if *seg == ".." {
+            out.pop();
+        } else if !dot {
+            out.push(seg);
+        }
+        if dot && i == last {
+            out.push("");
+        }
+    }
+    format!("/{}{}", out.join("/"), query)
+}
+
+/// Parse an authority port: ASCII digits only (so no `+80`) and no overflow.
+/// An empty port (`http://h:/`) means the scheme default, like curl.
+fn parse_port(p: &str, default_port: u16) -> Option<u16> {
+    if p.is_empty() {
+        return Some(default_port);
+    }
+    if !p.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    p.parse().ok()
+}
+
+/// `host` without the URL brackets of an IPv6 literal (`[::1]` → `::1`,
+/// `[fe80::1%25en0]` → `fe80::1%25en0`). Any other host is returned as is.
+pub(crate) fn unbracket(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Parse the inside of an IPv6 literal (no brackets) with an optional zone ID
+/// (`fe80::1%25en0`, RFC 6874; a bare `%en0` is tolerated too). Returns the
+/// address and the zone text, or `None` if it is not a valid IPv6 literal.
+pub(crate) fn ipv6_literal(inner: &str) -> Option<(std::net::Ipv6Addr, Option<&str>)> {
+    let (addr, zone) = match inner.find('%') {
+        Some(i) => {
+            let z = &inner[i + 1..];
+            let z = z.strip_prefix("25").filter(|z| !z.is_empty()).unwrap_or(z);
+            let zone_ok = !z.is_empty()
+                && z.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'));
+            if !zone_ok {
+                return None;
+            }
+            (&inner[..i], Some(z))
+        }
+        None => (inner, None),
+    };
+    addr.parse().ok().map(|a| (a, zone))
+}
+
+/// If `host` (bracketed or not) is an IP literal, its socket address without
+/// any DNS lookup. A numeric IPv6 zone ID becomes the scope ID; an
+/// interface-name zone cannot be mapped portably and yields `None`.
+pub(crate) fn ip_literal_addr(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::{SocketAddr, SocketAddrV6};
+    let h = unbracket(host);
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    let (ip, zone) = ipv6_literal(h)?;
+    let scope = match zone {
+        Some(z) => z.parse().ok()?,
+        None => 0,
+    };
+    Some(SocketAddr::V6(SocketAddrV6::new(ip, port, 0, scope)))
+}
+
+/// Percent-decode `s` (RFC 3986 §2.1) to a string; `%XX` with invalid hex is
+/// kept verbatim and invalid UTF-8 is replaced lossily. `+` is not special.
+pub(crate) fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Format `host:port` for a request authority or `CONNECT` line, bracketing a
+/// bare IPv6 literal (`::1` → `[::1]:443`).
+pub(crate) fn authority(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// Reject any field destined for the request line / `Host:` header that
@@ -571,7 +763,7 @@ mod tests {
         let u = Url::parse("http://expected.com?x=@attacker.com").unwrap();
         assert_eq!(u.host, "expected.com");
         assert_eq!(u.userinfo, None);
-        assert_eq!(u.path, "?x=@attacker.com");
+        assert_eq!(u.path, "/?x=@attacker.com");
     }
 
     #[test]
@@ -581,7 +773,7 @@ mod tests {
         let u = Url::parse("http://expected.com#@attacker.com/").unwrap();
         assert_eq!(u.host, "expected.com");
         assert_eq!(u.userinfo, None);
-        assert_eq!(u.path, "");
+        assert_eq!(u.path, "/");
     }
 
     #[test]
@@ -646,5 +838,171 @@ mod tests {
             u.set_idn(true).unwrap();
             assert_eq!(u.host, host, "ASCII/IP host must be unchanged: {raw}");
         }
+    }
+
+    /// A query- or fragment-only reference must still produce a root path, or
+    /// the request line becomes `GET ?x=1 HTTP/1.1` / `GET  HTTP/1.1`.
+    #[test]
+    fn query_or_fragment_only_url_gets_root_path() {
+        assert_eq!(Url::parse("http://h?x=1").unwrap().path, "/?x=1");
+        assert_eq!(Url::parse("http://h#frag").unwrap().path, "/");
+        assert_eq!(Url::parse("http://h:8080?a=b#c").unwrap().path, "/?a=b");
+    }
+
+    /// RFC 3986 §5.2.4 dot-segment removal (curl does it unless --path-as-is).
+    #[test]
+    fn dot_segments_are_removed_from_path() {
+        let cases = [
+            ("http://h/a/b/../c/./d", "/a/c/d"),
+            ("http://h/a/b/..", "/a/"),
+            ("http://h/a/b/.", "/a/b/"),
+            ("http://h/../../x", "/x"),
+            ("http://h/..", "/"),
+            ("http://h/a/./", "/a/"),
+            // Only whole segments are dots; the query is untouched.
+            ("http://h/a/..b/.c?q=/../x", "/a/..b/.c?q=/../x"),
+            ("http://h/a/../b?x=../y", "/b?x=../y"),
+            // Empty segments are preserved.
+            ("http://h/a//b/../c", "/a//c"),
+        ];
+        for (raw, path) in cases {
+            assert_eq!(Url::parse(raw).unwrap().path, path, "{raw}");
+        }
+    }
+
+    #[test]
+    fn resolve_query_only_keeps_base_path() {
+        let base = Url::parse("http://h/list/items?page=1").unwrap();
+        assert_eq!(
+            resolve(&base, "?page=2").unwrap().path,
+            "/list/items?page=2"
+        );
+    }
+
+    #[test]
+    fn resolve_fragment_only_is_base_document() {
+        let base = Url::parse("http://h/foo/bar?x=1").unwrap();
+        assert_eq!(resolve(&base, "#frag").unwrap().path, "/foo/bar?x=1");
+    }
+
+    #[test]
+    fn resolve_removes_dot_segments() {
+        let base = Url::parse("http://h/a/b/c").unwrap();
+        assert_eq!(resolve(&base, "../x").unwrap().path, "/a/x");
+        assert_eq!(resolve(&base, "./y").unwrap().path, "/a/b/y");
+        assert_eq!(resolve(&base, "../../../../z").unwrap().path, "/z");
+        assert_eq!(resolve(&base, "/p/../q").unwrap().path, "/q");
+        assert_eq!(resolve(&base, "..").unwrap().path, "/a/");
+    }
+
+    /// RFC 3986 §5.4.1 normal examples that apply to HTTP redirects.
+    #[test]
+    fn resolve_rfc3986_normal_examples() {
+        let base = Url::parse("http://a/b/c/d;p?q").unwrap();
+        let cases = [
+            ("g", "/b/c/g"),
+            ("./g", "/b/c/g"),
+            ("g/", "/b/c/g/"),
+            ("/g", "/g"),
+            ("?y", "/b/c/d;p?y"),
+            ("g?y", "/b/c/g?y"),
+            ("#s", "/b/c/d;p?q"),
+            ("g#s", "/b/c/g"),
+            (";x", "/b/c/;x"),
+            (".", "/b/c/"),
+            ("./", "/b/c/"),
+            ("..", "/b/"),
+            ("../", "/b/"),
+            ("../g", "/b/g"),
+            ("../..", "/"),
+            ("../../g", "/g"),
+        ];
+        for (reference, path) in cases {
+            let r = resolve(&base, reference).unwrap();
+            assert_eq!(r.host, "a", "{reference}");
+            assert_eq!(r.path, path, "{reference}");
+        }
+    }
+
+    /// curl percent-encodes a raw space (and 8-bit bytes) in a redirect
+    /// target instead of failing; control bytes stay rejected.
+    #[test]
+    fn resolve_percent_encodes_space_and_non_ascii() {
+        let base = Url::parse("http://h/dir/").unwrap();
+        assert_eq!(resolve(&base, "a b").unwrap().path, "/dir/a%20b");
+        assert_eq!(resolve(&base, "/é").unwrap().path, "/%C3%A9");
+        let abs = resolve(&base, "http://o.example/x y?q=1 2").unwrap();
+        assert_eq!(abs.host, "o.example");
+        assert_eq!(abs.path, "/x%20y?q=1%202");
+        assert!(resolve(&base, "/a\r\nX: y").is_err());
+    }
+
+    #[test]
+    fn empty_port_means_default_and_plus_sign_is_rejected() {
+        assert_eq!(Url::parse("http://h:/").unwrap().port, 80);
+        assert_eq!(Url::parse("https://[::1]:/").unwrap().port, 443);
+        assert!(Url::parse("http://h:+80/").is_err());
+        assert!(Url::parse("http://h:-1/").is_err());
+        assert!(Url::parse("http://h:65536/").is_err());
+        assert!(Url::parse("http://[::1]:+80/").is_err());
+    }
+
+    #[test]
+    fn bracketed_host_must_be_ipv6() {
+        assert!(Url::parse("http://[evil.com]/").is_err());
+        assert!(Url::parse("http://[127.0.0.1]/").is_err());
+        assert!(Url::parse("http://[]/").is_err());
+        assert!(Url::parse("http://[::1%]/").is_err());
+        assert!(Url::parse("http://[::1%25a/b]/").is_err());
+        let u = Url::parse("http://[fe80::1%25en0]:8080/").unwrap();
+        assert_eq!(u.host, "[fe80::1%25en0]");
+        assert_eq!(u.host_unbracketed(), "fe80::1%25en0");
+        assert_eq!(Url::parse("http://[2001:db8::1]/").unwrap().port, 80);
+    }
+
+    #[test]
+    fn scheme_is_case_insensitive_including_file() {
+        assert_eq!(Url::parse("HTTP://h/").unwrap().scheme, "http");
+        let f = Url::parse("FILE:///tmp/x").unwrap();
+        assert_eq!(f.scheme, "file");
+        assert_eq!(f.path, "/tmp/x");
+    }
+
+    #[test]
+    fn file_url_accepts_localhost_authority_only() {
+        assert_eq!(
+            Url::parse("file://localhost/etc/hosts").unwrap().path,
+            "/etc/hosts"
+        );
+        assert_eq!(Url::parse("file:///etc/hosts").unwrap().path, "/etc/hosts");
+        assert!(Url::parse("file://otherhost/etc/hosts").is_err());
+    }
+
+    #[test]
+    fn unbracket_and_ip_literal_helpers() {
+        assert_eq!(unbracket("[::1]"), "::1");
+        assert_eq!(unbracket("example.com"), "example.com");
+        assert_eq!(
+            ip_literal_addr("[::1]", 80),
+            Some("[::1]:80".parse().unwrap())
+        );
+        assert_eq!(
+            ip_literal_addr("10.0.0.1", 81),
+            Some("10.0.0.1:81".parse().unwrap())
+        );
+        assert_eq!(ip_literal_addr("example.com", 80), None);
+        // Interface-name zones cannot be mapped portably.
+        assert_eq!(ip_literal_addr("[fe80::1%25en0]", 80), None);
+        assert_eq!(authority("::1", 443), "[::1]:443");
+        assert_eq!(authority("[::1]", 443), "[::1]:443");
+        assert_eq!(authority("h", 80), "h:80");
+    }
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("p%40ss%3Aw"), "p@ss:w");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("a+b"), "a+b");
     }
 }

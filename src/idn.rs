@@ -34,17 +34,15 @@ pub(crate) fn to_ascii(host: &str, enabled: bool) -> Result<String> {
         // attacker can smuggle a delimiter past the parser and trigger
         // origin/host confusion (DNS, SNI, `Host:` header, proxy request line,
         // pool key). A legitimate punycode/ASCII hostname is only letters,
-        // digits, hyphens, and dots — none of the bytes below — so reject any
-        // encoded output that still carries one. This branch never sees a
-        // bracketed IPv6 literal (those are ASCII and skip the encoder), so
-        // rejecting `:` here is safe.
-        if ascii.bytes().any(|b| {
-            b < 0x20
-                || matches!(
-                    b,
-                    0x7f | b' ' | b'/' | b'\\' | b'@' | b':' | b'?' | b'#' | b'%'
-                )
-        }) {
+        // digits, hyphens, dots (and, in the wild, underscores), so accept
+        // exactly that set: an allowlist also catches mapped brackets
+        // (`［`/`］`) and `< > " | ^ { }` that a delimiter denylist would miss.
+        // This branch never sees a bracketed IPv6 literal (those are ASCII and
+        // skip the encoder).
+        if !ascii
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+        {
             return Err(Error::InvalidUrl(format!(
                 "IDN host encodes to a forbidden authority delimiter: {host}"
             )));
@@ -102,6 +100,11 @@ mod tests {
             "good.com：8080",        // U+FF1A -> ':'
             "evil＃.com",            // U+FF03 -> '#'
             "x？y.com",              // U+FF1F -> '?'
+            "［evil］.com",          // U+FF3B/U+FF3D -> '[' ']'
+            "a＜b＞.com",            // U+FF1C/U+FF1E -> '<' '>'
+            "a｜b.com",              // U+FF5C -> '|'
+            "a＂b.com",              // U+FF02 -> '"'
+            "a＾b.com",              // U+FF3E -> '^'
         ] {
             assert!(
                 to_ascii(input, true).is_err(),

@@ -60,6 +60,18 @@ pub use backend::{
     load_roots_from_file, RootCertStore, TlsConn, TlsOpts, TlsStream,
 };
 
+/// The TLS reference identity for a URL host: an IPv6 literal loses its URL
+/// brackets and zone ID (`[fe80::1%25en0]` → `fe80::1`) so both backends parse
+/// it as an IP (matched against iPAddress SANs, and — on rustls — never sent as
+/// SNI); DNS names pass through unchanged.
+pub(crate) fn server_name(host: &str) -> &str {
+    let h = crate::url::unbracket(host);
+    match h.find('%') {
+        Some(i) if h.contains(':') => &h[..i],
+        _ => h,
+    }
+}
+
 /// CVE-2011-0411-class STARTTLS plaintext-injection guard, shared by the mail
 /// protocols (imap/smtp/pop3). After the server's STARTTLS/STLS `OK` and
 /// *before* the TLS handshake ([`connect_over`]), the client's read buffer must
@@ -120,8 +132,31 @@ pub(crate) type ClientEngine = crate::proto::tls::PurecryptoEngine;
 
 #[cfg(test)]
 mod tests {
-    use super::reject_pipelined_plaintext;
+    use super::{reject_pipelined_plaintext, server_name};
     use crate::error::Error;
+
+    #[test]
+    fn server_name_unbrackets_ipv6_and_drops_zone() {
+        assert_eq!(server_name("[::1]"), "::1");
+        assert_eq!(server_name("[fe80::1%25en0]"), "fe80::1");
+        assert_eq!(server_name("127.0.0.1"), "127.0.0.1");
+        assert_eq!(server_name("example.com"), "example.com");
+    }
+
+    /// A URL-form IPv6 host (`[::1]`) must build a client engine on the active
+    /// backend — rustls used to reject it as an invalid DNS name, and
+    /// purecrypto could never match it against an iPAddress SAN.
+    #[test]
+    fn client_engine_accepts_bracketed_ipv6_host() {
+        for verify in [true, false] {
+            let mut opts = super::TlsOpts::verifying();
+            opts.verify = verify;
+            assert!(
+                super::build_client_engine("[::1]", &mut opts).is_ok(),
+                "verify={verify}"
+            );
+        }
+    }
 
     #[test]
     fn pipelined_guard_passes_on_empty_buffer() {
