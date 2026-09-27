@@ -106,6 +106,20 @@ pub(crate) struct ClientExchange {
     streaming: bool,
     /// In streaming mode, whether the one-shot `Head` event has been emitted.
     head_emitted: bool,
+    /// Interim (1xx) responses skipped so far, capped at [`MAX_INTERIM_RESPONSES`].
+    interim: usize,
+}
+
+/// Upper bound on interim `1xx` heads (e.g. `100 Continue`, `103 Early Hints`)
+/// accepted before the final response, so a server can't keep an exchange
+/// alive forever by streaming interim heads.
+pub(crate) const MAX_INTERIM_RESPONSES: usize = 32;
+
+/// Whether `status` is an interim (informational) response that precedes the
+/// final one. `101 Switching Protocols` is final: the connection changes
+/// protocol after it (RFC 9110 §15.2).
+pub(crate) fn is_interim_status(status: u16) -> bool {
+    (100..200).contains(&status) && status != 101
 }
 
 impl ClientExchange {
@@ -136,6 +150,7 @@ impl ClientExchange {
             events: VecDeque::new(),
             streaming,
             head_emitted: false,
+            interim: 0,
         }
     }
 
@@ -180,6 +195,18 @@ impl ClientExchange {
                     };
                     let head_bytes: Vec<u8> = self.rx.drain(..end).collect();
                     let head = parse_head(&head_bytes)?;
+                    if is_interim_status(head.status) {
+                        // RFC 9110 §15.2: a client must accept and discard
+                        // interim responses; the final response follows on the
+                        // same connection.
+                        self.interim += 1;
+                        if self.interim > MAX_INTERIM_RESPONSES {
+                            return Err(Error::BadResponse(
+                                "too many interim (1xx) responses".into(),
+                            ));
+                        }
+                        continue;
+                    }
                     let mode = body_mode(&self.method, &head, self.streaming)?;
                     self.head = Some(head);
                     self.state = match mode {
@@ -431,10 +458,7 @@ fn parse_head(block: &[u8]) -> Result<Http1Head> {
         if header_bytes > MAX_HEADER_BYTES {
             return Err(Error::BadResponse("headers exceed 64 KiB".into()));
         }
-        let (k, v) = line
-            .split_once(':')
-            .ok_or_else(|| Error::BadResponse(format!("malformed header line: {line:?}")))?;
-        headers.push((k.trim().to_string(), v.trim().to_string()));
+        crate::http::push_header_line(&mut headers, line)?;
     }
     Ok(Http1Head {
         version,
@@ -739,5 +763,66 @@ mod tests {
             head_body(decode("GET", b"HTTP/1.1 200 OK\nContent-Length: 2\n\nhi", false).unwrap());
         assert_eq!(head.status, 200);
         assert_eq!(body, b"hi");
+    }
+
+    #[test]
+    fn interim_responses_are_skipped() {
+        // 100 Continue and 103 Early Hints precede the final response and must
+        // not be mistaken for it (RFC 9110 §15.2).
+        let wire = b"HTTP/1.1 100 Continue\r\n\r\n\
+                     HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n\
+                     HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfinal";
+        let (head, body) = head_body(decode("GET", wire, false).unwrap());
+        assert_eq!(head.status, 200);
+        assert_eq!(body, b"final");
+    }
+
+    #[test]
+    fn interim_response_split_across_reads() {
+        // The final head arrives in a later read than the interim one.
+        let mut x = ClientExchange::new("GET", Vec::new());
+        x.handle_input(b"HTTP/1.1 103 Early Hints\r\n\r\n").unwrap();
+        assert!(
+            x.poll_event().is_none(),
+            "103 must not complete the exchange"
+        );
+        assert!(!x.is_finished());
+        x.handle_input(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+        let (head, body) = head_body(x.poll_event().unwrap());
+        assert_eq!((head.status, body.as_slice()), (200, &b"ok"[..]));
+    }
+
+    #[test]
+    fn switching_protocols_is_final() {
+        let (head, body) =
+            head_body(decode("GET", b"HTTP/1.1 101 Switching Protocols\r\n\r\n", false).unwrap());
+        assert_eq!(head.status, 101);
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn endless_interim_responses_are_bounded() {
+        let mut wire = Vec::new();
+        for _ in 0..=MAX_INTERIM_RESPONSES {
+            wire.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n\r\n");
+        }
+        assert!(matches!(
+            decode("GET", &wire, false),
+            Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn obs_fold_continuation_is_joined() {
+        let wire =
+            b"HTTP/1.1 200 OK\r\nX-Long: one\r\n  two\r\n\tthree\r\nContent-Length: 0\r\n\r\n";
+        let (head, _) = head_body(decode("GET", wire, false).unwrap());
+        assert_eq!(
+            head.headers[0],
+            ("X-Long".to_string(), "one two three".to_string())
+        );
+        // A fold with nothing to continue is malformed.
+        assert!(decode("GET", b"HTTP/1.1 200 OK\r\n bad\r\n\r\n", false).is_err());
     }
 }

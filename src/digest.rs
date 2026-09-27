@@ -2,20 +2,96 @@
 //!
 //! Given a `WWW-Authenticate: Digest ...` challenge and credentials, build the
 //! matching `Authorization: Digest ...` header. Supports `MD5`, `SHA-256`, and
-//! their `-sess` variants, and `qop=auth` (the common case); `auth-int` and
-//! userhash are not implemented (we fall back to the no-qop form if `auth`
-//! isn't offered).
+//! their `-sess` variants, and `qop=auth` (preferred) or `qop=auth-int` (which
+//! also hashes the request body). A challenge that offers a `qop` list with
+//! neither is refused; one with no `qop` at all gets the RFC 2069 form.
+//! userhash is not implemented.
 
 use std::collections::HashMap;
 
 /// Build the `Authorization: Digest ...` value, or `None` if the challenge is
-/// missing required fields.
+/// missing required fields. `body` is the request body, hashed only for
+/// `qop=auth-int`.
 pub(crate) fn authorization(
     user: &str,
     pass: &str,
     method: &str,
     uri: &str,
+    body: &[u8],
     challenge: &str,
+) -> Option<String> {
+    authorization_with_cnonce(
+        user,
+        pass,
+        method,
+        uri,
+        body,
+        challenge,
+        &hex(&rand_bytes()),
+    )
+}
+
+/// Whether a `Digest` challenge says the previous nonce merely went stale
+/// (`stale=true`), so the same credentials should be retried with the new one.
+pub(crate) fn is_stale(challenge: &str) -> bool {
+    let body = challenge.trim();
+    let body = body
+        .get(..6)
+        .filter(|s| s.eq_ignore_ascii_case("Digest"))
+        .map(|_| &body[6..])
+        .unwrap_or(body);
+    parse_params(body)
+        .get("stale")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// Find the `Digest` challenge among a response's `WWW-Authenticate` values. A
+/// server may send several challenges (e.g. `Basic` then `Digest`), either as
+/// separate header lines or comma-joined on one line.
+pub(crate) fn find_challenge<'a, I>(values: I) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for v in values {
+        let t = v.trim_start();
+        if t.as_bytes()
+            .get(..6)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"digest"))
+        {
+            return Some(t);
+        }
+        // `Basic realm="x", Digest realm=...` on one line: a new challenge
+        // starts at a `, <scheme> ` boundary.
+        let lower = t.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(off) = lower[from..].find("digest ") {
+            let at = from + off;
+            if lower[..at].trim_end().ends_with(',') {
+                return Some(&t[at..]);
+            }
+            from = at + 1;
+        }
+    }
+    None
+}
+
+/// Quote `v` as an RFC 9110 quoted-string body: `"` and `\` are
+/// backslash-escaped. Control bytes that could split the header are refused.
+fn quote(v: &str) -> Option<String> {
+    if v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return None;
+    }
+    Some(v.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn authorization_with_cnonce(
+    user: &str,
+    pass: &str,
+    method: &str,
+    uri: &str,
+    req_body: &[u8],
+    challenge: &str,
+    cnonce: &str,
 ) -> Option<String> {
     let body = challenge.trim().strip_prefix("Digest").or_else(|| {
         // Case-insensitive scheme prefix.
@@ -49,11 +125,22 @@ pub(crate) fn authorization(
         Some(a) if a.eq_ignore_ascii_case("SHA-256-sess") => ("SHA-256-sess", true, true),
         Some(_) => return None,
     };
-    // qop: pick "auth" if offered.
-    let qop_auth = p
-        .get("qop")
-        .map(|q| q.split(',').any(|t| t.trim().eq_ignore_ascii_case("auth")))
-        .unwrap_or(false);
+    // qop: prefer "auth"; fall back to "auth-int" (body integrity). A qop
+    // list offering neither can't be satisfied — and the RFC 2069 no-qop form
+    // would just be rejected — so refuse rather than send a doomed header.
+    let qop: Option<&str> = match p.get("qop") {
+        None => None,
+        Some(q) => {
+            let offered = |want: &str| q.split(',').any(|t| t.trim().eq_ignore_ascii_case(want));
+            if offered("auth") {
+                Some("auth")
+            } else if offered("auth-int") {
+                Some("auth-int")
+            } else {
+                return None;
+            }
+        }
+    };
 
     let h = |s: &str| -> String {
         if use_sha {
@@ -63,22 +150,31 @@ pub(crate) fn authorization(
         }
     };
 
-    let cnonce = hex(&rand_bytes());
     let nc = "00000001";
     let mut ha1 = h(&format!("{user}:{realm}:{pass}"));
     if sess {
         ha1 = h(&format!("{ha1}:{nonce}:{cnonce}"));
     }
-    let ha2 = h(&format!("{method}:{uri}"));
-    let response = if qop_auth {
-        h(&format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"))
+    let ha2 = if qop == Some("auth-int") {
+        let body_hash = if use_sha {
+            hex(&purecrypto::hash::sha256(req_body))
+        } else {
+            hex(&purecrypto::hash::md5(req_body))
+        };
+        h(&format!("{method}:{uri}:{body_hash}"))
     } else {
-        h(&format!("{ha1}:{nonce}:{ha2}"))
+        h(&format!("{method}:{uri}"))
+    };
+    let response = match qop {
+        Some(q) => h(&format!("{ha1}:{nonce}:{nc}:{cnonce}:{q}:{ha2}")),
+        None => h(&format!("{ha1}:{nonce}:{ha2}")),
     };
 
+    let q_user = quote(user)?;
+    let q_uri = quote(uri)?;
     let mut out = format!(
-        "Digest username=\"{user}\", realm=\"{realm}\", nonce=\"{nonce}\", \
-         uri=\"{uri}\", response=\"{response}\""
+        "Digest username=\"{q_user}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+         uri=\"{q_uri}\", response=\"{response}\""
     );
     if let Some(opaque) = p.get("opaque") {
         // Same quoted-string break-out hazard as realm/nonce.
@@ -92,8 +188,8 @@ pub(crate) fn authorization(
         // the raw challenge string.
         out.push_str(&format!(", algorithm={algorithm}"));
     }
-    if qop_auth {
-        out.push_str(&format!(", qop=auth, nc={nc}, cnonce=\"{cnonce}\""));
+    if let Some(q) = qop {
+        out.push_str(&format!(", qop={q}, nc={nc}, cnonce=\"{cnonce}\""));
     }
     Some(out)
 }
@@ -209,8 +305,15 @@ mod tests {
                     opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"";
         // Force the known cnonce/nc by checking structure rather than the exact
         // response (cnonce is random); assert the header is well-formed.
-        let h = authorization("Mufasa", "Circle Of Life", "GET", "/dir/index.html", chal)
-            .expect("digest header");
+        let h = authorization(
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            b"",
+            chal,
+        )
+        .expect("digest header");
         assert!(h.starts_with("Digest username=\"Mufasa\""));
         assert!(h.contains("realm=\"testrealm@host.com\""));
         assert!(h.contains("qop=auth"));
@@ -224,16 +327,16 @@ mod tests {
         // SHA-512-256 is a real RFC 7616 algorithm we do NOT implement; it must
         // not silently degrade to MD5.
         let chal = "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256";
-        assert!(authorization("u", "p", "GET", "/", chal).is_none());
+        assert!(authorization("u", "p", "GET", "/", b"", chal).is_none());
         // A bogus/typo token likewise fails closed.
         let chal2 = "Digest realm=\"r\", nonce=\"n\", algorithm=MD6";
-        assert!(authorization("u", "p", "GET", "/", chal2).is_none());
+        assert!(authorization("u", "p", "GET", "/", b"", chal2).is_none());
     }
 
     #[test]
     fn sha256_algorithm_echoed_as_selected() {
         let chal = "Digest realm=\"r\", nonce=\"n\", algorithm=sha-256";
-        let h = authorization("u", "p", "GET", "/", chal).unwrap();
+        let h = authorization("u", "p", "GET", "/", b"", chal).unwrap();
         // The emitted token reflects the selected algorithm (canonical form),
         // not the raw lowercase challenge string.
         assert!(h.contains("algorithm=SHA-256"), "got: {h}");
@@ -243,16 +346,16 @@ mod tests {
     fn quoted_value_breakout_rejected() {
         // A `"` in realm could otherwise forge auth-params.
         let chal = "Digest realm=\"r\\\"x\", nonce=\"n\"";
-        assert!(authorization("u", "p", "GET", "/", chal).is_none());
+        assert!(authorization("u", "p", "GET", "/", b"", chal).is_none());
         // CRLF in nonce would split the header.
         let chal2 = "Digest realm=\"r\", nonce=\"n\r\nX: y\"";
-        assert!(authorization("u", "p", "GET", "/", chal2).is_none());
+        assert!(authorization("u", "p", "GET", "/", b"", chal2).is_none());
     }
 
     #[test]
     fn no_qop_form() {
         let chal = "Digest realm=\"r\", nonce=\"n\"";
-        let h = authorization("u", "p", "GET", "/", chal).unwrap();
+        let h = authorization("u", "p", "GET", "/", b"", chal).unwrap();
         assert!(h.contains("response=\""));
         assert!(!h.contains("qop="));
         // Verify the no-qop response = MD5(HA1:nonce:HA2).
@@ -260,5 +363,94 @@ mod tests {
         let ha2 = hex(&purecrypto::hash::md5(b"GET:/"));
         let want = hex(&purecrypto::hash::md5(format!("{ha1}:n:{ha2}").as_bytes()));
         assert!(h.contains(&format!("response=\"{want}\"")));
+    }
+
+    #[test]
+    fn rfc2617_known_answer() {
+        // RFC 2617 §3.5 with its fixed cnonce: the response is fully determined.
+        let chal = "Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", \
+                    nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", \
+                    opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"";
+        let h = authorization_with_cnonce(
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            b"",
+            chal,
+            "0a4f113b",
+        )
+        .unwrap();
+        assert!(
+            h.contains("response=\"6629fae49393a05397450978507c4ef1\""),
+            "got: {h}"
+        );
+        assert!(h.contains("qop=auth, nc=00000001, cnonce=\"0a4f113b\""));
+    }
+
+    #[test]
+    fn rfc7616_sha256_known_answer() {
+        // RFC 7616 §3.9.1 SHA-256 example.
+        let chal = "Digest realm=\"http-auth@example.org\", qop=\"auth, auth-int\", \
+                    algorithm=SHA-256, \
+                    nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", \
+                    opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\"";
+        let h = authorization_with_cnonce(
+            "Mufasa",
+            "Circle of Life",
+            "GET",
+            "/dir/index.html",
+            b"",
+            chal,
+            "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+        )
+        .unwrap();
+        assert!(
+            h.contains(
+                "response=\"753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1\""
+            ),
+            "got: {h}"
+        );
+    }
+
+    #[test]
+    fn auth_int_only_hashes_body() {
+        let chal = "Digest realm=\"r\", nonce=\"n\", qop=\"auth-int\"";
+        let h = authorization_with_cnonce("u", "p", "POST", "/x", b"body", chal, "c").unwrap();
+        assert!(h.contains("qop=auth-int"), "got: {h}");
+        let md5 = |s: &[u8]| hex(&purecrypto::hash::md5(s));
+        let ha1 = md5(b"u:r:p");
+        let ha2 = md5(format!("POST:/x:{}", md5(b"body")).as_bytes());
+        let want = md5(format!("{ha1}:n:00000001:c:auth-int:{ha2}").as_bytes());
+        assert!(h.contains(&format!("response=\"{want}\"")), "got: {h}");
+    }
+
+    #[test]
+    fn unsatisfiable_qop_refused() {
+        let chal = "Digest realm=\"r\", nonce=\"n\", qop=\"auth-conf\"";
+        assert!(authorization("u", "p", "GET", "/", b"", chal).is_none());
+    }
+
+    #[test]
+    fn username_is_quoted_safely() {
+        let chal = "Digest realm=\"r\", nonce=\"n\"";
+        let h = authorization("a\"b\\c", "p", "GET", "/", b"", chal).unwrap();
+        assert!(h.starts_with("Digest username=\"a\\\"b\\\\c\""), "got: {h}");
+        assert!(authorization("a\r\nX: y", "p", "GET", "/", b"", chal).is_none());
+    }
+
+    #[test]
+    fn finds_digest_among_challenges() {
+        assert_eq!(
+            find_challenge(["Basic realm=\"x\"", "Digest realm=\"r\", nonce=\"n\""]),
+            Some("Digest realm=\"r\", nonce=\"n\"")
+        );
+        assert_eq!(
+            find_challenge(["Basic realm=\"x\", Digest realm=\"r\", nonce=\"n\""]),
+            Some("Digest realm=\"r\", nonce=\"n\"")
+        );
+        assert_eq!(find_challenge(["Basic realm=\"digest thing\""]), None);
+        assert!(is_stale("Digest realm=\"r\", nonce=\"n2\", stale=TRUE"));
+        assert!(!is_stale("Digest realm=\"r\", nonce=\"n2\""));
     }
 }

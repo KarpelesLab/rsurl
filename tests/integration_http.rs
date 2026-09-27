@@ -3576,3 +3576,78 @@ fn rsurl_cmd() -> std::process::Command {
     }
     cmd
 }
+
+/// RFC 9110 §15.4 / curl: a 302 re-sends a PUT unchanged (only POST is
+/// rewritten to GET), and a 303 turns it into a body-less GET.
+#[test]
+fn redirect_302_keeps_put_but_303_switches_to_get() {
+    use std::sync::{Arc, Mutex};
+    type Seen = Vec<(String, String, Vec<u8>)>;
+    let seen: Arc<Mutex<Seen>> = Arc::default();
+    let log = seen.clone();
+    let server = TestServer::start(move |req: SReq| {
+        log.lock()
+            .unwrap()
+            .push((req.method.clone(), req.path.clone(), req.body.clone()));
+        match req.path.as_str() {
+            "/found" => SResp::status(302).header("Location", "/dest"),
+            "/other" => SResp::status(303).header("Location", "/dest"),
+            _ => SResp::ok("done"),
+        }
+    });
+    for (start, want_method, want_body) in [
+        ("/found", "PUT", b"data".to_vec()),
+        ("/other", "GET", Vec::new()),
+    ] {
+        seen.lock().unwrap().clear();
+        let resp = Request::new("PUT", &server.url(start))
+            .unwrap()
+            .body(b"data".to_vec())
+            .follow_redirects(true)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        let log = seen.lock().unwrap();
+        let (m, p, b) = log.last().unwrap();
+        assert_eq!(
+            (m.as_str(), p.as_str()),
+            (want_method, "/dest"),
+            "from {start}"
+        );
+        assert_eq!(b, &want_body, "from {start}");
+    }
+}
+
+/// An empty-body POST carries `Content-Length: 0` (servers answer 411 without).
+#[test]
+fn empty_post_carries_content_length_zero() {
+    let server = TestServer::start(|req: SReq| {
+        SResp::ok(
+            req.header("content-length")
+                .unwrap_or("missing")
+                .to_string(),
+        )
+    });
+    let resp = Request::new("POST", &server.url("/"))
+        .unwrap()
+        .send()
+        .unwrap();
+    assert_eq!(resp.body, b"0");
+}
+
+/// A HEAD whose headers advertise `Content-Encoding: gzip` succeeds with an
+/// empty body instead of failing to inflate nothing.
+#[test]
+fn head_with_content_encoding_succeeds() {
+    let server = TestServer::start(|_req: SReq| {
+        SResp::status(200)
+            .header("Content-Encoding", "gzip")
+            .body(vec![0u8; 16])
+    });
+    let resp = Request::new("HEAD", &server.url("/"))
+        .unwrap()
+        .send()
+        .unwrap();
+    assert_eq!(resp.status, 200);
+    assert!(resp.body.is_empty());
+}

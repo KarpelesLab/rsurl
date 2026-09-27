@@ -58,6 +58,11 @@ pub(crate) struct Decoded {
     /// Drives whether the caller rewrites `Content-Encoding` /
     /// `Content-Length` on the [`crate::Response`].
     pub decoded: bool,
+    /// The inner (leftmost) layers still applied to `body` when decoding stopped
+    /// at a coding we can't read, joined as a `Content-Encoding` value; empty
+    /// when every layer was peeled. A partial peel must keep advertising these
+    /// so the caller doesn't mistake still-encoded bytes for plaintext.
+    pub remaining: String,
 }
 
 /// Walk a comma-separated `Content-Encoding` value right-to-left and peel
@@ -79,6 +84,7 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
         return Ok(Decoded {
             body,
             decoded: false,
+            remaining: String::new(),
         });
     }
 
@@ -97,7 +103,7 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
     // encodings can't each claim a fresh MAX_BODY_BYTES allowance. Each layer
     // may expand the running total only up to what remains.
     let mut budget = MAX_BODY_BYTES as u64;
-    for token in layers.iter().rev() {
+    for (idx, token) in layers.iter().enumerate().rev() {
         match Layer::parse(token) {
             Some(Layer::Identity) => {
                 // No-op; counts as recognised so the loop keeps going if
@@ -137,6 +143,7 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
                 return Ok(Decoded {
                     body: current,
                     decoded: peeled,
+                    remaining: layers[..=idx].join(", "),
                 });
             }
         }
@@ -144,6 +151,7 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
     Ok(Decoded {
         body: current,
         decoded: peeled,
+        remaining: String::new(),
     })
 }
 
@@ -306,6 +314,36 @@ pub(crate) fn stream_decode<R: Read, W: std::io::Write + ?Sized>(
 /// `Content-Length` is removed (not rewritten) because the decoded length
 /// is trivially `body.len()` and consumers who care can read that off the
 /// body directly; leaving a stale length would be worse than silence.
+/// Rewrite the headers after [`decode_body`] peeled at least one layer: drop the
+/// stale `Content-Length`, and replace `Content-Encoding` with the layers still
+/// applied (`decoded.remaining`), removing it only when nothing is left.
+pub(crate) fn headers_after_decode(
+    headers: Vec<(String, String)>,
+    decoded: &Decoded,
+) -> Vec<(String, String)> {
+    let mut out = strip_after_decode(headers);
+    if !decoded.remaining.is_empty() {
+        out.push(("Content-Encoding".into(), decoded.remaining.clone()));
+    }
+    out
+}
+
+/// Join every `Content-Encoding` header line into one list value (RFC 9110
+/// §5.3: repeated list headers are equivalent to one comma-joined line), or
+/// `None` when the response carries none.
+pub(crate) fn content_encoding(headers: &[(String, String)]) -> Option<String> {
+    let parts: Vec<&str> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
 pub(crate) fn strip_after_decode(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()
@@ -621,6 +659,39 @@ mod tests {
         let outer = gz(&inner);
         let out = decode_body(outer, "gzip, gzip").unwrap();
         assert_eq!(out.body, b"payload");
+    }
+
+    #[test]
+    fn partial_peel_keeps_unread_inner_layer() {
+        // "snappy, gzip": gzip was applied last, so it's peeled; snappy is
+        // unknown and must remain advertised on the (still-encoded) body.
+        let out = decode_body(gz(b"inner"), "snappy, gzip").unwrap();
+        assert!(out.decoded);
+        assert_eq!(out.body, b"inner");
+        assert_eq!(out.remaining, "snappy");
+        let h = vec![
+            ("Content-Encoding".into(), "snappy, gzip".into()),
+            ("Content-Length".into(), "9".into()),
+        ];
+        let h = headers_after_decode(h, &out);
+        assert_eq!(
+            h,
+            vec![("Content-Encoding".to_string(), "snappy".to_string())]
+        );
+        // A full peel leaves nothing behind.
+        let full = decode_body(gz(b"x"), "gzip").unwrap();
+        assert!(full.remaining.is_empty());
+    }
+
+    #[test]
+    fn content_encoding_joins_repeated_lines() {
+        let h = vec![
+            ("Content-Encoding".into(), "gzip".into()),
+            ("X".into(), "y".into()),
+            ("content-encoding".into(), "br".into()),
+        ];
+        assert_eq!(content_encoding(&h).as_deref(), Some("gzip, br"));
+        assert_eq!(content_encoding(&[]), None);
     }
 
     #[test]

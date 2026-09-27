@@ -52,6 +52,7 @@ pub(crate) trait TlsEngine {
     fn is_handshaking(&self) -> bool;
 
     /// Feed inbound ciphertext and advance the handshake/record state machine.
+    /// All of `ciphertext` is taken, however much plaintext it decrypts to.
     /// Errors on a malformed or undecryptable record.
     fn feed_incoming(&mut self, ciphertext: &[u8]) -> Result<()>;
 
@@ -73,6 +74,12 @@ pub(crate) trait TlsEngine {
     /// cipher suite, ALPN, peer certificate chain). Returns defaults while
     /// still handshaking.
     fn tls_params(&self) -> TlsParams;
+
+    /// Whether the peer sent a `close_notify` alert. A transport EOF without
+    /// one may be an attacker-injected FIN/RST (TLS-1), so a frontend must not
+    /// trust EOF as the end of a connection-close-delimited body unless this
+    /// is `true`.
+    fn received_close_notify(&self) -> bool;
 }
 
 /// A TLS-wrapped application exchange: drives the handshake, then carries the
@@ -98,6 +105,12 @@ impl<E: TlsEngine, M: Machine> TlsClient<E, M> {
     /// driver has run the handshake to completion).
     pub(crate) fn tls_params(&self) -> TlsParams {
         self.tls.tls_params()
+    }
+
+    /// Whether the peer closed the TLS session with `close_notify` (see
+    /// [`TlsEngine::received_close_notify`]).
+    pub(crate) fn received_close_notify(&self) -> bool {
+        self.tls.received_close_notify()
     }
 
     /// Consume the wrapper and return the underlying TLS engine, abandoning the
@@ -189,42 +202,93 @@ impl<E: TlsEngine, M: Machine> Machine for TlsClient<E, M> {
 /// factored out of the connect path in the wiring increment; this adapter only
 /// drives an already-built engine.
 #[cfg(feature = "rustls-tls")]
-pub(crate) struct RustlsEngine(pub(crate) rustls::ClientConnection);
+pub(crate) struct RustlsEngine {
+    conn: rustls::ClientConnection,
+    /// Decrypted plaintext moved out of rustls while feeding. rustls refuses
+    /// further `read_tls` ("received plaintext buffer full") once more than
+    /// 16 KiB of plaintext sits unread, which one inbound batch can exceed
+    /// (the tail of a record carried over + more whole records), so feeding
+    /// drains it here to honour the consume-all `feed_incoming` contract.
+    plaintext: Vec<u8>,
+    /// The peer sent `close_notify` (reported by `process_new_packets`).
+    peer_closed: bool,
+}
+
+#[cfg(feature = "rustls-tls")]
+impl RustlsEngine {
+    pub(crate) fn new(conn: rustls::ClientConnection) -> RustlsEngine {
+        RustlsEngine {
+            conn,
+            plaintext: Vec::new(),
+            peer_closed: false,
+        }
+    }
+
+    /// Move any plaintext rustls has decrypted into our own buffer.
+    fn spill_plaintext(&mut self) -> Result<()> {
+        use std::io::Read;
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match self.conn.reader().read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(n) => self.plaintext.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(crate::error::Error::Io(e)),
+            }
+        }
+    }
+}
 
 #[cfg(feature = "rustls-tls")]
 impl TlsEngine for RustlsEngine {
     fn is_handshaking(&self) -> bool {
-        self.0.is_handshaking()
+        self.conn.is_handshaking()
     }
 
     fn feed_incoming(&mut self, mut ciphertext: &[u8]) -> Result<()> {
         // Read ciphertext records into the engine and process them. `read_tls`
-        // may take less than offered when its internal buffer fills, so loop.
+        // may take less than offered when its internal buffer fills, so loop,
+        // spilling decrypted plaintext after each step so rustls's bounded
+        // plaintext buffer never fills mid-batch.
         while !ciphertext.is_empty() {
             let used = self
-                .0
+                .conn
                 .read_tls(&mut ciphertext)
                 .map_err(crate::error::Error::Io)?;
             if used == 0 {
                 break;
             }
-            self.0
+            let state = self
+                .conn
                 .process_new_packets()
                 .map_err(|e| crate::error::Error::Io(std::io::Error::other(format!("tls: {e}"))))?;
+            if state.peer_has_closed() {
+                self.peer_closed = true;
+            }
+            if state.plaintext_bytes_to_read() > 0 {
+                self.spill_plaintext()?;
+            }
         }
         Ok(())
     }
 
     fn drain_outgoing(&mut self, out: &mut Vec<u8>) {
         // Writing pending ciphertext into a Vec never fails.
-        while self.0.wants_write() {
-            let _ = self.0.write_tls(out);
+        while self.conn.wants_write() {
+            let _ = self.conn.write_tls(out);
         }
     }
 
     fn read_plaintext(&mut self, dst: &mut [u8]) -> Result<usize> {
         use std::io::Read;
-        match self.0.reader().read(dst) {
+        // Spilled plaintext comes first: it precedes anything still in rustls.
+        if !self.plaintext.is_empty() {
+            let n = dst.len().min(self.plaintext.len());
+            dst[..n].copy_from_slice(&self.plaintext[..n]);
+            self.plaintext.drain(..n);
+            return Ok(n);
+        }
+        match self.conn.reader().read(dst) {
             Ok(n) => Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
             Err(e) => Err(crate::error::Error::Io(e)),
@@ -234,28 +298,32 @@ impl TlsEngine for RustlsEngine {
     fn write_plaintext(&mut self, plaintext: &[u8]) {
         use std::io::Write;
         // Buffered into the engine; emitted as ciphertext by `drain_outgoing`.
-        let _ = self.0.writer().write_all(plaintext);
+        let _ = self.conn.writer().write_all(plaintext);
     }
 
     fn tls_params(&self) -> TlsParams {
         use crate::tls::ProtocolVersion;
         TlsParams {
-            version: self.0.protocol_version().map(|v| match v {
+            version: self.conn.protocol_version().map(|v| match v {
                 rustls::ProtocolVersion::TLSv1_2 => ProtocolVersion::TLSv1_2,
                 rustls::ProtocolVersion::TLSv1_3 => ProtocolVersion::TLSv1_3,
                 other => ProtocolVersion::Other(u16::from(other)),
             }),
             cipher_suite: self
-                .0
+                .conn
                 .negotiated_cipher_suite()
                 .map(|cs| u16::from(cs.suite())),
-            alpn: self.0.alpn_protocol().map(|p| p.to_vec()),
+            alpn: self.conn.alpn_protocol().map(|p| p.to_vec()),
             peer_certificates: self
-                .0
+                .conn
                 .peer_certificates()
                 .map(|certs| certs.iter().map(|c| c.to_vec()).collect())
                 .unwrap_or_default(),
         }
+    }
+
+    fn received_close_notify(&self) -> bool {
+        self.peer_closed
     }
 }
 
@@ -382,6 +450,10 @@ impl TlsEngine for PurecryptoEngine {
             peer_certificates: self.conn.peer_certificates().to_vec(),
         }
     }
+
+    fn received_close_notify(&self) -> bool {
+        self.conn.received_close_notify()
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +512,10 @@ mod tests {
 
         fn tls_params(&self) -> TlsParams {
             TlsParams::default() // the mock negotiates nothing
+        }
+
+        fn received_close_notify(&self) -> bool {
+            true
         }
     }
 
@@ -621,8 +697,10 @@ un9Yliw2Ah947iGL8Az3H6fsw/W1iLrM+V9Hqob9lsQksUPNlKF8c9z8
     fn real_rustls_handshake_carries_http_exchange() {
         let req =
             ClientExchange::encode_request("GET", "/", &[("Host".into(), "localhost".into())], b"");
-        let mut client =
-            TlsClient::new(RustlsEngine(client_conn()), ClientExchange::new("GET", req));
+        let mut client = TlsClient::new(
+            RustlsEngine::new(client_conn()),
+            ClientExchange::new("GET", req),
+        );
         let mut server = ServerConnection::new(server_config()).unwrap();
 
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nhello rustls";
@@ -672,6 +750,75 @@ un9Yliw2Ah947iGL8Az3H6fsw/W1iLrM+V9Hqob9lsQksUPNlKF8c9z8
             if let Some(Event::Response { head, body }) = client.poll_event() {
                 assert_eq!(head.status, 200);
                 assert_eq!(body, b"hello rustls");
+                return;
+            }
+        }
+        panic!("TLS exchange did not complete within the iteration budget");
+    }
+
+    /// A single inbound batch holding several full records decrypts to more
+    /// than rustls's 16 KiB received-plaintext limit. The engine must spill it
+    /// rather than fail `read_tls` with "received plaintext buffer full".
+    #[test]
+    fn large_inbound_batch_does_not_overflow_rustls_plaintext_buffer() {
+        let req =
+            ClientExchange::encode_request("GET", "/", &[("Host".into(), "localhost".into())], b"");
+        let mut client = TlsClient::new(
+            RustlsEngine::new(client_conn()),
+            ClientExchange::new("GET", req),
+        );
+        let mut server = ServerConnection::new(server_config()).unwrap();
+
+        // Let the test server queue the whole response in one go.
+        server.set_buffer_limit(None);
+        let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            payload.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&payload);
+        let mut server_req = Vec::new();
+        let mut replied = false;
+
+        for _ in 0..64 {
+            let mut c2s = Vec::new();
+            while client.poll_transmit(&mut c2s) {}
+            let mut cur = &c2s[..];
+            while !cur.is_empty() {
+                if server.read_tls(&mut cur).unwrap() == 0 {
+                    break;
+                }
+                server.process_new_packets().unwrap();
+            }
+            if !server.is_handshaking() {
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match server.reader().read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => server_req.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => panic!("server read: {e}"),
+                    }
+                }
+                if !replied && server_req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    server.writer().write_all(&response).unwrap();
+                    replied = true;
+                }
+            }
+            // All pending server records (≈ 64 KiB) arrive in ONE batch.
+            let mut s2c = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut s2c).unwrap();
+            }
+            if !s2c.is_empty() {
+                client
+                    .handle_input(&s2c)
+                    .expect("large batch must not overflow");
+            }
+            if let Some(Event::Response { head, body }) = client.poll_event() {
+                assert_eq!(head.status, 200);
+                assert_eq!(body, payload);
                 return;
             }
         }

@@ -48,6 +48,9 @@ pub struct Request {
     pub(crate) url: Url,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
+    /// AWS SigV4 signing parameters ([`Request::aws_sigv4`]), applied per hop
+    /// at send time by [`Request::apply_aws_sigv4`].
+    pub(crate) aws_sigv4: Option<crate::sigv4::SigV4Spec>,
     pub(crate) connect_timeout: Option<Duration>,
     pub(crate) read_timeout: Option<Duration>,
     pub(crate) http_version_pref: HttpVersionPref,
@@ -235,34 +238,84 @@ impl ProxyConfig {
     /// `http://user:pass@proxy:3128`. A bare `host:port` (no scheme) is
     /// also accepted and treated as `http://` — curl behaves the same way
     /// for the value of `-x`.
+    ///
+    /// Follows curl's proxy-URL rules (and `net::connector`'s parser): the
+    /// port defaults to **1080** when omitted (or empty), a trailing path such
+    /// as the common `http://proxy:3128/` form is ignored, the userinfo is
+    /// percent-decoded (`p%40ss` → `p@ss`), and an IPv6 literal is given in
+    /// brackets (`http://[::1]:3128`) and stored without them.
     pub fn parse(s: &str) -> Result<Self> {
-        // Curl accepts `proxy:8080` (no scheme); add one so the URL parser
-        // is happy and our scheme check below still rejects exotic schemes.
-        let normalised: String = if s.contains("://") {
-            s.to_string()
-        } else {
-            format!("http://{s}")
+        const DEFAULT_PROXY_PORT: u16 = 1080;
+        let bad = |what: &str| Error::InvalidUrl(format!("proxy: {what} in {s:?}"));
+        let (scheme, rest) = match s.split_once("://") {
+            Some((sch, r)) => (sch.to_ascii_lowercase(), r),
+            None => ("http".to_string(), s),
         };
-        let u = Url::parse(&normalised)?;
-        if u.scheme != "http" {
+        if scheme != "http" {
             return Err(Error::UnsupportedScheme(format!(
-                "proxy scheme {:?} not supported (only http:// at this milestone)",
-                u.scheme
+                "proxy scheme {scheme:?} not supported (only http:// at this milestone)"
             )));
         }
-        let auth = u
-            .userinfo
-            .as_deref()
-            .map(|info| match info.split_once(':') {
-                Some((u, p)) => (u.to_string(), p.to_string()),
-                None => (info.to_string(), String::new()),
-            });
-        Ok(ProxyConfig {
-            host: u.host.clone(),
-            port: u.port,
-            auth,
-        })
+        // Authority ends at the first path / query / fragment delimiter.
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let (userinfo, hostport) = match authority.rfind('@') {
+            Some(i) => (Some(&authority[..i]), &authority[i + 1..]),
+            None => (None, authority),
+        };
+        let auth = userinfo.map(|info| {
+            let (u, p) = info.split_once(':').unwrap_or((info, ""));
+            (percent_decode_lossy(u), percent_decode_lossy(p))
+        });
+        let parse_port = |p: &str| -> Result<u16> {
+            if p.is_empty() {
+                Ok(DEFAULT_PROXY_PORT)
+            } else if p.bytes().all(|b| b.is_ascii_digit()) {
+                p.parse().map_err(|_| bad("bad port"))
+            } else {
+                Err(bad("bad port"))
+            }
+        };
+        let (host, port) = if let Some(after) = hostport.strip_prefix('[') {
+            let close = after.find(']').ok_or_else(|| bad("unterminated IPv6"))?;
+            let tail = &after[close + 1..];
+            let port = match tail.strip_prefix(':') {
+                Some(p) => parse_port(p)?,
+                None if tail.is_empty() => DEFAULT_PROXY_PORT,
+                None => return Err(bad("junk after IPv6 host")),
+            };
+            (after[..close].to_string(), port)
+        } else {
+            match hostport.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), parse_port(p)?),
+                None => (hostport.to_string(), DEFAULT_PROXY_PORT),
+            }
+        };
+        if host.is_empty() {
+            return Err(bad("empty host"));
+        }
+        Ok(ProxyConfig { host, port, auth })
     }
+}
+
+/// Decode `%XX` escapes in a URL component (a malformed escape is kept
+/// literally; invalid UTF-8 is replaced).
+fn percent_decode_lossy(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl Request {
@@ -317,6 +370,7 @@ impl Request {
             priority: Priority::Normal,
             decompress: true,
             h2_recv_window: crate::http2::DEFAULT_RECV_WINDOW,
+            aws_sigv4: None,
         })
     }
 
@@ -459,40 +513,52 @@ impl Request {
     /// curl-style `provider1[:provider2[:region[:service]]]`; `region`/`service`
     /// default to the URL host's 2nd/1st labels (else `us-east-1`/`s3`). Adds
     /// `Authorization` + `X-Amz-Date` + `X-Amz-Content-Sha256` headers.
+    ///
+    /// The signature is computed when the request is sent (and again for each
+    /// redirect hop), so it covers the final method, body, IDN-normalised host
+    /// and the exact `Host:` authority (including a non-default port) on the
+    /// wire — builder calls made after this one are reflected.
     pub fn aws_sigv4(mut self, spec: &str, access: &str, secret: &str) -> Self {
-        let parts: Vec<&str> = spec.split(':').collect();
-        let labels: Vec<&str> = self.url.host.split('.').collect();
-        let region = parts
-            .get(2)
-            .filter(|s| !s.is_empty())
-            .copied()
-            .or_else(|| labels.get(1).copied())
-            .unwrap_or("us-east-1");
-        let service = parts
-            .get(3)
-            .filter(|s| !s.is_empty())
-            .copied()
-            .or_else(|| labels.first().copied())
-            .unwrap_or("s3");
+        self.aws_sigv4 = Some(crate::sigv4::SigV4Spec {
+            spec: spec.to_string(),
+            access_key: access.to_string(),
+            secret_key: secret.to_string(),
+        });
+        self
+    }
+
+    /// Replace this request's `Authorization`/`X-Amz-Date`/
+    /// `X-Amz-Content-Sha256` headers with a fresh AWS SigV4 signature, if
+    /// [`aws_sigv4`](Self::aws_sigv4) was set. Called on each outgoing hop,
+    /// after IDN normalisation and redirect rewriting.
+    pub(crate) fn apply_aws_sigv4(&mut self) {
+        let Some(spec) = self.aws_sigv4.clone() else {
+            return;
+        };
+        let (region, service) = spec.region_service(&self.url.host);
         let (path, query) = match self.url.path.split_once('?') {
             Some((p, q)) => (p.to_string(), q.to_string()),
             None => (self.url.path.clone(), String::new()),
         };
-        let amz = crate::sigv4::amz_date_now();
+        // Sign the authority exactly as the `Host:` header will carry it.
+        let host = self
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| host_header_value(&self.url));
         let cfg = crate::sigv4::SigV4 {
-            access_key: access,
-            secret_key: secret,
-            region,
-            service,
+            access_key: &spec.access_key,
+            secret_key: &spec.secret_key,
+            region: &region,
+            service: &service,
         };
-        let host = self.url.host.clone();
-        let method = self.method.clone();
-        let body = self.body.clone();
-        for (k, v) in crate::sigv4::sign(&cfg, &method, &host, &path, &query, &body, &amz) {
+        let method = effective_method(self);
+        let amz = crate::sigv4::amz_date_now();
+        for (k, v) in crate::sigv4::sign(&cfg, &method, &host, &path, &query, &self.body, &amz) {
             self.headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(&k));
             self.headers.push((k, v));
         }
-        self
     }
 
     /// Minimum acceptable TLS version (curl `--tlsv1.x`).
@@ -995,6 +1061,7 @@ impl Request {
         req.cancel_check()?;
         let mut hops_left = req.max_redirs;
         loop {
+            req.apply_aws_sigv4();
             let (head, mut bufrd, cancel) = open_h1_for_reader(&req, trace)?;
 
             // Follow a 3xx with a Location when redirects are enabled, draining
@@ -1091,6 +1158,7 @@ impl Request {
                     req.headers.push(("Cookie".to_string(), val));
                 }
             }
+            req.apply_aws_sigv4();
             let url = req.url.clone();
             let force_h2 = matches!(req.http_version_pref, HttpVersionPref::Http2Only);
             // Keep a copy to retry over HTTP/1.1 if the server doesn't pick h2.
@@ -1127,6 +1195,7 @@ impl Request {
         // when not following redirects. On a QUIC transport failure with
         // `--http3` (not `--http3-only`), retry the request over the Auto path.
         let h3_streamable = direct
+            && h3_route_blocker(&self).is_none()
             && self.url.scheme == "https"
             && !self.follow_redirects
             && matches!(
@@ -1144,6 +1213,7 @@ impl Request {
                     req.headers.push(("Cookie".to_string(), val));
                 }
             }
+            req.apply_aws_sigv4();
             let url = req.url.clone();
             let force_h3 = matches!(req.http_version_pref, HttpVersionPref::Http3Only);
             let fallback = (!force_h3).then(|| {
@@ -1162,7 +1232,11 @@ impl Request {
                     }
                     return Ok(resp);
                 }
-                Err(e) if fallback.is_some() && h3_should_fall_back(&e) => {
+                Err(e)
+                    if fallback
+                        .as_ref()
+                        .is_some_and(|fb| h3_should_fall_back(&e, &fb.method)) =>
+                {
                     let _ = writeln!(trace, "* HTTP/3 failed ({e}); falling back");
                     return fallback
                         .unwrap()
@@ -1260,6 +1334,7 @@ impl Request {
                     snapshot.headers.push(("Cookie".to_string(), val));
                 }
             }
+            snapshot.apply_aws_sigv4();
             write_request(
                 bufrd.get_mut(),
                 &snapshot,
@@ -1317,12 +1392,8 @@ impl Request {
             // unless the caller turned decompression off, in which case we skip
             // the decode block entirely and stream the raw bytes through below,
             // leaving the `Content-Encoding` header intact.
-            let content_encoding = head
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-                .map(|(_, v)| v.clone())
-                .filter(|_| req.decompress);
+            let content_encoding =
+                crate::compress::content_encoding(&head.headers).filter(|_| req.decompress);
             if let Some(ce) = content_encoding {
                 // Fast path: a single gzip/zstd/br layer over a Content-Length
                 // body decodes straight off the wire (bounded by the decoder's
@@ -1339,7 +1410,7 @@ impl Request {
                 if has_body && !chunked {
                     if let (Some(codec), Some(len)) = (
                         crate::compress::single_streamable_layer(&ce),
-                        parse_content_length(&head.headers)?,
+                        parse_content_length(&head.headers)?.filter(|&n| n > 0),
                     ) {
                         // Decoded straight to the sink (not buffered in memory),
                         // so the decoded size is bounded by the sink / disk, not
@@ -1400,7 +1471,8 @@ impl Request {
     }
 
     /// Single-shot send with no redirect handling. Pure protocol dispatch.
-    fn send_once(self, trace: &mut dyn Write) -> Result<Response> {
+    fn send_once(mut self, trace: &mut dyn Write) -> Result<Response> {
+        self.apply_aws_sigv4();
         if !self.verify_tls && self.url.scheme == "https" {
             let _ = writeln!(trace, "* WARNING: certificate verification disabled (-k)");
         }
@@ -1455,7 +1527,9 @@ impl Request {
         } else {
             None
         };
-        let mut digest_tried = false;
+        // Digest answers: the first 401, plus one retry when the server says
+        // our nonce merely went stale (`stale=true`, RFC 7616 §3.3).
+        let mut digest_attempts = 0u8;
         let deadline = req.max_time.map(|d| std::time::Instant::now() + d);
         let mut hops_left = req.max_redirs;
         let mut first_hop = true;
@@ -1489,29 +1563,31 @@ impl Request {
             if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
                 j.ingest_response(&req.url, &resp.headers);
             }
-            // Digest auth: answer a 401 Digest challenge once, then resend.
-            if resp.status == 401 && !digest_tried {
-                if let (Some((u, p)), Some(chal)) =
-                    (digest_creds.as_ref(), resp.header("www-authenticate"))
+            // Digest auth: answer a 401 Digest challenge, then resend. The
+            // Digest challenge may follow others (e.g. `Basic`), so look at
+            // every WWW-Authenticate value, not just the first.
+            if resp.status == 401 {
+                let chal = crate::digest::find_challenge(
+                    resp.headers
+                        .iter()
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("www-authenticate"))
+                        .map(|(_, v)| v.as_str()),
+                );
+                let may_answer = digest_attempts == 0
+                    || (digest_attempts == 1 && chal.is_some_and(crate::digest::is_stale));
+                if let (true, Some((u, p)), Some(chal)) = (may_answer, digest_creds.as_ref(), chal)
                 {
-                    let scheme = chal.trim_start();
-                    // Byte-index slicing here would panic if offset 6 is not a
-                    // UTF-8 char boundary, so compare the raw bytes instead —
-                    // `chal` is the attacker-controlled WWW-Authenticate value.
-                    if scheme
-                        .as_bytes()
-                        .get(..6)
-                        .is_some_and(|b| b.eq_ignore_ascii_case(b"digest"))
+                    // Hash the method actually sent on the wire (upper-cased
+                    // unless `keep_method_case`), or the server's HA2 differs.
+                    let method = effective_method(&req);
+                    if let Some(h) =
+                        crate::digest::authorization(u, p, &method, &req.url.path, &req.body, chal)
                     {
-                        if let Some(h) =
-                            crate::digest::authorization(u, p, &req.method, &req.url.path, chal)
-                        {
-                            req.headers
-                                .retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
-                            req.headers.push(("Authorization".to_string(), h));
-                            digest_tried = true;
-                            continue;
-                        }
+                        req.headers
+                            .retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+                        req.headers.push(("Authorization".to_string(), h));
+                        digest_attempts += 1;
+                        continue;
                     }
                 }
             }
@@ -1865,10 +1941,10 @@ impl Response {
 /// `Content-Length`) is still removed — that's hop-by-hop framing, not content
 /// coding.
 ///
-/// On a direct HTTP/1.1 connection with a `Content-Length` or
+/// On a direct HTTP/1.1 connection with a `Content-Length`, chunked, or
 /// connection-close-delimited body, the bytes stream straight off the socket
-/// and are never all held in memory at once. A chunked body, an empty-body
-/// status, and any non-HTTP/1.1 transport (a custom/SOCKS/HTTPS-proxy
+/// and are never all held in memory at once. An empty-body status and any
+/// non-HTTP/1.1 transport (a custom/SOCKS/HTTPS-proxy
 /// connector, or a forced HTTP/2/3 preference) are buffered once and then read
 /// back from memory — the `Read` interface is identical either way.
 pub struct BodyReader {
@@ -1881,14 +1957,16 @@ pub struct BodyReader {
 }
 
 enum BodyInner {
-    /// Whole body already in memory (chunked, empty status, or a non-HTTP/1.1
+    /// Whole body already in memory (empty status, or a non-HTTP/1.1
     /// transport that doesn't expose an incremental socket reader).
     Buffered(io::Cursor<Vec<u8>>),
     /// A `Content-Length`-bounded raw byte stream straight off the socket.
     Length(LengthBody),
+    /// A chunked body, de-chunked incrementally off the socket.
+    Chunked(ChunkedBody),
     /// A connection-close-delimited stream, read to the transport close
     /// (unbounded — the caller/sink bounds it, unlike the buffered path).
-    Eof(io::Take<BufReader<Box<dyn Rw>>>),
+    Eof(EofBody),
 }
 
 impl BodyReader {
@@ -1915,6 +1993,7 @@ impl Read for BodyReader {
         match &mut self.inner {
             BodyInner::Buffered(c) => c.read(buf),
             BodyInner::Length(l) => l.read(buf),
+            BodyInner::Chunked(c) => c.read(buf),
             BodyInner::Eof(t) => t.read(buf),
         }
     }
@@ -1979,14 +2058,14 @@ fn open_h1_for_reader(req: &Request, trace: &mut dyn Write) -> Result<OpenedBody
 
 /// Turn a read head + its connection into a [`BodyReader`], choosing the body
 /// framing the same way [`read_body`] does: an empty-body status yields nothing,
-/// a chunked body is de-chunked into memory (its incremental decode isn't
-/// exposed), a `Content-Length` body streams off the socket bounded by the
+/// a chunked body is de-chunked incrementally, a `Content-Length` body streams
+/// off the socket bounded by the
 /// length, and anything else streams until connection close. `Content-Encoding`
 /// is never touched — the bytes stay raw.
 fn build_body_reader(
     req: &Request,
     head: Head,
-    mut bufrd: BufReader<Box<dyn Rw>>,
+    bufrd: BufReader<Box<dyn Rw>>,
     cancel: Option<crate::cancel::CancelGuard>,
 ) -> Result<BodyReader> {
     let rhead = ResponseHead {
@@ -2029,19 +2108,16 @@ fn build_body_reader(
         k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
     });
     if chunked {
-        // De-chunking incrementally as a `Read` isn't exposed; buffer the
-        // de-chunked (still content-encoded) bytes and read them back.
-        let body = read_body(
-            &mut bufrd,
-            &head.headers,
-            &head.version,
-            head.status,
-            &req.method,
-        )?;
+        // De-chunked incrementally off the socket: like the other streaming
+        // framings, not bounded by the in-memory `MAX_BODY_BYTES` cap.
         return Ok(BodyReader {
             head: rhead,
-            inner: BodyInner::Buffered(io::Cursor::new(body)),
-            _cancel: None,
+            inner: BodyInner::Chunked(ChunkedBody {
+                src: bufrd,
+                remaining: 0,
+                done: false,
+            }),
+            _cancel: cancel,
         });
     }
 
@@ -2061,7 +2137,7 @@ fn build_body_reader(
         // No Content-Length, not chunked — connection-close-delimited.
         None => Ok(BodyReader {
             head: rhead,
-            inner: BodyInner::Eof(bufrd.take(u64::MAX)),
+            inner: BodyInner::Eof(EofBody { src: bufrd }),
             _cancel: cancel,
         }),
     }
@@ -2093,8 +2169,9 @@ fn buffered_body_reader(mut req: Request, trace: &mut dyn Write) -> Result<BodyR
 /// resolve + IDN-normalise the target, reject non-HTTP(S) schemes, emit the
 /// `* Following redirect to` trace line, drop `Authorization`/`Cookie` (and
 /// Basic creds) on a cross-host hop unless `--location-trusted`, set `Referer`
-/// for `-e ;auto`, and downgrade POST→GET (dropping the body + framing headers)
-/// on 301/302/303 except where `--post30x` opts out.
+/// for `-e ;auto`, and downgrade to GET (dropping the body + framing headers) a
+/// POST on 301/302 and any non-GET/HEAD method on 303, except where
+/// `--post30x` opts out for a POST.
 fn redirect_request(
     req: Request,
     status: u16,
@@ -2130,16 +2207,22 @@ fn redirect_request(
         });
         next.basic_auth = None;
     }
-    let keep_post = if (301..=303).contains(&status) {
-        next.keep_post[(status - 301) as usize]
-    } else {
-        false
+    // RFC 9110 §15.4 / curl `Curl_follow`: 301 and 302 only rewrite POST to
+    // GET (a PUT/DELETE/PATCH is re-sent as-is); 303 means "see other" and
+    // turns every method except GET/HEAD into GET. `--post30x` preserves only
+    // a POST, never another method on a 303.
+    let is_post = prev_method.eq_ignore_ascii_case("POST");
+    let keep_post = (301..=303).contains(&status) && next.keep_post[(status - 301) as usize];
+    let to_get = match status {
+        301 | 302 => is_post && !keep_post,
+        303 => {
+            !prev_method.eq_ignore_ascii_case("GET")
+                && !prev_method.eq_ignore_ascii_case("HEAD")
+                && !(is_post && keep_post)
+        }
+        _ => false,
     };
-    if (301..=303).contains(&status)
-        && !keep_post
-        && !prev_method.eq_ignore_ascii_case("GET")
-        && !prev_method.eq_ignore_ascii_case("HEAD")
-    {
+    if to_get {
         next.method = "GET".to_string();
         next.body = Vec::new();
         next.headers.retain(|(k, _)| {
@@ -2202,8 +2285,14 @@ fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     if direct {
         if let Some(stream) = core_pool_checkout_plain(req) {
             let _ = writeln!(trace, "* Reusing existing connection from pool");
-            match run_plain_core(stream, req, true, None, trace) {
+            let mut started = false;
+            match run_plain_core(stream, req, true, None, &mut started, trace) {
                 Ok(resp) => return Ok(resp),
+                // The server already answered on this socket: it wasn't a
+                // stale keep-alive race, and the request may have been acted
+                // on, so replaying it (e.g. a POST) is unsafe. Like curl, only
+                // retry a reused connection when no response arrived at all.
+                Err(e) if started => return Err(e),
                 Err(e) => match stale_or_hard(e) {
                     PooledError::Stale(why) => {
                         let _ =
@@ -2224,6 +2313,7 @@ fn send_plain_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
         req,
         direct,
         Some((start, namelookup, connect)),
+        &mut false,
         trace,
     )
 }
@@ -2256,12 +2346,15 @@ fn trace_response_head(trace: &mut dyn Write, head: &Http1Head) {
 /// driver tick at which the transport handshake reports complete. The response
 /// head is echoed to `trace` (`< ` lines) as soon as it parses, matching the
 /// legacy `-v` output. Shared by the plaintext and TLS core paths; both produce
-/// a [`Http1Event`] stream.
+/// a [`Http1Event`] stream. `started` is set once the response head has
+/// arrived, so a caller retrying a pooled connection can tell a stale socket
+/// (nothing received) from a failure mid-response (must not be replayed).
 fn drive_collect<M, S>(
     machine: &mut M,
     io: &mut S,
     start: Option<std::time::Instant>,
     track_appconnect: bool,
+    started: &mut bool,
     trace: &mut dyn Write,
 ) -> Result<(Http1Head, Vec<u8>, CoreTiming)>
 where
@@ -2277,6 +2370,7 @@ where
         |ev| {
             match ev {
                 Http1Event::Head(h) => {
+                    *started = true;
                     // First byte of the response head: time-to-first-byte.
                     timing.starttransfer = start.map(|s| s.elapsed());
                     trace_response_head(trace, &h);
@@ -2311,6 +2405,7 @@ fn run_plain_core(
     req: &Request,
     may_pool: bool,
     timing: Option<(std::time::Instant, Option<Duration>, Duration)>,
+    started: &mut bool,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let mut request_bytes = Vec::new();
@@ -2319,7 +2414,8 @@ fn run_plain_core(
     let method = effective_method(req);
     let mut exchange = ClientExchange::new_streaming(&method, request_bytes);
     let start = timing.map(|(s, _, _)| s);
-    let (head, body, core_timing) = drive_collect(&mut exchange, &mut stream, start, false, trace)?;
+    let (head, body, core_timing) =
+        drive_collect(&mut exchange, &mut stream, start, false, started, trace)?;
 
     let wire_len = body.len();
     let _ = writeln!(trace, "* Received {wire_len} body bytes");
@@ -2381,8 +2477,11 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     if direct && tls_pool_eligible(req) {
         if let Some((tcp, engine)) = core_pool_checkout_tls(req) {
             let _ = writeln!(trace, "* Reusing existing TLS connection from pool");
-            match run_https_core(tcp, req, Some(engine), true, None, trace) {
+            let mut started = false;
+            match run_https_core(tcp, req, Some(engine), true, None, &mut started, trace) {
                 Ok(resp) => return Ok(resp),
+                // See `send_plain_via_core`: never replay once a response began.
+                Err(e) if started => return Err(e),
                 Err(e) => match stale_or_hard(e) {
                     PooledError::Stale(why) => {
                         let _ = writeln!(
@@ -2407,6 +2506,7 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
         None,
         may_pool,
         Some((start, namelookup, connect)),
+        &mut false,
         trace,
     )
 }
@@ -2492,6 +2592,7 @@ fn run_https_core(
     engine_in: Option<crate::pool::CoreTlsEngine>,
     may_pool: bool,
     timing: Option<(std::time::Instant, Option<Duration>, Duration)>,
+    started: &mut bool,
     trace: &mut dyn Write,
 ) -> Result<Response> {
     let mut request_bytes = Vec::new();
@@ -2516,8 +2617,15 @@ fn run_https_core(
     let mut tls = crate::proto::tls::TlsClient::new(engine, exchange);
     let start = timing.map(|(s, _, _)| s);
     let (head, body, core_timing) =
-        drive_collect(&mut tls, &mut tcp, start, fresh_handshake, trace)?;
+        drive_collect(&mut tls, &mut tcp, start, fresh_handshake, started, trace)?;
     let params = tls.tls_params();
+    // TLS-1 (as in the legacy `read_body`): a body framed by the connection
+    // close is only complete if that close was authenticated with
+    // `close_notify`; a bare TCP FIN/RST may be an attacker truncating it.
+    if body_is_close_delimited(&method, head.status, &head.headers) && !tls.received_close_notify()
+    {
+        return Err(Error::UnexpectedEof);
+    }
     let engine = tls.into_engine();
 
     // Post-handshake trust policy, replicating the legacy `connect_over_tls`:
@@ -2730,16 +2838,34 @@ fn core_pool_checkout_tls(req: &Request) -> Option<crate::pool::CoreTlsConn> {
 /// certificate (`-E`), or with public-key pinning (`--pinnedpubkey`) must NEVER
 /// be handed to a later differently-configured request to the same host:port —
 /// that would silently downgrade the second request's trust decision (MITM) or
-/// reuse the wrong client identity. Mirrors `http2::pool_eligible`.
+/// reuse the wrong client identity.
+///
+/// A caller verify callback ([`Request::tls_verify_callback`]) disables engine
+/// verification in favour of the callback's verdict, and TLS version bounds
+/// (`--tlsv1.x`/`--tls-max`) constrain the negotiated protocol — neither
+/// holds for a session made under different settings, and a reused session
+/// skips the post-handshake checks entirely, so both disqualify pooling too.
+/// Only a direct connection pools: a proxied tunnel reaches the origin through
+/// a different path than a direct dial with the same pool key.
+///
+/// This is the single TLS-posture gate for every pool (HTTP/1.1 here and the
+/// HTTP/2 connection pool); pair it with [`pool_key_for`], which separates
+/// `--connect-to`/`--resolve` dial targets and partitions.
 pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
     req.verify_tls
         && req.ca_bundle.is_none()
         && req.ca_path.is_none()
         && req.client_cert.is_none()
+        && req.client_key.is_none()
         && req.pinned_pubkey.is_none()
         && req.crl_file.is_none()
         && req.ciphers.is_none()
         && req.tls13_ciphers.is_none()
+        && req.tls_verify_callback.is_none()
+        && req.tls_min.is_none()
+        && req.tls_max.is_none()
+        && (req.proxy.is_none() || proxy_bypassed(req))
+        && req.connector.is_direct()
 }
 
 /// Server-side keep-alive eligibility. Caller must also have read the body
@@ -2752,6 +2878,12 @@ pub(crate) fn tls_pool_eligible(req: &Request) -> bool {
 /// (reusable) from "no body framing because the server intends to close"
 /// (not reusable).
 fn response_is_reusable(method: &str, resp: &Response) -> bool {
+    // Interim heads are skipped by the parser, so a 1xx here is `101 Switching
+    // Protocols`: the connection now speaks another protocol and is never
+    // reusable for HTTP/1.1.
+    if (100..200).contains(&resp.status) {
+        return false;
+    }
     let conn_close = resp.headers.iter().any(|(k, v)| {
         k.eq_ignore_ascii_case("connection")
             && v.split(',')
@@ -2764,10 +2896,8 @@ fn response_is_reusable(method: &str, resp: &Response) -> bool {
         k.eq_ignore_ascii_case("content-length")
             || (k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked"))
     });
-    let no_body_allowed = method.eq_ignore_ascii_case("HEAD")
-        || (100..200).contains(&resp.status)
-        || resp.status == 204
-        || resp.status == 304;
+    let no_body_allowed =
+        method.eq_ignore_ascii_case("HEAD") || resp.status == 204 || resp.status == 304;
     if !has_framing && !no_body_allowed {
         // Close-delimited body: server signalled end-of-message by closing.
         return false;
@@ -2900,10 +3030,22 @@ pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls:
 /// silently re-issuing over h2 could mask a genuine protocol bug. Note that a
 /// real HTTP response with a 4xx/5xx status is `Ok(Response)`, not an error,
 /// and never reaches this function.
-pub(crate) fn h3_should_fall_back(e: &Error) -> bool {
+///
+/// Re-sending is only safe when the server can't have acted on the request.
+/// Failures that happen before any request byte leaves (configuration, client
+/// build, stream open) or that the server declares unprocessed (GOAWAY, `http3:
+/// peer closed`) always fall back. A transport failure that may strike after
+/// the request was (partly) sent — I/O, a torn-down connection, a stream
+/// read/write error — falls back only for an idempotent `method` (RFC 9110
+/// §9.2.2), so a POST whose upload died mid-way is not silently replayed.
+pub(crate) fn h3_should_fall_back(e: &Error, method: &str) -> bool {
+    let idempotent = ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"]
+        .iter()
+        .any(|m| method.eq_ignore_ascii_case(m));
     match e {
-        // I/O = UDP socket / connect / timeout failures.
-        Error::Io(_) => true,
+        // I/O = UDP socket / connect / timeout failures — possibly after the
+        // request went out.
+        Error::Io(_) => idempotent,
         // `http3::send` rejects non-`https://` URLs and unresolvable hosts up
         // front; those are configuration issues we can retry over TCP.
         Error::UnsupportedScheme(_) | Error::InvalidUrl(_) => true,
@@ -2911,20 +3053,23 @@ pub(crate) fn h3_should_fall_back(e: &Error) -> bool {
         // with an `http3:` prefix. Treat the handshake/connection ones as
         // transport failures; leave mid-response decode failures to propagate.
         Error::BadResponse(m) => {
-            m.starts_with("http3: connection closed")
-                || m.starts_with("http3: peer closed")
+            // Nothing sent yet, or the peer said it didn't process it.
+            let unsent = m.starts_with("http3: peer closed")
                 || m.starts_with("http3: build client")
                 || m.starts_with("http3: open_bidi")
-                || m.starts_with("http3: open_uni")
+                || m.starts_with("http3: open_uni");
+            // Transport failures that may follow a (partial) send.
+            let ambiguous = m.starts_with("http3: connection closed")
                 // `feed` is the QUIC datagram-ingest step: a decode failure here
                 // means we couldn't parse the peer's packets (version/transport
-                // mismatch), i.e. QUIC never came up — a transport failure.
+                // mismatch) — a transport failure.
                 || m.starts_with("http3: feed")
                 // stream read/write errors before any response bytes arrived are
                 // likewise a torn-down connection, not a real HTTP response.
                 || m.starts_with("http3: stream read")
                 || m.starts_with("http3: stream write")
-                || m.starts_with("http3: stream finish")
+                || m.starts_with("http3: stream finish");
+            unsent || (ambiguous && idempotent)
         }
         _ => false,
     }
@@ -2977,6 +3122,7 @@ pub fn send_multiplexed_traced(
     // connect error rather than failing the whole batch.
     for req in &mut reqs {
         let _ = req.url.set_idn(req.idn);
+        req.apply_aws_sigv4();
     }
     // Apply the priority hint as issuance order: stable-sort indices by
     // priority (High first), issue in that order, then restore the caller's
@@ -3024,16 +3170,29 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
     // the QUIC path produces. `Http3` returns a success or a non-transport
     // error verbatim, but on a transport failure it falls through to the
     // `Auto` h2/http1.1 logic below.
+    let h3_blocker = h3_route_blocker(&req);
     match req.http_version_pref {
         HttpVersionPref::Http3Only => {
+            if let Some(why) = h3_blocker {
+                return Err(Error::UnsupportedScheme(format!(
+                    "HTTP/3 (--http3-only) is not supported {why}"
+                )));
+            }
             let _ = writeln!(trace, "* Trying HTTP/3 (QUIC), required (--http3-only)");
             return crate::http3::send(req, trace);
+        }
+        HttpVersionPref::Http3 if h3_blocker.is_some() => {
+            let _ = writeln!(
+                trace,
+                "* HTTP/3 skipped ({}); using HTTP/2/1.1",
+                h3_blocker.unwrap_or_default()
+            );
         }
         HttpVersionPref::Http3 => {
             let _ = writeln!(trace, "* Trying HTTP/3 (QUIC)...");
             match crate::http3::send(req.clone(), trace) {
                 Ok(resp) => return Ok(resp),
-                Err(e) if h3_should_fall_back(&e) => {
+                Err(e) if h3_should_fall_back(&e, &req.method) => {
                     let _ = writeln!(trace, "* HTTP/3 failed ({e}), falling back to HTTP/2/1.1");
                     // Fall through to the Auto path (h2, then http/1.1).
                 }
@@ -3083,6 +3242,21 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
         return send_https_via_core(&req, trace);
     }
     send_https_fresh(req, trace)
+}
+
+/// Why HTTP/3 can't carry `req` as configured, or `None` when it can. The QUIC
+/// path dials the origin itself over UDP: it can't traverse an HTTP proxy, and
+/// it doesn't apply `--resolve`/`--connect-to` overrides — using it would
+/// silently bypass the proxy or the pinned backend. `--http3` then falls back
+/// to TCP; `--http3-only` fails.
+fn h3_route_blocker(req: &Request) -> Option<&'static str> {
+    if req.proxy.is_some() && !proxy_bypassed(req) {
+        return Some("through an HTTP proxy");
+    }
+    if effective_dial_target(&req.connect_to, &req.resolve, &req.url.host, req.url.port).is_some() {
+        return Some("with --resolve/--connect-to overrides");
+    }
+    None
 }
 
 fn send_https_fresh(req: Request, trace: &mut dyn Write) -> Result<Response> {
@@ -3136,7 +3310,11 @@ fn send_https_fresh(req: Request, trace: &mut dyn Write) -> Result<Response> {
 /// Apply `--connect-to` remapping to a dial target. An empty from-host or a
 /// zero from-port matches any. An empty to-host / zero to-port keeps the
 /// original. First match wins.
-fn apply_connect_to(rules: &[(String, u16, String, u16)], host: &str, port: u16) -> (String, u16) {
+pub(crate) fn apply_connect_to(
+    rules: &[(String, u16, String, u16)],
+    host: &str,
+    port: u16,
+) -> (String, u16) {
     for (fh, fp, th, tp) in rules {
         let host_ok = fh.is_empty() || fh.eq_ignore_ascii_case(host);
         let port_ok = *fp == 0 || *fp == port;
@@ -3279,7 +3457,7 @@ pub(crate) fn connect_tunnel<S: Read + Write>(
     proxy: &ProxyConfig,
     trace: &mut dyn Write,
 ) -> Result<()> {
-    let host_port = format!("{}:{}", target.host, target.port);
+    let host_port = format!("{}:{}", uri_host(&target.host), target.port);
     let mut buf = Vec::with_capacity(256);
     write!(&mut buf, "CONNECT {host_port} HTTP/1.1\r\n")?;
     write!(&mut buf, "Host: {host_port}\r\n")?;
@@ -3469,6 +3647,34 @@ fn validate_header(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `Host:` header value for `url`: the host, plus `:port` unless it's the
+/// scheme's default (RFC 9110 §7.2). An IPv6 literal is bracketed and loses
+/// any zone id (`fe80::1%25eth0` → `[fe80::1]`): the zone is meaningful only
+/// to the local stack and must not reach the server (RFC 6874 §4, as curl).
+pub(crate) fn host_header_value(url: &Url) -> String {
+    let host = uri_host(&url.host);
+    if (url.scheme == "http" && url.port == 80) || (url.scheme == "https" && url.port == 443) {
+        host
+    } else {
+        format!("{host}:{}", url.port)
+    }
+}
+
+/// `host` in URI-authority form: IPv6 literals bracketed with the zone id
+/// removed; names and IPv4 unchanged. Accepts the host with or without
+/// brackets.
+fn uri_host(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if !bare.contains(':') {
+        return host.to_string();
+    }
+    let no_zone = bare.split('%').next().unwrap_or(bare);
+    format!("[{no_zone}]")
+}
+
 /// Reject a request method that carries CR, LF, a space, or any control char —
 /// any of which would corrupt the request line / forge an extra line.
 fn validate_method(method: &str) -> Result<()> {
@@ -3492,13 +3698,7 @@ fn write_request<W: Write>(
         validate_header(k, v)?;
     }
 
-    let host_header = if (req.url.scheme == "http" && req.url.port == 80)
-        || (req.url.scheme == "https" && req.url.port == 443)
-    {
-        req.url.host.clone()
-    } else {
-        format!("{}:{}", req.url.host, req.url.port)
-    };
+    let host_header = host_header_value(&req.url);
     // In strict mode, only emit the URL-derived Host when the caller didn't set
     // their own — the browser owns the exact header set.
     let caller_set_host = req
@@ -3514,16 +3714,7 @@ fn write_request<W: Write>(
         // Re-serialise the target as `scheme://host[:port]<path>` so the
         // proxy can route it. Userinfo is omitted — we move it into
         // `Authorization:`/`Proxy-Authorization:` elsewhere.
-        let target = if (req.url.scheme == "http" && req.url.port == 80)
-            || (req.url.scheme == "https" && req.url.port == 443)
-        {
-            format!("{}://{}{}", req.url.scheme, req.url.host, req.url.path)
-        } else {
-            format!(
-                "{}://{}:{}{}",
-                req.url.scheme, req.url.host, req.url.port, req.url.path
-            )
-        };
+        let target = format!("{}://{host_header}{}", req.url.scheme, req.url.path);
         write!(&mut buf, "{method} {target} HTTP/1.1\r\n")?;
     } else {
         write!(&mut buf, "{method} {} HTTP/1.1\r\n", req.url.path)?;
@@ -3549,7 +3740,11 @@ fn write_request<W: Write>(
     let mut have_accept_enc = false;
     let mut have_clen = false;
     let mut have_auth = false;
+    let mut have_te = false;
     for (k, v) in &req.headers {
+        if k.eq_ignore_ascii_case("transfer-encoding") {
+            have_te = true;
+        }
         if k.eq_ignore_ascii_case("user-agent") {
             have_ua = true;
         }
@@ -3587,7 +3782,13 @@ fn write_request<W: Write>(
             write!(&mut buf, "Accept-Encoding: gzip, deflate\r\n")?;
         }
     }
-    if !req.body.is_empty() && !have_clen {
+    // RFC 9110 §8.6: send Content-Length whenever the method gives enclosed
+    // content a meaning — including an empty POST/PUT/PATCH (`-d ""`), which
+    // curl sends as `Content-Length: 0`. Many servers answer 411 without it.
+    let method_takes_body = ["POST", "PUT", "PATCH"]
+        .iter()
+        .any(|m| method.eq_ignore_ascii_case(m));
+    if !have_clen && !have_te && (!req.body.is_empty() || method_takes_body) {
         write!(&mut buf, "Content-Length: {}\r\n", req.body.len())?;
     }
     // No explicit `Connection:` header: HTTP/1.1's default is keep-alive,
@@ -3671,9 +3872,24 @@ struct Head {
     headers: Vec<(String, String)>,
 }
 
-/// Read the status line and header block (up to the blank line). The reader is
-/// left positioned at the first body byte.
+/// Read the final response's status line and header block (up to the blank
+/// line), skipping any interim `1xx` heads (`100 Continue`, `103 Early Hints`)
+/// as RFC 9110 §15.2 requires. The reader is left positioned at the first body
+/// byte.
 fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Head> {
+    for _ in 0..=crate::proto::http1::MAX_INTERIM_RESPONSES {
+        let head = read_one_head(r, trace)?;
+        if !crate::proto::http1::is_interim_status(head.status) {
+            return Ok(head);
+        }
+    }
+    Err(Error::BadResponse(
+        "too many interim (1xx) responses".into(),
+    ))
+}
+
+/// Read a single status line + header block, interim or final.
+fn read_one_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Head> {
     let mut status_line = String::new();
     let n = read_line_capped(r, &mut status_line, MAX_HEADER_BYTES)?;
     if n == 0 {
@@ -3700,10 +3916,7 @@ fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Hea
         if trimmed.is_empty() {
             break;
         }
-        let (k, v) = trimmed
-            .split_once(':')
-            .ok_or_else(|| Error::BadResponse(format!("malformed header line: {trimmed:?}")))?;
-        headers.push((k.trim().to_string(), v.trim().to_string()));
+        push_header_line(&mut headers, trimmed)?;
     }
     Ok(Head {
         version,
@@ -3711,6 +3924,35 @@ fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Hea
         reason,
         headers,
     })
+}
+
+/// Parse one response header line (EOL already stripped) onto `headers`.
+///
+/// A line starting with SP/HTAB is an obsolete line fold (`obs-fold`): RFC 9112
+/// §5.2 says a user agent must replace it (and the preceding CRLF) with a
+/// single space, joining it to the previous field's value — curl does the same.
+/// A fold with no preceding field, or a line without a colon, is malformed.
+pub(crate) fn push_header_line(headers: &mut Vec<(String, String)>, line: &str) -> Result<()> {
+    if line.starts_with([' ', '\t']) {
+        let Some((_, prev)) = headers.last_mut() else {
+            return Err(Error::BadResponse(format!(
+                "folded header line with no field to continue: {line:?}"
+            )));
+        };
+        let cont = line.trim();
+        if !cont.is_empty() {
+            if !prev.is_empty() {
+                prev.push(' ');
+            }
+            prev.push_str(cont);
+        }
+        return Ok(());
+    }
+    let (k, v) = line
+        .split_once(':')
+        .ok_or_else(|| Error::BadResponse(format!("malformed header line: {line:?}")))?;
+    headers.push((k.trim().to_string(), v.trim().to_string()));
+    Ok(())
 }
 
 fn read_response<R: Read>(
@@ -3792,14 +4034,13 @@ pub(crate) fn maybe_decode_body(
     decompress: bool,
     trace: &mut dyn Write,
 ) -> Result<HeadersAndBody> {
-    if !decompress {
+    // An empty body (HEAD, 204, 304, or a zero-length 200) has nothing to
+    // decode; its Content-Encoding describes the representation, not these
+    // (absent) bytes, so leave the headers alone rather than fail to inflate.
+    if !decompress || body.is_empty() {
         return Ok((headers, body));
     }
-    let Some(enc) = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
-        .map(|(_, v)| v.clone())
-    else {
+    let Some(enc) = crate::compress::content_encoding(&headers) else {
         return Ok((headers, body));
     };
     let wire_len = body.len();
@@ -3812,7 +4053,8 @@ pub(crate) fn maybe_decode_body(
             out.body.len(),
             enc
         );
-        Ok((crate::compress::strip_after_decode(headers), out.body))
+        let headers = crate::compress::headers_after_decode(headers, &out);
+        Ok((headers, out.body))
     } else {
         Ok((headers, out.body))
     }
@@ -3871,6 +4113,20 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<Optio
         }
     }
     Ok(seen)
+}
+
+/// Whether a response's body is framed by the connection close (RFC 9112 §6.3
+/// rule 8): it may carry a body, yet has neither `Transfer-Encoding` nor
+/// `Content-Length`.
+fn body_is_close_delimited(method: &str, status: u16, headers: &[(String, String)]) -> bool {
+    let bodyless = method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304;
+    !bodyless
+        && !headers.iter().any(|(k, _)| {
+            k.eq_ignore_ascii_case("transfer-encoding") || k.eq_ignore_ascii_case("content-length")
+        })
 }
 
 fn read_body<R: BufRead + TruncationAware>(
@@ -3949,59 +4205,158 @@ fn read_body<R: BufRead + TruncationAware>(
     Ok(body)
 }
 
+/// Read one chunk-size line and return the size. RFC 9112 §7.1: chunk-size is
+/// `1*HEXDIG` with optional `;ext` chunk extensions (ignored). A leading sign,
+/// internal junk, or a size overflowing `u64` is rejected.
+fn read_chunk_size<R: BufRead>(r: &mut R) -> Result<u64> {
+    let mut size_line = String::new();
+    let n = read_line_capped(r, &mut size_line, MAX_HEADER_BYTES)?;
+    if n == 0 {
+        return Err(Error::UnexpectedEof);
+    }
+    let size_str = size_line
+        .trim_end_matches(['\r', '\n'])
+        .split(';')
+        .next()
+        .unwrap_or("");
+    let s = size_str.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::BadResponse(format!("bad chunk size: {size_str:?}")));
+    }
+    u64::from_str_radix(s, 16)
+        .map_err(|_| Error::BadResponse(format!("bad chunk size: {size_str:?}")))
+}
+
+/// Consume the trailer section after the last chunk, up to its blank line.
+/// Each line is capped, and so is the whole block — otherwise a server could
+/// stream non-empty trailer lines forever and pin the thread.
+fn drain_chunk_trailers<R: BufRead>(r: &mut R) -> Result<()> {
+    let mut trailer_bytes: usize = 0;
+    loop {
+        let mut t = String::new();
+        let n = read_line_capped(r, &mut t, MAX_HEADER_BYTES)?;
+        if n == 0 || t.trim_end_matches(['\r', '\n']).is_empty() {
+            return Ok(());
+        }
+        trailer_bytes = trailer_bytes.saturating_add(n);
+        if trailer_bytes > MAX_HEADER_BYTES {
+            return Err(Error::BadResponse("trailer block too large".into()));
+        }
+    }
+}
+
+/// Consume the CRLF that terminates a chunk's data.
+fn read_chunk_crlf<R: BufRead>(r: &mut R) -> Result<()> {
+    let mut crlf = [0u8; 2];
+    r.read_exact(&mut crlf)?;
+    if &crlf != b"\r\n" {
+        return Err(Error::BadResponse("missing CRLF after chunk".into()));
+    }
+    Ok(())
+}
+
 fn read_chunked<R: BufRead>(r: &mut R) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     loop {
-        let mut size_line = String::new();
-        let n = read_line_capped(r, &mut size_line, MAX_HEADER_BYTES)?;
-        if n == 0 {
-            return Err(Error::UnexpectedEof);
-        }
-        let size_str = size_line
-            .trim_end_matches(['\r', '\n'])
-            .split(';')
-            .next()
-            .unwrap_or("");
-        // RFC 9112 §7.1: chunk-size is `1*HEXDIG`. Reject a leading sign or any
-        // non-hex content; only surrounding CR/LF/space the reader leaves
-        // (removed by `trim`) is tolerated.
-        let s = size_str.trim();
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::BadResponse(format!("bad chunk size: {size_str:?}")));
-        }
-        let size = usize::from_str_radix(s, 16)
-            .map_err(|_| Error::BadResponse(format!("bad chunk size: {size_str:?}")))?;
-        if body.len().saturating_add(size) > MAX_BODY_BYTES {
+        let size = read_chunk_size(r)?;
+        if (body.len() as u64).saturating_add(size) > MAX_BODY_BYTES as u64 {
             return Err(Error::BadResponse("body too large".into()));
         }
         if size == 0 {
-            // Consume trailers until empty line. Each line is capped, but the
-            // total trailer block must be bounded too — otherwise a server can
-            // stream non-empty trailer lines forever and pin the thread.
-            let mut trailer_bytes: usize = 0;
-            loop {
-                let mut t = String::new();
-                let n = read_line_capped(r, &mut t, MAX_HEADER_BYTES)?;
-                if n == 0 || t.trim_end_matches(['\r', '\n']).is_empty() {
-                    break;
-                }
-                trailer_bytes = trailer_bytes.saturating_add(n);
-                if trailer_bytes > MAX_HEADER_BYTES {
-                    return Err(Error::BadResponse("trailer block too large".into()));
-                }
-            }
+            drain_chunk_trailers(r)?;
             break;
         }
-        let start = body.len();
-        body.resize(start + size, 0);
-        r.read_exact(&mut body[start..])?;
-        let mut crlf = [0u8; 2];
-        r.read_exact(&mut crlf)?;
-        if &crlf != b"\r\n" {
-            return Err(Error::BadResponse("missing CRLF after chunk".into()));
+        // Grow as bytes actually arrive (like the Content-Length path) rather
+        // than pre-allocating the claimed size: a single size line must not be
+        // able to force a large allocation for free.
+        let got = r.by_ref().take(size).read_to_end(&mut body)?;
+        if (got as u64) < size {
+            return Err(Error::UnexpectedEof);
         }
+        read_chunk_crlf(r)?;
     }
     Ok(body)
+}
+
+/// Incremental de-chunking [`Read`] adapter over a chunked body, so
+/// [`BodyReader`] can stream a chunked response without buffering it.
+struct ChunkedBody {
+    src: BufReader<Box<dyn Rw>>,
+    /// Data bytes left in the current chunk (0 = a size line comes next).
+    remaining: u64,
+    /// The terminating `0` chunk and trailers have been consumed.
+    done: bool,
+}
+
+impl ChunkedBody {
+    fn fill(&mut self) -> Result<()> {
+        let size = read_chunk_size(&mut self.src)?;
+        if size == 0 {
+            drain_chunk_trailers(&mut self.src)?;
+            self.done = true;
+        } else {
+            self.remaining = size;
+        }
+        Ok(())
+    }
+}
+
+fn error_to_io(e: Error) -> io::Error {
+    match e {
+        Error::Io(e) => e,
+        Error::UnexpectedEof => io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "response body truncated mid-chunk",
+        ),
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    }
+}
+
+impl Read for ChunkedBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            if self.done {
+                return Ok(0);
+            }
+            self.fill().map_err(error_to_io)?;
+            if self.done {
+                return Ok(0);
+            }
+        }
+        let cap = self.remaining.min(buf.len() as u64) as usize;
+        let n = self.src.read(&mut buf[..cap])?;
+        if n == 0 {
+            return Err(error_to_io(Error::UnexpectedEof));
+        }
+        self.remaining -= n as u64;
+        if self.remaining == 0 {
+            read_chunk_crlf(&mut self.src).map_err(error_to_io)?;
+        }
+        Ok(n)
+    }
+}
+
+/// A connection-close-delimited body reader that, like [`read_body`], rejects
+/// a TLS transport EOF without `close_notify` (TLS-1) instead of reporting a
+/// possibly attacker-truncated body as a clean end.
+struct EofBody {
+    src: BufReader<Box<dyn Rw>>,
+}
+
+impl Read for EofBody {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.src.read(buf)?;
+        if n == 0 && !buf.is_empty() && self.src.get_ref().truncated() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "TLS connection closed without close_notify; body may be truncated",
+            ));
+        }
+        Ok(n)
+    }
 }
 
 /// Any bidirectional byte stream — lets the streaming download path hold a
@@ -4132,50 +4487,18 @@ fn stream_body<R: BufRead + TruncationAware, W: Write + ?Sized>(
 fn stream_chunked<R: BufRead, W: Write + ?Sized>(r: &mut R, sink: &mut W) -> Result<u64> {
     let mut total: u64 = 0;
     loop {
-        let mut size_line = String::new();
-        let n = read_line_capped(r, &mut size_line, MAX_HEADER_BYTES)?;
-        if n == 0 {
-            return Err(Error::UnexpectedEof);
-        }
-        let size_str = size_line
-            .trim_end_matches(['\r', '\n'])
-            .split(';')
-            .next()
-            .unwrap_or("");
-        let s = size_str.trim();
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(Error::BadResponse(format!("bad chunk size: {size_str:?}")));
-        }
-        let size = usize::from_str_radix(s, 16)
-            .map_err(|_| Error::BadResponse(format!("bad chunk size: {size_str:?}")))?;
+        let size = read_chunk_size(r)?;
         // Streaming to the sink: no in-memory cap on the aggregate body size.
         if size == 0 {
-            // Bound the total trailer block (each line is already capped) so a
-            // server can't stream non-empty trailer lines forever.
-            let mut trailer_bytes: usize = 0;
-            loop {
-                let mut t = String::new();
-                let n = read_line_capped(r, &mut t, MAX_HEADER_BYTES)?;
-                if n == 0 || t.trim_end_matches(['\r', '\n']).is_empty() {
-                    break;
-                }
-                trailer_bytes = trailer_bytes.saturating_add(n);
-                if trailer_bytes > MAX_HEADER_BYTES {
-                    return Err(Error::BadResponse("trailer block too large".into()));
-                }
-            }
+            drain_chunk_trailers(r)?;
             break;
         }
-        let copied = io::copy(&mut r.by_ref().take(size as u64), sink)?;
-        if copied < size as u64 {
+        let copied = io::copy(&mut r.by_ref().take(size), sink)?;
+        if copied < size {
             return Err(Error::UnexpectedEof);
         }
-        let mut crlf = [0u8; 2];
-        r.read_exact(&mut crlf)?;
-        if &crlf != b"\r\n" {
-            return Err(Error::BadResponse("missing CRLF after chunk".into()));
-        }
-        total += size as u64;
+        read_chunk_crlf(r)?;
+        total = total.saturating_add(size);
     }
     Ok(total)
 }
@@ -4286,26 +4609,34 @@ mod tests {
     #[test]
     fn h3_fallback_classification() {
         use std::io;
-        // Transport failures fall back under --http3.
-        assert!(h3_should_fall_back(&Error::Io(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "x"
-        ))));
-        assert!(h3_should_fall_back(&Error::BadResponse(
-            "http3: feed: Decode".into()
-        )));
-        assert!(h3_should_fall_back(&Error::BadResponse(
-            "http3: connection closed mid-handshake".into()
-        )));
-        assert!(h3_should_fall_back(&Error::BadResponse(
-            "http3: peer closed connection".into()
-        )));
+        let io_err = || Error::Io(io::Error::new(io::ErrorKind::TimedOut, "x"));
+        let bad = |m: &str| Error::BadResponse(m.into());
+        // Transport failures fall back under --http3 for an idempotent request.
+        assert!(h3_should_fall_back(&io_err(), "GET"));
+        assert!(h3_should_fall_back(&bad("http3: feed: Decode"), "GET"));
+        assert!(h3_should_fall_back(
+            &bad("http3: connection closed mid-handshake"),
+            "GET"
+        ));
+        assert!(h3_should_fall_back(&bad("http3: stream write: x"), "PUT"));
+        // Failures that may follow a (partial) send must not replay a POST...
+        assert!(!h3_should_fall_back(&io_err(), "POST"));
+        assert!(!h3_should_fall_back(&bad("http3: stream write: x"), "POST"));
+        assert!(!h3_should_fall_back(&bad("http3: stream read: x"), "PATCH"));
+        // ...but nothing-sent / server-declared-unprocessed failures may.
+        assert!(h3_should_fall_back(
+            &bad("http3: peer closed connection"),
+            "POST"
+        ));
+        assert!(h3_should_fall_back(&bad("http3: open_bidi: x"), "POST"));
+        assert!(h3_should_fall_back(&Error::InvalidUrl("x".into()), "POST"));
         // A mid-response protocol/decode error over an established QUIC
         // connection is propagated, not silently retried over TCP.
-        assert!(!h3_should_fall_back(&Error::BadResponse(
-            "qpack: dynamic index out of range".into()
-        )));
-        assert!(!h3_should_fall_back(&Error::H2NotNegotiated));
+        assert!(!h3_should_fall_back(
+            &bad("qpack: dynamic index out of range"),
+            "GET"
+        ));
+        assert!(!h3_should_fall_back(&Error::H2NotNegotiated, "GET"));
     }
 
     #[test]
@@ -4961,6 +5292,45 @@ mod tests {
     }
 
     #[test]
+    fn proxy_parse_follows_curl_rules() {
+        // No port → curl's proxy default, 1080 (not the scheme's 80).
+        let p = ProxyConfig::parse("http://proxy.example").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("proxy.example", 1080));
+        let p = ProxyConfig::parse("proxy.example:").unwrap();
+        assert_eq!(p.port, 1080);
+        // The ubiquitous `http_proxy=http://proxy:3128/` form.
+        let p = ProxyConfig::parse("http://proxy:3128/").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("proxy", 3128));
+        // Percent-encoded credentials are decoded.
+        let p = ProxyConfig::parse("http://al%40ice:p%3Ass@proxy:8080").unwrap();
+        assert_eq!(p.auth, Some(("al@ice".to_string(), "p:ss".to_string())));
+        // An '@' in the (unencoded) password still splits at the last '@'.
+        let p = ProxyConfig::parse("http://u:p@ss@proxy:1").unwrap();
+        assert_eq!(p.auth.unwrap().1, "p@ss");
+        // IPv6 literal, stored bare.
+        let p = ProxyConfig::parse("http://[::1]:3128").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("::1", 3128));
+        assert_eq!(ProxyConfig::parse("HTTP://[::1]").unwrap().port, 1080);
+        // Malformed ports and empty hosts are rejected.
+        assert!(ProxyConfig::parse("http://proxy:+80").is_err());
+        assert!(ProxyConfig::parse("http://proxy:99999").is_err());
+        assert!(ProxyConfig::parse("http://:8080").is_err());
+    }
+
+    #[test]
+    fn host_header_strips_ipv6_zone_id() {
+        let mut u = Url::parse("http://example.com:8080/").unwrap();
+        assert_eq!(host_header_value(&u), "example.com:8080");
+        for raw in ["[fe80::1%25eth0]", "fe80::1%eth0", "[fe80::1]", "fe80::1"] {
+            u.host = raw.to_string();
+            u.port = 80;
+            assert_eq!(host_header_value(&u), "[fe80::1]", "from {raw}");
+            u.port = 8080;
+            assert_eq!(host_header_value(&u), "[fe80::1]:8080", "from {raw}");
+        }
+    }
+
+    #[test]
     fn proxy_parse_rejects_https() {
         let err = ProxyConfig::parse("https://proxy:443").unwrap_err();
         matches!(err, Error::UnsupportedScheme(_));
@@ -5412,6 +5782,7 @@ mod tests {
             None,
             true,
             Some((std::time::Instant::now(), nl, Duration::ZERO)),
+            &mut false,
             &mut io::sink(),
         )
         .unwrap();
@@ -5426,7 +5797,16 @@ mod tests {
 
         // Leg 2: resume the pooled session — no fresh dial, no new handshake (the
         // server dropped its listener and reused one ServerConnection).
-        let r2 = run_https_core(tcp2, &req, Some(engine), false, None, &mut io::sink()).unwrap();
+        let r2 = run_https_core(
+            tcp2,
+            &req,
+            Some(engine),
+            false,
+            None,
+            &mut false,
+            &mut io::sink(),
+        )
+        .unwrap();
         assert_eq!(r2.body, b"hi");
     }
 
@@ -5562,5 +5942,535 @@ mod tests {
         let s = String::from_utf8(trace).unwrap();
         assert!(s.contains("Following redirect to"));
         assert!(s.contains("b.example"));
+    }
+
+    // --- Review fixes: 1xx, pooling, redirects, framing, auth, signing ---
+
+    /// Read one request (head + Content-Length body) off `sock`; `None` on EOF.
+    fn read_request(sock: &mut std::net::TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            match sock.read(&mut byte) {
+                Ok(1) => buf.push(byte[0]),
+                _ => return None,
+            }
+        }
+        let head = String::from_utf8_lossy(&buf).to_string();
+        let len = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        sock.read_exact(&mut body).ok()?;
+        Some(head)
+    }
+
+    #[test]
+    fn interim_103_does_not_poison_pooled_connection() {
+        // Request A gets a 103 first and its real 200 in a *later* packet. The
+        // 103 must not be taken as A's response — otherwise A's 200 stays on the
+        // pooled socket and request B would read A's body.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            read_request(&mut sock).unwrap();
+            sock.write_all(b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nsecret-for-A")
+                .unwrap();
+            if read_request(&mut sock).is_some() {
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfor-B");
+            }
+            crate::test_support::graceful_close(&mut sock);
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let a = Request::get(&url).unwrap().send().unwrap();
+        assert_eq!((a.status, a.body.as_slice()), (200, &b"secret-for-A"[..]));
+        let b = Request::get(&url).unwrap().send().unwrap();
+        assert_eq!((b.status, b.body.as_slice()), (200, &b"for-B"[..]));
+    }
+
+    #[test]
+    fn legacy_reader_skips_interim_heads() {
+        // The streaming (legacy `read_head`) path skips 100/103 too.
+        let port = serve_n(
+            1,
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"
+                .to_vec(),
+        );
+        let mut sink = Vec::new();
+        let resp = Request::get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .send_download(&mut sink, None, &mut io::sink())
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(sink, b"body");
+    }
+
+    #[test]
+    fn switching_protocols_response_is_never_pooled() {
+        let resp = Response {
+            status: 101,
+            reason: "Switching Protocols".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![("Content-Length".into(), "0".into())],
+            body: Vec::new(),
+            timing: Timing::default(),
+            final_url: String::new(),
+            tls: None,
+        };
+        assert!(!response_is_reusable("GET", &resp));
+    }
+
+    #[test]
+    fn head_and_304_with_content_encoding_do_not_fail_decode() {
+        // An empty body carrying `Content-Encoding: gzip` has nothing to decode.
+        let port = serve_n(
+            1,
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 20\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        );
+        let resp = Request::new("HEAD", &format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.is_empty());
+        // The representation's encoding stays advertised for a HEAD.
+        assert_eq!(resp.header("content-encoding"), Some("gzip"));
+
+        let port = serve_n(
+            1,
+            b"HTTP/1.1 304 Not Modified\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        );
+        let resp = Request::get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(resp.status, 304);
+    }
+
+    #[test]
+    fn repeated_content_encoding_lines_are_combined() {
+        // `identity` on one line, `gzip` on another: the body is gzip. Using
+        // only the first line would hand back the compressed bytes.
+        let gz = compcol::vec::compress_to_vec::<compcol::gzip::Gzip>(b"combined").unwrap();
+        let headers = vec![
+            ("Content-Encoding".to_string(), "identity".to_string()),
+            ("Content-Encoding".to_string(), "gzip".to_string()),
+        ];
+        let (h, body) = maybe_decode_body(headers, gz, true, &mut io::sink()).unwrap();
+        assert_eq!(body, b"combined");
+        assert!(!h
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")));
+    }
+
+    #[test]
+    fn pooled_post_is_not_replayed_after_a_partial_response() {
+        // Leg 1 parks a keep-alive socket. Leg 2 (a POST) reuses it; the server
+        // starts answering, then dies mid-body. The POST was delivered and
+        // possibly acted on, so it must fail — not be silently re-sent.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let posts = Arc::new(AtomicUsize::new(0));
+        let seen = posts.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                while let Some(head) = read_request(&mut sock) {
+                    if head.starts_with("POST") {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc");
+                        break; // die mid-body
+                    }
+                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                }
+                crate::test_support::graceful_close(&mut sock);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/pay");
+        let r1 = Request::get(&url).unwrap().send().unwrap();
+        assert_eq!(r1.body, b"ok");
+        let err = Request::new("POST", &url)
+            .unwrap()
+            .body(b"amount=1".to_vec())
+            .send()
+            .unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof), "got {err:?}");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(posts.load(Ordering::SeqCst), 1, "POST must not be replayed");
+    }
+
+    #[test]
+    fn stale_pooled_socket_still_retries() {
+        // The complementary case: the server closed the idle pooled socket
+        // before answering anything, so a fresh dial retry is correct.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Conn 1: answer once (keep-alive), then close while idle.
+            let (mut s1, _) = listener.accept().unwrap();
+            read_request(&mut s1).unwrap();
+            s1.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n1")
+                .unwrap();
+            crate::test_support::graceful_close(&mut s1);
+            // Conn 2: the retried request.
+            let (mut s2, _) = listener.accept().unwrap();
+            read_request(&mut s2).unwrap();
+            s2.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n2")
+                .unwrap();
+            crate::test_support::graceful_close(&mut s2);
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        assert_eq!(Request::get(&url).unwrap().send().unwrap().body, b"1");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(Request::get(&url).unwrap().send().unwrap().body, b"2");
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    fn serve_https_close_delimited(close_notify: bool) -> u16 {
+        use rustls::ServerConnection;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut server =
+                ServerConnection::new(crate::proto::tls::rustls_tests::server_config()).unwrap();
+            {
+                let mut tls = rustls::Stream::new(&mut server, &mut sock);
+                let mut buf = Vec::new();
+                let mut byte = [0u8; 1];
+                while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                // No Content-Length / chunked: the body ends at the close.
+                let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial");
+                let _ = tls.flush();
+            }
+            if close_notify {
+                server.send_close_notify();
+                let _ = server.write_tls(&mut sock);
+            }
+            crate::test_support::graceful_close(&mut sock);
+        });
+        port
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn close_delimited_https_body_requires_close_notify() {
+        // TLS-1 on the sans-IO HTTPS path: without close_notify the transport
+        // EOF may be an attacker truncating the body.
+        let port = serve_https_close_delimited(false);
+        let req = Request::get(&format!("https://127.0.0.1:{port}/"))
+            .unwrap()
+            .verify_tls(false);
+        let err = send_https_via_core(&req, &mut io::sink()).unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEof), "got {err:?}");
+
+        let port = serve_https_close_delimited(true);
+        let req = Request::get(&format!("https://127.0.0.1:{port}/"))
+            .unwrap()
+            .verify_tls(false);
+        let resp = send_https_via_core(&req, &mut io::sink()).unwrap();
+        assert_eq!(resp.body, b"partial");
+    }
+
+    fn redirect_method(method: &str, status: u16, keep_post: bool) -> (String, bool) {
+        let mut req = Request::new(method, "https://a.example/one")
+            .unwrap()
+            .header("Content-Type", "text/plain")
+            .body(b"payload".to_vec());
+        if keep_post {
+            req = req.keep_post_on(status);
+        }
+        let next = redirect_request(req, status, "/two", &mut io::sink()).unwrap();
+        (next.method, next.body.is_empty())
+    }
+
+    #[test]
+    fn redirect_method_rewrite_follows_rfc9110_and_curl() {
+        // 301/302 rewrite only POST.
+        assert_eq!(redirect_method("POST", 301, false), ("GET".into(), true));
+        assert_eq!(redirect_method("POST", 302, false), ("GET".into(), true));
+        for m in ["PUT", "DELETE", "PATCH"] {
+            for st in [301, 302] {
+                assert_eq!(
+                    redirect_method(m, st, false),
+                    (m.to_string(), false),
+                    "{m} on {st}"
+                );
+            }
+        }
+        // 303 turns everything but GET/HEAD into GET.
+        assert_eq!(redirect_method("PUT", 303, false), ("GET".into(), true));
+        assert_eq!(redirect_method("POST", 303, false), ("GET".into(), true));
+        assert_eq!(redirect_method("HEAD", 303, false).0, "HEAD");
+        // --post30x keeps a POST, but never another method on a 303.
+        assert_eq!(redirect_method("POST", 302, true), ("POST".into(), false));
+        assert_eq!(redirect_method("POST", 303, true), ("POST".into(), false));
+        assert_eq!(redirect_method("PUT", 303, true), ("GET".into(), true));
+        // 307/308 never rewrite.
+        assert_eq!(redirect_method("POST", 307, false), ("POST".into(), false));
+        assert_eq!(redirect_method("PUT", 308, false), ("PUT".into(), false));
+    }
+
+    #[test]
+    fn legacy_reader_joins_obs_fold() {
+        let mut r = io::BufReader::new(io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nX-A: one\r\n two\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ));
+        let resp = read_response(&mut r, "GET", true, &mut io::sink()).unwrap();
+        assert_eq!(resp.header("x-a"), Some("one two"));
+    }
+
+    #[test]
+    fn read_chunked_does_not_preallocate_the_claimed_size() {
+        // A ~256 MiB chunk-size with 3 real bytes: fails as truncated without
+        // first reserving the claimed size.
+        let mut r = io::Cursor::new(b"FFFFFF0\r\nabc".to_vec());
+        assert!(matches!(read_chunked(&mut r), Err(Error::UnexpectedEof)));
+        // Overflowing hex sizes are rejected, not wrapped.
+        let mut r = io::Cursor::new(b"1FFFFFFFFFFFFFFFF\r\n".to_vec());
+        assert!(matches!(read_chunked(&mut r), Err(Error::BadResponse(_))));
+    }
+
+    #[test]
+    fn send_reader_streams_chunked_bodies() {
+        // A chunked body is de-chunked incrementally (not buffered), with
+        // extensions and trailers handled like the buffered decoder.
+        let port = serve_n(
+            1,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: t\r\n\r\n"
+                .to_vec(),
+        );
+        let mut reader = Request::get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .send_reader()
+            .unwrap();
+        assert!(matches!(reader.inner, BodyInner::Chunked(_)));
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"hello world");
+
+        // A chunked body cut off mid-chunk surfaces as an error, not a short read.
+        let port = serve_n(
+            1,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\na\r\nabc".to_vec(),
+        );
+        let mut reader = Request::get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .send_reader()
+            .unwrap();
+        let err = reader.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn empty_body_post_sends_content_length_zero() {
+        let render = |method: &str| {
+            let req = Request::new(method, "http://h.example/").unwrap();
+            let mut out = Vec::new();
+            write_request(&mut out, &req, false, &mut io::sink()).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        for m in ["POST", "PUT", "PATCH"] {
+            assert!(render(m).contains("\r\nContent-Length: 0\r\n"), "{m}");
+        }
+        for m in ["GET", "HEAD", "DELETE"] {
+            assert!(!render(m).contains("Content-Length"), "{m}");
+        }
+    }
+
+    #[test]
+    fn tls_pool_eligibility_covers_callback_versions_and_routing() {
+        let base = || Request::get("https://example.com/").unwrap();
+        assert!(tls_pool_eligible(&base()));
+        let cb = crate::tls::VerifyCallback::new(|_| crate::tls::CertVerdict::Accept);
+        assert!(!tls_pool_eligible(&base().tls_verify_callback(cb)));
+        assert!(!tls_pool_eligible(
+            &base().tls_min_version(crate::tls::ProtocolVersion::TLSv1_3)
+        ));
+        assert!(!tls_pool_eligible(
+            &base().tls_max_version(crate::tls::ProtocolVersion::TLSv1_2)
+        ));
+        assert!(!tls_pool_eligible(&base().client_key("/tmp/k.pem")));
+        assert!(!tls_pool_eligible(
+            &base().proxy("http://127.0.0.1:3128").unwrap()
+        ));
+        // A proxy the host bypasses is effectively direct.
+        assert!(tls_pool_eligible(
+            &base()
+                .proxy("http://127.0.0.1:3128")
+                .unwrap()
+                .no_proxy(["example.com"])
+        ));
+    }
+
+    #[test]
+    fn http3_is_not_used_through_a_proxy_or_dial_overrides() {
+        let base = || Request::get("https://example.com/").unwrap();
+        assert!(h3_route_blocker(&base()).is_none());
+        assert!(h3_route_blocker(&base().proxy("http://127.0.0.1:1").unwrap()).is_some());
+        assert!(h3_route_blocker(&base().resolve_addr(
+            "example.com",
+            443,
+            std::net::IpAddr::from([127, 0, 0, 1])
+        ))
+        .is_some());
+        assert!(h3_route_blocker(&base().connect_to("example.com", 443, "other", 8443)).is_some());
+        // A --resolve for a different authority doesn't affect this request.
+        assert!(h3_route_blocker(&base().resolve_addr(
+            "unrelated.test",
+            443,
+            std::net::IpAddr::from([127, 0, 0, 1])
+        ))
+        .is_none());
+        // --http3-only through a proxy fails up front instead of bypassing it.
+        let err = base()
+            .proxy("http://127.0.0.1:1")
+            .unwrap()
+            .http3_only()
+            .send()
+            .unwrap_err();
+        assert!(matches!(err, Error::UnsupportedScheme(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn sigv4_signs_at_send_time_with_port_and_final_method() {
+        let mut req = Request::new("GET", "http://127.0.0.1:9000/bucket/key?uploads")
+            .unwrap()
+            .aws_sigv4("aws:amz:us-east-1:s3", "AKID", "SECRET")
+            .method("put")
+            .body(b"data".to_vec());
+        // Nothing is signed at build time.
+        assert!(req_header(&req, "authorization").is_none());
+        req.apply_aws_sigv4();
+        let date = req_header(&req, "x-amz-date").unwrap().to_string();
+        let cfg = crate::sigv4::SigV4 {
+            access_key: "AKID",
+            secret_key: "SECRET",
+            region: "us-east-1",
+            service: "s3",
+        };
+        // The signed host includes the non-default port (as the `Host:` header
+        // does), and the method is the final, upper-cased one.
+        let want = crate::sigv4::sign(
+            &cfg,
+            "PUT",
+            "127.0.0.1:9000",
+            "/bucket/key",
+            "uploads",
+            b"data",
+            &date,
+        );
+        let auth = want.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert_eq!(req_header(&req, "authorization"), Some(auth.1.as_str()));
+        // Re-signing replaces rather than duplicates the headers.
+        req.apply_aws_sigv4();
+        let n = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .count();
+        assert_eq!(n, 1);
+        // The secret never shows up in Debug output.
+        assert!(!format!("{req:?}").contains("SECRET"));
+    }
+
+    #[test]
+    fn digest_answers_second_challenge_with_wire_method() {
+        // The server offers Basic first and Digest second; the request method
+        // is given in lower case but sent (and so must be hashed) as `GET`.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut s1, _) = listener.accept().unwrap();
+            read_request(&mut s1).unwrap();
+            s1.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\n\
+                  WWW-Authenticate: Basic realm=\"b\"\r\n\
+                  WWW-Authenticate: Digest realm=\"r\", nonce=\"n1\", qop=\"auth\"\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            crate::test_support::graceful_close(&mut s1);
+            let (mut s2, _) = listener.accept().unwrap();
+            let head = read_request(&mut s2).unwrap();
+            s2.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            crate::test_support::graceful_close(&mut s2);
+            head
+        });
+        let resp = Request::new("get", &format!("http://127.0.0.1:{port}/p"))
+            .unwrap()
+            .basic_auth("u", "pw")
+            .digest_auth(true)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        let head = handle.join().unwrap();
+        let auth = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Authorization: "))
+            .expect("digest Authorization sent");
+        assert!(auth.starts_with("Digest "), "got {auth}");
+        let field = |name: &str| {
+            let at = auth.find(&format!("{name}=")).unwrap() + name.len() + 1;
+            let rest = auth[at..].trim_start_matches('"');
+            rest.split(['"', ',']).next().unwrap().to_string()
+        };
+        let md5 = |s: &str| crate::digest::hex(&purecrypto::hash::md5(s.as_bytes()));
+        let ha1 = md5("u:r:pw");
+        let ha2 = md5("GET:/p");
+        let want = md5(&format!(
+            "{ha1}:n1:{}:{}:auth:{ha2}",
+            field("nc"),
+            field("cnonce")
+        ));
+        assert_eq!(field("response"), want);
+    }
+
+    #[test]
+    fn digest_retries_once_on_stale_nonce() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let replies: [&[u8]; 3] = [
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"r\", nonce=\"n1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"r\", nonce=\"n2\", stale=true\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ];
+            for reply in replies {
+                let (mut s, _) = listener.accept().unwrap();
+                read_request(&mut s).unwrap();
+                s.write_all(reply).unwrap();
+                crate::test_support::graceful_close(&mut s);
+            }
+        });
+        let resp = Request::get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .basic_auth("u", "pw")
+            .digest_auth(true)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status, 200);
     }
 }

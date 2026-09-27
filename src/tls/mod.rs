@@ -107,9 +107,9 @@ pub(crate) fn build_client_engine(
     sni: &str,
     opts: &mut TlsOpts,
 ) -> crate::error::Result<crate::proto::tls::RustlsEngine> {
-    Ok(crate::proto::tls::RustlsEngine(backend::build_client_conn(
-        sni, opts,
-    )?))
+    Ok(crate::proto::tls::RustlsEngine::new(
+        backend::build_client_conn(sni, opts)?,
+    ))
 }
 
 #[cfg(all(feature = "purecrypto-tls", not(feature = "rustls-tls")))]
