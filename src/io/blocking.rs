@@ -76,6 +76,8 @@ where
 {
     let mut scratch = [0u8; 16 * 1024];
     let mut out = Vec::new();
+    // Input the machine has not consumed yet, re-offered with the next read.
+    let mut pending: Vec<u8> = Vec::new();
     let mut eof_seen = false;
 
     loop {
@@ -126,7 +128,8 @@ where
                 machine.handle_eof()?;
             }
             Ok(n) => {
-                machine.handle_input(&scratch[..n])?;
+                pending.extend_from_slice(&scratch[..n]);
+                crate::io::asyncio::feed(machine, &mut pending)?;
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 if !timer_armed {

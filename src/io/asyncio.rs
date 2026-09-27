@@ -26,6 +26,9 @@ where
     let mut events = Vec::new();
     let mut scratch = [0u8; 16 * 1024];
     let mut out = Vec::new();
+    // Input the machine has not consumed yet; re-offered, with new bytes
+    // appended, on the next read (the `handle_input` contract).
+    let mut pending: Vec<u8> = Vec::new();
     let mut eof_seen = false;
 
     loop {
@@ -59,7 +62,72 @@ where
             eof_seen = true;
             machine.handle_eof()?;
         } else {
-            machine.handle_input(&scratch[..n])?;
+            pending.extend_from_slice(&scratch[..n]);
+            feed(machine, &mut pending)?;
         }
+    }
+}
+
+/// Offer `pending` to `machine` until it stops consuming, keeping whatever it
+/// leaves for the next read. A machine may take less than it is offered (a
+/// partial frame it wants contiguously); returning 0 means "need more bytes".
+pub(crate) fn feed<M: Machine>(machine: &mut M, pending: &mut Vec<u8>) -> Result<()> {
+    while !pending.is_empty() {
+        let used = machine.handle_input(pending)?.min(pending.len());
+        if used == 0 {
+            break;
+        }
+        pending.drain(..used);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A machine that only consumes whole 4-byte records, one per call, and
+    /// finishes after `want` of them.
+    struct Records {
+        want: usize,
+        got: Vec<Vec<u8>>,
+    }
+
+    impl Machine for Records {
+        type Event = Vec<u8>;
+        fn handle_input(&mut self, wire: &[u8]) -> Result<usize> {
+            if wire.len() < 4 {
+                return Ok(0);
+            }
+            self.got.push(wire[..4].to_vec());
+            Ok(4)
+        }
+        fn poll_transmit(&mut self, _out: &mut Vec<u8>) -> bool {
+            false
+        }
+        fn poll_event(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+        fn is_finished(&self) -> bool {
+            self.got.len() >= self.want
+        }
+    }
+
+    #[test]
+    fn unconsumed_input_is_reoffered() {
+        let mut m = Records {
+            want: 3,
+            got: Vec::new(),
+        };
+        let mut pending = b"aaaabb".to_vec();
+        feed(&mut m, &mut pending).unwrap();
+        assert_eq!(pending, b"bb", "partial record kept");
+        pending.extend_from_slice(b"bbcccc");
+        feed(&mut m, &mut pending).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(
+            m.got,
+            vec![b"aaaa".to_vec(), b"bbbb".to_vec(), b"cccc".to_vec()]
+        );
     }
 }

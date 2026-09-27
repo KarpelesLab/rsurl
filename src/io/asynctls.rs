@@ -25,11 +25,21 @@ fn to_io(e: crate::error::Error) -> io::Error {
 }
 
 /// An async, plaintext byte stream layered on the encrypted `conn`.
+///
+/// Reads are cancel-safe as long as `conn.read` is: ciphertext is only fed to
+/// the engine after a read completes. Writes are not: once plaintext has been
+/// sealed into records, a `conn.write_all` that fails or is dropped part-way
+/// leaves an unknown prefix of those records on the wire, so the stream is
+/// marked poisoned and every later operation fails instead of desynchronising
+/// the TLS record layer.
 pub(crate) struct AsyncTlsStream<C> {
     conn: C,
     engine: ClientEngine,
     /// Scratch for inbound ciphertext reads.
     inbuf: Vec<u8>,
+    /// Set while ciphertext is being written, and left set if that write fails
+    /// or its future is dropped.
+    poisoned: bool,
 }
 
 impl<C: AsyncConn> AsyncTlsStream<C> {
@@ -67,12 +77,43 @@ impl<C: AsyncConn> AsyncTlsStream<C> {
             conn,
             engine,
             inbuf,
+            poisoned: false,
         })
+    }
+
+    fn check_not_poisoned(&self) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tls: stream unusable after an interrupted or failed write",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Write out every record the engine has queued (and flush when asked),
+    /// poisoning the stream for the duration — see the type docs.
+    async fn send_queued(&mut self, flush: bool) -> io::Result<()> {
+        let mut out = Vec::new();
+        self.engine.drain_outgoing(&mut out);
+        if out.is_empty() && !flush {
+            return Ok(());
+        }
+        self.poisoned = true;
+        if !out.is_empty() {
+            self.conn.write_all(&out).await?;
+        }
+        if flush {
+            self.conn.flush().await?;
+        }
+        self.poisoned = false;
+        Ok(())
     }
 }
 
 impl<C: AsyncConn> AsyncConn for AsyncTlsStream<C> {
     async fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        self.check_not_poisoned()?;
         loop {
             // Drain already-decrypted plaintext first.
             let n = self.engine.read_plaintext(dst).map_err(to_io)?;
@@ -88,31 +129,18 @@ impl<C: AsyncConn> AsyncConn for AsyncTlsStream<C> {
             self.engine.feed_incoming(&chunk).map_err(to_io)?;
             // Feeding may have produced records to send (e.g. a TLS 1.3
             // post-handshake message or key update) — flush them.
-            let mut out = Vec::new();
-            self.engine.drain_outgoing(&mut out);
-            if !out.is_empty() {
-                self.conn.write_all(&out).await?;
-                self.conn.flush().await?;
-            }
+            self.send_queued(true).await?;
         }
     }
 
     async fn write_all(&mut self, src: &[u8]) -> io::Result<()> {
+        self.check_not_poisoned()?;
         self.engine.write_plaintext(src);
-        let mut out = Vec::new();
-        self.engine.drain_outgoing(&mut out);
-        if !out.is_empty() {
-            self.conn.write_all(&out).await?;
-        }
-        Ok(())
+        self.send_queued(false).await
     }
 
     async fn flush(&mut self) -> io::Result<()> {
-        let mut out = Vec::new();
-        self.engine.drain_outgoing(&mut out);
-        if !out.is_empty() {
-            self.conn.write_all(&out).await?;
-        }
-        self.conn.flush().await
+        self.check_not_poisoned()?;
+        self.send_queued(true).await
     }
 }

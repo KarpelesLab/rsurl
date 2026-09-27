@@ -94,17 +94,19 @@ pub(crate) const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 /// under that timeout could otherwise hold the connection for up to the 64 KiB
 /// header cap × ~60 s — a slowloris-style hold. This deadline caps the whole
 /// header read regardless of how the bytes are paced.
-const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The permessage-deflate offer we put in the upgrade request. We advertise
 /// `client_no_context_takeover` and `server_no_context_takeover` so each
 /// message inflates/deflates independently (no sliding window carried across
-/// messages), which keeps state bounded and the implementation simple. We
-/// also offer `client_max_window_bits` so a server that wants to shrink our
-/// (notional) window can; we don't carry context anyway, so any value it
-/// echoes is fine.
+/// messages), which keeps state bounded and the implementation simple.
+///
+/// We deliberately do **not** offer `client_max_window_bits`: our encoder
+/// always uses the full 32 KiB (15-bit) window, so if a server replied with a
+/// smaller value we could not honour it, and a zlib peer inflating with that
+/// smaller window would fail on back-references beyond it (RFC 7692 §7.1.2.2).
 const PMD_OFFER: &str =
-    "permessage-deflate; client_no_context_takeover; server_no_context_takeover; client_max_window_bits";
+    "permessage-deflate; client_no_context_takeover; server_no_context_takeover";
 
 /// Negotiated permessage-deflate (RFC 7692) state for a connection.
 ///
@@ -167,20 +169,38 @@ impl Pmd {
         let result = Self::run_inflate(&mut limited, &input);
         // Restore the (now advanced) decoder regardless of outcome.
         self.decoder = limited.into_inner();
-        result
+        let (out, stream_ended, consumed) = result?;
+        if stream_ended {
+            // The sender ended the DEFLATE stream with a BFINAL=1 block
+            // (RFC 7692 §7.2.3.4). A finished decoder would decode every later
+            // message to nothing, so start the next message on a fresh one.
+            self.decoder.reset();
+            // Anything the *sender* put after its final block would otherwise
+            // be silently dropped; only our own appended tail may remain.
+            if consumed < compressed.len() {
+                return Err(Error::BadResponse(
+                    "permessage-deflate: data after the final DEFLATE block".into(),
+                ));
+            }
+        }
+        Ok(out)
     }
 
     /// Drive the bounded decoder over `input`, collecting all inflated output.
     /// Stops at stream end (our own BFINAL=1 messages) or when the input is
     /// exhausted with no further progress (a peer's sync-flushed message,
     /// whose final empty block leaves the decoder parked in `InputEmpty`).
+    ///
+    /// Returns the inflated bytes, whether the stream ended (BFINAL), and how
+    /// many input bytes were consumed.
     fn run_inflate(
         limited: &mut LimitedDecoder<<Deflate as Algorithm>::Decoder>,
         input: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, bool, usize)> {
         let mut out: Vec<u8> = Vec::new();
         let mut scratch = vec![0u8; 64 * 1024];
         let mut consumed = 0usize;
+        let mut stream_ended = false;
         loop {
             let before_consumed = consumed;
             let before_written = out.len();
@@ -192,7 +212,10 @@ impl Pmd {
             out.extend_from_slice(&scratch[..p.written]);
             consumed += p.consumed;
             match status {
-                Status::StreamEnd => break,
+                Status::StreamEnd => {
+                    stream_ended = true;
+                    break;
+                }
                 Status::OutputFull => continue,
                 Status::InputEmpty => {
                     if consumed >= input.len()
@@ -203,7 +226,7 @@ impl Pmd {
                 }
             }
         }
-        Ok(out)
+        Ok((out, stream_ended, consumed))
     }
 }
 
@@ -440,6 +463,15 @@ struct WsTransport {
     /// ([`WsWriter::keepalive`]): a ping is sent only after this much time has
     /// elapsed with no write, so a busy connection is never pinged needlessly.
     last_write: Mutex<Instant>,
+    /// Set once an outbound write fails. The failed write may have put part
+    /// of a frame on the wire (e.g. a write timeout mid-frame), so any later
+    /// frame would be parsed by the peer as the tail of that one; every
+    /// subsequent write therefore fails fast instead of corrupting the stream.
+    broken: AtomicBool,
+    /// Serializes "is a close already sent?" checks with the writes they
+    /// guard, so a data frame can never follow our close frame on the wire
+    /// even when the reader echoes a peer close concurrently with a writer.
+    close_gate: Mutex<()>,
 }
 
 /// A socket read timeout/`WouldBlock` — i.e. a poll tick elapsed with no data,
@@ -461,7 +493,35 @@ impl WsTransport {
             shutdown: Arc::new(AtomicBool::new(false)),
             read_timeout: Mutex::new(Some(SEND_TIMEOUT)),
             last_write: Mutex::new(Instant::now()),
+            broken: AtomicBool::new(false),
+            close_gate: Mutex::new(()),
         }
+    }
+
+    /// Write one whole frame and flush it, unless we have already sent a close
+    /// (RFC 6455 §5.5.1: no data after our close). Atomic with respect to
+    /// [`write_close`](Self::write_close).
+    fn write_unless_closed(&self, send_closed: &AtomicBool, frame: &[u8]) -> Result<()> {
+        let _gate = self.close_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if send_closed.load(Ordering::SeqCst) {
+            return Err(Error::BadResponse(
+                "websocket: the connection is closed".into(),
+            ));
+        }
+        self.write_all(frame).map_err(Error::Io)?;
+        self.flush().map_err(Error::Io)
+    }
+
+    /// Send our close frame `frame` unless one was already sent; marks the
+    /// connection send-closed either way. Returns whether this call sent it.
+    fn write_close(&self, send_closed: &AtomicBool, frame: &[u8]) -> Result<bool> {
+        let _gate = self.close_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if send_closed.swap(true, Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.write_all(frame).map_err(Error::Io)?;
+        self.flush().map_err(Error::Io)?;
+        Ok(true)
     }
 
     /// How long since the last successful outbound write. Used by the keepalive
@@ -521,13 +581,30 @@ impl WsTransport {
     }
 
     fn write_all(&self, data: &[u8]) -> io::Result<()> {
-        self.kind.write_all(data)?;
+        self.check_not_broken()?;
+        if let Err(e) = self.kind.write_all(data) {
+            self.broken.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
         *self.last_write.lock().unwrap() = Instant::now();
         Ok(())
     }
 
     fn flush(&self) -> io::Result<()> {
-        self.kind.flush()
+        self.check_not_broken()?;
+        self.kind.flush().inspect_err(|_| {
+            self.broken.store(true, Ordering::SeqCst);
+        })
+    }
+
+    fn check_not_broken(&self) -> io::Result<()> {
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "websocket: connection unusable after an earlier failed write",
+            ));
+        }
+        Ok(())
     }
 
     fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
@@ -633,10 +710,17 @@ pub struct WsReader {
     /// Wire bytes read but not yet consumed into a delivered frame; only drained
     /// once a whole frame is assembled, so a mid-frame read error is resumable.
     rxbuf: Vec<u8>,
+    /// A fragmented data message whose first frame(s) have arrived but whose
+    /// FIN frame has not. Kept on the reader (not the stack) so a read error
+    /// between fragments — typically a read timeout on a peer that pauses
+    /// mid-message — leaves the message resumable by the next `recv`.
+    partial: Option<PartialMessage>,
     pmd: Option<Pmd>,
     compression: bool,
     /// Auto-reply to incoming pings with a pong (default `true`); curl's
-    /// `CURLWS_NOAUTOPONG`.
+    /// `CURLWS_NOAUTOPONG`. Only [`recv_event`](WsReader::recv_event) honours
+    /// it being off; [`recv`](WsReader::recv) always answers pings because it
+    /// never surfaces them to the caller.
     auto_pong: bool,
     /// We have sent a close frame (shared with the writer half).
     send_closed: Arc<AtomicBool>,
@@ -645,6 +729,17 @@ pub struct WsReader {
     /// A dedicated socket clone for [`WsShutdown`], or `None` if the transport
     /// can't be cloned (e.g. the in-process mock).
     shutdown: Option<ShutdownSock>,
+}
+
+/// The reassembly state of a fragmented data message in progress.
+struct PartialMessage {
+    /// The data opcode (text/binary) of the message's first frame.
+    opcode: u8,
+    /// RSV1 was set on the first frame: the message is permessage-deflate
+    /// compressed.
+    compressed: bool,
+    /// The (still compressed, if `compressed`) payload so far.
+    buf: Vec<u8>,
 }
 
 /// The write half of a [`WebSocket`] (from [`split`](WebSocket::split)). Sends
@@ -760,10 +855,9 @@ fn spawn_keepalive(
                 // A failed ping means the socket is gone — stop quietly.
                 match build_client_frame(OPCODE_PING, &[]) {
                     Ok(frame) => {
-                        if transport.write_all(&frame).is_err() {
+                        if transport.write_unless_closed(&send_closed, &frame).is_err() {
                             return;
                         }
-                        let _ = transport.flush();
                     }
                     Err(_) => return,
                 }
@@ -888,6 +982,7 @@ impl WebSocket {
             reader: WsReader {
                 transport: Arc::clone(&transport),
                 rxbuf: Vec::new(),
+                partial: None,
                 pmd,
                 compression,
                 auto_pong: true,
@@ -1083,11 +1178,17 @@ impl WsReader {
         self.send_closed.load(Ordering::SeqCst) || self.recv_closed.load(Ordering::SeqCst)
     }
 
-    /// Block until the next data message arrives, auto-answering interleaved
-    /// control frames. `Ok(None)` once the peer closes.
+    /// Block until the next data message arrives, answering interleaved
+    /// control frames. Pings are always answered here — whatever
+    /// [`set_auto_pong`](Self::set_auto_pong) says — because `recv` never
+    /// surfaces them, so nobody else could. `Ok(None)` once the peer closes.
+    ///
+    /// A read error (e.g. the read timeout) part-way through a fragmented
+    /// message is resumable: the fragments received so far are kept and the
+    /// next call carries on with the same message.
     pub fn recv(&mut self) -> Result<Option<WsMessage>> {
         loop {
-            match self.recv_event()? {
+            match self.next_event(true)? {
                 WsEvent::Text(s) => return Ok(Some(WsMessage::Text(s))),
                 WsEvent::Binary(b) => return Ok(Some(WsMessage::Binary(b))),
                 WsEvent::Ping(_) | WsEvent::Pong(_) => continue,
@@ -1098,24 +1199,24 @@ impl WsReader {
 
     /// Receive the next [`WsEvent`], surfacing control frames. A ping is
     /// auto-ponged (through the shared, write-serialized transport) unless
-    /// auto-pong is off; a close is echoed.
+    /// auto-pong is off; a close is echoed with the peer's status code.
     pub fn recv_event(&mut self) -> Result<WsEvent> {
+        self.next_event(self.auto_pong)
+    }
+
+    fn next_event(&mut self, auto_pong: bool) -> Result<WsEvent> {
         if self.recv_closed.load(Ordering::SeqCst) {
             return Ok(WsEvent::Close(None));
         }
-        let mut frag_opcode: Option<u8> = None;
-        let mut compressed = false;
-        let mut buf: Vec<u8> = Vec::new();
-
         loop {
-            let frame = read_frame(&mut TransportIo(self.transport.as_ref()), &mut self.rxbuf)?;
+            let frame = self.next_frame()?;
 
             if frame.opcode >= 0x8 {
                 validate_control_frame(&frame)?;
-                let mid_message = frag_opcode.is_some();
+                let mid_message = self.partial.is_some();
                 match frame.opcode {
                     OPCODE_PING => {
-                        if self.auto_pong {
+                        if auto_pong {
                             let pong = build_client_frame(OPCODE_PONG, &frame.payload)?;
                             self.transport.write_all(&pong).map_err(Error::Io)?;
                             self.transport.flush().map_err(Error::Io)?;
@@ -1131,17 +1232,7 @@ impl WsReader {
                         }
                         return Ok(WsEvent::Pong(frame.payload));
                     }
-                    OPCODE_CLOSE => {
-                        // Echo the close (best-effort) unless we already sent one.
-                        if !self.send_closed.swap(true, Ordering::SeqCst) {
-                            if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
-                                let _ = self.transport.write_all(&close);
-                                let _ = self.transport.flush();
-                            }
-                        }
-                        self.recv_closed.store(true, Ordering::SeqCst);
-                        return Ok(WsEvent::Close(parse_close_payload(&frame.payload)));
-                    }
+                    OPCODE_CLOSE => return self.handle_close(&frame.payload),
                     other => {
                         return Err(Error::BadResponse(format!(
                             "unknown WS control opcode 0x{other:x}"
@@ -1152,39 +1243,42 @@ impl WsReader {
 
             match frame.opcode {
                 OPCODE_TEXT | OPCODE_BINARY => {
-                    if frag_opcode.is_some() {
+                    if self.partial.is_some() {
                         return Err(Error::BadResponse(
                             "new data frame began while a fragmented message was in progress"
                                 .into(),
                         ));
                     }
-                    if frame.rsv1 {
-                        if self.pmd.is_none() {
-                            return Err(Error::BadResponse(
-                                "RSV1 set on a WS frame but permessage-deflate was not negotiated"
-                                    .into(),
-                            ));
-                        }
-                        compressed = true;
+                    if frame.rsv1 && self.pmd.is_none() {
+                        return Err(Error::BadResponse(
+                            "RSV1 set on a WS frame but permessage-deflate was not negotiated"
+                                .into(),
+                        ));
                     }
-                    accumulate(&mut buf, &frame.payload)?;
                     if frame.fin {
-                        return self.finish_event(frame.opcode, buf, compressed);
+                        return self.finish_event(frame.opcode, frame.payload, frame.rsv1);
                     }
-                    frag_opcode = Some(frame.opcode);
+                    self.partial = Some(PartialMessage {
+                        opcode: frame.opcode,
+                        compressed: frame.rsv1,
+                        buf: frame.payload,
+                    });
                 }
                 OPCODE_CONT => {
-                    let opcode = frag_opcode.ok_or_else(|| {
-                        Error::BadResponse("continuation frame with no message in progress".into())
-                    })?;
+                    let Some(partial) = self.partial.as_mut() else {
+                        return Err(Error::BadResponse(
+                            "continuation frame with no message in progress".into(),
+                        ));
+                    };
                     if frame.rsv1 {
                         return Err(Error::BadResponse(
                             "RSV1 set on a WS continuation frame".into(),
                         ));
                     }
-                    accumulate(&mut buf, &frame.payload)?;
+                    accumulate(&mut partial.buf, &frame.payload)?;
                     if frame.fin {
-                        return self.finish_event(opcode, buf, compressed);
+                        let done = self.partial.take().expect("checked above");
+                        return self.finish_event(done.opcode, done.buf, done.compressed);
                     }
                 }
                 other => {
@@ -1194,23 +1288,92 @@ impl WsReader {
         }
     }
 
-    fn finish_event(&mut self, opcode: u8, payload: Vec<u8>, compressed: bool) -> Result<WsEvent> {
-        match finish_data_message(opcode, payload, compressed, self.pmd.as_mut())? {
-            Message::Data { opcode, payload } if opcode == OPCODE_TEXT => {
-                let s = String::from_utf8(payload).map_err(|_| {
-                    Error::BadResponse("WS TEXT message payload is not valid UTF-8".into())
-                })?;
-                Ok(WsEvent::Text(s))
+    /// Read the next whole frame. A transport EOF means the peer is gone, so it
+    /// also marks the receive side closed (then surfaces the error).
+    fn next_frame(&mut self) -> Result<Frame> {
+        match read_frame(&mut TransportIo(self.transport.as_ref()), &mut self.rxbuf) {
+            Err(Error::UnexpectedEof) => {
+                self.recv_closed.store(true, Ordering::SeqCst);
+                Err(Error::UnexpectedEof)
             }
-            Message::Data { payload, .. } => Ok(WsEvent::Binary(payload)),
-            Message::Closed => Ok(WsEvent::Close(None)),
+            other => other,
+        }
+    }
+
+    /// Handle a peer CLOSE: validate it, echo its status code (unless we had
+    /// already sent our own close), and mark the receive side closed. A
+    /// malformed close fails the connection with 1002/1007 (RFC 6455 §7.1.7).
+    fn handle_close(&mut self, payload: &[u8]) -> Result<WsEvent> {
+        self.recv_closed.store(true, Ordering::SeqCst);
+        match parse_close_payload(payload) {
+            Ok(close) => {
+                if let Ok(frame) =
+                    build_client_frame(OPCODE_CLOSE, &close_echo_payload(close.as_ref()))
+                {
+                    // Best-effort: the peer is closing regardless.
+                    let _ = self.transport.write_close(&self.send_closed, &frame);
+                }
+                Ok(WsEvent::Close(close))
+            }
+            Err(status) => {
+                self.fail(status);
+                Err(bad_close_error(status))
+            }
+        }
+    }
+
+    /// _Fail the WebSocket Connection_ (RFC 6455 §7.1.7): send a close frame
+    /// carrying `status` (best-effort, and only if we have not closed yet).
+    fn fail(&self, status: u16) {
+        if let Ok(frame) =
+            close_payload(status, "").and_then(|p| build_client_frame(OPCODE_CLOSE, &p))
+        {
+            let _ = self.transport.write_close(&self.send_closed, &frame);
+        }
+    }
+
+    fn finish_event(&mut self, opcode: u8, payload: Vec<u8>, compressed: bool) -> Result<WsEvent> {
+        let payload = if compressed {
+            let pmd = self.pmd.as_mut().ok_or_else(|| {
+                Error::BadResponse(
+                    "compressed WS message without negotiated permessage-deflate".into(),
+                )
+            })?;
+            pmd.inflate_message(&payload)?
+        } else {
+            payload
+        };
+        if opcode != OPCODE_TEXT {
+            return Ok(WsEvent::Binary(payload));
+        }
+        // RFC 6455 §8.1: invalid UTF-8 in a text message fails the connection
+        // with 1007. Validated on the whole (reassembled, inflated) message so a
+        // code point split across fragments is fine.
+        match String::from_utf8(payload) {
+            Ok(s) => Ok(WsEvent::Text(s)),
+            Err(_) => {
+                self.fail(CLOSE_INVALID_DATA);
+                Err(Error::BadResponse(
+                    "WS TEXT message payload is not valid UTF-8".into(),
+                ))
+            }
         }
     }
 
     /// Receive a single raw frame (no reassembly/decompression/control
-    /// handling) — curl's raw mode.
+    /// handling) — curl's raw mode. The frame-level rules still apply: RSV1 is
+    /// only legal on the first frame of a data message and only when
+    /// permessage-deflate was negotiated, and control frames must be
+    /// unfragmented.
     pub fn recv_frame(&mut self) -> Result<WsFrame> {
-        let frame = read_frame(&mut TransportIo(self.transport.as_ref()), &mut self.rxbuf)?;
+        let frame = self.next_frame()?;
+        if frame.opcode >= 0x8 {
+            validate_control_frame(&frame)?;
+        } else if frame.rsv1 && (self.pmd.is_none() || frame.opcode == OPCODE_CONT) {
+            return Err(Error::BadResponse(
+                "RSV1 set on a WS frame where permessage-deflate does not allow it".into(),
+            ));
+        }
         Ok(WsFrame {
             fin: frame.fin,
             opcode: WsOpcode::from_u8(frame.opcode)?,
@@ -1234,35 +1397,21 @@ impl WsWriter {
         })
     }
 
-    fn ensure_open(&self) -> Result<()> {
-        if self.send_closed.load(Ordering::SeqCst) {
-            return Err(Error::BadResponse(
-                "websocket: the connection is closed".into(),
-            ));
-        }
-        Ok(())
+    /// Write one whole frame unless a close has been sent (by either half).
+    fn write_frame(&self, frame: &[u8]) -> Result<()> {
+        self.transport.write_unless_closed(&self.send_closed, frame)
     }
 
     /// Send a UTF-8 text message (opcode 0x1).
     pub fn send_text(&mut self, text: &str) -> Result<()> {
-        self.ensure_open()?;
-        send_message(
-            &mut TransportIo(self.transport.as_ref()),
-            OPCODE_TEXT,
-            text.as_bytes(),
-            self.compress,
-        )
+        let frame = build_data_frame(OPCODE_TEXT, text.as_bytes(), self.compress)?;
+        self.write_frame(&frame)
     }
 
     /// Send a binary message (opcode 0x2).
     pub fn send_binary(&mut self, data: &[u8]) -> Result<()> {
-        self.ensure_open()?;
-        send_message(
-            &mut TransportIo(self.transport.as_ref()),
-            OPCODE_BINARY,
-            data,
-            self.compress,
-        )
+        let frame = build_data_frame(OPCODE_BINARY, data, self.compress)?;
+        self.write_frame(&frame)
     }
 
     /// Stream a data message from `reader`, fragmenting it across frames so the
@@ -1271,13 +1420,16 @@ impl WsWriter {
     /// uncompressed regardless of the negotiated permessage-deflate (streaming
     /// DEFLATE would need the whole message). Control frames (e.g. a reader's
     /// auto-pong) may interleave between fragments, which is spec-legal.
+    ///
+    /// If the connection closes part-way (e.g. the paired reader echoes a peer
+    /// close), no further fragment is sent and this returns an error: nothing
+    /// may follow a close frame on the wire.
     pub fn send_stream<R: Read>(&mut self, opcode: WsOpcode, reader: &mut R) -> Result<()> {
-        self.ensure_open()?;
-        send_stream_inner(
-            &mut TransportIo(self.transport.as_ref()),
-            opcode.to_u8(),
-            reader,
-        )
+        let transport = Arc::clone(&self.transport);
+        let send_closed = Arc::clone(&self.send_closed);
+        send_stream_inner(opcode.to_u8(), reader, |frame| {
+            transport.write_unless_closed(&send_closed, frame)
+        })
     }
 
     /// Start sending a PING whenever the connection is idle (no outbound write)
@@ -1303,20 +1455,18 @@ impl WsWriter {
 
     /// Send a ping with `payload` (≤ 125 bytes).
     pub fn ping(&mut self, payload: &[u8]) -> Result<()> {
-        self.ensure_open()?;
         self.send_control(OPCODE_PING, payload)
     }
 
     /// Send a pong with `payload` (≤ 125 bytes).
     pub fn send_pong(&mut self, payload: &[u8]) -> Result<()> {
-        self.ensure_open()?;
         self.send_control(OPCODE_PONG, payload)
     }
 
     /// Send a low-level frame, bypassing reassembly and permessage-deflate
-    /// (curl's raw mode).
+    /// (curl's raw mode). A [`WsOpcode::Close`] frame sent this way marks the
+    /// connection closed, like [`close`](Self::close).
     pub fn send_frame(&mut self, fin: bool, opcode: WsOpcode, payload: &[u8]) -> Result<()> {
-        self.ensure_open()?;
         if opcode.is_control() {
             if !fin {
                 return Err(Error::BadResponse(
@@ -1331,9 +1481,10 @@ impl WsWriter {
             }
         }
         let frame = build_client_frame_inner(fin, opcode.to_u8(), payload, false)?;
-        self.transport.write_all(&frame).map_err(Error::Io)?;
-        self.transport.flush().map_err(Error::Io)?;
-        Ok(())
+        if opcode == WsOpcode::Close {
+            return self.send_close_frame(&frame);
+        }
+        self.write_frame(&frame)
     }
 
     fn send_control(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
@@ -1344,32 +1495,29 @@ impl WsWriter {
             )));
         }
         let frame = build_client_frame(opcode, payload)?;
-        self.transport.write_all(&frame).map_err(Error::Io)?;
-        self.transport.flush().map_err(Error::Io)?;
+        self.write_frame(&frame)
+    }
+
+    /// Send our close `frame` once; later calls (or a close already echoed by
+    /// the reader) are no-ops.
+    fn send_close_frame(&mut self, frame: &[u8]) -> Result<()> {
+        self.transport.write_close(&self.send_closed, frame)?;
         Ok(())
     }
 
     /// Send a close frame and mark the connection closed. Idempotent.
     pub fn close(&mut self) -> Result<()> {
-        if self.send_closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
         let frame = build_client_frame(OPCODE_CLOSE, &[])?;
-        self.transport.write_all(&frame).map_err(Error::Io)?;
-        self.transport.flush().map_err(Error::Io)?;
-        Ok(())
+        self.send_close_frame(&frame)
     }
 
     /// Send a close frame with a status code and reason, then mark closed.
+    /// Idempotent. `code` must be one that may appear on the wire (1000-1003,
+    /// 1007-1014 or 3000-4999); 1005/1006/1015 are local-only and rejected.
     pub fn close_with(&mut self, code: u16, reason: &str) -> Result<()> {
         let payload = close_payload(code, reason)?;
-        if self.send_closed.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
         let frame = build_client_frame(OPCODE_CLOSE, &payload)?;
-        self.transport.write_all(&frame).map_err(Error::Io)?;
-        self.transport.flush().map_err(Error::Io)?;
-        Ok(())
+        self.send_close_frame(&frame)
     }
 }
 
@@ -1401,11 +1549,7 @@ fn handshake<S: Read + Write>(
     };
 
     // Sec-WebSocket-Protocol: comma-separated subprotocols in preference order.
-    let proto_header = if subprotocols.is_empty() {
-        String::new()
-    } else {
-        format!("Sec-WebSocket-Protocol: {}\r\n", subprotocols.join(", "))
-    };
+    let proto_header = subprotocol_header(subprotocols)?;
 
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
@@ -1425,14 +1569,95 @@ fn handshake<S: Read + Write>(
     // post-handshake WS frame stream. RFC 6455 requires the response end at
     // \r\n\r\n with no extra data, so this is fine.
     let buf = read_handshake_head(stream, HANDSHAKE_DEADLINE)?;
+    let resp = check_handshake_response(&buf, &key_b64, subprotocols)?;
 
-    let head = std::str::from_utf8(&buf)
+    // If the server accepted permessage-deflate, enable compression and record
+    // the negotiated context-takeover parameters. Otherwise operate
+    // uncompressed exactly as before.
+    let pmd = match resp.extensions.as_deref() {
+        Some(v) => parse_pmd_response(v)?,
+        None => None,
+    };
+
+    Ok((pmd, resp.subprotocol))
+}
+
+/// The `Sec-WebSocket-Protocol` request header line (with trailing CRLF) for
+/// `subprotocols`, or an empty string when none are offered. Each value must
+/// be a non-empty RFC 7230 token (RFC 6455 §4.1), which also rules out CR/LF
+/// header injection and a `,` that would split one value into two. Shared with
+/// the async WebSocket in `crate::aio`.
+pub(crate) fn subprotocol_header(subprotocols: &[String]) -> Result<String> {
+    if subprotocols.is_empty() {
+        return Ok(String::new());
+    }
+    for p in subprotocols {
+        if !is_http_token(p) {
+            return Err(Error::InvalidUrl(format!(
+                "websocket: invalid subprotocol {p:?} (must be an HTTP token)"
+            )));
+        }
+    }
+    Ok(format!(
+        "Sec-WebSocket-Protocol: {}\r\n",
+        subprotocols.join(", ")
+    ))
+}
+
+/// Whether `s` is a non-empty RFC 7230 §3.2.6 `token`.
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// The parts of a validated `101` upgrade response the caller still needs.
+pub(crate) struct HandshakeResponse {
+    /// The (comma-joined) `Sec-WebSocket-Extensions` value, if any was sent.
+    pub(crate) extensions: Option<String>,
+    /// The subprotocol the server selected — guaranteed to be one we offered.
+    pub(crate) subprotocol: Option<String>,
+}
+
+/// Validate the upgrade response head `buf` (through the blank line) for the
+/// request that carried `key_b64` and offered `offered` subprotocols (RFC 6455
+/// §4.1): an `HTTP/1.1 101` status, `Upgrade: websocket`, `Connection:
+/// upgrade`, the matching `Sec-WebSocket-Accept`, and — if present — a
+/// `Sec-WebSocket-Protocol` naming exactly one of the offered values. Shared by
+/// the blocking and async clients so the two cannot diverge.
+pub(crate) fn check_handshake_response(
+    buf: &[u8],
+    key_b64: &str,
+    offered: &[String],
+) -> Result<HandshakeResponse> {
+    let head = std::str::from_utf8(buf)
         .map_err(|_| Error::BadResponse("non-utf8 handshake response".into()))?;
     let mut lines = head.split("\r\n");
     let status_line = lines
         .next()
         .ok_or_else(|| Error::BadResponse("empty handshake response".into()))?;
-    if !(status_line.starts_with("HTTP/1.1 101") || status_line.starts_with("HTTP/1.0 101")) {
+    // The upgrade mechanism is HTTP/1.1-only (RFC 6455 §4.1 requires an
+    // HTTP/1.1-or-higher response; an HTTP/1.0 server cannot upgrade).
+    let mut parts = status_line.split(' ');
+    if parts.next() != Some("HTTP/1.1") || parts.next() != Some("101") {
         return Err(Error::BadResponse(format!(
             "expected 101 Switching Protocols, got: {status_line:?}"
         )));
@@ -1465,7 +1690,11 @@ fn handshake<S: Read + Write>(
         } else if k.eq_ignore_ascii_case("sec-websocket-accept") {
             accept_value = Some(v.to_string());
         } else if k.eq_ignore_ascii_case("sec-websocket-protocol") {
-            subprotocol_value = Some(v.to_string());
+            if subprotocol_value.replace(v.to_string()).is_some() {
+                return Err(Error::BadResponse(
+                    "websocket: server sent Sec-WebSocket-Protocol more than once".into(),
+                ));
+            }
         } else if k.eq_ignore_ascii_case("sec-websocket-extensions") {
             // A server may repeat the header; concatenate as the spec allows
             // a comma-joined list to be split across lines.
@@ -1490,19 +1719,27 @@ fn handshake<S: Read + Write>(
     }
     let accept = accept_value
         .ok_or_else(|| Error::BadResponse("missing Sec-WebSocket-Accept header".into()))?;
-    let expected = derive_accept(&key_b64);
+    let expected = derive_accept(key_b64);
     if accept != expected {
         return Err(Error::BadResponse(format!(
             "Sec-WebSocket-Accept mismatch: got {accept:?}, expected {expected:?}"
         )));
     }
 
-    // If the server accepted permessage-deflate, enable compression and record
-    // the negotiated context-takeover parameters. Otherwise operate
-    // uncompressed exactly as before.
-    let pmd = extensions_value.as_deref().and_then(parse_pmd_response);
+    // RFC 6455 §4.1: a subprotocol the client did not offer (or any, when it
+    // offered none) fails the connection. Values are compared exactly.
+    if let Some(sel) = &subprotocol_value {
+        if !offered.iter().any(|p| p == sel) {
+            return Err(Error::BadResponse(format!(
+                "websocket: server selected subprotocol {sel:?}, which was not offered"
+            )));
+        }
+    }
 
-    Ok((pmd, subprotocol_value))
+    Ok(HandshakeResponse {
+        extensions: extensions_value.filter(|v| !v.trim().is_empty()),
+        subprotocol: subprotocol_value,
+    })
 }
 
 /// Read the HTTP/1.1 upgrade-handshake response header off `stream`, one byte
@@ -1543,47 +1780,107 @@ fn read_handshake_head<S: Read>(stream: &mut S, deadline: Duration) -> Result<Ve
 }
 
 /// Parse a `Sec-WebSocket-Extensions` response value and, if it selects
-/// `permessage-deflate`, return the negotiated `Pmd` state. Returns `None`
-/// if permessage-deflate was not selected.
+/// `permessage-deflate`, return the negotiated `Pmd` state. Returns
+/// `Ok(None)` if the server selected no extension.
 ///
 /// The header is a comma-separated list of extensions, each a semicolon-
 /// separated list of `token[=value]` parameters (RFC 7692 §7 / RFC 6455 §9.1).
-/// We look only at the first `permessage-deflate` offer the server returned
-/// (a compliant server returns at most one) and read the two
-/// context-takeover flags; `*_max_window_bits` values are accepted but, since
-/// we never carry a window on our side and bound the inflate output by byte
-/// count regardless, they don't change our behaviour.
-fn parse_pmd_response(value: &str) -> Option<Pmd> {
-    for ext in value.split(',') {
-        let mut params = ext.split(';').map(str::trim);
-        let name = params.next()?;
-        if !name.eq_ignore_ascii_case("permessage-deflate") {
+/// The client MUST fail the connection on a response it did not ask for
+/// (RFC 6455 §4.1 / RFC 7692 §7.1), so this is strict:
+///
+///  * any extension other than `permessage-deflate`, or more than one
+///    `permessage-deflate` element, is rejected (we offered exactly one);
+///  * unknown or duplicate parameters are rejected;
+///  * the `*_no_context_takeover` flags must carry no value;
+///  * `server_max_window_bits` must be an integer 8..=15 (our inflater keeps a
+///    full 32 KiB window, so any smaller server window decodes correctly);
+///  * `client_max_window_bits` was not offered (see [`PMD_OFFER`]); it is
+///    tolerated only as the no-op value `15`, since we cannot compress with a
+///    smaller window.
+fn parse_pmd_response(value: &str) -> Result<Option<Pmd>> {
+    let bad = |why: &str| {
+        Error::BadResponse(format!(
+            "websocket: invalid Sec-WebSocket-Extensions response ({why}): {value:?}"
+        ))
+    };
+    let mut pmd: Option<Pmd> = None;
+    for ext in value.split(',').map(str::trim) {
+        if ext.is_empty() {
             continue;
+        }
+        let mut params = ext.split(';').map(str::trim);
+        let name = params.next().unwrap_or("");
+        if !name.eq_ignore_ascii_case("permessage-deflate") {
+            return Err(bad("extension was not offered"));
+        }
+        if pmd.is_some() {
+            return Err(bad("permessage-deflate selected more than once"));
         }
         let mut client_no_context_takeover = false;
         let mut server_no_context_takeover = false;
+        let mut server_max_window_bits = false;
+        let mut client_max_window_bits = false;
         for param in params {
-            if param.is_empty() {
-                continue;
+            let (key, val) = match param.split_once('=') {
+                Some((k, v)) => {
+                    let v = v.trim();
+                    // RFC 6455 §9.1 allows a quoted-string value.
+                    let v = v
+                        .strip_prefix('"')
+                        .and_then(|v| v.strip_suffix('"'))
+                        .unwrap_or(v);
+                    (k.trim(), Some(v))
+                }
+                None => (param, None),
+            };
+            let flag = |seen: &mut bool| -> Result<()> {
+                if std::mem::replace(seen, true) {
+                    return Err(bad("duplicate parameter"));
+                }
+                Ok(())
+            };
+            if key.eq_ignore_ascii_case("client_no_context_takeover") {
+                flag(&mut client_no_context_takeover)?;
+                if val.is_some() {
+                    return Err(bad("client_no_context_takeover takes no value"));
+                }
+            } else if key.eq_ignore_ascii_case("server_no_context_takeover") {
+                flag(&mut server_no_context_takeover)?;
+                if val.is_some() {
+                    return Err(bad("server_no_context_takeover takes no value"));
+                }
+            } else if key.eq_ignore_ascii_case("server_max_window_bits") {
+                flag(&mut server_max_window_bits)?;
+                match val.and_then(parse_window_bits) {
+                    Some(_) => {}
+                    None => return Err(bad("server_max_window_bits must be 8..=15")),
+                }
+            } else if key.eq_ignore_ascii_case("client_max_window_bits") {
+                flag(&mut client_max_window_bits)?;
+                if val.and_then(parse_window_bits) != Some(15) {
+                    return Err(bad("client_max_window_bits was not offered"));
+                }
+            } else {
+                return Err(bad("unknown parameter"));
             }
-            // A parameter may be `token` or `token=value`; we only key off the
-            // token names here.
-            let token = param.split('=').next().unwrap_or(param).trim();
-            if token.eq_ignore_ascii_case("client_no_context_takeover") {
-                client_no_context_takeover = true;
-            } else if token.eq_ignore_ascii_case("server_no_context_takeover") {
-                server_no_context_takeover = true;
-            }
-            // client_max_window_bits / server_max_window_bits are accepted but
-            // intentionally ignored (see the doc comment).
         }
-        return Some(Pmd {
+        pmd = Some(Pmd {
             client_no_context_takeover,
             server_no_context_takeover,
             decoder: Deflate::decoder(),
         });
     }
-    None
+    Ok(pmd)
+}
+
+/// Parse a `*_max_window_bits` value: a plain decimal 8..=15 (no sign, no
+/// leading zeros, per the RFC 7692 §7.1.2 ABNF).
+fn parse_window_bits(v: &str) -> Option<u8> {
+    if v.is_empty() || v.len() > 2 || v.starts_with('0') || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u8 = v.parse().ok()?;
+    (8..=15).contains(&n).then_some(n)
 }
 
 /// What `read_message` produced for the caller.
@@ -1657,13 +1954,19 @@ fn read_message<S: Read + Write>(stream: &mut S, mut pmd: Option<&mut Pmd>) -> R
                 }
                 OPCODE_PONG => continue,
                 OPCODE_CLOSE => {
-                    // Echo the close (masked, per §5.3). Best-effort: if we
-                    // can't build it we still report a clean close.
-                    if let Ok(close) = build_client_frame(OPCODE_CLOSE, &[]) {
+                    // Echo the close with the peer's status code (masked, per
+                    // §5.3), or fail the connection with 1002/1007 if the close
+                    // itself is malformed. Best-effort: if we can't build the
+                    // frame we still report the outcome.
+                    let (echo, outcome) = match parse_close_payload(&frame.payload) {
+                        Ok(close) => (Ok(close_echo_payload(close.as_ref())), Ok(Message::Closed)),
+                        Err(status) => (close_payload(status, ""), Err(bad_close_error(status))),
+                    };
+                    if let Ok(close) = echo.and_then(|p| build_client_frame(OPCODE_CLOSE, &p)) {
                         let _ = stream.write_all(&close);
                         let _ = stream.flush();
                     }
-                    return Ok(Message::Closed);
+                    return outcome;
                 }
                 other => {
                     return Err(Error::BadResponse(format!(
@@ -1755,7 +2058,7 @@ fn finish_data_message(
 /// Append `chunk` to the reassembly buffer, enforcing the cumulative cap.
 /// `read_frame` already bounds a single frame; this guards against many
 /// small fragments adding up past `MAX_PAYLOAD_BYTES`.
-fn accumulate(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
+pub(crate) fn accumulate(buf: &mut Vec<u8>, chunk: &[u8]) -> Result<()> {
     let total = buf.len() as u64 + chunk.len() as u64;
     if total > MAX_PAYLOAD_BYTES {
         return Err(Error::BadResponse(format!(
@@ -1787,45 +2090,94 @@ pub(crate) fn validate_control_frame(frame: &Frame) -> Result<()> {
     Ok(())
 }
 
-/// Parse a CLOSE frame's payload into a [`WsClose`] (RFC 6455 §5.5.1): a 2-byte
-/// big-endian status code optionally followed by a UTF-8 reason. An empty
-/// payload (no code) yields `None`; a 1-byte payload is malformed and also
-/// yields `None` rather than erroring (we are closing regardless).
-pub(crate) fn parse_close_payload(payload: &[u8]) -> Option<WsClose> {
-    if payload.len() < 2 {
-        return None;
-    }
-    let code = u16::from_be_bytes([payload[0], payload[1]]);
-    let reason = String::from_utf8_lossy(&payload[2..]).into_owned();
-    Some(WsClose { code, reason })
+/// Whether `code` may appear in a CLOSE frame on the wire (RFC 6455 §7.4.1 plus
+/// the IANA registry): 1000–1003, 1007–1014 and the application/private range
+/// 3000–4999. 1004 is reserved, 1005/1006/1015 are local-only pseudo-codes
+/// that MUST NOT be sent, and 1016–2999 are reserved for future use.
+pub(crate) fn is_valid_close_code(code: u16) -> bool {
+    matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
-/// Send a masked client data frame. `opcode` must be [`OPCODE_TEXT`] or
+/// Status code for a protocol error (RFC 6455 §7.4.1).
+pub(crate) const CLOSE_PROTOCOL_ERROR: u16 = 1002;
+/// Status code for data inconsistent with the message type, e.g. non-UTF-8
+/// text (RFC 6455 §7.4.1).
+pub(crate) const CLOSE_INVALID_DATA: u16 = 1007;
+
+/// Parse a received CLOSE frame's payload into a [`WsClose`] (RFC 6455
+/// §5.5.1): a 2-byte big-endian status code optionally followed by a UTF-8
+/// reason. An empty payload (no code) yields `Ok(None)`.
+///
+/// A malformed payload is a protocol violation that fails the connection: a
+/// 1-byte payload or a code that may not appear on the wire yields
+/// `Err(1002)`, a reason that is not valid UTF-8 yields `Err(1007)` — the
+/// status the caller should close with.
+pub(crate) fn parse_close_payload(payload: &[u8]) -> std::result::Result<Option<WsClose>, u16> {
+    match payload.len() {
+        0 => return Ok(None),
+        1 => return Err(CLOSE_PROTOCOL_ERROR),
+        _ => {}
+    }
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    if !is_valid_close_code(code) {
+        return Err(CLOSE_PROTOCOL_ERROR);
+    }
+    let reason = std::str::from_utf8(&payload[2..])
+        .map_err(|_| CLOSE_INVALID_DATA)?
+        .to_string();
+    Ok(Some(WsClose { code, reason }))
+}
+
+/// The error surfaced when the peer's CLOSE frame is malformed (`status` is
+/// what [`parse_close_payload`] returned, and what we closed with).
+pub(crate) fn bad_close_error(status: u16) -> Error {
+    Error::BadResponse(format!(
+        "websocket: malformed close frame from peer (failed the connection with {status})"
+    ))
+}
+
+/// The payload we echo back for a peer's close (RFC 6455 §5.5.1: "typically
+/// echos the status code it received"). No reason is echoed; a close that
+/// carried no code is answered with an empty payload.
+pub(crate) fn close_echo_payload(close: Option<&WsClose>) -> Vec<u8> {
+    match close {
+        Some(c) => c.code.to_be_bytes().to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Build a masked client data frame. `opcode` must be [`OPCODE_TEXT`] or
 /// [`OPCODE_BINARY`]; the payload is masked per RFC 6455 §5.3 using the
 /// crate's CSPRNG. Drives the send side of the persistent [`WebSocket`] API.
 ///
-/// When `pmd` is `Some` (permessage-deflate was negotiated), the payload is
+/// When `compress` is set (permessage-deflate was negotiated), the payload is
 /// raw-DEFLATE-compressed (RFC 7692 §7.2.1) and the frame's RSV1 bit is set.
 /// We always compress and never carry encoder context across messages, so
 /// each message is an independent stream (consistent with our
 /// `client_no_context_takeover` offer).
+fn build_data_frame(opcode: u8, payload: &[u8], compress: bool) -> Result<Vec<u8>> {
+    if opcode != OPCODE_TEXT && opcode != OPCODE_BINARY {
+        return Err(Error::BadResponse(format!(
+            "send_message expects a data opcode (text/binary), got 0x{opcode:x}"
+        )));
+    }
+    if compress {
+        let compressed = deflate_message(payload)?;
+        build_client_frame_rsv1(opcode, &compressed)
+    } else {
+        build_client_frame(opcode, payload)
+    }
+}
+
+/// Build a data frame with [`build_data_frame`] and write it to `stream`.
+#[cfg(test)]
 fn send_message<S: Write>(
     stream: &mut S,
     opcode: u8,
     payload: &[u8],
     compress: bool,
 ) -> Result<()> {
-    if opcode != OPCODE_TEXT && opcode != OPCODE_BINARY {
-        return Err(Error::BadResponse(format!(
-            "send_message expects a data opcode (text/binary), got 0x{opcode:x}"
-        )));
-    }
-    let frame = if compress {
-        let compressed = deflate_message(payload)?;
-        build_client_frame_rsv1(opcode, &compressed)?
-    } else {
-        build_client_frame(opcode, payload)?
-    };
+    let frame = build_data_frame(opcode, payload, compress)?;
     stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
@@ -1857,7 +2209,14 @@ fn read_chunk<R: Read>(reader: &mut R, cap: usize) -> io::Result<Vec<u8>> {
 /// once (only two `STREAM_CHUNK` buffers are held). Sent uncompressed: a
 /// per-message DEFLATE layer would require buffering the entire message. A
 /// zero-byte source sends a single empty `FIN` frame.
-fn send_stream_inner<S: Write, R: Read>(stream: &mut S, opcode: u8, reader: &mut R) -> Result<()> {
+///
+/// Each whole frame is handed to `emit`, which writes (and flushes) it — and
+/// may refuse, e.g. once the connection has closed, which stops the stream.
+fn send_stream_inner<R: Read>(
+    opcode: u8,
+    reader: &mut R,
+    mut emit: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     if opcode != OPCODE_TEXT && opcode != OPCODE_BINARY {
         return Err(Error::BadResponse(format!(
             "send_stream expects a data opcode (text/binary), got 0x{opcode:x}"
@@ -1871,14 +2230,13 @@ fn send_stream_inner<S: Write, R: Read>(stream: &mut S, opcode: u8, reader: &mut
         let fin = next.is_empty();
         let op = if first { opcode } else { OPCODE_CONT };
         let frame = build_client_frame_inner(fin, op, &cur, false)?;
-        stream.write_all(&frame)?;
+        emit(&frame)?;
         first = false;
         if fin {
             break;
         }
         cur = next;
     }
-    stream.flush()?;
     Ok(())
 }
 
@@ -1954,6 +2312,12 @@ pub(crate) fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
                 return Ok(None);
             }
             let v = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as u64;
+            // RFC 6455 §5.2: "the minimal number of bytes MUST be used".
+            if v < 126 {
+                return Err(Error::BadResponse(
+                    "non-minimal 16-bit WS payload length".into(),
+                ));
+            }
             pos += 2;
             v
         }
@@ -1962,6 +2326,18 @@ pub(crate) fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>> {
                 return Ok(None);
             }
             let v = u64::from_be_bytes(buf[pos..pos + 8].try_into().unwrap());
+            // The most significant bit MUST be 0, and the 64-bit form is only
+            // for lengths that do not fit in 16 bits (RFC 6455 §5.2).
+            if v >> 63 != 0 {
+                return Err(Error::BadResponse(
+                    "WS payload length has its most significant bit set".into(),
+                ));
+            }
+            if v <= u16::MAX as u64 {
+                return Err(Error::BadResponse(
+                    "non-minimal 64-bit WS payload length".into(),
+                ));
+            }
             pos += 8;
             v
         }
@@ -2028,6 +2404,13 @@ fn read_frame<S: Read>(stream: &mut S, rx: &mut Vec<u8>) -> Result<Frame> {
 /// frame. Shared by the blocking [`WsWriter::close_with`] and the async
 /// [`crate::aio::WebSocket::close_with`].
 pub(crate) fn close_payload(code: u16, reason: &str) -> Result<Vec<u8>> {
+    // 1005/1006/1015 are local pseudo-codes that MUST NOT be sent, and the
+    // reserved ranges are equally illegal on the wire (RFC 6455 §7.4).
+    if !is_valid_close_code(code) {
+        return Err(Error::BadResponse(format!(
+            "websocket: close code {code} may not be sent (use 1000-1003, 1007-1014 or 3000-4999)"
+        )));
+    }
     let mut payload = Vec::with_capacity(2 + reason.len());
     payload.extend_from_slice(&code.to_be_bytes());
     payload.extend_from_slice(reason.as_bytes());
@@ -2858,6 +3241,7 @@ mod tests {
     #[test]
     fn parse_pmd_response_enables_compression() {
         let pmd = parse_pmd_response("permessage-deflate; server_no_context_takeover")
+            .unwrap()
             .expect("permessage-deflate accepted");
         assert!(pmd.server_no_context_takeover);
         assert!(!pmd.client_no_context_takeover);
@@ -2865,18 +3249,58 @@ mod tests {
         let pmd2 = parse_pmd_response(
             "permessage-deflate; client_no_context_takeover; server_no_context_takeover",
         )
+        .unwrap()
         .expect("accepted with both flags");
         assert!(pmd2.client_no_context_takeover);
         assert!(pmd2.server_no_context_takeover);
+
+        // A server may shrink its own window (our inflater keeps 32 KiB), and
+        // may quote the value.
+        for ok in [
+            "permessage-deflate; server_max_window_bits=10",
+            "permessage-deflate; server_max_window_bits=\"8\"",
+            "permessage-deflate; client_max_window_bits=15",
+        ] {
+            assert!(parse_pmd_response(ok).unwrap().is_some(), "{ok}");
+        }
     }
 
     #[test]
     fn parse_pmd_response_without_extension_is_none() {
-        // No permessage-deflate token at all → compression stays off.
-        assert!(parse_pmd_response("some-other-extension").is_none());
-        assert!(parse_pmd_response("").is_none());
-        // A different (unrelated) extension alongside is still no PMD.
-        assert!(parse_pmd_response("foo; bar=1").is_none());
+        assert!(parse_pmd_response("").unwrap().is_none());
+        assert!(parse_pmd_response(" , ").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_pmd_response_rejects_what_was_not_offered() {
+        for bad in [
+            // An extension we never offered.
+            "some-other-extension",
+            "foo; bar=1",
+            "permessage-deflate, x-webkit-deflate-frame",
+            // permessage-deflate twice.
+            "permessage-deflate, permessage-deflate",
+            // Unknown / duplicate parameters, values on flag parameters.
+            "permessage-deflate; foo",
+            "permessage-deflate; server_no_context_takeover; server_no_context_takeover",
+            "permessage-deflate; server_no_context_takeover=1",
+            // Out-of-range or malformed window bits.
+            "permessage-deflate; server_max_window_bits=7",
+            "permessage-deflate; server_max_window_bits=16",
+            "permessage-deflate; server_max_window_bits=010",
+            "permessage-deflate; server_max_window_bits",
+            // We did not offer client_max_window_bits and cannot shrink our
+            // encoder's window.
+            "permessage-deflate; client_max_window_bits=10",
+            "permessage-deflate; client_max_window_bits",
+        ] {
+            assert!(parse_pmd_response(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn handshake_no_longer_offers_client_max_window_bits() {
+        assert!(!PMD_OFFER.contains("client_max_window_bits"));
     }
 
     #[test]
@@ -3095,6 +3519,7 @@ mod tests {
             reader: WsReader {
                 transport: Arc::clone(&transport),
                 rxbuf: Vec::new(),
+                partial: None,
                 pmd,
                 compression,
                 auto_pong: true,
@@ -3110,6 +3535,364 @@ mod tests {
                 shutdown: None,
             },
             subprotocol: None,
+        }
+    }
+
+    /// A duplex whose reads replay a script of chunks and errors (e.g. a read
+    /// timeout between fragments) and whose writes can be made to fail.
+    #[derive(Clone, Default)]
+    struct ScriptedMock {
+        reads: Arc<Mutex<std::collections::VecDeque<std::io::Result<Vec<u8>>>>>,
+        sent: Arc<Mutex<Vec<u8>>>,
+        fail_writes: Arc<AtomicBool>,
+    }
+
+    impl ScriptedMock {
+        fn new(reads: Vec<std::io::Result<Vec<u8>>>) -> Self {
+            ScriptedMock {
+                reads: Arc::new(Mutex::new(reads.into())),
+                ..Default::default()
+            }
+        }
+        fn sent(&self) -> Vec<u8> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl Read for ScriptedMock {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.lock().unwrap().pop_front() {
+                None => Ok(0),
+                Some(Err(e)) => Err(e),
+                Some(Ok(chunk)) => {
+                    // Chunks are small in these tests; one read delivers one.
+                    buf[..chunk.len()].copy_from_slice(&chunk);
+                    Ok(chunk.len())
+                }
+            }
+        }
+    }
+
+    impl Write for ScriptedMock {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                // Model a write timeout after part of the frame went out.
+                let half = buf.len() / 2;
+                self.sent.lock().unwrap().extend_from_slice(&buf[..half]);
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "stall"));
+            }
+            self.sent.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ws_over_scripted(mock: ScriptedMock) -> WebSocket {
+        let transport = Arc::new(WsTransport::new(WsTransportKind::Shared(Mutex::new(
+            Box::new(mock),
+        ))));
+        let send_closed = Arc::new(AtomicBool::new(false));
+        let recv_closed = Arc::new(AtomicBool::new(false));
+        WebSocket {
+            reader: WsReader {
+                transport: Arc::clone(&transport),
+                rxbuf: Vec::new(),
+                partial: None,
+                pmd: None,
+                compression: false,
+                auto_pong: true,
+                send_closed: Arc::clone(&send_closed),
+                recv_closed: Arc::clone(&recv_closed),
+                shutdown: None,
+            },
+            writer: WsWriter {
+                transport,
+                compress: false,
+                send_closed,
+                recv_closed,
+                shutdown: None,
+            },
+            subprotocol: None,
+        }
+    }
+
+    fn timed_out() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, "read timed out")
+    }
+
+    #[test]
+    fn read_timeout_between_fragments_is_resumable() {
+        let mock = ScriptedMock::new(vec![
+            Ok(server_frame(false, OPCODE_TEXT, b"hel")),
+            Err(timed_out()),
+            Ok(server_frame(true, OPCODE_CONT, b"lo")),
+        ]);
+        let mut ws = ws_over_scripted(mock);
+        assert!(ws.recv().is_err(), "the timeout surfaces");
+        assert!(!ws.is_closed());
+        assert_eq!(ws.recv().unwrap(), Some(WsMessage::Text("hello".into())));
+    }
+
+    #[test]
+    fn peer_close_is_echoed_with_its_code() {
+        let mut payload = 1001u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"bye");
+        let mock = SharedMock::new(server_frame(true, OPCODE_CLOSE, &payload));
+        let mut ws = ws_over(mock.clone(), None);
+        assert_eq!(ws.recv().unwrap(), None);
+        assert_eq!(
+            decode_sent(&mock.sent()),
+            vec![(OPCODE_CLOSE, 1001u16.to_be_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn malformed_close_fails_the_connection() {
+        for (payload, status) in [
+            (vec![0x03], 1002u16),                  // 1-byte payload
+            (999u16.to_be_bytes().to_vec(), 1002),  // below 1000
+            (1004u16.to_be_bytes().to_vec(), 1002), // reserved
+            (1006u16.to_be_bytes().to_vec(), 1002), // local-only
+            (1015u16.to_be_bytes().to_vec(), 1002), // local-only
+            (2000u16.to_be_bytes().to_vec(), 1002), // reserved range
+            (vec![0x03, 0xE8, 0xC3, 0x28], 1007),   // bad UTF-8 reason
+        ] {
+            let mock = SharedMock::new(server_frame(true, OPCODE_CLOSE, &payload));
+            let mut ws = ws_over(mock.clone(), None);
+            assert!(ws.recv_event().is_err(), "{payload:?}");
+            assert!(ws.is_closed());
+            assert_eq!(
+                decode_sent(&mock.sent()),
+                vec![(OPCODE_CLOSE, status.to_be_bytes().to_vec())],
+                "{payload:?}"
+            );
+        }
+        // Valid codes, including the IANA-registered 1012-1014 and the private
+        // range, are accepted.
+        for code in [1000u16, 1003, 1007, 1011, 1014, 3000, 4999] {
+            let mock = SharedMock::new(server_frame(true, OPCODE_CLOSE, &code.to_be_bytes()));
+            let mut ws = ws_over(mock, None);
+            assert!(ws.recv_event().is_ok(), "{code}");
+        }
+    }
+
+    #[test]
+    fn close_with_refuses_codes_that_may_not_be_sent() {
+        let mock = SharedMock::new(Vec::new());
+        let mut ws = ws_over(mock.clone(), None);
+        for code in [0u16, 1004, 1005, 1006, 1015, 2999, 5000] {
+            assert!(ws.close_with(code, "").is_err(), "{code}");
+        }
+        assert!(
+            !ws.is_closed(),
+            "a refused close must not mark the socket closed"
+        );
+        assert!(mock.sent().is_empty());
+    }
+
+    #[test]
+    fn invalid_utf8_text_fails_with_1007() {
+        let mock = SharedMock::new(server_frame(true, OPCODE_TEXT, &[0xC3]));
+        let mut ws = ws_over(mock.clone(), None);
+        assert!(ws.recv().is_err());
+        assert_eq!(
+            decode_sent(&mock.sent()),
+            vec![(OPCODE_CLOSE, 1007u16.to_be_bytes().to_vec())]
+        );
+    }
+
+    #[test]
+    fn eof_marks_the_socket_closed() {
+        let mock = SharedMock::new(Vec::new());
+        let mut ws = ws_over(mock, None);
+        assert!(matches!(ws.recv(), Err(Error::UnexpectedEof)));
+        assert!(ws.is_closed());
+    }
+
+    #[test]
+    fn recv_answers_pings_even_with_auto_pong_off() {
+        let mut inbound = server_frame(true, OPCODE_PING, b"hi");
+        inbound.extend(server_frame(true, OPCODE_TEXT, b"x"));
+        let mock = SharedMock::new(inbound);
+        let mut ws = ws_over(mock.clone(), None);
+        ws.set_auto_pong(false);
+        assert_eq!(ws.recv().unwrap(), Some(WsMessage::Text("x".into())));
+        assert_eq!(
+            decode_sent(&mock.sent()),
+            vec![(OPCODE_PONG, b"hi".to_vec())]
+        );
+    }
+
+    #[test]
+    fn failed_partial_write_poisons_the_transport() {
+        let mock = ScriptedMock::default();
+        let mut ws = ws_over_scripted(mock.clone());
+        mock.fail_writes.store(true, Ordering::SeqCst);
+        assert!(ws.send_text("first").is_err());
+        let after_failure = mock.sent().len();
+        mock.fail_writes.store(false, Ordering::SeqCst);
+        // A second frame would be parsed by the peer as the tail of the first.
+        assert!(ws.send_text("second").is_err());
+        assert_eq!(mock.sent().len(), after_failure, "nothing more written");
+    }
+
+    #[test]
+    fn send_stream_stops_once_the_connection_closes() {
+        let mock = SharedMock::new(Vec::new());
+        let mut ws = ws_over(mock.clone(), None);
+        let writer = &mut ws.writer;
+        // A reader that closes the connection (as a peer close echo would)
+        // after the first chunk has been pulled.
+        struct ClosingReader {
+            send_closed: Arc<AtomicBool>,
+            served: usize,
+        }
+        impl Read for ClosingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.served += 1;
+                if self.served > 2 {
+                    self.send_closed.store(true, Ordering::SeqCst);
+                }
+                if self.served > 6 {
+                    return Ok(0);
+                }
+                let n = buf.len().min(STREAM_CHUNK);
+                buf[..n].fill(b'a');
+                Ok(n)
+            }
+        }
+        let mut src = ClosingReader {
+            send_closed: Arc::clone(&writer.send_closed),
+            served: 0,
+        };
+        assert!(writer.send_stream(WsOpcode::Binary, &mut src).is_err());
+        // Only the first fragment (sent before the close) reached the wire.
+        let frames = decode_sent(&mock.sent());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, OPCODE_BINARY);
+    }
+
+    #[test]
+    fn raw_recv_frame_rejects_unnegotiated_rsv1() {
+        let mock = SharedMock::new(server_frame_rsv1(true, OPCODE_TEXT, b"x"));
+        let mut ws = ws_over(mock, None);
+        assert!(ws.recv_frame().is_err());
+
+        let mut inbound = server_frame(false, OPCODE_TEXT, b"a");
+        inbound.extend(server_frame_rsv1(true, OPCODE_CONT, b"b"));
+        let mock = SharedMock::new(inbound);
+        let mut ws = ws_over(mock, Some(test_pmd()));
+        assert!(ws.recv_frame().is_ok());
+        assert!(ws.recv_frame().is_err(), "RSV1 on a continuation frame");
+    }
+
+    #[test]
+    fn non_minimal_length_encodings_are_rejected() {
+        // 5 bytes declared with the 16-bit form.
+        let mut f = vec![0x82, 126, 0, 5];
+        f.extend_from_slice(b"hello");
+        assert!(try_parse_frame(&f).is_err());
+        // 300 bytes declared with the 64-bit form.
+        let mut f = vec![0x82, 127];
+        f.extend_from_slice(&300u64.to_be_bytes());
+        f.extend(vec![0u8; 300]);
+        assert!(try_parse_frame(&f).is_err());
+        // 64-bit length with the most significant bit set.
+        let mut f = vec![0x82, 127];
+        f.extend_from_slice(&(1u64 << 63 | 70_000).to_be_bytes());
+        assert!(try_parse_frame(&f).is_err());
+    }
+
+    #[test]
+    fn context_takeover_decoder_survives_bfinal_messages() {
+        // The server declined server_no_context_takeover, so the decoder is
+        // kept across messages; compcol ends each message with BFINAL=1. The
+        // second message must still decode (it used to come back empty).
+        let mut pmd = Pmd {
+            client_no_context_takeover: true,
+            server_no_context_takeover: false,
+            decoder: Deflate::decoder(),
+        };
+        assert_eq!(
+            pmd.inflate_message(&pmd_compress(b"first")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            pmd.inflate_message(&pmd_compress(b"second")).unwrap(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn data_after_the_final_deflate_block_is_rejected() {
+        let mut pmd = test_pmd();
+        let mut payload = pmd_compress(b"hello");
+        payload.extend_from_slice(b"trailing junk");
+        assert!(pmd.inflate_message(&payload).is_err());
+    }
+
+    fn check(resp: &str, key: &str, offered: &[&str]) -> Result<HandshakeResponse> {
+        let offered: Vec<String> = offered.iter().map(|s| s.to_string()).collect();
+        check_handshake_response(resp.as_bytes(), key, &offered)
+    }
+
+    fn resp_101(status: &str, key: &str, extra: &str) -> String {
+        format!(
+            "{status}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n{extra}\r\n",
+            derive_accept(key)
+        )
+    }
+
+    #[test]
+    fn handshake_response_subprotocol_must_have_been_offered() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let ok = resp_101(
+            "HTTP/1.1 101 Switching Protocols",
+            key,
+            "Sec-WebSocket-Protocol: chat\r\n",
+        );
+        assert_eq!(
+            check(&ok, key, &["chat"]).unwrap().subprotocol.as_deref(),
+            Some("chat")
+        );
+        assert!(check(&ok, key, &["other"]).is_err(), "not offered");
+        assert!(check(&ok, key, &[]).is_err(), "none offered");
+        assert!(check(&ok, key, &["Chat"]).is_err(), "exact match only");
+        let twice = resp_101(
+            "HTTP/1.1 101 Switching Protocols",
+            key,
+            "Sec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: chat\r\n",
+        );
+        assert!(check(&twice, key, &["chat"]).is_err());
+        // No subprotocol in the response is fine either way.
+        let none = resp_101("HTTP/1.1 101 Switching Protocols", key, "");
+        assert!(check(&none, key, &["chat"]).unwrap().subprotocol.is_none());
+    }
+
+    #[test]
+    fn handshake_response_requires_http11_101() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for status in [
+            "HTTP/1.0 101 Switching Protocols",
+            "HTTP/1.1 1010 x",
+            "HTTP/1.1 200 OK",
+        ] {
+            assert!(
+                check(&resp_101(status, key, ""), key, &[]).is_err(),
+                "{status}"
+            );
+        }
+        assert!(check(&resp_101("HTTP/1.1 101", key, ""), key, &[]).is_ok());
+    }
+
+    #[test]
+    fn subprotocol_values_must_be_tokens() {
+        assert!(subprotocol_header(&["chat".into(), "v2.proto".into()]).is_ok());
+        for bad in ["", "a b", "a,b", "chat\r\nX-Evil: 1", "caf\u{e9}"] {
+            assert!(subprotocol_header(&[bad.to_string()]).is_err(), "{bad:?}");
         }
     }
 
@@ -3324,7 +4107,11 @@ mod tests {
     fn send_stream_fragments_payload_across_frames() {
         let data: Vec<u8> = (0..(STREAM_CHUNK * 2 + 100)).map(|n| n as u8).collect();
         let mut sink = Vec::new();
-        send_stream_inner(&mut sink, OPCODE_BINARY, &mut Cursor::new(data.clone())).unwrap();
+        send_stream_inner(OPCODE_BINARY, &mut Cursor::new(data.clone()), |f| {
+            sink.extend_from_slice(f);
+            Ok(())
+        })
+        .unwrap();
         let frames = decode_sent_fin(&sink);
         assert_eq!(frames.len(), 3, "two 64 KiB chunks + a tail => 3 frames");
         assert_eq!((frames[0].0, frames[0].1), (false, OPCODE_BINARY));
@@ -3337,7 +4124,11 @@ mod tests {
     #[test]
     fn send_stream_empty_source_sends_single_fin_frame() {
         let mut sink = Vec::new();
-        send_stream_inner(&mut sink, OPCODE_TEXT, &mut Cursor::new(Vec::new())).unwrap();
+        send_stream_inner(OPCODE_TEXT, &mut Cursor::new(Vec::new()), |f| {
+            sink.extend_from_slice(f);
+            Ok(())
+        })
+        .unwrap();
         let frames = decode_sent_fin(&sink);
         assert_eq!(frames.len(), 1);
         assert_eq!((frames[0].0, frames[0].1), (true, OPCODE_TEXT));
@@ -3348,7 +4139,11 @@ mod tests {
     fn send_stream_rejects_control_opcode() {
         let mut sink = Vec::new();
         assert!(
-            send_stream_inner(&mut sink, OPCODE_PING, &mut Cursor::new(vec![1, 2, 3])).is_err()
+            send_stream_inner(OPCODE_PING, &mut Cursor::new(vec![1, 2, 3]), |f| {
+                sink.extend_from_slice(f);
+                Ok(())
+            })
+            .is_err()
         );
     }
 

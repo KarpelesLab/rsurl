@@ -89,7 +89,7 @@ async fn exchange<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
 /// deliberately depends on no async-ecosystem crate (see
 /// [`crate::io::runtime`]), and a two-way select is a dozen lines of safe,
 /// stable `poll_fn`.
-async fn with_timeout<R, F, T>(rt: &R, dur: Option<Duration>, fut: F) -> Result<T>
+pub(super) async fn with_timeout<R, F, T>(rt: &R, dur: Option<Duration>, fut: F) -> Result<T>
 where
     R: Runtime,
     F: Future<Output = Result<T>>,
