@@ -152,6 +152,18 @@ const MAX_PING_FRAMES: u32 = 2_000;
 /// to churn our state. A legitimate server resets at most a few of our streams.
 const MAX_RST_STREAM_FRAMES: u32 = 2_000;
 
+/// Upper bound on interim (1xx) response heads per stream. Each costs an HPACK
+/// decode and counts as "progress" for the no-progress guard, so without a cap
+/// a server could stream informational responses forever.
+const MAX_INTERIM_RESPONSES: u32 = 32;
+
+/// RST_STREAM error code PROTOCOL_ERROR (RFC 9113 §7).
+const ERR_PROTOCOL: u32 = 0x1;
+/// RST_STREAM error code NO_ERROR (RFC 9113 §7).
+const ERR_NO_ERROR: u32 = 0x0;
+/// RST_STREAM error code REFUSED_STREAM (RFC 9113 §7).
+const ERR_REFUSED_STREAM: u32 = 0x7;
+
 /// Peer (server) SETTINGS values, with RFC 9113 defaults for any parameter
 /// the peer hasn't sent. We track all six standard parameters even if we
 /// don't yet act on each of them; future tasks will consume more.
@@ -479,11 +491,21 @@ struct Frame {
 
 const MAX_FRAME_PAYLOAD: usize = 1 << 20; // 1 MiB hard cap, plenty for our use.
 
+/// Largest inbound frame payload we accept. We never send
+/// `SETTINGS_MAX_FRAME_SIZE`, so the peer is bound by the RFC default of
+/// 2^14; anything larger is a FRAME_SIZE_ERROR (RFC 9113 §4.2).
+const OUR_MAX_FRAME_SIZE: usize = MAX_FRAME_SIZE_MIN as usize;
+
 fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
     r.read_exact(buf)
 }
 
 fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
+    read_frame_limited(r, OUR_MAX_FRAME_SIZE)
+}
+
+fn read_frame_limited<R: Read>(r: &mut R, max_payload: usize) -> io::Result<Frame> {
+    let max_payload = max_payload.min(MAX_FRAME_PAYLOAD);
     let mut hdr = [0u8; 9];
     read_exact(r, &mut hdr)?;
     let length = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | (hdr[2] as usize);
@@ -493,10 +515,10 @@ fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
         | ((hdr[6] as u32) << 16)
         | ((hdr[7] as u32) << 8)
         | (hdr[8] as u32);
-    if length > MAX_FRAME_PAYLOAD {
+    if length > max_payload {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame payload too large: {length}"),
+            format!("frame payload too large: {length} (FRAME_SIZE_ERROR)"),
         ));
     }
     let mut payload = vec![0u8; length];
@@ -590,8 +612,16 @@ fn decode_int(buf: &[u8], prefix_bits: u8) -> Result<(u64, usize)> {
         }
         let b = buf[i];
         i += 1;
+        let part = (b & 0x7f) as u64;
+        // A plain `part << shift` silently drops high bits once `shift`
+        // nears 64; reject any continuation byte whose bits would not survive
+        // the shift instead of decoding a wrapped (wrong) value.
+        let shifted = part << shift;
+        if shifted >> shift != part {
+            return Err(Error::BadResponse("hpack: integer overflow".into()));
+        }
         value = value
-            .checked_add(((b & 0x7f) as u64) << shift)
+            .checked_add(shifted)
             .ok_or_else(|| Error::BadResponse("hpack: integer overflow".into()))?;
         if b & 0x80 == 0 {
             return Ok((value, i));
@@ -960,10 +990,47 @@ const HUFFMAN: [(u32, u8); 257] = [
     (0x3fffffff, 30), // EOS, index 256
 ];
 
-/// Decode a Huffman-coded literal. We walk bit-by-bit over the input, OR each
-/// bit into an accumulator, and check after every bit whether the accumulator
-/// (left-aligned for that length) matches any code of that length. With 257
-/// symbols this is small enough to scan linearly.
+/// Canonical-Huffman decode index built once from [`HUFFMAN`]. The RFC 7541
+/// code is canonical: within one bit length the codes are consecutive, so a
+/// `(len, code)` lookup is `symbols[offset[len] + (code - first[len])]` when
+/// `code - first[len] < count[len]` — O(1) per candidate length instead of a
+/// 257-entry scan (which let a server burn client CPU with long codes).
+struct HuffmanIndex {
+    first: [u32; 31],
+    count: [u32; 31],
+    offset: [u16; 31],
+    symbols: [u16; 257],
+}
+
+fn huffman_index() -> &'static HuffmanIndex {
+    static INDEX: OnceLock<HuffmanIndex> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut order: Vec<u16> = (0..257u16).collect();
+        order.sort_by_key(|&s| (HUFFMAN[s as usize].1, HUFFMAN[s as usize].0));
+        let mut idx = HuffmanIndex {
+            first: [0; 31],
+            count: [0; 31],
+            offset: [0; 31],
+            symbols: [0; 257],
+        };
+        for (pos, &sym) in order.iter().enumerate() {
+            idx.symbols[pos] = sym;
+            let (code, len) = HUFFMAN[sym as usize];
+            let l = len as usize;
+            if idx.count[l] == 0 {
+                idx.first[l] = code;
+                idx.offset[l] = pos as u16;
+            }
+            debug_assert_eq!(code, idx.first[l] + idx.count[l], "code must be canonical");
+            idx.count[l] += 1;
+        }
+        idx
+    })
+}
+
+/// Decode a Huffman-coded literal. After each input byte we try to match the
+/// accumulator's leading bits against every code length (shortest first) via
+/// the canonical index, emitting symbols until no complete code remains.
 fn huffman_decode(input: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len().saturating_mul(2));
     let mut acc: u64 = 0;
@@ -1017,12 +1084,16 @@ fn huffman_decode(input: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn lookup_huffman(code: u32, len: u8) -> Option<u16> {
-    for (i, (c, l)) in HUFFMAN.iter().enumerate() {
-        if *l == len && *c == code {
-            return Some(i as u16);
-        }
+    let idx = huffman_index();
+    let l = len as usize;
+    if l >= idx.count.len() || idx.count[l] == 0 {
+        return None;
     }
-    None
+    let delta = code.checked_sub(idx.first[l])?;
+    if delta >= idx.count[l] {
+        return None;
+    }
+    Some(idx.symbols[idx.offset[l] as usize + delta as usize])
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,11 +1222,26 @@ impl Decoder {
                 self.insert(name.clone(), value.clone());
                 (name, value)
             } else if b & 0x20 != 0 {
-                // Dynamic table size update (§6.3).
+                // Dynamic table size update (§6.3). RFC 7541 §4.2: it MUST
+                // occur at the beginning of the block (before any field), and
+                // a value above the limit we advertised (the 4096 default —
+                // we never raise SETTINGS_HEADER_TABLE_SIZE) is a decoding
+                // error. Silently capping would desynchronise our table from
+                // the peer's view of it.
+                if !out.is_empty() {
+                    return Err(Error::BadResponse(
+                        "hpack: dynamic table size update after a header field (COMPRESSION_ERROR)"
+                            .into(),
+                    ));
+                }
                 let (new_size, n) = decode_int(&buf[pos..], 5)?;
                 pos += n;
-                let cap = (new_size as usize).min(DYN_TABLE_CAP);
-                self.dyn_table_cap = cap;
+                if new_size > DYN_TABLE_CAP as u64 {
+                    return Err(Error::BadResponse(format!(
+                        "hpack: dynamic table size update {new_size} exceeds limit {DYN_TABLE_CAP} (COMPRESSION_ERROR)"
+                    )));
+                }
+                self.dyn_table_cap = new_size as usize;
                 self.evict_to_fit(0);
                 continue;
             } else {
@@ -1299,6 +1385,10 @@ struct Encoder {
     /// at the head of the next header block we emit. The signal MUST
     /// precede any header field representation in that block.
     pending_max_table_size_signal: Option<usize>,
+    /// Smallest table size in effect since the last emitted signal. RFC 7541
+    /// §4.2: when the limit shrank and then grew again between two header
+    /// blocks, the encoder must signal that minimum before the final size.
+    pending_min_table_size: Option<usize>,
 }
 
 impl Encoder {
@@ -1308,6 +1398,7 @@ impl Encoder {
             dyn_table_size: 0,
             max_dyn_table_size: DYN_TABLE_CAP,
             pending_max_table_size_signal: None,
+            pending_min_table_size: None,
         }
     }
 
@@ -1319,7 +1410,19 @@ impl Encoder {
     /// encoder MUST emit a §6.3 size-update signal in the next header
     /// block to acknowledge the change, and MUST evict entries
     /// immediately so the table never exceeds the new cap.
+    ///
+    /// The peer's value is only an upper bound on what we may use: we never
+    /// grow our table past [`DYN_TABLE_CAP`], so a peer advertising e.g. 4 GiB
+    /// cannot make a long-lived pooled connection's table grow without limit.
     fn set_peer_max_table_size(&mut self, n: usize) {
+        let n = n.min(DYN_TABLE_CAP);
+        if n == self.max_dyn_table_size && self.pending_max_table_size_signal.is_none() {
+            return;
+        }
+        let prev_min = self
+            .pending_min_table_size
+            .unwrap_or(self.max_dyn_table_size);
+        self.pending_min_table_size = Some(prev_min.min(n));
         self.max_dyn_table_size = n;
         self.evict_to_fit(0);
         self.pending_max_table_size_signal = Some(n);
@@ -1390,6 +1493,13 @@ impl Encoder {
     fn encode_header(&mut self, out: &mut Vec<u8>, name: &str, value: &str) {
         // (1) Pending size-update signal: 5-bit prefix, top three bits `001`.
         if let Some(n) = self.pending_max_table_size_signal.take() {
+            // A shrink-then-grow since the last block must first signal the
+            // minimum (RFC 7541 §4.2), then the final size.
+            if let Some(min) = self.pending_min_table_size.take().filter(|m| *m < n) {
+                let mut bytes = encode_int(min as u64, 5);
+                bytes[0] |= 0x20;
+                out.extend_from_slice(&bytes);
+            }
             let mut bytes = encode_int(n as u64, 5);
             bytes[0] |= 0x20;
             out.extend_from_slice(&bytes);
@@ -1560,6 +1670,28 @@ struct Stream {
     /// The single-stream `send_request_on` path never populates this — it
     /// writes the body inline with its own blocking loop.
     pending_body: Option<PendingBody>,
+    /// `:status` of the final (non-1xx) response head, once received. A
+    /// header block arriving after it is a trailer section.
+    final_status: Option<u16>,
+    /// Interim (1xx) response heads seen so far; bounded by
+    /// [`MAX_INTERIM_RESPONSES`].
+    interim_count: u32,
+    /// `content-length` of the final response head, checked against the DATA
+    /// actually received (RFC 9113 §8.1.1).
+    expected_len: Option<u64>,
+    /// The request was HEAD: a `content-length` then describes the would-be
+    /// GET body, not DATA on this stream.
+    head_request: bool,
+    /// The peer reset this stream with REFUSED_STREAM (RFC 9113 §8.7): it did
+    /// no application processing, so the request is safe to retry.
+    refused: bool,
+    /// Any frame for this stream (HEADERS, DATA, RST_STREAM) has arrived.
+    /// Distinguishes "connection died before the server said anything about
+    /// this request" from a failure mid-response.
+    rx_any: bool,
+    /// The header block being accumulated arrived on an already-closed
+    /// stream: decode it (to keep HPACK in sync) but ignore its content.
+    discard_headers: bool,
 }
 
 /// A request body that is being streamed out across multiple `pump`
@@ -1584,6 +1716,13 @@ impl Stream {
             streamed_len: 0,
             end_stream_recv: false,
             pending_body: None,
+            final_status: None,
+            interim_count: 0,
+            expected_len: None,
+            head_request: false,
+            refused: false,
+            rx_any: false,
+            discard_headers: false,
         }
     }
 
@@ -1815,6 +1954,14 @@ impl<S: Read + Write> Connection<S> {
         })
     }
 
+    /// Largest frame payload we will emit: the peer's `SETTINGS_MAX_FRAME_SIZE`
+    /// (up to 16 MiB) clamped to what [`write_frame`] accepts, so a peer
+    /// advertising a huge frame size can't make a large body chunk fail to
+    /// serialise.
+    fn send_frame_limit(&self) -> usize {
+        (self.peer.max_frame_size as usize).min(MAX_FRAME_PAYLOAD)
+    }
+
     /// Cheap, no-I/O check that this connection is structurally safe to hand
     /// out from the pool for another request:
     ///
@@ -1938,7 +2085,7 @@ impl<S: Read + Write> Connection<S> {
         self.send_priority_hint(stream_id, req.priority)?;
         let header_block = build_header_block(&mut self.encoder, req);
         let has_body = !req.body.is_empty();
-        let max_frame_size = self.peer.max_frame_size as usize;
+        let max_frame_size = self.send_frame_limit();
         let header_frames =
             fragment_header_block(stream_id, &header_block, max_frame_size, !has_body);
 
@@ -1954,6 +2101,7 @@ impl<S: Read + Write> Connection<S> {
                 .get_mut(&stream_id)
                 .ok_or_else(|| Error::BadResponse(format!("stream {stream_id} not found")))?;
             s.state = s.state.send_data(!has_body)?;
+            s.head_request = crate::http::effective_method(req).eq_ignore_ascii_case("HEAD");
         }
 
         if has_body {
@@ -1970,14 +2118,28 @@ impl<S: Read + Write> Connection<S> {
                     if budget > 0 {
                         break;
                     }
+                    self.check_not_abandoned(stream_id)?;
                     match self.read_and_dispatch(None)? {
                         DispatchOutcome::Continue => {}
                         DispatchOutcome::Done(done_id) if done_id == stream_id => {
-                            // The peer ended our stream before we finished
-                            // sending the body — protocol error from our side.
-                            return Err(Error::BadResponse(
-                                "server ended stream before request body was fully sent".into(),
-                            ));
+                            // The server sent a complete response (e.g. 413 or
+                            // 401) before taking the whole body. RFC 9113 §8.1
+                            // allows this: the response stands, and we abort
+                            // the rest of our send side with
+                            // RST_STREAM(NO_ERROR) — which keeps the connection
+                            // itself healthy for reuse.
+                            let rst = Frame {
+                                typ: F_RST_STREAM,
+                                flags: 0,
+                                stream_id,
+                                payload: ERR_NO_ERROR.to_be_bytes().to_vec(),
+                            };
+                            write_frame(&mut self.tls, &rst)?;
+                            self.tls.flush()?;
+                            if let Some(s) = self.streams.get_mut(&stream_id) {
+                                s.state = StreamState::Closed;
+                            }
+                            return Ok(());
                         }
                         DispatchOutcome::Done(_) => {
                             // Some other stream finished while we were
@@ -1986,7 +2148,7 @@ impl<S: Read + Write> Connection<S> {
                     }
                 }
 
-                let max_frame_size = self.peer.max_frame_size as usize;
+                let max_frame_size = self.send_frame_limit();
                 let budget = self
                     .streams
                     .get(&stream_id)
@@ -2040,6 +2202,7 @@ impl<S: Read + Write> Connection<S> {
                     self.fire_head(stream_id, &mut on_head);
                     return Ok(self.streams.remove(&stream_id).unwrap());
                 }
+                self.check_not_abandoned(stream_id)?;
             } else {
                 return Err(Error::BadResponse(format!(
                     "stream {stream_id} not registered"
@@ -2129,7 +2292,7 @@ impl<S: Read + Write> Connection<S> {
         self.send_priority_hint(stream_id, req.priority)?;
         let header_block = build_header_block(&mut self.encoder, req);
         let has_body = !req.body.is_empty();
-        let max_frame_size = self.peer.max_frame_size as usize;
+        let max_frame_size = self.send_frame_limit();
         let header_frames =
             fragment_header_block(stream_id, &header_block, max_frame_size, !has_body);
         for f in &header_frames {
@@ -2140,6 +2303,7 @@ impl<S: Read + Write> Connection<S> {
             .get_mut(&stream_id)
             .ok_or_else(|| Error::BadResponse(format!("stream {stream_id} not found")))?;
         s.state = s.state.send_data(!has_body)?;
+        s.head_request = crate::http::effective_method(req).eq_ignore_ascii_case("HEAD");
         if has_body {
             s.pending_body = Some(PendingBody {
                 bytes: req.body.clone(),
@@ -2163,7 +2327,7 @@ impl<S: Read + Write> Connection<S> {
     /// `-v` trace stable across runs.
     fn pump_pending_sends(&mut self, trace: &mut dyn Write) -> Result<bool> {
         let mut wrote = false;
-        let max_frame_size = self.peer.max_frame_size as usize;
+        let max_frame_size = self.send_frame_limit();
         // Snapshot the ids with work to do so we don't borrow `self.streams`
         // while mutating it inside the loop.
         let mut ids: Vec<u32> = self
@@ -2364,6 +2528,18 @@ impl<S: Read + Write> Connection<S> {
                         .streams
                         .remove(&done_id)
                         .expect("Done stream must still be registered");
+                    if stream.pending_body.is_some() {
+                        // Complete response before our body was fully sent
+                        // (§8.1): stop sending the rest with
+                        // RST_STREAM(NO_ERROR); the response stands.
+                        let rst = Frame {
+                            typ: F_RST_STREAM,
+                            flags: 0,
+                            stream_id: done_id,
+                            payload: ERR_NO_ERROR.to_be_bytes().to_vec(),
+                        };
+                        let _ = write_frame(&mut self.tls, &rst);
+                    }
                     let mut built = build_response_from_stream_labelled(
                         stream,
                         Some(done_id),
@@ -2592,6 +2768,35 @@ impl<S: Read + Write> Connection<S> {
     /// 0 would be a protocol error but we just ignore it.
     fn process_conn_frame(&mut self, frame: Frame) -> Result<DispatchOutcome> {
         match frame.typ {
+            // RFC 9113 §6.1/§6.2/§6.3/§6.4/§6.6/§6.10: these frame types are
+            // always associated with a stream; on stream 0 they are a
+            // connection error of type PROTOCOL_ERROR.
+            F_DATA | F_HEADERS | F_PRIORITY | F_RST_STREAM | F_PUSH_PROMISE | F_CONTINUATION => {
+                return Err(Error::BadResponse(format!(
+                    "http2: frame type 0x{:x} on stream 0 (PROTOCOL_ERROR)",
+                    frame.typ
+                )));
+            }
+            F_SETTINGS if frame.flags & FLAG_ACK != 0 && !frame.payload.is_empty() => {
+                // §6.5: a SETTINGS ACK with a payload is FRAME_SIZE_ERROR.
+                return Err(Error::BadResponse(
+                    "http2: SETTINGS ACK with non-empty payload (FRAME_SIZE_ERROR)".into(),
+                ));
+            }
+            F_PING if frame.payload.len() != 8 => {
+                // §6.7: PING payload is exactly 8 octets.
+                return Err(Error::BadResponse(format!(
+                    "http2: PING payload of {} bytes (FRAME_SIZE_ERROR)",
+                    frame.payload.len()
+                )));
+            }
+            F_GOAWAY if frame.payload.len() < 8 => {
+                // §6.8: last-stream-id (4) + error code (4) minimum.
+                return Err(Error::BadResponse(format!(
+                    "http2: GOAWAY payload of {} bytes (FRAME_SIZE_ERROR)",
+                    frame.payload.len()
+                )));
+            }
             F_SETTINGS if frame.flags & FLAG_ACK == 0 => {
                 let old_initial = self.peer.initial_window_size;
                 let old_header_table_size = self.peer.header_table_size;
@@ -2647,16 +2852,15 @@ impl<S: Read + Write> Connection<S> {
                 // process; ids ≥ this are abandoned. We refuse to allocate
                 // any new id beyond `last` but allow existing streams ≤ last
                 // to keep running.
-                let last = if frame.payload.len() >= 4 {
-                    u32::from_be_bytes([
-                        frame.payload[0],
-                        frame.payload[1],
-                        frame.payload[2],
-                        frame.payload[3],
-                    ]) & 0x7fff_ffff
-                } else {
-                    0
-                };
+                // Payload length (>= 8) was validated above.
+                let last = u32::from_be_bytes([
+                    frame.payload[0],
+                    frame.payload[1],
+                    frame.payload[2],
+                    frame.payload[3],
+                ]) & 0x7fff_ffff;
+                // A later GOAWAY may only lower the boundary (§6.8).
+                let last = self.goaway_received.map_or(last, |prev| prev.min(last));
                 self.goaway_received = Some(last);
                 // If any of our open streams has id > last, the peer will not
                 // process them; mark them closed and let the caller see that.
@@ -2675,9 +2879,8 @@ impl<S: Read + Write> Connection<S> {
                 }
             }
             _ => {
-                // PRIORITY on stream 0 is technically a PROTOCOL_ERROR; we
-                // tolerate by ignoring. Unknown frame types are explicitly
-                // ignorable per RFC 9113 §4.1.
+                // Unknown frame types are explicitly ignorable per RFC 9113
+                // §4.1.
             }
         }
         Ok(DispatchOutcome::Continue)
@@ -2691,6 +2894,20 @@ impl<S: Read + Write> Connection<S> {
         sink: Option<&mut dyn Write>,
     ) -> Result<DispatchOutcome> {
         match frame.typ {
+            // §6.5 / §6.7 / §6.8: connection-scoped frames on a stream are a
+            // PROTOCOL_ERROR, not something to silently ignore.
+            F_SETTINGS | F_PING | F_GOAWAY => Err(Error::BadResponse(format!(
+                "http2: frame type 0x{:x} on stream {} (PROTOCOL_ERROR)",
+                frame.typ, frame.stream_id
+            ))),
+            F_PRIORITY if frame.payload.len() != 5 => Err(Error::BadResponse(format!(
+                "http2: PRIORITY payload of {} bytes (FRAME_SIZE_ERROR)",
+                frame.payload.len()
+            ))),
+            F_RST_STREAM if frame.payload.len() != 4 => Err(Error::BadResponse(format!(
+                "http2: RST_STREAM payload of {} bytes (FRAME_SIZE_ERROR)",
+                frame.payload.len()
+            ))),
             F_HEADERS => self.process_headers(frame),
             F_CONTINUATION => self.process_continuation(frame),
             F_DATA => self.process_data(frame, sink),
@@ -2779,11 +2996,11 @@ impl<S: Read + Write> Connection<S> {
                 let _ = self.decoder.decode_block(frag)?;
             } else {
                 // Conservatively buffer on the closed stream so the
-                // CONTINUATION still finds its target.
-                self.streams
-                    .get_mut(&stream_id)
-                    .unwrap()
-                    .push_header_fragment(frag)?;
+                // CONTINUATION still finds its target; the completed block is
+                // decoded (HPACK sync) but its content discarded.
+                let s = self.streams.get_mut(&stream_id).unwrap();
+                s.push_header_fragment(frag)?;
+                s.discard_headers = true;
                 self.expecting_continuation = Some(stream_id);
             }
             return Ok(DispatchOutcome::Continue);
@@ -2791,41 +3008,165 @@ impl<S: Read + Write> Connection<S> {
         let new_state = state.recv_headers(end_stream)?;
 
         let s = self.streams.get_mut(&stream_id).unwrap();
+        s.rx_any = true;
         s.push_header_fragment(frag)?;
         if end_stream {
             s.end_stream_recv = true;
         }
+        s.state = new_state;
         if end_headers {
             // Decode now; clear the buffer.
             let block = std::mem::take(&mut s.headers_buf);
+            self.expecting_continuation = None;
             // Drop the &mut borrow before reaching for the decoder.
             let decoded = self.decoder.decode_block(&block)?;
-            let s = self.streams.get_mut(&stream_id).unwrap();
-            s.response_headers = Some(decoded);
-            s.state = new_state;
-            self.expecting_continuation = None;
             // A header block completed: forward progress.
             self.made_progress = true;
+            self.complete_header_block(stream_id, decoded)?;
         } else {
-            s.state = new_state;
             self.expecting_continuation = Some(stream_id);
         }
+        Ok(self.outcome_for(stream_id))
+    }
 
-        let done = matches!(
-            self.streams.get(&stream_id).unwrap().state,
-            StreamState::Closed | StreamState::HalfClosedRemote
-        ) && self.streams.get(&stream_id).unwrap().end_stream_recv
-            && self
-                .streams
-                .get(&stream_id)
-                .unwrap()
-                .response_headers
-                .is_some();
-        Ok(if done {
+    /// Error out if a GOAWAY abandoned `stream_id` (its id is above the
+    /// peer's last-stream-id, so `process_conn_frame` closed it): no response
+    /// will ever arrive, and waiting would only end at the peer's EOF.
+    fn check_not_abandoned(&self, stream_id: u32) -> Result<()> {
+        match self.goaway_received {
+            Some(last) if stream_id > last => Err(Error::BadResponse(format!(
+                "stream {stream_id} not processed: GOAWAY last-stream-id={last}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// `Done(stream_id)` once the stream has its final response head and the
+    /// peer's END_STREAM; `Continue` otherwise.
+    fn outcome_for(&self, stream_id: u32) -> DispatchOutcome {
+        let done = self.streams.get(&stream_id).is_some_and(|s| {
+            matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
+                && s.end_stream_recv
+                && s.response_headers.is_some()
+        });
+        if done {
             DispatchOutcome::Done(stream_id)
         } else {
             DispatchOutcome::Continue
-        })
+        }
+    }
+
+    /// Fail one stream (RFC 9113 §5.4.2 stream error): reset it with
+    /// PROTOCOL_ERROR, mark it `Closed` with no usable response (so the
+    /// multiplexed driver attributes the error to this stream only), and
+    /// return the error for the caller to propagate.
+    fn stream_error(&mut self, stream_id: u32, msg: String) -> Error {
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.state = StreamState::Closed;
+            s.response_headers = None;
+        }
+        let rst = Frame {
+            typ: F_RST_STREAM,
+            flags: 0,
+            stream_id,
+            payload: ERR_PROTOCOL.to_be_bytes().to_vec(),
+        };
+        // Best-effort: the error is reported regardless of the write.
+        if write_frame(&mut self.tls, &rst).is_ok() {
+            let _ = self.tls.flush();
+        }
+        Error::BadResponse(format!("http2: stream {stream_id}: {msg}"))
+    }
+
+    /// Apply a fully decoded header block on `stream_id` (RFC 9113 §8.1): an
+    /// interim 1xx head (skipped, bounded), the final response head, or —
+    /// after the final head — a trailer section, which must end the stream and
+    /// never replaces the response headers. Malformed sections are stream
+    /// errors.
+    fn complete_header_block(
+        &mut self,
+        stream_id: u32,
+        decoded: Vec<(String, String)>,
+    ) -> Result<()> {
+        let Some(s) = self.streams.get(&stream_id) else {
+            return Ok(());
+        };
+        let end_stream = s.end_stream_recv;
+        if s.final_status.is_some() {
+            // Trailer section (§8.1): must carry END_STREAM and no
+            // pseudo-headers. Trailers are not surfaced by `Response`, so they
+            // are validated and dropped; the response head is left intact.
+            if !end_stream {
+                return Err(
+                    self.stream_error(stream_id, "second HEADERS block without END_STREAM".into())
+                );
+            }
+            if let Err(m) = validate_response_fields(&decoded, true) {
+                return Err(self.stream_error(stream_id, format!("malformed trailers: {m}")));
+            }
+            return self.check_content_length(stream_id);
+        }
+        let info = match validate_response_fields(&decoded, false) {
+            Ok(info) => info,
+            Err(m) => {
+                return Err(self.stream_error(stream_id, format!("malformed response head: {m}")))
+            }
+        };
+        if info.status < 200 {
+            // §8.1: an interim response never carries END_STREAM, and 101 is
+            // not allowed in HTTP/2 at all (§8.6).
+            if end_stream {
+                return Err(self.stream_error(
+                    stream_id,
+                    format!("interim {} response with END_STREAM", info.status),
+                ));
+            }
+            if info.status == 101 {
+                return Err(self.stream_error(stream_id, "101 response in HTTP/2".into()));
+            }
+            let s = self.streams.get_mut(&stream_id).unwrap();
+            s.interim_count += 1;
+            if s.interim_count > MAX_INTERIM_RESPONSES {
+                return Err(self.stream_error(
+                    stream_id,
+                    format!("more than {MAX_INTERIM_RESPONSES} interim responses"),
+                ));
+            }
+            return Ok(());
+        }
+        let s = self.streams.get_mut(&stream_id).unwrap();
+        s.final_status = Some(info.status);
+        s.expected_len = info.content_length;
+        s.response_headers = Some(decoded);
+        if end_stream {
+            return self.check_content_length(stream_id);
+        }
+        Ok(())
+    }
+
+    /// Enforce `content-length` against the DATA received on `stream_id`
+    /// (RFC 9113 §8.1.1): once END_STREAM is seen the totals must match
+    /// exactly; before that, receiving more than declared is already an
+    /// error. HEAD responses and 204/304 carry no content, so their
+    /// `content-length` is not compared.
+    fn check_content_length(&mut self, stream_id: u32) -> Result<()> {
+        let Some(s) = self.streams.get(&stream_id) else {
+            return Ok(());
+        };
+        if s.head_request || matches!(s.final_status, Some(204) | Some(304)) {
+            return Ok(());
+        }
+        let Some(expected) = s.expected_len else {
+            return Ok(());
+        };
+        let got = s.body.len() as u64 + s.streamed_len;
+        if got > expected || (s.end_stream_recv && got != expected) {
+            return Err(self.stream_error(
+                stream_id,
+                format!("content-length {expected} but received {got} body bytes"),
+            ));
+        }
+        Ok(())
     }
 
     fn process_continuation(&mut self, frame: Frame) -> Result<DispatchOutcome> {
@@ -2846,30 +3187,16 @@ impl<S: Read + Write> Connection<S> {
         let end_headers = frame.flags & FLAG_END_HEADERS != 0;
         if end_headers {
             let block = std::mem::take(&mut s.headers_buf);
-            let decoded = self.decoder.decode_block(&block)?;
-            let s = self.streams.get_mut(&stream_id).unwrap();
-            if s.state != StreamState::Closed {
-                s.response_headers = Some(decoded);
-            }
+            let discard = std::mem::take(&mut s.discard_headers);
             self.expecting_continuation = None;
+            let decoded = self.decoder.decode_block(&block)?;
             // A header block completed: forward progress.
             self.made_progress = true;
+            if !discard {
+                self.complete_header_block(stream_id, decoded)?;
+            }
         }
-        let done = matches!(
-            self.streams.get(&stream_id).unwrap().state,
-            StreamState::Closed | StreamState::HalfClosedRemote
-        ) && self.streams.get(&stream_id).unwrap().end_stream_recv
-            && self
-                .streams
-                .get(&stream_id)
-                .unwrap()
-                .response_headers
-                .is_some();
-        Ok(if done {
-            DispatchOutcome::Done(stream_id)
-        } else {
-            DispatchOutcome::Continue
-        })
+        Ok(self.outcome_for(stream_id))
     }
 
     fn process_data(
@@ -2916,6 +3243,7 @@ impl<S: Read + Write> Connection<S> {
         let new_state = state.recv_data(end_stream)?;
 
         let s = self.streams.get_mut(&stream_id).unwrap();
+        s.rx_any = true;
         s.recv_window.consume(frame_bytes);
         // Per-stream counterpart of the connection-level check above
         // (RFC 9113 §6.9.1). A negative window means the peer sent more DATA
@@ -2938,6 +3266,13 @@ impl<S: Read + Write> Connection<S> {
                 return Err(Error::BadResponse("DATA padding overruns payload".into()));
             }
             payload = &payload[..payload.len() - pad_len];
+        }
+        // RFC 9113 §8.1: DATA may only follow the final response head. Before
+        // it (no HEADERS yet, or only interim 1xx heads) the response is
+        // malformed — and with a sink we'd be writing body bytes before the
+        // head callback could fire.
+        if s.final_status.is_none() {
+            return Err(self.stream_error(stream_id, "DATA before the response HEADERS".into()));
         }
         // Stream the body straight to the caller's sink when possible: a sink
         // is present, nothing has been buffered yet (so byte order is kept),
@@ -2979,6 +3314,7 @@ impl<S: Read + Write> Connection<S> {
         if appended_body {
             self.made_progress = true;
         }
+        self.check_content_length(stream_id)?;
 
         // Replenish either window if it's dropped below half. Both checks are
         // independent — a single large DATA frame can fire both.
@@ -3009,22 +3345,30 @@ impl<S: Read + Write> Connection<S> {
 
     fn process_rst(&mut self, frame: Frame) -> Result<DispatchOutcome> {
         let stream_id = frame.stream_id;
-        let code = if frame.payload.len() >= 4 {
-            u32::from_be_bytes([
-                frame.payload[0],
-                frame.payload[1],
-                frame.payload[2],
-                frame.payload[3],
-            ])
-        } else {
-            0
-        };
+        // Payload length (exactly 4) was validated in `process_stream_frame`.
+        let code = u32::from_be_bytes([
+            frame.payload[0],
+            frame.payload[1],
+            frame.payload[2],
+            frame.payload[3],
+        ]);
         match self.streams.get_mut(&stream_id) {
             Some(s) => {
                 // RST_STREAM on closed → silently ignore (RFC 9113 §5.1).
                 if s.state == StreamState::Closed {
                     return Ok(DispatchOutcome::Continue);
                 }
+                s.rx_any = true;
+                // A complete response followed by RST_STREAM(NO_ERROR) is the
+                // server telling us to stop sending the rest of our request
+                // body (§8.1) — the response stands.
+                if code == ERR_NO_ERROR && s.end_stream_recv && s.response_headers.is_some() {
+                    s.state = StreamState::Closed;
+                    return Ok(DispatchOutcome::Done(stream_id));
+                }
+                // REFUSED_STREAM guarantees no application processing (§8.7),
+                // which makes the request safe to retry on a new connection.
+                s.refused = code == ERR_REFUSED_STREAM;
                 s.state = s.state.recv_rst()?;
                 Err(Error::BadResponse(format!(
                     "stream {stream_id} reset by server, error code {code}"
@@ -3286,11 +3630,37 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
     Ok((conn, cancel_guard))
 }
 
-/// True if `req`'s TLS options match what the pool can safely reuse. We
-/// refuse to pool when verification is off or a custom CA bundle is set —
-/// see the module comment above the pool definitions for the rationale.
+/// True if a pooled connection may be shared with `req`. The [`PoolKey`] only
+/// names the origin (+ partition), so any request whose TLS posture or dial
+/// route differs from the default must neither park its connection in the
+/// pool nor pick one up — otherwise a later request would silently inherit
+/// (or skip) someone else's trust decision: `-k`, a custom CA (`--cacert` /
+/// `--capath`) or CRL, `--pinnedpubkey`, a client identity (`-E`/`--key`),
+/// cipher / TLS-version restrictions, or a verify callback (whose engine
+/// skips built-in verification). Likewise a connection dialed through a proxy
+/// or a `--connect-to` / `--resolve` override reaches a different endpoint
+/// than a plain dial to the same origin. We refuse pooling for all of these
+/// rather than key on them (mirrors `http::tls_pool_eligible`, plus the
+/// routing inputs the h1 pool keys on).
 fn pool_eligible(req: &Request) -> bool {
-    req.verify_tls && req.ca_bundle.is_none()
+    let tls_default = req.verify_tls
+        && req.ca_bundle.is_none()
+        && req.ca_path.is_none()
+        && req.crl_file.is_none()
+        && req.pinned_pubkey.is_none()
+        && req.client_cert.is_none()
+        && req.client_key.is_none()
+        && req.ciphers.is_none()
+        && req.tls13_ciphers.is_none()
+        && req.tls_min.is_none()
+        && req.tls_max.is_none()
+        && req.tls_verify_callback.is_none();
+    let direct_route = req.connector.is_direct()
+        && req.proxy_resolver.is_none()
+        && (req.proxy.is_none() || crate::http::proxy_bypassed(req))
+        && req.connect_to.is_empty()
+        && req.resolve.is_empty();
+    tls_default && direct_route
 }
 
 /// Send a single request/response over an HTTP/2 connection, reusing a
@@ -3341,6 +3711,7 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
             let mut conn_guard = arc.lock().unwrap_or_else(|e| e.into_inner());
             if conn_guard.is_usable() {
                 let _ = writeln!(trace, "* Reusing existing connection from pool");
+                let first_id = conn_guard.next_stream_id;
                 match run_one_request(&mut conn_guard, &req, trace) {
                     Ok(resp) => {
                         let still_usable = conn_guard.is_usable();
@@ -3354,15 +3725,22 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
                         }
                         return Ok(resp);
                     }
-                    Err(_e) => {
-                        // Wire state may now be inconsistent. Drop the conn
-                        // and fall through to a cold dial; the original error
-                        // is intentionally discarded in favour of the
-                        // (likely cleaner) error from the fresh attempt.
+                    Err(e) => {
+                        // Wire state may now be inconsistent: never re-pool.
+                        // Retry on a fresh connection only when the server
+                        // provably did not act on the request (see
+                        // `pooled_failure_retryable`); otherwise a POST the
+                        // server processed before resetting the stream would
+                        // silently be sent twice.
+                        let retry = pooled_failure_retryable(&conn_guard, first_id, &req, &e);
                         drop(conn_guard);
+                        if !retry {
+                            let _ = writeln!(trace, "* Connection closed");
+                            return Err(e);
+                        }
                         let _ = writeln!(
                             trace,
-                            "* Pooled connection unusable (request failed); reconnecting"
+                            "* Pooled connection unusable ({e}); retrying on a fresh connection"
                         );
                     }
                 }
@@ -3389,6 +3767,45 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
         let _ = writeln!(trace, "* Connection closed");
     }
     Ok(resp)
+}
+
+/// Whether a request that failed on a *pooled* connection may be re-sent on a
+/// fresh one. Mirrors curl: only when the server provably did no application
+/// processing —
+///
+/// - the stream was never opened (nothing was sent);
+/// - its id is above a GOAWAY's last-stream-id (RFC 9113 §6.8);
+/// - it was reset with REFUSED_STREAM (§8.7); or
+/// - the (stale) connection failed at the transport level before *any* frame
+///   for the stream arrived, and the method is idempotent (RFC 9110 §9.2.2),
+///   so a repeat is harmless even if the server did see it.
+///
+/// `first_id` is the connection's `next_stream_id` before the attempt.
+fn pooled_failure_retryable<S: Read + Write>(
+    conn: &Connection<S>,
+    first_id: u32,
+    req: &Request,
+    err: &Error,
+) -> bool {
+    if conn.next_stream_id == first_id {
+        return true;
+    }
+    let id = first_id;
+    if conn.goaway_received.is_some_and(|last| id > last) {
+        return true;
+    }
+    let stream = conn.streams.get(&id);
+    if stream.is_some_and(|s| s.refused) {
+        return true;
+    }
+    let transport_failure = matches!(err, Error::Io(_) | Error::UnexpectedEof);
+    let nothing_received = stream.is_none_or(|s| !s.rx_any);
+    let method = crate::http::effective_method(req).to_ascii_uppercase();
+    let idempotent = matches!(
+        method.as_str(),
+        "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE"
+    );
+    transport_failure && nothing_received && idempotent
 }
 
 /// Drive one request/response exchange on an already-established conn.
@@ -3729,6 +4146,94 @@ fn is_connection_specific_header(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" // unless value is exactly "trailers"; we conservatively drop.
     )
+}
+
+/// What a validated response header section carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResponseFieldInfo {
+    /// `:status` (only for a response head; `0` for a trailer section).
+    pub(crate) status: u16,
+    /// The (single, consistent) `content-length`, if present.
+    pub(crate) content_length: Option<u64>,
+}
+
+/// Validate a decoded HTTP/2 or HTTP/3 response field section (RFC 9113
+/// §8.1.1/§8.2/§8.3, RFC 9114 §4.1.2/§4.2/§4.3). A response head
+/// (`trailers == false`) must carry exactly one `:status` — a 3-digit code —
+/// and no other pseudo-header; a trailer section carries none. Pseudo-headers
+/// must precede regular fields, connection-specific fields are forbidden, and
+/// every `content-length` must agree. A section failing any of these is
+/// malformed; accepting it could let a re-serialising consumer smuggle a
+/// different response.
+pub(crate) fn validate_response_fields(
+    fields: &[(String, String)],
+    trailers: bool,
+) -> std::result::Result<ResponseFieldInfo, String> {
+    let mut status: Option<u16> = None;
+    let mut content_length: Option<u64> = None;
+    let mut seen_regular = false;
+    for (name, value) in fields {
+        if let Some(pseudo) = name.strip_prefix(':') {
+            if seen_regular {
+                return Err(format!("pseudo-header :{pseudo} after a regular field"));
+            }
+            if trailers {
+                return Err(format!("pseudo-header :{pseudo} in trailers"));
+            }
+            if pseudo != "status" {
+                return Err(format!("pseudo-header :{pseudo} not allowed in a response"));
+            }
+            if status.is_some() {
+                return Err("duplicate :status".into());
+            }
+            let code = (value.len() == 3 && value.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| value.parse::<u16>().ok())
+                .flatten()
+                .filter(|c| (100..=999).contains(c))
+                .ok_or_else(|| format!("bad :status {value:?}"))?;
+            status = Some(code);
+            continue;
+        }
+        seen_regular = true;
+        let lname = name.to_ascii_lowercase();
+        if lname == "te" {
+            if !value.trim().eq_ignore_ascii_case("trailers") {
+                return Err(format!("te: {value:?} not allowed"));
+            }
+            continue;
+        }
+        if is_connection_specific_header(&lname) {
+            return Err(format!("connection-specific field {lname:?}"));
+        }
+        if lname == "content-length" && !trailers {
+            for part in value.split(',') {
+                let part = part.trim();
+                if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(format!("bad content-length {value:?}"));
+                }
+                let n: u64 = part
+                    .parse()
+                    .map_err(|_| format!("bad content-length {value:?}"))?;
+                match content_length {
+                    Some(prev) if prev != n => {
+                        return Err("conflicting content-length values".into());
+                    }
+                    _ => content_length = Some(n),
+                }
+            }
+        }
+    }
+    if trailers {
+        return Ok(ResponseFieldInfo {
+            status: 0,
+            content_length: None,
+        });
+    }
+    let status = status.ok_or_else(|| "response missing :status".to_string())?;
+    Ok(ResponseFieldInfo {
+        status,
+        content_length,
+    })
 }
 
 /// Like [`trace_request`] but labels every `>` line with `[stream N]` so the
@@ -6228,6 +6733,8 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        // DATA is only valid after the final response head.
+        conn.streams.get_mut(&id).unwrap().final_status = Some(200);
 
         // A single 40_000-byte DATA frame drops both windows from 65_535 to
         // 25_535 — below the 32_767 half-threshold — so both replenish.
@@ -6263,6 +6770,8 @@ mod tests {
         let mut conn = fake_conn();
         let id = conn.open_stream().unwrap();
         conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        // DATA is only valid after the final response head.
+        conn.streams.get_mut(&id).unwrap().final_status = Some(200);
 
         conn.process_frame(synth_data(id, b"hello", false), None)
             .unwrap();
@@ -6667,5 +7176,533 @@ mod tests {
         let mut sink = std::io::sink();
         let out = send_multiplexed(Vec::new(), &mut sink);
         assert!(out.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Review regressions: pool isolation, trailers, retries, early
+    // responses, response validation, content-length, HPACK and framing.
+    // -----------------------------------------------------------------
+
+    /// A HEADERS frame carrying `fields` as raw literals (no indexing, so the
+    /// connection's HPACK table is unaffected).
+    fn fields_frame(id: u32, fields: &[(&str, &str)], end_stream: bool) -> Frame {
+        let mut payload = Vec::new();
+        for (n, v) in fields {
+            payload.extend(raw_literal_block(n.as_bytes(), v.as_bytes()));
+        }
+        let mut flags = FLAG_END_HEADERS;
+        if end_stream {
+            flags |= FLAG_END_STREAM;
+        }
+        Frame {
+            typ: F_HEADERS,
+            flags,
+            stream_id: id,
+            payload,
+        }
+    }
+
+    fn goaway_frame(last: u32) -> Frame {
+        let mut payload = last.to_be_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        Frame {
+            typ: F_GOAWAY,
+            flags: 0,
+            stream_id: 0,
+            payload,
+        }
+    }
+
+    fn rst_frame(id: u32, code: u32) -> Frame {
+        Frame {
+            typ: F_RST_STREAM,
+            flags: 0,
+            stream_id: id,
+            payload: code.to_be_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn pool_eligible_refuses_non_default_tls_and_routing() {
+        let base = || Request::get("https://example.com/").unwrap();
+        assert!(pool_eligible(&base()));
+        let cases: Vec<(&str, Request)> = vec![
+            ("-k", {
+                let mut r = base();
+                r.verify_tls = false;
+                r
+            }),
+            ("--pinnedpubkey", base().pinned_pubkey("sha256//AAAA")),
+            ("-E", base().client_cert("/tmp/c.pem")),
+            ("--capath", {
+                let mut r = base();
+                r.ca_path = Some("/tmp/ca".into());
+                r
+            }),
+            ("--crlfile", {
+                let mut r = base();
+                r.crl_file = Some("/tmp/crl.pem".into());
+                r
+            }),
+            ("--ciphers", {
+                let mut r = base();
+                r.ciphers = Some("X".into());
+                r
+            }),
+            ("--tls13-ciphers", {
+                let mut r = base();
+                r.tls13_ciphers = Some("X".into());
+                r
+            }),
+            (
+                "--tls-max",
+                base().tls_max_version(crate::tls::ProtocolVersion::TLSv1_2),
+            ),
+            (
+                "verify callback",
+                base().tls_verify_callback(crate::tls::VerifyCallback::new(|_| {
+                    crate::tls::CertVerdict::Accept
+                })),
+            ),
+            (
+                "--connect-to",
+                base().connect_to("", 0, "other.example", 443),
+            ),
+            ("--resolve", {
+                let mut r = base();
+                r.resolve
+                    .push(("example.com".into(), 443, "127.0.0.1".parse().unwrap()));
+                r
+            }),
+            ("-x", base().proxy("http://proxy.example:3128").unwrap()),
+        ];
+        for (what, req) in cases {
+            assert!(!pool_eligible(&req), "{what} must bypass the h2 pool");
+        }
+    }
+
+    #[test]
+    fn trailers_do_not_replace_response_headers() {
+        // HEADERS(:status 200) → DATA → trailing HEADERS(grpc-status,
+        // END_STREAM): the response keeps its head and body.
+        let inbound = vec![
+            fields_frame(
+                1,
+                &[(":status", "200"), ("content-type", "application/grpc")],
+                false,
+            ),
+            synth_data(1, b"payload", false),
+            fields_frame(1, &[("grpc-status", "0")], true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let resp = run_one_request(
+            &mut conn,
+            &h2_get("https://example.com/"),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"payload");
+        assert!(resp.headers.iter().any(|(k, _)| k == "content-type"));
+        assert!(!resp.headers.iter().any(|(k, _)| k == "grpc-status"));
+    }
+
+    #[test]
+    fn trailers_without_end_stream_or_with_pseudo_are_rejected() {
+        for trailer in [
+            fields_frame(1, &[("x-t", "v")], false),
+            fields_frame(1, &[(":status", "500")], true),
+        ] {
+            let inbound = vec![fields_frame(1, &[(":status", "200")], false), trailer];
+            let mut conn = fake_conn_with_inbound(&inbound);
+            assert!(run_one_request(
+                &mut conn,
+                &h2_get("https://example.com/"),
+                &mut std::io::sink()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn interim_responses_then_final_head() {
+        let inbound = vec![
+            fields_frame(
+                1,
+                &[(":status", "103"), ("link", "</a>; rel=preload")],
+                false,
+            ),
+            fields_frame(1, &[(":status", "200")], false),
+            synth_data(1, b"ok", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let resp = run_one_request(
+            &mut conn,
+            &h2_get("https://example.com/"),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"ok");
+    }
+
+    #[test]
+    fn interim_flood_and_interim_end_stream_are_rejected() {
+        let mut inbound = Vec::new();
+        for _ in 0..=MAX_INTERIM_RESPONSES {
+            inbound.push(fields_frame(1, &[(":status", "103")], false));
+        }
+        let mut conn = fake_conn_with_inbound(&inbound);
+        assert!(run_one_request(
+            &mut conn,
+            &h2_get("https://example.com/"),
+            &mut std::io::sink()
+        )
+        .is_err());
+
+        let inbound = vec![fields_frame(1, &[(":status", "100")], true)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        assert!(run_one_request(
+            &mut conn,
+            &h2_get("https://example.com/"),
+            &mut std::io::sink()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn data_before_final_head_is_a_stream_error() {
+        let mut conn = fake_conn();
+        let id = conn.open_stream().unwrap();
+        conn.streams.get_mut(&id).unwrap().state = StreamState::Open;
+        assert!(conn
+            .process_frame(synth_data(id, b"x", false), None)
+            .is_err());
+        // Reset with PROTOCOL_ERROR, and the stream closed with no response.
+        let out = drain_wire_out(&conn);
+        assert!(out
+            .iter()
+            .any(|f| f.typ == F_RST_STREAM && f.payload == ERR_PROTOCOL.to_be_bytes()));
+        assert_eq!(conn.streams[&id].state, StreamState::Closed);
+    }
+
+    #[test]
+    fn malformed_response_heads_are_rejected() {
+        for fields in [
+            &[(":status", "200"), (":status", "204")][..],
+            &[("server", "x"), (":status", "200")][..],
+            &[(":status", "200"), ("connection", "close")][..],
+            &[(":status", "200"), ("keep-alive", "timeout=5")][..],
+            &[(":status", "200"), ("transfer-encoding", "chunked")][..],
+            &[(":status", "200"), (":method", "GET")][..],
+            &[(":status", "2000")][..],
+            &[("server", "x")][..],
+            &[(":status", "200"), ("content-length", "3, 4")][..],
+        ] {
+            let inbound = vec![fields_frame(1, fields, true)];
+            let mut conn = fake_conn_with_inbound(&inbound);
+            assert!(
+                run_one_request(
+                    &mut conn,
+                    &h2_get("https://example.com/"),
+                    &mut std::io::sink()
+                )
+                .is_err(),
+                "{fields:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn content_length_mismatch_is_rejected() {
+        // Short body.
+        let inbound = vec![
+            fields_frame(1, &[(":status", "200"), ("content-length", "10")], false),
+            synth_data(1, b"short", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        assert!(run_one_request(
+            &mut conn,
+            &h2_get("https://example.com/"),
+            &mut std::io::sink()
+        )
+        .is_err());
+        // Excess body: rejected on the frame that overflows.
+        let inbound = vec![
+            fields_frame(1, &[(":status", "200"), ("content-length", "2")], false),
+            synth_data(1, b"too long", false),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        assert!(run_one_request(
+            &mut conn,
+            &h2_get("https://example.com/"),
+            &mut std::io::sink()
+        )
+        .is_err());
+        // Matching length and repeated identical values are fine.
+        let inbound = vec![
+            fields_frame(1, &[(":status", "200"), ("content-length", "4, 4")], false),
+            synth_data(1, b"four", true),
+        ];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let resp = run_one_request(
+            &mut conn,
+            &h2_get("https://example.com/"),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert_eq!(resp.body, b"four");
+        // HEAD: content-length describes the GET body.
+        let inbound = vec![fields_frame(
+            1,
+            &[(":status", "200"), ("content-length", "99")],
+            true,
+        )];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let head = Request::new("HEAD", "https://example.com/").unwrap();
+        assert_eq!(
+            run_one_request(&mut conn, &head, &mut std::io::sink())
+                .unwrap()
+                .status,
+            200
+        );
+    }
+
+    #[test]
+    fn early_complete_response_during_upload_is_returned() {
+        // Only 5 bytes of a 12-byte body fit the stream window; the server
+        // answers 413 with END_STREAM instead of granting more.
+        let inbound = vec![fields_frame(1, &[(":status", "413")], true)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        conn.peer.initial_window_size = 5;
+        let req = h2_request_with_body((0..12u8).collect());
+        let resp = run_one_request(&mut conn, &req, &mut std::io::sink()).unwrap();
+        assert_eq!(resp.status, 413);
+        // We stopped sending with RST_STREAM(NO_ERROR), keeping the
+        // connection healthy.
+        let out = drain_wire_out(&conn);
+        assert!(out
+            .iter()
+            .any(|f| f.typ == F_RST_STREAM && f.payload == ERR_NO_ERROR.to_be_bytes()));
+        assert!(conn.is_usable());
+    }
+
+    #[test]
+    fn goaway_below_our_stream_fails_fast_and_is_retryable() {
+        let inbound = vec![goaway_frame(0)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let req = h2_request_with_body(b"pay".to_vec());
+        let first = conn.next_stream_id;
+        let err = run_one_request(&mut conn, &req, &mut std::io::sink()).unwrap_err();
+        assert!(err.to_string().contains("GOAWAY"), "{err}");
+        // Even a POST is safe to retry: the server promised not to process it.
+        assert!(pooled_failure_retryable(&conn, first, &req, &err));
+    }
+
+    #[test]
+    fn pooled_failure_retry_classification() {
+        let post = h2_request_with_body(b"pay".to_vec());
+        let get = h2_get("https://example.com/");
+
+        // Connection died before anything arrived for the stream: only an
+        // idempotent request may be replayed.
+        for (req, expect) in [(&get, true), (&post, false)] {
+            let mut conn = fake_conn();
+            let first = conn.next_stream_id;
+            let err = run_one_request(&mut conn, req, &mut std::io::sink()).unwrap_err();
+            assert!(matches!(err, Error::UnexpectedEof), "{err:?}");
+            assert_eq!(pooled_failure_retryable(&conn, first, req, &err), expect);
+        }
+
+        // Response already started, then the connection died: never replay.
+        let inbound = vec![fields_frame(1, &[(":status", "200")], false)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let first = conn.next_stream_id;
+        let err = run_one_request(&mut conn, &get, &mut std::io::sink()).unwrap_err();
+        assert!(!pooled_failure_retryable(&conn, first, &get, &err));
+
+        // Stream reset after the server processed it: never replay a POST.
+        let inbound = vec![rst_frame(1, 0x2 /* INTERNAL_ERROR */)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let first = conn.next_stream_id;
+        let err = run_one_request(&mut conn, &post, &mut std::io::sink()).unwrap_err();
+        assert!(!pooled_failure_retryable(&conn, first, &post, &err));
+
+        // REFUSED_STREAM guarantees no processing: replay is safe.
+        let inbound = vec![rst_frame(1, ERR_REFUSED_STREAM)];
+        let mut conn = fake_conn_with_inbound(&inbound);
+        let first = conn.next_stream_id;
+        let err = run_one_request(&mut conn, &post, &mut std::io::sink()).unwrap_err();
+        assert!(pooled_failure_retryable(&conn, first, &post, &err));
+    }
+
+    #[test]
+    fn hpack_size_update_rules() {
+        // At the start of a block and within our limit: fine.
+        let mut dec = Decoder::new();
+        dec.decode_block(&[0x3f, 0xe1, 0x07, 0x82]).unwrap(); // 1024, then :method GET
+        assert_eq!(dec.dyn_table_cap, 1024);
+        // Above the 4096 we advertise: COMPRESSION_ERROR, not a silent cap.
+        let mut over = encode_int(100_000, 5);
+        over[0] |= 0x20;
+        assert!(Decoder::new().decode_block(&over).is_err());
+        // After a header field: COMPRESSION_ERROR.
+        assert!(Decoder::new().decode_block(&[0x82, 0x20]).is_err());
+    }
+
+    #[test]
+    fn hpack_int_rejects_bits_lost_at_high_shift() {
+        // 5-bit prefix saturated, 9 continuation bytes of 0x80, then 0x02:
+        // bit 1 of the final byte lands at shift 63 → would need bit 64.
+        let mut buf = vec![0x1f];
+        buf.extend(std::iter::repeat_n(0x80, 9));
+        buf.push(0x02);
+        assert!(decode_int(&buf, 5).is_err());
+        // The largest in-range value still round-trips.
+        let enc = encode_int(u64::MAX >> 1, 5);
+        assert_eq!(decode_int(&enc, 5).unwrap().0, u64::MAX >> 1);
+    }
+
+    #[test]
+    fn huffman_decode_all_symbols_round_trip_and_worst_case_is_fast() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(huffman_decode(&huffman_encode(&all)).unwrap(), all);
+        // 256 KiB of the longest (30-bit-class) symbols used to take ~0.4 s
+        // with a linear table scan per candidate length.
+        let worst = vec![b'\x16'; 64 * 1024];
+        let enc = huffman_encode(&worst);
+        let t = std::time::Instant::now();
+        assert_eq!(huffman_decode(&enc).unwrap(), worst);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(2000),
+            "huffman decode too slow: {:?}",
+            t.elapsed()
+        );
+    }
+
+    #[test]
+    fn encoder_caps_peer_table_size_and_signals_minimum_first() {
+        let mut enc = Encoder::new();
+        enc.set_peer_max_table_size(1 << 30);
+        assert_eq!(enc.max_dyn_table_size, DYN_TABLE_CAP);
+        // Shrink to 0 then grow back to 4096 between blocks: RFC 7541 §4.2
+        // requires signalling 0 before 4096.
+        let mut enc = Encoder::new();
+        enc.set_peer_max_table_size(0);
+        enc.set_peer_max_table_size(4096);
+        let mut out = Vec::new();
+        enc.encode_header(&mut out, ":method", "GET");
+        let mut expected = vec![0x20]; // size update 0
+        let mut int = encode_int(4096, 5);
+        int[0] |= 0x20;
+        expected.extend(int);
+        expected.push(0x82);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn oversize_inbound_frame_is_frame_size_error() {
+        let big = Frame {
+            typ: F_DATA,
+            flags: 0,
+            stream_id: 1,
+            payload: vec![0; OUR_MAX_FRAME_SIZE + 1],
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &big).unwrap();
+        assert!(read_frame(&mut Cursor::new(bytes)).is_err());
+    }
+
+    #[test]
+    fn send_frame_limit_clamps_peer_max_frame_size() {
+        let mut conn = fake_conn();
+        conn.peer.max_frame_size = MAX_FRAME_SIZE_MAX;
+        assert_eq!(conn.send_frame_limit(), MAX_FRAME_PAYLOAD);
+    }
+
+    #[test]
+    fn control_frame_length_and_stream_rules() {
+        let bad = [
+            // PING must be 8 octets.
+            Frame {
+                typ: F_PING,
+                flags: 0,
+                stream_id: 0,
+                payload: vec![0; 7],
+            },
+            // GOAWAY needs at least 8 octets.
+            Frame {
+                typ: F_GOAWAY,
+                flags: 0,
+                stream_id: 0,
+                payload: vec![0; 4],
+            },
+            // SETTINGS ACK must be empty.
+            Frame {
+                typ: F_SETTINGS,
+                flags: FLAG_ACK,
+                stream_id: 0,
+                payload: vec![0; 6],
+            },
+            // Stream-scoped frames on stream 0.
+            Frame {
+                typ: F_DATA,
+                flags: 0,
+                stream_id: 0,
+                payload: vec![],
+            },
+            Frame {
+                typ: F_PRIORITY,
+                flags: 0,
+                stream_id: 0,
+                payload: vec![0; 5],
+            },
+            Frame {
+                typ: F_RST_STREAM,
+                flags: 0,
+                stream_id: 0,
+                payload: vec![0; 4],
+            },
+            // Connection-scoped frames on a stream.
+            Frame {
+                typ: F_SETTINGS,
+                flags: 0,
+                stream_id: 1,
+                payload: vec![],
+            },
+            Frame {
+                typ: F_PING,
+                flags: 0,
+                stream_id: 1,
+                payload: vec![0; 8],
+            },
+            // Wrong payload lengths on stream frames.
+            Frame {
+                typ: F_RST_STREAM,
+                flags: 0,
+                stream_id: 1,
+                payload: vec![0; 3],
+            },
+            Frame {
+                typ: F_PRIORITY,
+                flags: 0,
+                stream_id: 1,
+                payload: vec![0; 4],
+            },
+        ];
+        for f in bad {
+            let mut conn = fake_conn();
+            let _ = conn.open_stream().unwrap();
+            let desc = format!(
+                "type=0x{:x} stream={} len={}",
+                f.typ,
+                f.stream_id,
+                f.payload.len()
+            );
+            assert!(
+                conn.process_frame(f, None).is_err(),
+                "{desc} must be rejected"
+            );
+        }
     }
 }

@@ -61,7 +61,6 @@
 
 use std::io;
 use std::io::Write;
-use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
 
 use crate::net::udp::{open_udp_transport, UdpTransport};
@@ -448,8 +447,9 @@ const MAX_DATAGRAM: usize = 65_535;
 /// Per-connection HTTP/3 / QPACK decoder state. Holds the QPACK decoder (whose
 /// dynamic table is fed by the peer's encoder stream), the partial-read buffers
 /// for the server's unidirectional streams (so an instruction split across
-/// datagrams can be reassembled), and the client's QPACK decoder stream id
-/// (where we send Section Acknowledgements).
+/// datagrams can be reassembled), the client's QPACK decoder stream id (where
+/// we send Section Acknowledgements), and what we learned from the peer's
+/// control stream.
 struct Http3State {
     /// The QPACK decoder; its dynamic table is populated from the peer's
     /// encoder stream and bounded by our advertised max table capacity.
@@ -458,23 +458,39 @@ struct Http3State {
     decoder_stream: Option<StreamId>,
     /// Per server-uni-stream reassembly state, keyed by stream id value.
     uni: std::collections::HashMap<u64, UniStreamState>,
+    /// Stream ids of the peer's critical unidirectional streams, once seen.
+    /// Each may exist at most once per connection (RFC 9114 §6.2.1, RFC 9204
+    /// §4.2), and none may be closed (H3_CLOSED_CRITICAL_STREAM).
+    peer_control: Option<u64>,
+    peer_qpack_encoder: Option<u64>,
+    peer_qpack_decoder: Option<u64>,
+    /// Whether the peer's SETTINGS (the mandatory first control frame) arrived.
+    settings_seen: bool,
+    /// Lowest stream id announced by a peer GOAWAY (RFC 9114 §5.2): request
+    /// streams at or above it were not, and will not be, processed.
+    goaway_id: Option<u64>,
 }
 
 /// State for one server-initiated unidirectional stream while we classify it
-/// by its leading stream-type varint and (for the QPACK encoder stream)
-/// accumulate and apply instructions.
+/// by its leading stream-type varint and then process (control, QPACK
+/// encoder) or discard (everything else) its bytes.
 #[derive(Default)]
 struct UniStreamState {
-    /// Bytes received but not yet processed (a partial type prefix, or a
-    /// partial encoder instruction).
+    /// Bytes received but not yet processed (a partial type prefix, a partial
+    /// control frame, or a partial encoder instruction).
     buf: Vec<u8>,
     /// The decoded stream type, once the leading varint has been read.
     ty: Option<u64>,
+    /// Control stream: payload bytes of an ignorable (unknown / grease) frame
+    /// still to be skipped without buffering.
+    skip_remaining: u64,
 }
 
 /// Cap on bytes we buffer from a single server uni-stream awaiting a complete
-/// QPACK encoder instruction. Bounds memory against a peer that dribbles an
-/// unterminated instruction. Generous relative to any real instruction.
+/// QPACK encoder instruction or control frame. Bounds memory against a peer
+/// that dribbles an unterminated one. Generous relative to any real instruction
+/// or SETTINGS/GOAWAY frame. Streams we don't process (the peer's QPACK decoder
+/// stream, grease types) are discarded as they arrive and never count toward it.
 const MAX_UNI_BUFFER: usize = 64 * 1024;
 
 impl Http3State {
@@ -483,6 +499,11 @@ impl Http3State {
             decoder: QpackDecoder::with_max_table_capacity(QPACK_MAX_TABLE_CAPACITY as usize),
             decoder_stream,
             uni: std::collections::HashMap::new(),
+            peer_control: None,
+            peer_qpack_encoder: None,
+            peer_qpack_decoder: None,
+            settings_seen: false,
+            goaway_id: None,
         }
     }
 }
@@ -589,7 +610,16 @@ fn send_inner(
         peer_certificates: conn.peer_certificates().to_vec(),
     };
 
-    write_request(&mut conn, request_stream, &req, trace)?;
+    let wire = Wire {
+        sock: &*sock,
+        peer,
+        start: dial_start,
+        idle_timeout: req
+            .read_timeout
+            .unwrap_or(MAX_TOTAL_DEADLINE)
+            .min(MAX_TOTAL_DEADLINE),
+    };
+    write_request(&mut conn, &wire, request_stream, &req, trace)?;
     if !req.body.is_empty() {
         let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
     }
@@ -615,12 +645,13 @@ fn send_inner(
 }
 
 /// Read all readable server-initiated unidirectional streams, classify each
-/// by its leading stream-type varint (RFC 9114 §6.2), and apply the QPACK
-/// encoder stream's instructions (RFC 9204 §4.3) into the dynamic table.
-/// Bytes on the server's control / decoder / push streams are buffered-and-
-/// discarded for our one-shot model. This must run BEFORE we decode a
-/// response HEADERS block so the table is populated (we advertise zero
-/// blocked streams, so the encoder front-loads every referenced insert).
+/// by its leading stream-type varint (RFC 9114 §6.2), and process it: the
+/// control stream's frames (SETTINGS first, GOAWAY) and the QPACK encoder
+/// stream's instructions (RFC 9204 §4.3) into the dynamic table. Everything
+/// else (the peer's QPACK decoder stream, reserved/grease stream types) is
+/// discarded as it arrives. This must run BEFORE we decode a response HEADERS
+/// block so the table is populated (we advertise zero blocked streams, so the
+/// encoder front-loads every referenced insert).
 fn drain_uni_streams(conn: &mut QuicConnection, state: &mut Http3State) -> Result<()> {
     // Snapshot the readable server uni-streams; reading mutates the iterator
     // source, so collect ids first.
@@ -628,32 +659,63 @@ fn drain_uni_streams(conn: &mut QuicConnection, state: &mut Http3State) -> Resul
         .readable_streams()
         .filter(|s| s.is_uni() && s.is_server_initiated())
         .collect();
+    let mut tmp = vec![0u8; 16 * 1024];
     for sid in ids {
-        let mut tmp = vec![0u8; 16 * 1024];
-        // A read error on a uni stream we don't strictly need is not fatal for
-        // a one-shot request; `while let Ok` simply stops draining it. `n == 0`
-        // (no more buffered bytes right now) also ends this pass.
-        while let Ok((n, _fin)) = conn.read(sid, &mut tmp) {
+        // A read error on a uni stream is not fatal for a one-shot request;
+        // `while let Ok` simply stops draining it. `n == 0` (no more buffered
+        // bytes right now) also ends this pass.
+        while let Ok((n, fin)) = conn.read(sid, &mut tmp) {
+            if n > 0 {
+                state
+                    .uni
+                    .entry(sid.value())
+                    .or_default()
+                    .buf
+                    .extend_from_slice(&tmp[..n]);
+                // Process per chunk so discarded stream types never
+                // accumulate, and a processed stream only ever holds one
+                // incomplete unit.
+                process_uni_stream(state, sid.value())?;
+                if state
+                    .uni
+                    .get(&sid.value())
+                    .is_some_and(|e| e.buf.len() > MAX_UNI_BUFFER)
+                {
+                    return Err(Error::BadResponse(
+                        "http3: server uni-stream buffer exceeded limit".into(),
+                    ));
+                }
+            }
+            if fin {
+                // RFC 9114 §6.2.1 / RFC 9204 §4.2: closing the control or a
+                // QPACK stream is H3_CLOSED_CRITICAL_STREAM.
+                let v = sid.value();
+                if [
+                    state.peer_control,
+                    state.peer_qpack_encoder,
+                    state.peer_qpack_decoder,
+                ]
+                .contains(&Some(v))
+                {
+                    return Err(Error::BadResponse(format!(
+                        "http3: peer closed critical stream {v} (H3_CLOSED_CRITICAL_STREAM)"
+                    )));
+                }
+                state.uni.remove(&v);
+                break;
+            }
             if n == 0 {
                 break;
             }
-            let entry = state.uni.entry(sid.value()).or_default();
-            if entry.buf.len() + n > MAX_UNI_BUFFER {
-                return Err(Error::BadResponse(
-                    "http3: server uni-stream buffer exceeded limit".into(),
-                ));
-            }
-            entry.buf.extend_from_slice(&tmp[..n]);
         }
-        // Process whatever is buffered for this stream.
-        process_uni_stream(state, sid.value())?;
     }
     Ok(())
 }
 
 /// Classify and process the buffered bytes for one server uni-stream. Once
-/// the leading stream-type varint is known, QPACK-encoder bytes are applied
-/// to the dynamic table and other stream types are drained.
+/// the leading stream-type varint is known, control-stream frames are parsed,
+/// QPACK-encoder bytes are applied to the dynamic table, and other stream
+/// types are drained.
 fn process_uni_stream(state: &mut Http3State, sid: u64) -> Result<()> {
     let entry = state.uni.entry(sid).or_default();
     // Decode the stream-type prefix once.
@@ -662,11 +724,35 @@ fn process_uni_stream(state: &mut Http3State, sid: u64) -> Result<()> {
             Ok((ty, used)) => {
                 entry.ty = Some(ty);
                 entry.buf.drain(..used);
+                let slot = match ty {
+                    uni_stream_type::CONTROL => Some(&mut state.peer_control),
+                    uni_stream_type::QPACK_ENCODER => Some(&mut state.peer_qpack_encoder),
+                    uni_stream_type::QPACK_DECODER => Some(&mut state.peer_qpack_decoder),
+                    uni_stream_type::PUSH => {
+                        // We never send MAX_PUSH_ID, so the server may not
+                        // open a push stream (RFC 9114 §4.6: H3_ID_ERROR).
+                        return Err(Error::BadResponse(
+                            "http3: server opened a push stream without MAX_PUSH_ID (H3_ID_ERROR)"
+                                .into(),
+                        ));
+                    }
+                    _ => None,
+                };
+                if let Some(slot) = slot {
+                    if slot.is_some() {
+                        return Err(Error::BadResponse(format!(
+                            "http3: duplicate unidirectional stream type {ty:#x} (H3_STREAM_CREATION_ERROR)"
+                        )));
+                    }
+                    *slot = Some(sid);
+                }
             }
             Err(_) => return Ok(()), // need more bytes for the type prefix
         }
     }
+    let entry = state.uni.get_mut(&sid).expect("entry present");
     match entry.ty {
+        Some(uni_stream_type::CONTROL) => process_control_stream(state, sid),
         Some(uni_stream_type::QPACK_ENCODER) => {
             // Feed only whole instructions to the decoder; a trailing partial
             // one stays buffered for the next pass (see
@@ -680,15 +766,147 @@ fn process_uni_stream(state: &mut Http3State, sid: u64) -> Result<()> {
                 let entry = state.uni.get_mut(&sid).expect("entry present");
                 entry.buf.drain(..consumed);
             }
+            Ok(())
         }
-        // Control / decoder / push / unknown: drain and ignore for our
-        // one-shot request. We never reference push, and the server's
-        // control SETTINGS don't change our static-only request encoding.
+        // The peer's QPACK decoder stream (acks for an encoder table we never
+        // use) and reserved/grease stream types: discard as they arrive.
         _ => {
             entry.buf.clear();
+            Ok(())
+        }
+    }
+}
+
+/// Parse complete frames on the peer's control stream (RFC 9114 §6.2.1,
+/// §7.2): the first must be SETTINGS and it may not repeat; GOAWAY records
+/// the boundary above which requests were not processed; frames that belong
+/// on request streams, and HTTP/2 frame types reserved in HTTP/3, are
+/// H3_FRAME_UNEXPECTED. Unknown / grease frames are skipped without being
+/// buffered.
+fn process_control_stream(state: &mut Http3State, sid: u64) -> Result<()> {
+    loop {
+        let entry = state.uni.get_mut(&sid).expect("entry present");
+        if entry.skip_remaining > 0 {
+            let n = entry.skip_remaining.min(entry.buf.len() as u64) as usize;
+            entry.buf.drain(..n);
+            entry.skip_remaining -= n as u64;
+            if entry.skip_remaining > 0 {
+                return Ok(());
+            }
+        }
+        let Ok((frame, hdr_len)) = Frame::decode_header(&entry.buf) else {
+            return Ok(()); // partial frame header
+        };
+        if !state.settings_seen && frame.ty != frame_type::SETTINGS {
+            return Err(Error::BadResponse(format!(
+                "http3: first control frame is {:#x}, not SETTINGS (H3_MISSING_SETTINGS)",
+                frame.ty
+            )));
+        }
+        match frame.ty {
+            frame_type::DATA | frame_type::HEADERS | frame_type::PUSH_PROMISE => {
+                return Err(Error::BadResponse(format!(
+                    "http3: frame type {:#x} on the control stream (H3_FRAME_UNEXPECTED)",
+                    frame.ty
+                )));
+            }
+            ty if is_h2_reserved_frame_type(ty) => {
+                return Err(Error::BadResponse(format!(
+                    "http3: reserved HTTP/2 frame type {ty:#x} (H3_FRAME_UNEXPECTED)"
+                )));
+            }
+            frame_type::SETTINGS
+            | frame_type::GOAWAY
+            | frame_type::MAX_PUSH_ID
+            | frame_type::CANCEL_PUSH => {
+                if frame.len > MAX_UNI_BUFFER as u64 {
+                    return Err(Error::BadResponse(format!(
+                        "http3: control frame {:#x} too large ({} bytes)",
+                        frame.ty, frame.len
+                    )));
+                }
+                let total = hdr_len + frame.len as usize;
+                if entry.buf.len() < total {
+                    return Ok(()); // wait for the whole frame
+                }
+                let payload: Vec<u8> = entry.buf[hdr_len..total].to_vec();
+                entry.buf.drain(..total);
+                match frame.ty {
+                    frame_type::SETTINGS => {
+                        if state.settings_seen {
+                            return Err(Error::BadResponse(
+                                "http3: second SETTINGS frame (H3_FRAME_UNEXPECTED)".into(),
+                            ));
+                        }
+                        validate_settings(&payload)?;
+                        state.settings_seen = true;
+                    }
+                    frame_type::GOAWAY => {
+                        let malformed = || {
+                            Error::BadResponse("http3: malformed GOAWAY (H3_FRAME_ERROR)".into())
+                        };
+                        let (id, used) = varint::decode(&payload).map_err(|_| malformed())?;
+                        if used != payload.len() {
+                            return Err(malformed());
+                        }
+                        // §5.2: the id may only stay or shrink.
+                        if state.goaway_id.is_some_and(|prev| id > prev) {
+                            return Err(Error::BadResponse(
+                                "http3: GOAWAY id increased (H3_ID_ERROR)".into(),
+                            ));
+                        }
+                        state.goaway_id = Some(id);
+                    }
+                    frame_type::MAX_PUSH_ID => {
+                        // Only a client sends MAX_PUSH_ID (§7.2.7).
+                        return Err(Error::BadResponse(
+                            "http3: MAX_PUSH_ID from server (H3_FRAME_UNEXPECTED)".into(),
+                        ));
+                    }
+                    // CANCEL_PUSH: we never accept pushes; nothing to cancel.
+                    _ => {}
+                }
+            }
+            _ => {
+                // Unknown / grease (§9): skip its payload as it streams in.
+                entry.buf.drain(..hdr_len);
+                entry.skip_remaining = frame.len;
+            }
+        }
+    }
+}
+
+/// Validate a peer SETTINGS payload (RFC 9114 §7.2.4): well-formed varint
+/// pairs, no identifier twice, and none of the HTTP/2 setting identifiers
+/// reserved in HTTP/3 (H3_SETTINGS_ERROR). We don't act on any value: our
+/// requests use a literal-only QPACK encoding and no extensions.
+fn validate_settings(payload: &[u8]) -> Result<()> {
+    let malformed = || Error::BadResponse("http3: malformed SETTINGS (H3_FRAME_ERROR)".into());
+    let mut seen = std::collections::HashSet::new();
+    let mut pos = 0;
+    while pos < payload.len() {
+        let (id, n1) = varint::decode(&payload[pos..]).map_err(|_| malformed())?;
+        let (_value, n2) = varint::decode(&payload[pos + n1..]).map_err(|_| malformed())?;
+        pos += n1 + n2;
+        if matches!(id, 0x02..=0x05) {
+            return Err(Error::BadResponse(format!(
+                "http3: reserved HTTP/2 setting {id:#x} (H3_SETTINGS_ERROR)"
+            )));
+        }
+        if !seen.insert(id) {
+            return Err(Error::BadResponse(format!(
+                "http3: duplicate setting {id:#x} (H3_SETTINGS_ERROR)"
+            )));
         }
     }
     Ok(())
+}
+
+/// HTTP/2 frame types with no HTTP/3 equivalent, reserved so that receiving
+/// one is H3_FRAME_UNEXPECTED (RFC 9114 §7.2.8, §11.2.1): PRIORITY (0x02),
+/// PING (0x06), WINDOW_UPDATE (0x08), CONTINUATION (0x09).
+fn is_h2_reserved_frame_type(ty: u64) -> bool {
+    matches!(ty, 0x02 | 0x06 | 0x08 | 0x09)
 }
 
 /// Post-handshake server-certificate policy for HTTP/3, mirroring the TCP TLS
@@ -723,7 +941,7 @@ fn verify_peer_certificates(conn: &QuicConnection, req: &Request, pins: &[[u8; 3
     if let Some(cb) = &req.tls_verify_callback {
         let chain = conn.peer_certificates().to_vec();
         let verdict = cb.call(&crate::tls::CertVerify {
-            server_name: &req.url.host,
+            server_name: tls_host(&req.url.host),
             chain_der: &chain,
         });
         if verdict == crate::tls::CertVerdict::Reject {
@@ -785,7 +1003,7 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
     let mut builder = purecrypto::tls::Config::builder()
         .tls_only()
         .roots(roots)
-        .server_name(req.url.host.clone())
+        .server_name(quic_server_name(req))
         // A verify callback is the sole trust authority (browser model): when
         // one is set, disable the engine's own chain verification and defer to
         // the callback post-handshake (see `verify_peer_certificates`). This
@@ -870,16 +1088,12 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         cfg
     };
 
-    QuicConnection::client(cfg, &req.url.host)
+    QuicConnection::client(cfg, &quic_server_name(req))
         .map_err(|e| Error::BadResponse(format!("http3: build client: {e:?}")))
 }
 
 fn open_udp(req: &Request) -> Result<(Box<dyn UdpTransport>, std::net::SocketAddr)> {
-    let host_port = format!("{}:{}", req.url.host, req.url.port);
-    let peer = host_port
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::InvalidUrl(req.url.host.clone()))?;
+    let peer = dial_addr(req)?;
     // Direct UDP, or relayed through a SOCKS5 proxy if the connector is one;
     // a non-UDP-capable proxy (http/https/socks4) errors here.
     let sock = open_udp_transport(req.connector.udp_proxy(), peer)?;
@@ -888,6 +1102,71 @@ fn open_udp(req: &Request) -> Result<(Box<dyn UdpTransport>, std::net::SocketAdd
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
     sock.set_write_timeout(req.read_timeout)?;
     Ok((sock, peer))
+}
+
+/// The host as a TLS reference identity / resolver input: a bracketed IPv6
+/// literal from the URL (`[::1]`, `[fe80::1%25en0]`) loses its brackets and
+/// any zone id (RFC 6874), which name nothing to the peer or to DNS.
+fn tls_host(host: &str) -> &str {
+    match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(inner) => inner.split('%').next().unwrap_or(inner),
+        None => host,
+    }
+}
+
+/// The name handed to purecrypto for the QUIC handshake. purecrypto uses one
+/// string both as the SNI and as the reference identity it verifies the leaf
+/// against, and omits SNI only when it is empty. RFC 6066 §3 forbids an IP
+/// literal in SNI, but an IP must still be the reference identity (matched
+/// against iPAddress SANs) whenever the engine verifies — so an IP literal is
+/// only dropped (no SNI) when engine verification is off: `-k`, or a verify
+/// callback that owns trust (and gets the name via [`tls_host`] instead).
+fn quic_server_name(req: &Request) -> String {
+    let host = tls_host(&req.url.host);
+    let engine_verifies = req.verify_tls && req.tls_verify_callback.is_none();
+    if !engine_verifies && host.parse::<std::net::IpAddr>().is_ok() {
+        String::new()
+    } else {
+        host.to_string()
+    }
+}
+
+/// The UDP address to dial for `req`, applying the same overrides as the TCP
+/// path (`http::tcp_connect`) in the same order: `--connect-to` remaps the
+/// dial host/port, then a `--resolve` pin for the (remapped) host:port wins
+/// over DNS, otherwise the request's pluggable resolver runs and `-4`/`-6`
+/// picks the family. The QUIC handshake still names (and verifies) the URL
+/// host, so remapping the dial target never changes whose certificate is
+/// accepted.
+fn dial_addr(req: &Request) -> Result<std::net::SocketAddr> {
+    let (mut host, mut port) = (tls_host(&req.url.host).to_string(), req.url.port);
+    for (fh, fp, th, tp) in &req.connect_to {
+        let host_ok = fh.is_empty() || fh.eq_ignore_ascii_case(&host);
+        let port_ok = *fp == 0 || *fp == port;
+        if host_ok && port_ok {
+            if !th.is_empty() {
+                host = th.clone();
+            }
+            if *tp != 0 {
+                port = *tp;
+            }
+            break;
+        }
+    }
+    if let Some((_, _, ip)) = req
+        .resolve
+        .iter()
+        .find(|(h, p, _)| *p == port && h.eq_ignore_ascii_case(&host))
+    {
+        return Ok(std::net::SocketAddr::new(*ip, port));
+    }
+    let addrs = req.resolver.resolve(&host, port)?;
+    let chosen = match req.ip_family {
+        Some(crate::http::IpFamily::V4) => addrs.into_iter().find(|a| a.is_ipv4()),
+        Some(crate::http::IpFamily::V6) => addrs.into_iter().find(|a| a.is_ipv6()),
+        None => addrs.into_iter().next(),
+    };
+    chosen.ok_or(Error::InvalidUrl(host))
 }
 
 /// Drain whatever the connection wants to send right now, blast it out, and
@@ -1043,14 +1322,16 @@ fn encode_section_ack(stream_id: u64, out: &mut Vec<u8>) {
     encode_prefixed_int(stream_id, 7, 0b1000_0000, out);
 }
 
+/// Queue `data` on `sid` without driving the connection. For the small,
+/// fixed-size writes on our own unidirectional streams (stream types,
+/// SETTINGS, section acks), which always fit the initial flow-control credit;
+/// a request body goes through [`write_all_pumped`] instead.
 fn write_all(conn: &mut QuicConnection, sid: StreamId, mut data: &[u8]) -> Result<()> {
     while !data.is_empty() {
         let n = conn
             .write(sid, data)
             .map_err(|e| Error::BadResponse(format!("http3: stream write: {e:?}")))?;
         if n == 0 {
-            // Flow control blocked — rather than spin, bail out (a request
-            // header section plus a small body fits the initial flow window).
             return Err(Error::BadResponse(
                 "http3: stream write blocked (flow control)".into(),
             ));
@@ -1060,9 +1341,75 @@ fn write_all(conn: &mut QuicConnection, sid: StreamId, mut data: &[u8]) -> Resul
     Ok(())
 }
 
+/// The UDP path and clock a stream write needs to wait out flow control.
+struct Wire<'a> {
+    sock: &'a dyn UdpTransport,
+    peer: std::net::SocketAddr,
+    /// Connection start (for `on_timeout`).
+    start: Instant,
+    /// Give up waiting for credit after this long without any.
+    idle_timeout: Duration,
+}
+
+/// Queue all of `data` on `sid`, driving the connection while the peer's
+/// flow control (MAX_DATA / MAX_STREAM_DATA) holds us back. `write` returning
+/// `Ok(0)` means "blocked": we flush what's queued and read the peer's
+/// datagrams until fresh credit arrives, rather than failing any body larger
+/// than the peer's initial window (e.g. nginx-quic's 64 KiB default).
+fn write_all_pumped(
+    conn: &mut QuicConnection,
+    wire: &Wire<'_>,
+    sid: StreamId,
+    mut data: &[u8],
+) -> Result<()> {
+    let mut last_progress = Instant::now();
+    while !data.is_empty() {
+        let n = conn
+            .write(sid, data)
+            .map_err(|e| Error::BadResponse(format!("http3: stream write: {e:?}")))?;
+        if n > 0 {
+            data = &data[n..];
+            last_progress = Instant::now();
+            continue;
+        }
+        if conn.is_closed() {
+            return Err(Error::BadResponse(
+                "http3: peer closed connection while sending the request body".into(),
+            ));
+        }
+        if last_progress.elapsed() > wire.idle_timeout {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "http3: timed out waiting for flow-control credit",
+            )));
+        }
+        pump_once(conn, wire.sock, wire.peer, true, wire.start)?;
+    }
+    Ok(())
+}
+
+/// Whether a caller-supplied request header (lowercased name `kl`) must be
+/// left out of an HTTP/3 request: pseudo-headers (we emit our own), `Host`
+/// (carried as `:authority`), connection-specific fields (RFC 9114 §4.2), and
+/// `te` with any value other than "trailers".
+fn omit_request_field(kl: &str, value: &str) -> bool {
+    kl.starts_with(':')
+        || matches!(
+            kl,
+            "host"
+                | "connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "keep-alive"
+                | "proxy-connection"
+        )
+        || (kl == "te" && !value.trim().eq_ignore_ascii_case("trailers"))
+}
+
 /// Serialize HEADERS + DATA for `req` onto `sid` and finish the send side.
 fn write_request(
     conn: &mut QuicConnection,
+    wire: &Wire<'_>,
     sid: StreamId,
     req: &Request,
     trace: &mut dyn Write,
@@ -1086,14 +1433,7 @@ fn write_request(
     let mut have_accept_enc = false;
     for (k, v) in &req.headers {
         let kl = k.to_ascii_lowercase();
-        if kl.starts_with(':')
-            || kl == "host"
-            || kl == "connection"
-            || kl == "transfer-encoding"
-            || kl == "upgrade"
-            || kl == "keep-alive"
-            || kl == "proxy-connection"
-        {
+        if omit_request_field(&kl, v) {
             continue;
         }
         if kl == "user-agent" {
@@ -1156,9 +1496,11 @@ fn write_request(
     out.extend_from_slice(&qpack_payload);
     if !req.body.is_empty() {
         Frame::encode_header(frame_type::DATA, req.body.len() as u64, &mut out);
-        out.extend_from_slice(&req.body);
     }
-    write_all(conn, sid, &out)?;
+    write_all_pumped(conn, wire, sid, &out)?;
+    if !req.body.is_empty() {
+        write_all_pumped(conn, wire, sid, &req.body)?;
+    }
     conn.finish(sid)
         .map_err(|e| Error::BadResponse(format!("http3: stream finish: {e:?}")))?;
     Ok(())
@@ -1196,7 +1538,6 @@ fn read_response(
     trace: &mut dyn Write,
     conn_start: Instant,
 ) -> Result<Response> {
-    let mut streamed_len: u64 = 0;
     let total_deadline = req
         .read_timeout
         .unwrap_or(MAX_TOTAL_DEADLINE)
@@ -1204,8 +1545,10 @@ fn read_response(
     let start = Instant::now();
 
     let mut stream_buf: Vec<u8> = Vec::new();
-    let mut headers: Option<Fields> = None;
-    let mut body: Vec<u8> = Vec::new();
+    let mut rs = ReqStream {
+        head_request: crate::http::effective_method(req).eq_ignore_ascii_case("HEAD"),
+        ..ReqStream::default()
+    };
 
     loop {
         if start.elapsed() > total_deadline {
@@ -1222,6 +1565,17 @@ fn read_response(
         // try to decode a HEADERS block, since we advertise zero blocked
         // streams and the encoder front-loads every referenced insert.
         drain_uni_streams(conn, state)?;
+        // RFC 9114 §5.2: a GOAWAY naming an id at or below our request stream
+        // means the server did not process it — fail now (it is safe to retry
+        // elsewhere) instead of waiting for a response that will never come.
+        if let Some(g) = state.goaway_id {
+            if sid.value() >= g {
+                return Err(Error::BadResponse(format!(
+                    "http3: peer closed connection (GOAWAY {g}) before processing request stream {}",
+                    sid.value()
+                )));
+            }
+        }
 
         // Pull whatever has arrived on the request stream.
         let mut tmp = vec![0u8; 16 * 1024];
@@ -1244,7 +1598,7 @@ fn read_response(
             // decode, so even an encoded body streams straight through as raw
             // bytes. Recomputed each frame because HEADERS may have just arrived.
             let encoded = req.decompress
-                && headers.as_ref().is_some_and(|f| {
+                && rs.headers.as_ref().is_some_and(|f| {
                     f.iter()
                         .any(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
                 });
@@ -1256,18 +1610,12 @@ fn read_response(
                     None => None,
                 }
             };
-            let (consumed, ack_owed) = match try_consume_frame(
-                &stream_buf,
-                &mut headers,
-                &mut body,
-                &mut state.decoder,
-                frame_sink,
-                &mut streamed_len,
-            ) {
-                FrameOutcome::Consumed(n, ack) => (n, ack),
-                FrameOutcome::NeedMore => break,
-                FrameOutcome::Err(e) => return Err(e),
-            };
+            let (consumed, ack_owed) =
+                match try_consume_frame(&stream_buf, &mut rs, &mut state.decoder, frame_sink) {
+                    FrameOutcome::Consumed(n, ack) => (n, ack),
+                    FrameOutcome::NeedMore => break,
+                    FrameOutcome::Err(e) => return Err(e),
+                };
             if ack_owed {
                 // RFC 9204 §4.4.1: acknowledge a section that referenced the
                 // dynamic table. Best-effort; the result doesn't depend on it.
@@ -1278,7 +1626,7 @@ fn read_response(
             // DATA frames are consumed on later passes of this inner loop, so
             // this runs before the first body byte reaches the sink.
             if on_head.is_some() {
-                if let Some(fields) = headers.as_ref() {
+                if let Some(fields) = rs.headers.as_ref() {
                     fire_h3_head(fields, &mut on_head);
                 }
             }
@@ -1288,7 +1636,7 @@ fn read_response(
         }
 
         if fin {
-            if !stream_buf.is_empty() {
+            if !stream_buf.is_empty() || rs.data_remaining > 0 || rs.skip_remaining > 0 {
                 return Err(Error::BadResponse(
                     "http3: stream FIN with partial frame in buffer".into(),
                 ));
@@ -1300,8 +1648,106 @@ fn read_response(
         pump_once(conn, sock, peer, true, conn_start)?;
     }
 
-    let fields = headers.ok_or_else(|| Error::BadResponse("http3: no HEADERS frame".into()))?;
-    finalize_response(fields, body, streamed_len, req.decompress, sink, trace)
+    rs.check_content_length(true)?;
+    let fields = rs
+        .headers
+        .ok_or_else(|| Error::BadResponse("http3: no HEADERS frame".into()))?;
+    finalize_response(
+        fields,
+        rs.body,
+        rs.streamed_len,
+        req.decompress,
+        sink,
+        trace,
+    )
+}
+
+/// Receive-side state of the request stream (RFC 9114 §4.1): the final
+/// response head, the body, and where we are in the frame sequence.
+#[derive(Default)]
+struct ReqStream {
+    /// The final (non-1xx) response head, once received.
+    headers: Option<Fields>,
+    /// A trailer section has been received; nothing but FIN may follow.
+    trailers_seen: bool,
+    /// Interim (1xx) heads seen so far; bounded by [`MAX_INTERIM_RESPONSES`].
+    interim: u32,
+    /// `content-length` of the final head, checked against the DATA received.
+    content_length: Option<u64>,
+    /// The request was HEAD: `content-length` describes the would-be GET body.
+    head_request: bool,
+    /// Buffered body (content-encoded, or no sink).
+    body: Vec<u8>,
+    /// Body bytes written straight to the sink.
+    streamed_len: u64,
+    /// Payload bytes of the current DATA frame not yet received. DATA is
+    /// consumed as it arrives rather than after the whole frame is buffered,
+    /// so a large frame streams to the sink with bounded memory.
+    data_remaining: u64,
+    /// Payload bytes of an ignorable (reserved / grease) frame still to skip.
+    skip_remaining: u64,
+}
+
+/// Upper bound on interim (1xx) response heads per request. Each is decoded
+/// and would otherwise keep the read loop busy forever.
+const MAX_INTERIM_RESPONSES: u32 = 32;
+
+impl ReqStream {
+    fn received(&self) -> u64 {
+        self.body.len() as u64 + self.streamed_len
+    }
+
+    /// The `content-length` the DATA must match, or `None` when there is none
+    /// or it doesn't describe this stream's content (HEAD, 204, 304).
+    fn enforced_content_length(&self) -> Option<u64> {
+        let exempt = self.head_request
+            || self
+                .headers
+                .as_ref()
+                .and_then(header_status)
+                .is_some_and(|s| s == 204 || s == 304);
+        if exempt {
+            None
+        } else {
+            self.content_length
+        }
+    }
+
+    /// RFC 9114 §4.1.2: a response whose DATA length differs from its
+    /// `content-length` is malformed. Before FIN (`at_end == false`) only an
+    /// excess is detectable. HEAD responses and 204/304 carry no content.
+    fn check_content_length(&self, at_end: bool) -> Result<()> {
+        let Some(expected) = self.enforced_content_length() else {
+            return Ok(());
+        };
+        let got = self.received();
+        if got > expected || (at_end && got != expected) {
+            return Err(Error::BadResponse(format!(
+                "http3: content-length {expected} but received {got} body bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Hand `payload` (part of a DATA frame) to the sink or the body buffer.
+    fn deliver(&mut self, payload: &[u8], sink: Option<&mut dyn Write>) -> Result<()> {
+        // Stream straight to the caller's sink when one is supplied and
+        // nothing has been buffered yet (the caller passes `None` for a
+        // content-encoded response, which must be buffered to decode).
+        match sink {
+            Some(w) if self.body.is_empty() => {
+                w.write_all(payload)?;
+                self.streamed_len += payload.len() as u64;
+            }
+            _ => {
+                if self.body.len().saturating_add(payload.len()) > MAX_RESPONSE_BYTES {
+                    return Err(Error::BadResponse("http3: response too large".into()));
+                }
+                self.body.extend_from_slice(payload);
+            }
+        }
+        self.check_content_length(false)
+    }
 }
 
 enum FrameOutcome {
@@ -1313,42 +1759,139 @@ enum FrameOutcome {
     Err(Error),
 }
 
-/// Try to parse one HTTP/3 frame out of `buf`. On success, the relevant
-/// output bucket (HEADERS → `headers`, DATA → `body`) is populated and the
-/// number of bytes consumed is returned. A HEADERS block is decoded with
-/// `decoder` (whose dynamic table the encoder stream has already populated);
-/// the returned flag reports whether the block referenced the dynamic table
-/// (Required Insert Count > 0), so the caller can send a Section
-/// Acknowledgement.
-#[allow(clippy::too_many_arguments)]
+/// Try to consume the next piece of the request stream from `buf`: the rest
+/// of an in-progress DATA (or ignorable) frame, or one new frame. DATA and
+/// ignorable payloads are consumed as they arrive; HEADERS needs its whole
+/// frame. A HEADERS block is decoded with `decoder` (whose dynamic table the
+/// encoder stream has already populated); the returned flag reports whether
+/// the block referenced the dynamic table (Required Insert Count > 0), so the
+/// caller can send a Section Acknowledgement.
 fn try_consume_frame(
     buf: &[u8],
-    headers: &mut Option<Fields>,
-    body: &mut Vec<u8>,
+    rs: &mut ReqStream,
     decoder: &mut QpackDecoder,
     sink: Option<&mut dyn Write>,
-    streamed_len: &mut u64,
 ) -> FrameOutcome {
-    let (frame, hdr_len) = match Frame::decode_header(buf) {
-        Ok(x) => x,
-        Err(_) => return FrameOutcome::NeedMore,
-    };
-    // Reject obviously-bogus declared lengths *before* waiting to buffer that
-    // many bytes. A HEADERS section is tiny, and a DATA frame can't carry more
-    // than the remaining response budget.
-    match frame.ty {
-        frame_type::HEADERS if frame.len > MAX_HEADERS_FRAME_LEN => {
-            return FrameOutcome::Err(Error::BadResponse(
-                "http3: HEADERS frame length exceeds limit".into(),
-            ));
+    match consume_frame(buf, rs, decoder, sink) {
+        Ok(Some(x)) => FrameOutcome::Consumed(x.0, x.1),
+        Ok(None) => FrameOutcome::NeedMore,
+        Err(e) => FrameOutcome::Err(e),
+    }
+}
+
+fn consume_frame(
+    buf: &[u8],
+    rs: &mut ReqStream,
+    decoder: &mut QpackDecoder,
+    sink: Option<&mut dyn Write>,
+) -> Result<Option<(usize, bool)>> {
+    // Continue a partially received DATA / ignorable frame.
+    if rs.data_remaining > 0 || rs.skip_remaining > 0 {
+        let pending = rs.data_remaining.max(rs.skip_remaining);
+        let n = pending.min(buf.len() as u64) as usize;
+        if n == 0 {
+            return Ok(None);
         }
+        if rs.data_remaining > 0 {
+            rs.data_remaining -= n as u64;
+            rs.deliver(&buf[..n], sink)?;
+        } else {
+            rs.skip_remaining -= n as u64;
+        }
+        return Ok(Some((n, false)));
+    }
+
+    let Ok((frame, hdr_len)) = Frame::decode_header(buf) else {
+        return Ok(None);
+    };
+    match frame.ty {
         frame_type::DATA => {
-            let remaining = MAX_RESPONSE_BYTES.saturating_sub(body.len()) as u64;
-            if frame.len > remaining {
-                return FrameOutcome::Err(Error::BadResponse(
-                    "http3: DATA frame length exceeds response budget".into(),
+            // RFC 9114 §4.1: DATA only between the final HEADERS and any
+            // trailers; before it (or after trailers) the response is
+            // malformed (H3_FRAME_UNEXPECTED).
+            if rs.headers.is_none() {
+                return Err(Error::BadResponse(
+                    "http3: DATA before the response HEADERS (H3_FRAME_UNEXPECTED)".into(),
                 ));
             }
+            if rs.trailers_seen {
+                return Err(Error::BadResponse(
+                    "http3: DATA after trailers (H3_FRAME_UNEXPECTED)".into(),
+                ));
+            }
+            // Reject an obviously-bogus declared length up front when the body
+            // is buffered: it can't exceed the remaining response budget. A
+            // body streamed to a sink is bounded by the sink instead.
+            let streaming = sink.is_some() && rs.body.is_empty();
+            if !streaming {
+                let remaining = MAX_RESPONSE_BYTES.saturating_sub(rs.body.len()) as u64;
+                if frame.len > remaining {
+                    return Err(Error::BadResponse(
+                        "http3: DATA frame length exceeds response budget".into(),
+                    ));
+                }
+            }
+            // Checked against the declared frame length so an oversized frame
+            // is refused before any of it is delivered.
+            if let Some(cl) = rs.enforced_content_length() {
+                if rs.received().saturating_add(frame.len) > cl {
+                    return Err(Error::BadResponse(format!(
+                        "http3: DATA exceeds content-length {cl}"
+                    )));
+                }
+            }
+            let avail = ((buf.len() - hdr_len) as u64).min(frame.len) as usize;
+            rs.data_remaining = frame.len - avail as u64;
+            rs.deliver(&buf[hdr_len..hdr_len + avail], sink)?;
+            Ok(Some((hdr_len + avail, false)))
+        }
+        frame_type::HEADERS => {
+            if frame.len > MAX_HEADERS_FRAME_LEN {
+                return Err(Error::BadResponse(
+                    "http3: HEADERS frame length exceeds limit".into(),
+                ));
+            }
+            if rs.trailers_seen {
+                return Err(Error::BadResponse(
+                    "http3: HEADERS after trailers (H3_FRAME_UNEXPECTED)".into(),
+                ));
+            }
+            let total = hdr_len + frame.len as usize;
+            if buf.len() < total {
+                return Ok(None);
+            }
+            let payload = &buf[hdr_len..total];
+            let fields = decode_header_block(decoder, payload)?;
+            // A block always owes a Section Ack if it referenced the dynamic
+            // table, regardless of which kind of HEADERS it is.
+            let ack_owed = block_references_dynamic_table(payload);
+            if rs.headers.is_some() {
+                // A HEADERS block after the final response is trailers (RFC
+                // 9114 §4.1) — allowed, validated, but not surfaced.
+                crate::http2::validate_response_fields(&fields, true)
+                    .map_err(|m| Error::BadResponse(format!("http3: malformed trailers: {m}")))?;
+                rs.trailers_seen = true;
+                return Ok(Some((total, ack_owed)));
+            }
+            let info = crate::http2::validate_response_fields(&fields, false)
+                .map_err(|m| Error::BadResponse(format!("http3: malformed response head: {m}")))?;
+            if info.status < 200 {
+                // An interim 1xx informational response: not the final head.
+                // 101 has no meaning in HTTP/3 (§4.5).
+                if info.status == 101 {
+                    return Err(Error::BadResponse("http3: 101 response in HTTP/3".into()));
+                }
+                rs.interim += 1;
+                if rs.interim > MAX_INTERIM_RESPONSES {
+                    return Err(Error::BadResponse(format!(
+                        "http3: more than {MAX_INTERIM_RESPONSES} interim responses"
+                    )));
+                }
+            } else {
+                rs.content_length = info.content_length;
+                rs.headers = Some(fields);
+            }
+            Ok(Some((total, ack_owed)))
         }
         // RFC 9114 §7.2: these frames belong on the control stream (or, for
         // PUSH_PROMISE, require a push we never enabled). Seeing one on a
@@ -1358,69 +1901,20 @@ fn try_consume_frame(
         | frame_type::GOAWAY
         | frame_type::CANCEL_PUSH
         | frame_type::MAX_PUSH_ID
-        | frame_type::PUSH_PROMISE => {
-            return FrameOutcome::Err(Error::BadResponse(format!(
-                "http3: frame type {:#x} not allowed on a request stream",
-                frame.ty
-            )));
+        | frame_type::PUSH_PROMISE => Err(Error::BadResponse(format!(
+            "http3: frame type {:#x} not allowed on a request stream",
+            frame.ty
+        ))),
+        ty if is_h2_reserved_frame_type(ty) => Err(Error::BadResponse(format!(
+            "http3: reserved HTTP/2 frame type {ty:#x} (H3_FRAME_UNEXPECTED)"
+        ))),
+        // RFC 9114 §7.2.8 / §9 reserved/grease types: skip their payload as
+        // it arrives (never buffered, whatever the declared length).
+        _ => {
+            let avail = ((buf.len() - hdr_len) as u64).min(frame.len);
+            rs.skip_remaining = frame.len - avail;
+            Ok(Some((hdr_len + avail as usize, false)))
         }
-        _ => {}
-    }
-    // `frame.len` is a QUIC varint (up to 2^62-1). On a 32-bit target a plain
-    // `as usize` cast would truncate the high bits and mis-bound the frame —
-    // harmless for the length-capped HEADERS/DATA arms above, but the
-    // reserved/grease arm has no cap, so reject anything that doesn't fit usize
-    // to keep the cast lossless on every target.
-    let frame_len = match usize::try_from(frame.len) {
-        Ok(n) => n,
-        Err(_) => {
-            return FrameOutcome::Err(Error::BadResponse("http3: frame length too large".into()));
-        }
-    };
-    let total = hdr_len.saturating_add(frame_len);
-    if buf.len() < total {
-        return FrameOutcome::NeedMore;
-    }
-    let payload = &buf[hdr_len..total];
-    match frame.ty {
-        frame_type::HEADERS => match decode_header_block(decoder, payload) {
-            Ok(fields) => {
-                // A block always owes a Section Ack if it referenced the
-                // dynamic table, regardless of which kind of HEADERS it is.
-                let ack_owed = block_references_dynamic_table(payload);
-                if headers.is_some() {
-                    // A HEADERS block after the final response is trailers
-                    // (RFC 9114 §4.1) — allowed, but we don't surface them.
-                    // Discard silently.
-                } else if header_status(&fields).is_some_and(|s| (100..200).contains(&s)) {
-                    // An interim 1xx informational response (RFC 9114 §4.1):
-                    // not the final head. Skip it and keep reading for the
-                    // real HEADERS block.
-                } else {
-                    *headers = Some(fields);
-                }
-                FrameOutcome::Consumed(total, ack_owed)
-            }
-            Err(e) => FrameOutcome::Err(e),
-        },
-        frame_type::DATA => {
-            // Stream straight to the caller's sink when one is supplied and
-            // nothing has been buffered yet (the caller passes `None` for a
-            // content-encoded response, which must be buffered to decode).
-            if let Some(w) = sink {
-                if body.is_empty() {
-                    if let Err(e) = w.write_all(payload) {
-                        return FrameOutcome::Err(Error::Io(e));
-                    }
-                    *streamed_len += payload.len() as u64;
-                    return FrameOutcome::Consumed(total, false);
-                }
-            }
-            body.extend_from_slice(payload);
-            FrameOutcome::Consumed(total, false)
-        }
-        // RFC 9114 §7.2.8 reserved/grease types — ignore (drain).
-        _ => FrameOutcome::Consumed(total, false),
     }
 }
 
@@ -1934,32 +2428,42 @@ mod tests {
         );
     }
 
+    /// A request stream that has already received a final `200` head.
+    fn rs_with_head() -> ReqStream {
+        ReqStream {
+            headers: Some(vec![(":status".into(), "200".into())]),
+            ..ReqStream::default()
+        }
+    }
+
+    fn consume(buf: &[u8], rs: &mut ReqStream) -> FrameOutcome {
+        let mut dec = decoder();
+        try_consume_frame(buf, rs, &mut dec, None)
+    }
+
     #[test]
     fn oversized_headers_frame_len_is_rejected() {
         // A HEADERS frame declaring a length far larger than any real header
         // section must be rejected before we buffer toward MAX_RESPONSE_BYTES.
         let mut buf = Vec::new();
         Frame::encode_header(frame_type::HEADERS, MAX_HEADERS_FRAME_LEN + 1, &mut buf);
-        let mut headers = None;
-        let mut body = Vec::new();
-        let mut dec = decoder();
+        let mut rs = ReqStream::default();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body, &mut dec, None, &mut 0),
+            consume(&buf, &mut rs),
             FrameOutcome::Err(Error::BadResponse(_))
         ));
     }
 
     #[test]
     fn data_frame_len_past_budget_is_rejected() {
-        // A DATA frame claiming more bytes than the remaining response budget
-        // must be rejected rather than buffered up to the 256 MiB cap.
+        // A buffered DATA frame claiming more bytes than the remaining
+        // response budget must be rejected rather than buffered up to the
+        // 256 MiB cap.
         let mut buf = Vec::new();
         Frame::encode_header(frame_type::DATA, (MAX_RESPONSE_BYTES + 1) as u64, &mut buf);
-        let mut headers = None;
-        let mut body = Vec::new();
-        let mut dec = decoder();
+        let mut rs = rs_with_head();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body, &mut dec, None, &mut 0),
+            consume(&buf, &mut rs),
             FrameOutcome::Err(Error::BadResponse(_))
         ));
     }
@@ -1972,72 +2476,77 @@ mod tests {
         let mut buf = Vec::new();
         Frame::encode_header(frame_type::DATA, payload.len() as u64, &mut buf);
         buf.extend_from_slice(payload);
-        let mut headers = None;
-        let mut body = Vec::new();
+        let mut rs = rs_with_head();
         let mut dec = decoder();
         let mut sink: Vec<u8> = Vec::new();
-        let mut streamed: u64 = 0;
-        let outcome = try_consume_frame(
-            &buf,
-            &mut headers,
-            &mut body,
-            &mut dec,
-            Some(&mut sink),
-            &mut streamed,
-        );
+        let outcome = try_consume_frame(&buf, &mut rs, &mut dec, Some(&mut sink));
         assert!(
-            matches!(outcome, FrameOutcome::Consumed(_, _)),
+            matches!(outcome, FrameOutcome::Consumed(n, _) if n == buf.len()),
             "expected the DATA frame to be consumed"
         );
         assert_eq!(sink, payload);
-        assert!(body.is_empty(), "streamed body must not be buffered");
-        assert_eq!(streamed, payload.len() as u64);
+        assert!(rs.body.is_empty(), "streamed body must not be buffered");
+        assert_eq!(rs.streamed_len, payload.len() as u64);
     }
 
     #[test]
-    fn grease_frame_len_exceeding_usize_is_rejected() {
-        // A reserved/grease frame type (RFC 9114 §7.2.8) has no length cap, so
-        // its declared varint length is the only thing that bounds the frame.
-        // `frame.len` is a u64 QUIC varint; on a 32-bit target a plain
-        // `as usize` cast would truncate the high bits and mis-bound the frame,
-        // desyncing the parser. A length that doesn't fit `usize` must be
-        // rejected rather than truncated. `usize::try_from` can only fail when
-        // `usize` is narrower than 64 bits, so this reject path is exercised on
-        // 32-bit (and smaller) targets; on 64-bit hosts every u64 fits and the
-        // companion `grease_frame_len_within_usize_needs_full_buffer` test
-        // covers the bounding behaviour instead.
-        #[cfg(target_pointer_width = "32")]
-        {
-            let mut buf = Vec::new();
-            // 0x21 is a reserved/grease frame type → the uncapped `_` arm.
-            Frame::encode_header(0x21, 0x1_0000_0001, &mut buf);
-            let mut headers = None;
-            let mut body = Vec::new();
-            let mut dec = decoder();
-            assert!(matches!(
-                try_consume_frame(&buf, &mut headers, &mut body, &mut dec, None, &mut 0),
-                FrameOutcome::Err(Error::BadResponse(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn grease_frame_len_within_usize_needs_full_buffer() {
-        // A grease frame whose declared length fits `usize` but isn't fully
-        // buffered yet must report `NeedMore` (not consume a truncated count),
-        // confirming the length drives bounding correctly after the
-        // fits-in-usize conversion.
+    fn large_data_frame_streams_progressively_past_the_buffer_cap() {
+        // A single DATA frame larger than MAX_RESPONSE_BYTES is fine when
+        // streaming to a sink: its payload is delivered as it arrives, never
+        // buffered whole.
+        let declared = (MAX_RESPONSE_BYTES as u64) + 10;
         let mut buf = Vec::new();
-        // 0x21 is a reserved/grease frame type → the uncapped `_` arm.
-        Frame::encode_header(0x21, 4096, &mut buf);
-        // Only the header is present; the 4096-byte payload is not.
-        let mut headers = None;
-        let mut body = Vec::new();
+        Frame::encode_header(frame_type::DATA, declared, &mut buf);
+        let hdr = buf.len();
+        buf.extend_from_slice(b"abc");
+        let mut rs = rs_with_head();
         let mut dec = decoder();
+        let mut sink: Vec<u8> = Vec::new();
+        let outcome = try_consume_frame(&buf, &mut rs, &mut dec, Some(&mut sink));
+        assert!(matches!(outcome, FrameOutcome::Consumed(n, _) if n == hdr + 3));
+        assert_eq!(sink, b"abc");
+        assert_eq!(rs.data_remaining, declared - 3);
+        // The next bytes on the stream continue the same frame.
+        let outcome = try_consume_frame(b"defg", &mut rs, &mut dec, Some(&mut sink));
+        assert!(matches!(outcome, FrameOutcome::Consumed(4, _)));
+        assert_eq!(sink, b"abcdefg");
+        assert_eq!(rs.data_remaining, declared - 7);
+    }
+
+    #[test]
+    fn data_before_headers_is_rejected() {
+        let mut buf = Vec::new();
+        Frame::encode_header(frame_type::DATA, 2, &mut buf);
+        buf.extend_from_slice(b"hi");
+        let mut rs = ReqStream::default();
+        let mut dec = decoder();
+        let mut sink: Vec<u8> = Vec::new();
         assert!(matches!(
-            try_consume_frame(&buf, &mut headers, &mut body, &mut dec, None, &mut 0),
-            FrameOutcome::NeedMore
+            try_consume_frame(&buf, &mut rs, &mut dec, Some(&mut sink)),
+            FrameOutcome::Err(Error::BadResponse(_))
         ));
+        assert!(sink.is_empty(), "no body byte may precede the head");
+    }
+
+    #[test]
+    fn grease_frame_payload_is_skipped_progressively() {
+        // A reserved/grease frame (RFC 9114 §7.2.8) is skipped as it arrives,
+        // whatever its declared length — never buffered whole.
+        let mut buf = Vec::new();
+        Frame::encode_header(0x21, 4096, &mut buf);
+        let hdr = buf.len();
+        let mut rs = ReqStream::default();
+        assert!(matches!(
+            consume(&buf, &mut rs),
+            FrameOutcome::Consumed(n, false) if n == hdr
+        ));
+        assert_eq!(rs.skip_remaining, 4096);
+        assert!(matches!(
+            consume(&[0u8; 100], &mut rs),
+            FrameOutcome::Consumed(100, false)
+        ));
+        assert_eq!(rs.skip_remaining, 3996);
+        assert!(rs.body.is_empty());
     }
 
     /// Build a HEADERS frame carrying `fields`, statically QPACK-encoded.
@@ -2068,15 +2577,31 @@ mod tests {
         ] {
             let mut buf = Vec::new();
             Frame::encode_header(ty, 8, &mut buf); // declares 8 bytes, sends none
-            let mut headers = None;
-            let mut body = Vec::new();
-            let mut dec = decoder();
+            let mut rs = ReqStream::default();
             assert!(
                 matches!(
-                    try_consume_frame(&buf, &mut headers, &mut body, &mut dec, None, &mut 0),
+                    consume(&buf, &mut rs),
                     FrameOutcome::Err(Error::BadResponse(_))
                 ),
                 "frame type {ty:#x} must be rejected on a request stream"
+            );
+        }
+    }
+
+    #[test]
+    fn h2_reserved_frame_types_are_rejected_on_request_stream() {
+        // PRIORITY / PING / WINDOW_UPDATE / CONTINUATION are reserved in
+        // HTTP/3 (§7.2.8): H3_FRAME_UNEXPECTED, not grease to be skipped.
+        for ty in [0x02u64, 0x06, 0x08, 0x09] {
+            let mut buf = Vec::new();
+            Frame::encode_header(ty, 0, &mut buf);
+            let mut rs = rs_with_head();
+            assert!(
+                matches!(
+                    consume(&buf, &mut rs),
+                    FrameOutcome::Err(Error::BadResponse(_))
+                ),
+                "frame type {ty:#x} must be rejected"
             );
         }
     }
@@ -2087,63 +2612,317 @@ mod tests {
         // the following final block is the real one (RFC 9114 §4.1).
         let interim = headers_frame(&[(":status", "103")]);
         let final_block = headers_frame(&[(":status", "200"), ("content-type", "text/plain")]);
-        let mut headers = None;
-        let mut body = Vec::new();
+        let mut rs = ReqStream::default();
         let mut dec = decoder();
 
         assert!(matches!(
-            try_consume_frame(&interim, &mut headers, &mut body, &mut dec, None, &mut 0),
+            try_consume_frame(&interim, &mut rs, &mut dec, None),
             FrameOutcome::Consumed(_, _)
         ));
         assert!(
-            headers.is_none(),
+            rs.headers.is_none(),
             "interim 1xx must not be stored as the head"
         );
 
         assert!(matches!(
-            try_consume_frame(
-                &final_block,
-                &mut headers,
-                &mut body,
-                &mut dec,
-                None,
-                &mut 0
-            ),
+            try_consume_frame(&final_block, &mut rs, &mut dec, None),
             FrameOutcome::Consumed(_, _)
         ));
-        let fields = headers.expect("final HEADERS should be stored");
+        let fields = rs.headers.expect("final HEADERS should be stored");
         assert_eq!(header_status(&fields), Some(200));
+    }
+
+    #[test]
+    fn interim_1xx_flood_is_bounded() {
+        let interim = headers_frame(&[(":status", "103")]);
+        let mut rs = ReqStream::default();
+        let mut dec = decoder();
+        for _ in 0..MAX_INTERIM_RESPONSES {
+            assert!(matches!(
+                try_consume_frame(&interim, &mut rs, &mut dec, None),
+                FrameOutcome::Consumed(_, _)
+            ));
+        }
+        assert!(matches!(
+            try_consume_frame(&interim, &mut rs, &mut dec, None),
+            FrameOutcome::Err(Error::BadResponse(_))
+        ));
     }
 
     #[test]
     fn trailers_after_final_headers_are_discarded() {
         let final_block = headers_frame(&[(":status", "200")]);
         let trailers = headers_frame(&[("x-trailer", "v")]);
-        let mut headers = None;
-        let mut body = Vec::new();
+        let mut rs = ReqStream::default();
         let mut dec = decoder();
 
-        let _ = try_consume_frame(
-            &final_block,
-            &mut headers,
-            &mut body,
-            &mut dec,
-            None,
-            &mut 0,
-        );
-        assert_eq!(header_status(headers.as_ref().unwrap()), Some(200));
+        let _ = try_consume_frame(&final_block, &mut rs, &mut dec, None);
+        assert_eq!(header_status(rs.headers.as_ref().unwrap()), Some(200));
 
         // A second HEADERS block (after the final response) is trailers: consumed
         // but does not replace the stored head.
         assert!(matches!(
-            try_consume_frame(&trailers, &mut headers, &mut body, &mut dec, None, &mut 0),
+            try_consume_frame(&trailers, &mut rs, &mut dec, None),
             FrameOutcome::Consumed(_, _)
         ));
-        let fields = headers.unwrap();
-        assert_eq!(header_status(&fields), Some(200));
+        let fields = rs.headers.as_ref().unwrap();
+        assert_eq!(header_status(fields), Some(200));
         assert!(
             !fields.iter().any(|(k, _)| k == "x-trailer"),
             "trailers must not be merged into the head"
         );
+
+        // Nothing but FIN may follow trailers.
+        let mut data = Vec::new();
+        Frame::encode_header(frame_type::DATA, 1, &mut data);
+        data.push(b'x');
+        assert!(matches!(
+            try_consume_frame(&data, &mut rs, &mut dec, None),
+            FrameOutcome::Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn trailers_with_pseudo_header_are_rejected() {
+        let final_block = headers_frame(&[(":status", "200")]);
+        let trailers = headers_frame(&[(":status", "500")]);
+        let mut rs = ReqStream::default();
+        let mut dec = decoder();
+        let _ = try_consume_frame(&final_block, &mut rs, &mut dec, None);
+        assert!(matches!(
+            try_consume_frame(&trailers, &mut rs, &mut dec, None),
+            FrameOutcome::Err(Error::BadResponse(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_response_heads_are_rejected() {
+        for fields in [
+            &[(":status", "200"), (":status", "204")][..],
+            &[("content-type", "x"), (":status", "200")][..],
+            &[(":status", "200"), ("connection", "close")][..],
+            &[(":status", "200"), ("transfer-encoding", "chunked")][..],
+            &[(":status", "200"), (":path", "/")][..],
+            &[(":status", "20")][..],
+            &[("content-type", "x")][..],
+            &[
+                (":status", "200"),
+                ("content-length", "1"),
+                ("content-length", "2"),
+            ][..],
+        ] {
+            let block = headers_frame(fields);
+            let mut rs = ReqStream::default();
+            assert!(
+                matches!(
+                    consume(&block, &mut rs),
+                    FrameOutcome::Err(Error::BadResponse(_))
+                ),
+                "{fields:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn content_length_mismatch_is_detected() {
+        // Short body: detected when the stream ends.
+        let head = headers_frame(&[(":status", "200"), ("content-length", "5")]);
+        let mut rs = ReqStream::default();
+        let mut dec = decoder();
+        let _ = try_consume_frame(&head, &mut rs, &mut dec, None);
+        let mut data = Vec::new();
+        Frame::encode_header(frame_type::DATA, 3, &mut data);
+        data.extend_from_slice(b"abc");
+        assert!(matches!(
+            try_consume_frame(&data, &mut rs, &mut dec, None),
+            FrameOutcome::Consumed(_, _)
+        ));
+        assert!(rs.check_content_length(true).is_err());
+
+        // Excess: rejected as soon as the DATA frame header declares it.
+        let mut data = Vec::new();
+        Frame::encode_header(frame_type::DATA, 3, &mut data);
+        data.extend_from_slice(b"def");
+        assert!(matches!(
+            try_consume_frame(&data, &mut rs, &mut dec, None),
+            FrameOutcome::Err(Error::BadResponse(_))
+        ));
+
+        // HEAD: content-length describes the GET body, not this stream.
+        let mut rs = ReqStream {
+            head_request: true,
+            ..ReqStream::default()
+        };
+        let _ = try_consume_frame(&head, &mut rs, &mut dec, None);
+        assert!(rs.check_content_length(true).is_ok());
+    }
+
+    #[test]
+    fn dial_addr_honours_connect_to_and_resolve() {
+        // --resolve pins the URL host.
+        let mut req = Request::get("https://h3.invalid/").unwrap();
+        req.resolve
+            .push(("h3.invalid".into(), 443, "127.0.0.9".parse().unwrap()));
+        assert_eq!(dial_addr(&req).unwrap(), "127.0.0.9:443".parse().unwrap());
+
+        // --connect-to remaps first; the pin then applies to the new target.
+        let mut req = Request::get("https://h3.invalid/").unwrap().connect_to(
+            "h3.invalid",
+            443,
+            "backend.invalid",
+            8443,
+        );
+        req.resolve
+            .push(("backend.invalid".into(), 8443, "127.0.0.7".parse().unwrap()));
+        assert_eq!(dial_addr(&req).unwrap(), "127.0.0.7:8443".parse().unwrap());
+    }
+
+    #[test]
+    fn ipv6_literal_host_is_unbracketed_for_tls_and_dialing() {
+        assert_eq!(tls_host("[::1]"), "::1");
+        assert_eq!(tls_host("[fe80::1%25en0]"), "fe80::1");
+        assert_eq!(tls_host("example.com"), "example.com");
+
+        let req = Request::get("https://[::1]:8443/").unwrap();
+        assert_eq!(dial_addr(&req).unwrap(), "[::1]:8443".parse().unwrap());
+        // Verifying: the bare IP is the reference identity.
+        assert_eq!(quic_server_name(&req), "::1");
+        // Not verifying: no SNI for an IP literal (RFC 6066 §3).
+        let mut insecure = req.clone();
+        insecure.verify_tls = false;
+        assert_eq!(quic_server_name(&insecure), "");
+        let named = Request::get("https://example.com/").unwrap();
+        assert_eq!(quic_server_name(&named), "example.com");
+    }
+
+    #[test]
+    fn te_request_field_only_passes_trailers() {
+        assert!(omit_request_field("te", "gzip"));
+        assert!(!omit_request_field("te", "trailers"));
+        assert!(omit_request_field("connection", "keep-alive"));
+        assert!(omit_request_field("host", "example.com"));
+        assert!(!omit_request_field("accept", "*/*"));
+    }
+
+    // ---- server unidirectional streams (RFC 9114 §6.2) ----
+
+    fn uni_bytes(state: &mut Http3State, sid: u64, bytes: &[u8]) -> Result<()> {
+        state
+            .uni
+            .entry(sid)
+            .or_default()
+            .buf
+            .extend_from_slice(bytes);
+        process_uni_stream(state, sid)
+    }
+
+    fn control_prefix_with_settings(settings: &[(u64, u64)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for (id, v) in settings {
+            varint::encode(*id, &mut payload);
+            varint::encode(*v, &mut payload);
+        }
+        let mut out = Vec::new();
+        varint::encode(uni_stream_type::CONTROL, &mut out);
+        Frame::encode_header(frame_type::SETTINGS, payload.len() as u64, &mut out);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn control_stream_requires_settings_first() {
+        let mut state = Http3State::new(None);
+        let mut bytes = Vec::new();
+        varint::encode(uni_stream_type::CONTROL, &mut bytes);
+        Frame::encode_header(frame_type::GOAWAY, 1, &mut bytes);
+        bytes.push(0);
+        assert!(uni_bytes(&mut state, 3, &bytes).is_err());
+    }
+
+    #[test]
+    fn control_stream_settings_then_goaway_is_recorded() {
+        let mut state = Http3State::new(None);
+        let bytes = control_prefix_with_settings(&[(settings_id::QPACK_MAX_TABLE_CAPACITY, 0)]);
+        uni_bytes(&mut state, 3, &bytes).unwrap();
+        assert!(state.settings_seen);
+        let mut goaway = Vec::new();
+        Frame::encode_header(frame_type::GOAWAY, 1, &mut goaway);
+        goaway.push(4);
+        uni_bytes(&mut state, 3, &goaway).unwrap();
+        assert_eq!(state.goaway_id, Some(4));
+        // A later GOAWAY may not raise the id.
+        let mut higher = Vec::new();
+        Frame::encode_header(frame_type::GOAWAY, 1, &mut higher);
+        higher.push(8);
+        assert!(uni_bytes(&mut state, 3, &higher).is_err());
+    }
+
+    #[test]
+    fn control_stream_rejects_second_settings_and_reserved_ids() {
+        let mut state = Http3State::new(None);
+        uni_bytes(&mut state, 3, &control_prefix_with_settings(&[])).unwrap();
+        let mut again = Vec::new();
+        Frame::encode_header(frame_type::SETTINGS, 0, &mut again);
+        assert!(uni_bytes(&mut state, 3, &again).is_err());
+
+        // HTTP/2's SETTINGS_ENABLE_PUSH (0x2) is reserved in HTTP/3.
+        let mut state = Http3State::new(None);
+        assert!(uni_bytes(&mut state, 3, &control_prefix_with_settings(&[(0x2, 0)])).is_err());
+    }
+
+    #[test]
+    fn control_stream_rejects_h2_frame_types_and_skips_grease() {
+        let mut state = Http3State::new(None);
+        uni_bytes(&mut state, 3, &control_prefix_with_settings(&[])).unwrap();
+        // A large grease frame is skipped without buffering its payload.
+        let mut grease = Vec::new();
+        Frame::encode_header(0x21, 1_000_000, &mut grease);
+        grease.extend_from_slice(&[0u8; 1000]);
+        uni_bytes(&mut state, 3, &grease).unwrap();
+        assert!(state.uni[&3].buf.is_empty());
+        assert_eq!(state.uni[&3].skip_remaining, 999_000);
+
+        let mut state = Http3State::new(None);
+        uni_bytes(&mut state, 3, &control_prefix_with_settings(&[])).unwrap();
+        let mut ping = Vec::new();
+        Frame::encode_header(0x06, 8, &mut ping);
+        ping.extend_from_slice(&[0u8; 8]);
+        assert!(uni_bytes(&mut state, 3, &ping).is_err());
+    }
+
+    #[test]
+    fn duplicate_critical_uni_streams_are_rejected() {
+        let mut state = Http3State::new(None);
+        uni_bytes(&mut state, 3, &control_prefix_with_settings(&[])).unwrap();
+        assert!(uni_bytes(&mut state, 7, &control_prefix_with_settings(&[])).is_err());
+
+        let mut state = Http3State::new(None);
+        let mut enc = Vec::new();
+        varint::encode(uni_stream_type::QPACK_ENCODER, &mut enc);
+        uni_bytes(&mut state, 3, &enc).unwrap();
+        assert!(uni_bytes(&mut state, 7, &enc).is_err());
+    }
+
+    #[test]
+    fn push_stream_without_max_push_id_is_rejected() {
+        let mut state = Http3State::new(None);
+        let mut push = Vec::new();
+        varint::encode(uni_stream_type::PUSH, &mut push);
+        assert!(uni_bytes(&mut state, 3, &push).is_err());
+    }
+
+    #[test]
+    fn grease_uni_stream_is_discarded_not_buffered() {
+        // A reserved stream type (0x21) carrying far more than MAX_UNI_BUFFER
+        // must be discarded as it arrives rather than tripping the buffer cap.
+        let mut state = Http3State::new(None);
+        let mut first = Vec::new();
+        varint::encode(0x21, &mut first);
+        first.extend_from_slice(&[0u8; 16 * 1024]);
+        uni_bytes(&mut state, 3, &first).unwrap();
+        for _ in 0..10 {
+            uni_bytes(&mut state, 3, &[0u8; 16 * 1024]).unwrap();
+            assert!(state.uni[&3].buf.is_empty());
+        }
     }
 }
