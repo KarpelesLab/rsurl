@@ -127,11 +127,22 @@ pub fn download(
         (Some(final_path), vec![(part.clone(), len)], part)
     } else {
         let sidecar = topdir(&layout, &meta.name).join(".rsurlpart");
+        // A torrent file at the sidecar's own path would be clobbered by the
+        // resume state and then deleted on completion. Compared
+        // case-insensitively (Windows / macOS default filesystems).
+        let lower = |p: &Path| p.to_string_lossy().to_ascii_lowercase();
+        if layout.iter().any(|(p, _)| lower(p) == lower(&sidecar)) {
+            return Err(crate::error::Error::BadResponse(
+                "bittorrent: torrent contains a file named like the resume sidecar (.rsurlpart)"
+                    .into(),
+            ));
+        }
         (None, layout.clone(), sidecar)
     };
     let real_size = if single { meta.total_length } else { 0 };
 
     let mut storage = Storage::create(storage_layout, meta.piece_length, meta.pieces.clone())?;
+    mark_padding(&mut storage, meta, layout.len());
 
     // Resume: rebuild the completion bitfield. `--recheck` re-hashes the
     // on-disk data; otherwise we trust a matching saved bitfield.
@@ -177,7 +188,10 @@ pub fn download(
         }
     };
 
-    // Complete: finalise the output.
+    // Complete: finalise the output. Size every file first: this creates
+    // zero-length files no piece touched and cuts stale bytes off a
+    // pre-existing larger file (multi-file data is written in place).
+    storage.finalize_files()?;
     if let Some(final_path) = final_single {
         drop(storage); // close the .rsurlpart handle before renaming (Windows)
         resume::finalize(&state_path, &final_path, meta.total_length)?;
@@ -229,7 +243,7 @@ pub fn download_window(
         end,
     )?;
     let mut nosave = |_: &Bitfield| {};
-    engine::run(
+    let stats = engine::run(
         meta,
         &mut storage,
         peers,
@@ -237,7 +251,25 @@ pub fn download_window(
         opts,
         progress,
         &mut nosave,
-    )
+    )?;
+    // Trim a pre-existing longer `out` (or create an empty one for an empty
+    // range) so it holds exactly the window.
+    storage.finalize_files()?;
+    Ok(stats)
+}
+
+/// Flag BEP 47 padding files so they are never created on disk. Only a layout
+/// that maps the torrent's files one-to-one (a multi-file download) carries
+/// padding entries; a single-file layout holds real data.
+fn mark_padding(storage: &mut Storage, meta: &Metainfo, layout_len: usize) {
+    if layout_len != meta.files.len() || layout_len < 2 {
+        return;
+    }
+    for (i, f) in meta.files.iter().enumerate() {
+        if f.padding {
+            storage.set_padding(i);
+        }
+    }
 }
 
 /// Serialise resume metadata for a torrent: infohash followed by the bitfield.

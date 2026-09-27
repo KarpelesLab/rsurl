@@ -7,7 +7,7 @@
 //! terminated for [`SeedMode::Forever`](super::download::SeedMode)).
 
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,30 @@ use super::storage::Storage;
 
 /// Largest `request` length we will serve, bounding per-request allocation.
 const MAX_REQUEST: u32 = 128 * 1024;
+
+/// Most inbound peer connections served at once; one thread each, so an
+/// unbounded accept loop is a thread/memory exhaustion vector. Connections
+/// beyond the cap are closed immediately.
+const MAX_INBOUND: usize = 50;
+
+/// Decrements the live-connection count when a serving thread ends.
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Claim one of `max` connection slots, or `None` when all are taken.
+fn claim_slot(active: &Arc<AtomicUsize>, max: usize) -> Option<ConnSlot> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < max).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| ConnSlot(Arc::clone(active)))
+}
 
 fn serr(msg: impl Into<String>) -> Error {
     Error::BadResponse(format!("bt seed: {}", msg.into()))
@@ -66,10 +90,15 @@ pub fn run(
     };
     listener.set_nonblocking(true).map_err(Error::Io)?;
 
+    let active = Arc::new(AtomicUsize::new(0));
     let mut last_report = Instant::now();
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                let Some(slot) = claim_slot(&active, MAX_INBOUND) else {
+                    drop(stream); // at capacity: refuse
+                    continue;
+                };
                 // A socket from accept() inherits the listener's non-blocking
                 // flag on macOS/BSD and Windows (but not Linux); force blocking
                 // so serve()'s timeout-based reads behave consistently.
@@ -78,6 +107,7 @@ pub fn run(
                 let uploaded = Arc::clone(&uploaded);
                 let bf = complete_bf.clone();
                 std::thread::spawn(move || {
+                    let _slot = slot;
                     let _ = serve(
                         stream,
                         info_hash,
@@ -176,6 +206,18 @@ mod tests {
     use crate::bittorrent::metainfo::sha1;
     use crate::bittorrent::peer::BLOCK_SIZE;
     use std::path::PathBuf;
+
+    #[test]
+    fn connection_slots_are_capped_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let a = claim_slot(&active, 2).expect("first");
+        let b = claim_slot(&active, 2).expect("second");
+        assert!(claim_slot(&active, 2).is_none(), "cap reached");
+        drop(a);
+        let c = claim_slot(&active, 2).expect("slot freed on drop");
+        drop((b, c));
+        assert_eq!(active.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn serves_a_block_to_a_leecher() {

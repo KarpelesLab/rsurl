@@ -2,14 +2,16 @@
 //!
 //! Bencode has four types: integers (`i<n>e`), byte strings (`<len>:<bytes>`),
 //! lists (`l...e`) and dictionaries (`d<key><val>...e`) whose keys are byte
-//! strings sorted in raw byte order. Dictionary keys are kept in a
-//! [`BTreeMap<Vec<u8>, Value>`], which sorts by raw bytes — exactly the
-//! canonical ordering — so re-encoding a dict is byte-identical to a correctly
-//! formed input.
+//! strings that BEP 3 says are sorted in raw byte order. Dictionary keys are
+//! kept in a [`BTreeMap<Vec<u8>, Value>`], which sorts by raw bytes — exactly
+//! the canonical ordering — so encoding always emits canonical output.
 //!
-//! For the infohash we must hash the *original* bytes of the `info` dictionary
-//! (a re-encode can differ for non-canonical inputs), so [`Decoder`] also
-//! exposes its cursor and a manual entry-walk; see `metainfo`.
+//! Decoding is deliberately lenient about key *order*: trackers, DHT nodes and
+//! real-world `.torrent`/`info` dicts do emit unsorted keys, and libtorrent
+//! accepts them. Duplicate keys are still rejected (their meaning is
+//! ambiguous). Because a non-canonical input re-encodes differently, the
+//! infohash must hash the *original* bytes of the `info` dictionary, so
+//! [`Decoder`] also exposes its cursor and a manual entry-walk; see `metainfo`.
 
 use std::collections::BTreeMap;
 
@@ -150,7 +152,13 @@ impl<'a> Decoder<'a> {
         let start = self.pos;
         let end = self.find(b'e')?;
         let s = std::str::from_utf8(&self.buf[start..end]).map_err(|_| err("non-utf8 integer"))?;
-        if s.is_empty() || s == "-0" || (s.starts_with('0') && s.len() > 1) || (s.starts_with("-0"))
+        // Strictly `-?[0-9]+`: `str::parse` would also accept a leading `+`.
+        let digits = s.strip_prefix('-').unwrap_or(s);
+        if digits.is_empty()
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+            || s == "-0"
+            || (s.starts_with('0') && s.len() > 1)
+            || s.starts_with("-0")
         {
             return Err(err("malformed integer"));
         }
@@ -164,7 +172,10 @@ impl<'a> Decoder<'a> {
         let colon = self.find(b':')?;
         let len_s =
             std::str::from_utf8(&self.buf[self.pos..colon]).map_err(|_| err("bad length"))?;
-        if len_s.is_empty() || (len_s.starts_with('0') && len_s.len() > 1) {
+        if len_s.is_empty()
+            || !len_s.bytes().all(|b| b.is_ascii_digit())
+            || (len_s.starts_with('0') && len_s.len() > 1)
+        {
             return Err(err("malformed string length"));
         }
         let len: usize = len_s
@@ -199,7 +210,6 @@ impl<'a> Decoder<'a> {
     fn dict(&mut self, depth: usize) -> Result<Value> {
         self.pos += 1; // 'd'
         let mut map = BTreeMap::new();
-        let mut last_key: Option<Vec<u8>> = None;
         loop {
             if self.peek()? == b'e' {
                 self.pos += 1;
@@ -209,15 +219,12 @@ impl<'a> Decoder<'a> {
                 return Err(err("dict key is not a byte string"));
             }
             let key = self.byte_string()?;
-            // Keys must be strictly increasing (BEP 3 canonical form).
-            if let Some(prev) = &last_key {
-                if key <= *prev {
-                    return Err(err("dict keys not sorted/unique"));
-                }
-            }
             let val = self.value_depth(depth + 1)?;
-            last_key = Some(key.clone());
-            map.insert(key, val);
+            // Unsorted keys are tolerated (see the module docs); a repeated key
+            // is not, since which value "wins" would be ambiguous.
+            if map.insert(key, val).is_some() {
+                return Err(err("duplicate dict key"));
+            }
         }
     }
 
@@ -312,13 +319,26 @@ mod tests {
             b"i-0e",           // negative zero
             b"ie",             // empty int
             b"2:a",            // short string
-            b"d1:bi1e1:ai2ee", // keys out of order
+            b"d1:ai1e1:ai2ee", // duplicate key
+            b"i+5e",           // explicit plus sign
+            b"i-e",            // bare minus
+            b"i1-2e",          // stray sign
             b"i42",            // missing terminator
             b"i42ee",          // trailing byte
             b"01:a",           // bad length
         ] {
             assert!(parse(bad).is_err(), "should reject {:?}", bad);
         }
+    }
+
+    /// Unsorted keys (seen from real trackers / DHT nodes / torrents) parse,
+    /// and re-encode canonically.
+    #[test]
+    fn accepts_unsorted_dict_keys() {
+        let v = parse(b"d1:bi1e1:ai2ee").expect("unsorted keys");
+        assert_eq!(v.get(b"a").and_then(Value::as_int), Some(2));
+        assert_eq!(v.get(b"b").and_then(Value::as_int), Some(1));
+        assert_eq!(encode(&v), b"d1:ai2e1:bi1ee");
     }
 
     #[test]

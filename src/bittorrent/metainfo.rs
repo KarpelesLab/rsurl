@@ -35,6 +35,10 @@ pub struct FileEntry {
     /// separator components).
     pub path: PathBuf,
     pub length: u64,
+    /// A BEP 47 padding file (`attr` contains `p`, or a legacy BitComet
+    /// `_____padding_file_*` name): it only aligns the next file to a piece
+    /// boundary, holds zeros, and is never written to disk.
+    pub padding: bool,
 }
 
 /// Parsed `.torrent` metainfo plus the computed infohash.
@@ -94,7 +98,9 @@ impl Metainfo {
             .get(b"pieces")
             .and_then(Value::as_bytes)
             .ok_or_else(|| terr("missing info.pieces"))?;
-        if pieces_raw.is_empty() || pieces_raw.len() % 20 != 0 {
+        // May be empty only for a torrent whose files are all zero-length;
+        // the piece-count check below enforces that.
+        if pieces_raw.len() % 20 != 0 {
             return Err(terr("info.pieces is not a multiple of 20 bytes"));
         }
         let pieces: Vec<[u8; 20]> = pieces_raw.as_chunks::<20>().0.to_vec();
@@ -108,6 +114,7 @@ impl Metainfo {
                 vec![FileEntry {
                     path: PathBuf::from(&name),
                     length: len as u64,
+                    padding: false,
                 }],
                 len as u64,
             )
@@ -126,24 +133,36 @@ impl Metainfo {
                     .and_then(Value::as_list)
                     .ok_or_else(|| terr("missing files[].path"))?;
                 let mut rel = PathBuf::new();
+                let mut last = "";
                 for c in comps {
                     let s = c.as_str().ok_or_else(|| terr("non-utf8 path component"))?;
                     sanitize_component(s)?;
                     rel.push(s);
+                    last = s;
                 }
                 if rel.as_os_str().is_empty() {
                     return Err(terr("empty file path"));
                 }
+                let padding = f
+                    .get(b"attr")
+                    .and_then(Value::as_bytes)
+                    .is_some_and(|a| a.contains(&b'p'))
+                    || last.starts_with("_____padding_file_");
                 // Files live under the torrent's name directory.
                 let path = Path::new(&name).join(rel);
                 total = total
                     .checked_add(len)
                     .ok_or_else(|| terr("total length overflow"))?;
-                files.push(FileEntry { path, length: len });
+                files.push(FileEntry {
+                    path,
+                    length: len,
+                    padding,
+                });
             }
             if files.is_empty() {
                 return Err(terr("empty files list"));
             }
+            check_path_conflicts(&files)?;
             (files, total)
         } else {
             return Err(terr("info has neither length nor files"));
@@ -153,9 +172,8 @@ impl Metainfo {
         // degenerate total_length == 0 case, which must carry no piece hashes.
         // (A zero-length torrent with >= 2 hashes would otherwise make
         // `piece_size`/`Storage::piece_size` compute `total - start` with
-        // `start > total`, underflowing to a bogus huge size.) Note `pieces` is
-        // already guaranteed non-empty above, so a zero-length torrent (which
-        // must have zero pieces) is consistently rejected here.
+        // `start > total`, underflowing to a bogus huge size.) A torrent of
+        // only zero-length files therefore has an empty piece table.
         let expected_pieces = if total_length == 0 {
             0
         } else {
@@ -226,6 +244,33 @@ impl Metainfo {
             self.total_length.saturating_sub(before)
         }
     }
+}
+
+/// Reject two (non-padding) files that would land on the same path, or a file
+/// that is also another file's parent directory (`a` and `a/b`): either would
+/// make writes to one silently corrupt the other, or fail mid-download.
+/// Compared ASCII-case-insensitively, since the default filesystems on Windows
+/// and macOS are, so a torrent behaves the same everywhere. Padding files are
+/// never written, and BEP 47 names them by size, so repeats are expected.
+fn check_path_conflicts(files: &[FileEntry]) -> Result<()> {
+    use std::collections::HashSet;
+    let key = |p: &Path| p.to_string_lossy().to_ascii_lowercase();
+    let mut paths: HashSet<String> = HashSet::new();
+    for f in files.iter().filter(|f| !f.padding) {
+        if !paths.insert(key(&f.path)) {
+            return Err(terr("duplicate file path"));
+        }
+    }
+    for f in files.iter().filter(|f| !f.padding) {
+        let mut dir = f.path.parent();
+        while let Some(d) = dir {
+            if !d.as_os_str().is_empty() && paths.contains(&key(d)) {
+                return Err(terr("file path conflicts with a directory"));
+            }
+            dir = d.parent();
+        }
+    }
+    Ok(())
 }
 
 /// Windows reserved device names (case-insensitive, matched with or without an
@@ -397,6 +442,89 @@ mod tests {
         // A plain component is still accepted.
         assert!(sanitize_component("readme.txt").is_ok());
         assert!(sanitize_component("console.log").is_ok());
+    }
+
+    fn multi_file_info(files: Vec<Value>, pieces: usize) -> Vec<u8> {
+        let mut info = BTreeMap::new();
+        info.insert(b"name".to_vec(), Value::Bytes(b"dir".to_vec()));
+        info.insert(b"piece length".to_vec(), Value::Int(4));
+        info.insert(b"pieces".to_vec(), Value::Bytes(vec![0u8; 20 * pieces]));
+        info.insert(b"files".to_vec(), Value::List(files));
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), Value::Dict(info));
+        bencode::encode(&Value::Dict(root))
+    }
+
+    fn file_val(len: i64, parts: &[&str], attr: Option<&str>) -> Value {
+        let mut f = BTreeMap::new();
+        f.insert(b"length".to_vec(), Value::Int(len));
+        f.insert(
+            b"path".to_vec(),
+            Value::List(
+                parts
+                    .iter()
+                    .map(|p| Value::Bytes(p.as_bytes().to_vec()))
+                    .collect(),
+            ),
+        );
+        if let Some(a) = attr {
+            f.insert(b"attr".to_vec(), Value::Bytes(a.as_bytes().to_vec()));
+        }
+        Value::Dict(f)
+    }
+
+    /// A torrent of only zero-length files has no pieces, and is valid.
+    #[test]
+    fn accepts_all_empty_torrent() {
+        let bytes = multi_file_info(
+            vec![file_val(0, &["a"], None), file_val(0, &["b"], None)],
+            0,
+        );
+        let m = Metainfo::from_bytes(&bytes).unwrap();
+        assert_eq!(m.num_pieces(), 0);
+        assert_eq!(m.total_length, 0);
+        assert_eq!(m.files.len(), 2);
+    }
+
+    #[test]
+    fn detects_bep47_padding_files() {
+        let bytes = multi_file_info(
+            vec![
+                file_val(3, &["a"], None),
+                file_val(1, &[".pad", "1"], Some("p")),
+                file_val(1, &[".pad", "1"], Some("p")), // repeated pad name is fine
+                file_val(3, &["b"], Some("x")),
+            ],
+            2,
+        );
+        let m = Metainfo::from_bytes(&bytes).unwrap();
+        let pads: Vec<bool> = m.files.iter().map(|f| f.padding).collect();
+        assert_eq!(pads, vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn rejects_duplicate_and_prefix_paths() {
+        // Same path twice (case-insensitively).
+        let dup = multi_file_info(
+            vec![file_val(2, &["a.txt"], None), file_val(2, &["A.TXT"], None)],
+            1,
+        );
+        assert!(Metainfo::from_bytes(&dup).is_err());
+        // A file that is also a directory of another file.
+        let prefix = multi_file_info(
+            vec![file_val(2, &["a"], None), file_val(2, &["a", "b"], None)],
+            1,
+        );
+        assert!(Metainfo::from_bytes(&prefix).is_err());
+        // Siblings sharing a directory are fine.
+        let ok = multi_file_info(
+            vec![
+                file_val(2, &["d", "a"], None),
+                file_val(2, &["d", "b"], None),
+            ],
+            1,
+        );
+        assert!(Metainfo::from_bytes(&ok).is_ok());
     }
 
     #[test]

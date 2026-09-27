@@ -66,15 +66,29 @@ pub fn file_layout(meta: &Metainfo, base: &Path) -> Vec<(PathBuf, u64)> {
         .collect()
 }
 
+/// Fill `buf` from the OS CSPRNG, failing closed (rather than panicking) if no
+/// entropy source is available. Used for peer ids and for the UDP tracker /
+/// DHT transaction ids an off-path attacker must not be able to predict.
+pub(crate) fn random_bytes(buf: &mut [u8]) -> Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        OsRng.fill_bytes(buf);
+    }))
+    .map_err(|_| Error::BadResponse("bittorrent: no secure entropy source".into()))
+}
+
+/// A random `u32` from the OS CSPRNG (see [`random_bytes`]).
+pub(crate) fn random_u32() -> Result<u32> {
+    let mut b = [0u8; 4];
+    random_bytes(&mut b)?;
+    Ok(u32::from_ne_bytes(b))
+}
+
 /// Generate a 20-byte BitTorrent peer id with the Azureus-style prefix
 /// `-RS` + version, the rest random. Fails closed if no OS entropy is
 /// available (a predictable id is worse than an error).
 pub fn generate_peer_id() -> Result<[u8; 20]> {
     let mut id = [0u8; 20];
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        OsRng.fill_bytes(&mut id);
-    }))
-    .map_err(|_| Error::BadResponse("bittorrent: no secure entropy source".into()))?;
+    random_bytes(&mut id)?;
     // Peer-id convention: "-<2-char client><4-digit version>-" then random.
     let prefix = b"-RS0001-";
     id[..prefix.len()].copy_from_slice(prefix);

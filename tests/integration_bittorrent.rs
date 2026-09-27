@@ -1026,3 +1026,431 @@ fn rsurl_cmd() -> std::process::Command {
     }
     cmd
 }
+
+// ---------------------------------------------------------------------------
+// Swarm-liveness and output-finalisation regressions (scripted peers).
+// ---------------------------------------------------------------------------
+
+/// A one-connection peer that handshakes and then hands the socket to
+/// `script`. Returns the listening port.
+fn start_scripted_peer<F>(info_hash: [u8; 20], script: F) -> u16
+where
+    F: FnOnce(&mut TcpStream) + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        match peer::read_handshake(&mut s) {
+            Ok(h) if h.info_hash == info_hash => {}
+            _ => return,
+        }
+        let _ = peer::write_handshake(&mut s, &Handshake::new(info_hash, [0x77; 20]));
+        script(&mut s);
+    });
+    port
+}
+
+fn full_bitfield(n: usize) -> Vec<u8> {
+    let mut bf = Bitfield::new(n);
+    for i in 0..n {
+        bf.set(i);
+    }
+    bf.as_bytes().to_vec()
+}
+
+/// Answer one request from the linear `data`.
+fn serve_block(s: &mut TcpStream, data: &[u8], piece_len: usize, index: u32, begin: u32, len: u32) {
+    let off = index as usize * piece_len + begin as usize;
+    let end = (off + len as usize).min(data.len());
+    let _ = peer::write_message(
+        s,
+        &Message::Piece {
+            index,
+            begin,
+            block: data[off..end].to_vec(),
+        },
+    );
+}
+
+/// Read until the peer says Interested, then unchoke it.
+fn unchoke_on_interest(s: &mut TcpStream) {
+    while let Ok(m) = peer::read_message(s) {
+        if m == Message::Interested {
+            let _ = peer::write_message(s, &Message::Unchoke);
+            return;
+        }
+    }
+}
+
+/// Run `download` on a thread, returning its result or `None` if it had not
+/// finished within `limit` (i.e. it hung).
+fn download_within(
+    meta: Metainfo,
+    layout: Vec<(std::path::PathBuf, u64)>,
+    peers: Vec<std::net::SocketAddr>,
+    opts: TorrentOptions,
+    limit: Duration,
+) -> Option<rsurl::Result<u64>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let r = download(&meta, layout, &peers, &opts, &mut |_| {});
+        let _ = tx.send(r.map(|s| s.downloaded));
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+fn tmp_out(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("rsurl_bt_{tag}_{}.bin", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    p
+}
+
+/// A peer chokes us right after our first requests (discarding them, per
+/// BEP 3), chatters, then unchokes. The engine must re-request the missing
+/// blocks; it used to wait for the discarded ones until the socket timed out,
+/// which keep-alives prevented forever.
+#[test]
+fn choke_mid_piece_then_unchoke_rerequests() {
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i % 249) as u8).collect();
+    let piece_len = 32 * 1024;
+    let meta = make_torrent(&data, piece_len, "choke.bin");
+    let n = meta.num_pieces();
+    let d = data.clone();
+    let port = start_scripted_peer(meta.info_hash, move |s| {
+        let _ = peer::write_message(s, &Message::Bitfield(full_bitfield(n)));
+        unchoke_on_interest(s);
+        // Wait for the first request, then choke: everything pending is dropped.
+        while !matches!(peer::read_message(s), Ok(Message::Request { .. })) {}
+        let _ = peer::write_message(s, &Message::Choke);
+        s.set_read_timeout(Some(Duration::from_millis(100))).ok();
+        let until = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < until {
+            let _ = peer::write_message(s, &Message::KeepAlive);
+            let _ = peer::read_message(s); // discard requests made before the choke
+        }
+        s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        let _ = peer::write_message(s, &Message::Unchoke);
+        while let Ok(m) = peer::read_message(s) {
+            if let Message::Request {
+                index,
+                begin,
+                length,
+            } = m
+            {
+                serve_block(s, &d, piece_len, index, begin, length);
+            }
+        }
+    });
+    let out = tmp_out("choke");
+    let got = download_within(
+        meta,
+        vec![(out.clone(), data.len() as u64)],
+        vec![format!("127.0.0.1:{port}").parse().unwrap()],
+        TorrentOptions::default(),
+        Duration::from_secs(15),
+    )
+    .expect("download hung after a choke/unchoke cycle")
+    .expect("download");
+    assert_eq!(got, data.len() as u64);
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+    let _ = std::fs::remove_file(&out);
+}
+
+/// A peer that starts with only piece 0 and announces the rest via `have`
+/// later must be used for them; the engine used to stop it as useless.
+#[test]
+fn haves_after_join_are_used() {
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 241) as u8).collect();
+    let piece_len = 4096;
+    let meta = make_torrent(&data, piece_len, "haves.bin");
+    let n = meta.num_pieces();
+    let d = data.clone();
+    let port = start_scripted_peer(meta.info_hash, move |s| {
+        let mut bf = Bitfield::new(n);
+        bf.set(0);
+        let _ = peer::write_message(s, &Message::Bitfield(bf.as_bytes().to_vec()));
+        unchoke_on_interest(s);
+        let mut announced = false;
+        while let Ok(m) = peer::read_message(s) {
+            if let Message::Request {
+                index,
+                begin,
+                length,
+            } = m
+            {
+                serve_block(s, &d, piece_len, index, begin, length);
+                if !announced {
+                    announced = true;
+                    thread::sleep(Duration::from_millis(200));
+                    for i in 1..n {
+                        let _ = peer::write_message(s, &Message::Have(i as u32));
+                    }
+                }
+            }
+        }
+    });
+    let out = tmp_out("haves");
+    let got = download_within(
+        meta,
+        vec![(out.clone(), data.len() as u64)],
+        vec![format!("127.0.0.1:{port}").parse().unwrap()],
+        TorrentOptions::default(),
+        Duration::from_secs(15),
+    )
+    .expect("download hung")
+    .expect("pieces announced by `have` must be fetched");
+    assert_eq!(got, data.len() as u64);
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+    let _ = std::fs::remove_file(&out);
+}
+
+/// A peer serving garbage for every block.
+fn start_corrupt_peer(meta: &Metainfo) -> u16 {
+    let n = meta.num_pieces();
+    start_scripted_peer(meta.info_hash, move |s| {
+        let _ = peer::write_message(s, &Message::Bitfield(full_bitfield(n)));
+        unchoke_on_interest(s);
+        while let Ok(m) = peer::read_message(s) {
+            if let Message::Request {
+                index,
+                begin,
+                length,
+            } = m
+            {
+                let _ = peer::write_message(
+                    s,
+                    &Message::Piece {
+                        index,
+                        begin,
+                        block: vec![0xa5; length as usize],
+                    },
+                );
+            }
+        }
+    })
+}
+
+/// A peer that only ever sends corrupt data is banned, so the download ends
+/// with an error instead of re-fetching the same bad piece from it forever.
+#[test]
+fn corrupt_peer_is_banned_not_retried_forever() {
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 239) as u8).collect();
+    let meta = make_torrent(&data, 4096, "corrupt.bin");
+    let port = start_corrupt_peer(&meta);
+    let out = tmp_out("corrupt");
+    let r = download_within(
+        meta,
+        vec![(out.clone(), data.len() as u64)],
+        vec![format!("127.0.0.1:{port}").parse().unwrap()],
+        TorrentOptions::default(),
+        Duration::from_secs(15),
+    )
+    .expect("download looped on a corrupt peer");
+    assert!(r.is_err(), "corrupt-only swarm must fail");
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(rsurl::resume::part_path(&out));
+}
+
+/// With a corrupt peer alongside a good one, the download still completes.
+#[test]
+fn corrupt_peer_does_not_block_a_good_one() {
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i % 233) as u8).collect();
+    let meta = make_torrent(&data, 4096, "mixed.bin");
+    let bad = start_corrupt_peer(&meta);
+    let good = start_seeder(data.clone(), meta.clone());
+    let out = tmp_out("mixed");
+    let got = download_within(
+        meta,
+        vec![(out.clone(), data.len() as u64)],
+        vec![
+            format!("127.0.0.1:{bad}").parse().unwrap(),
+            format!("127.0.0.1:{good}").parse().unwrap(),
+        ],
+        TorrentOptions::default(),
+        Duration::from_secs(15),
+    )
+    .expect("download hung")
+    .expect("download");
+    assert_eq!(got, data.len() as u64);
+    assert_eq!(std::fs::read(&out).unwrap(), data);
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Peers that keep the connection busy (keep-alives) but never unchoke us,
+/// or unchoke then choke us mid-piece for good, used to pin the download
+/// forever; each is now bounded by the per-peer deadlines / stall watchdog.
+#[test]
+fn chattering_unhelpful_peers_do_not_hang_the_download() {
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 229) as u8).collect();
+    let meta = make_torrent(&data, 4096, "chatter.bin");
+    let n = meta.num_pieces();
+    fn keepalive_forever(s: &mut TcpStream) {
+        s.set_read_timeout(Some(Duration::from_millis(100))).ok();
+        let until = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < until {
+            if peer::write_message(s, &Message::KeepAlive).is_err() {
+                return;
+            }
+            let _ = peer::read_message(s);
+        }
+    }
+    let never_unchokes = start_scripted_peer(meta.info_hash, move |s| {
+        let _ = peer::write_message(s, &Message::Bitfield(full_bitfield(n)));
+        keepalive_forever(s);
+    });
+    let chokes_mid_piece = start_scripted_peer(meta.info_hash, move |s| {
+        let _ = peer::write_message(s, &Message::Bitfield(full_bitfield(n)));
+        unchoke_on_interest(s);
+        while !matches!(peer::read_message(s), Ok(Message::Request { .. })) {}
+        let _ = peer::write_message(s, &Message::Choke);
+        keepalive_forever(s);
+    });
+    let out = tmp_out("chatter");
+    let opts = TorrentOptions {
+        peer_timeout: Duration::from_secs(1),
+        ..TorrentOptions::default()
+    };
+    let r = download_within(
+        meta,
+        vec![(out.clone(), data.len() as u64)],
+        vec![
+            format!("127.0.0.1:{never_unchokes}").parse().unwrap(),
+            format!("127.0.0.1:{chokes_mid_piece}").parse().unwrap(),
+        ],
+        opts,
+        Duration::from_secs(20),
+    )
+    .expect("download hung on chattering peers");
+    assert!(r.is_err());
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(rsurl::resume::part_path(&out));
+}
+
+/// Multi-file completion sizes every file: a pre-existing longer file loses
+/// its stale tail, a zero-length file is created, and a BEP 47 padding file
+/// is never written.
+#[test]
+fn multi_file_finalises_sizes_empty_and_padding_files() {
+    let piece_len = 4096usize;
+    // a.bin (5000) + padding to the next piece boundary + b.bin (3000) + empty.
+    let pad_len = 2 * piece_len - 5000;
+    let mut data: Vec<u8> = (0..5000u32).map(|i| (i % 227) as u8).collect();
+    data.extend(std::iter::repeat_n(0u8, pad_len));
+    data.extend((0..3000u32).map(|i| (i % 223) as u8));
+    let mut pieces = Vec::new();
+    for chunk in data.chunks(piece_len) {
+        pieces.extend_from_slice(&sha1(chunk));
+    }
+    let file = |len: usize, path: &[&str], attr: Option<&str>| {
+        let mut f = BTreeMap::new();
+        f.insert(b"length".to_vec(), Value::Int(len as i64));
+        f.insert(
+            b"path".to_vec(),
+            Value::List(
+                path.iter()
+                    .map(|p| Value::Bytes(p.as_bytes().to_vec()))
+                    .collect(),
+            ),
+        );
+        if let Some(a) = attr {
+            f.insert(b"attr".to_vec(), Value::Bytes(a.as_bytes().to_vec()));
+        }
+        Value::Dict(f)
+    };
+    let pad_name = pad_len.to_string();
+    let mut info = BTreeMap::new();
+    info.insert(b"name".to_vec(), Value::Bytes(b"fin".to_vec()));
+    info.insert(b"piece length".to_vec(), Value::Int(piece_len as i64));
+    info.insert(b"pieces".to_vec(), Value::Bytes(pieces));
+    info.insert(
+        b"files".to_vec(),
+        Value::List(vec![
+            file(5000, &["a.bin"], None),
+            file(pad_len, &[".pad", &pad_name], Some("p")),
+            file(3000, &["b.bin"], None),
+            file(0, &["empty.txt"], None),
+        ]),
+    );
+    let mut root = BTreeMap::new();
+    root.insert(b"info".to_vec(), Value::Dict(info));
+    let meta = Metainfo::from_bytes(&encode(&Value::Dict(root))).unwrap();
+    assert!(meta.files[1].padding);
+
+    let base = std::env::temp_dir().join(format!("rsurl_bt_fin_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("fin")).unwrap();
+    // Stale, much longer content where a.bin will land.
+    std::fs::write(base.join("fin/a.bin"), vec![0xee; 50_000]).unwrap();
+
+    let port = start_seeder(data.clone(), meta.clone());
+    let layout = file_layout(&meta, &base);
+    download(
+        &meta,
+        layout,
+        &[format!("127.0.0.1:{port}").parse().unwrap()],
+        &TorrentOptions::default(),
+        &mut |_| {},
+    )
+    .expect("download");
+
+    assert_eq!(
+        std::fs::read(base.join("fin/a.bin")).unwrap(),
+        &data[..5000]
+    );
+    assert_eq!(
+        std::fs::read(base.join("fin/b.bin")).unwrap(),
+        &data[2 * piece_len..]
+    );
+    assert_eq!(std::fs::read(base.join("fin/empty.txt")).unwrap().len(), 0);
+    assert!(
+        !base.join("fin/.pad").exists(),
+        "padding must not be written"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A torrent of only empty files needs no peers and still creates them.
+#[test]
+fn all_empty_torrent_creates_files() {
+    let (_data, meta) = make_multi_torrent(&[("x", 0), ("y", 0)], 4096, "empties");
+    assert_eq!(meta.num_pieces(), 0);
+    let base = std::env::temp_dir().join(format!("rsurl_bt_empty_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    download(
+        &meta,
+        file_layout(&meta, &base),
+        &[],
+        &TorrentOptions::default(),
+        &mut |_| {},
+    )
+    .expect("empty download");
+    assert!(base.join("empties/x").is_file());
+    assert!(base.join("empties/y").is_file());
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// `download_window` into a pre-existing longer file leaves exactly the
+/// window's bytes (no stale tail).
+#[test]
+fn download_window_truncates_existing_output() {
+    let (data, meta) = make_multi_torrent(&[("a.bin", 12_000), ("b.bin", 8_000)], 4096, "wpack");
+    let port = start_seeder(data.clone(), meta.clone());
+    let out = tmp_out("wintrunc");
+    std::fs::write(&out, vec![0xee; 30_000]).unwrap();
+    download_window(
+        &meta,
+        out.clone(),
+        &[format!("127.0.0.1:{port}").parse().unwrap()],
+        &TorrentOptions::default(),
+        12_000,
+        20_000,
+        &mut |_| {},
+    )
+    .expect("window download");
+    assert_eq!(std::fs::read(&out).unwrap(), &data[12_000..]);
+    let _ = std::fs::remove_file(&out);
+}

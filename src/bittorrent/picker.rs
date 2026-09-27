@@ -17,12 +17,46 @@ impl Bitfield {
         }
     }
 
-    /// Build from wire bytes; extra bytes/bits beyond `len` are ignored.
+    /// Build from stored bytes (e.g. resume state); extra bytes/bits beyond
+    /// `len` are ignored. Use [`from_wire`](Self::from_wire) for a peer's
+    /// `bitfield` message, which must be validated instead.
     pub fn from_bytes(bytes: &[u8], len: usize) -> Self {
         let mut bf = Bitfield::new(len);
         let n = bytes.len().min(bf.bits.len());
         bf.bits[..n].copy_from_slice(&bytes[..n]);
+        // Clear spare bits so `as_bytes` stays canonical.
+        if !len.is_multiple_of(8) {
+            if let Some(last) = bf.bits.last_mut() {
+                *last &= 0xffu8 << (8 - len % 8);
+            }
+        }
         bf
+    }
+
+    /// Parse a peer's `bitfield` message payload (BEP 3): exactly
+    /// `ceil(len / 8)` bytes with every spare trailing bit clear. Returns
+    /// `None` for a malformed bitfield, on which the peer must be dropped.
+    pub fn from_wire(bytes: &[u8], len: usize) -> Option<Self> {
+        if bytes.len() != len.div_ceil(8) {
+            return None;
+        }
+        if !len.is_multiple_of(8) {
+            let spare = 0xffu8 >> (len % 8);
+            if bytes.last().is_some_and(|&b| b & spare != 0) {
+                return None;
+            }
+        }
+        Some(Bitfield {
+            bits: bytes.to_vec(),
+            len,
+        })
+    }
+
+    /// Set every bit that is set in `other` (same length).
+    pub fn merge(&mut self, other: &Bitfield) {
+        for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+            *a |= *b;
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -43,6 +77,12 @@ impl Bitfield {
     pub fn set(&mut self, i: usize) {
         if i < self.len {
             self.bits[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+
+    pub fn unset(&mut self, i: usize) {
+        if i < self.len {
+            self.bits[i / 8] &= !(0x80 >> (i % 8));
         }
     }
 
@@ -145,6 +185,43 @@ mod tests {
         assert!(bf.has(0));
         assert!(!bf.has(1));
         assert!(bf.has(2));
+    }
+
+    #[test]
+    fn from_wire_validates_length_and_spare_bits() {
+        // 10 pieces => exactly 2 bytes, low 6 bits of byte 1 are spare.
+        assert!(Bitfield::from_wire(&[0xff, 0xc0], 10).is_some());
+        assert!(Bitfield::from_wire(&[0xff], 10).is_none(), "too short");
+        assert!(
+            Bitfield::from_wire(&[0xff, 0xc0, 0], 10).is_none(),
+            "too long"
+        );
+        assert!(
+            Bitfield::from_wire(&[0xff, 0xc1], 10).is_none(),
+            "spare bit set"
+        );
+        // A multiple of 8 has no spare bits.
+        assert!(Bitfield::from_wire(&[0xff], 8).is_some());
+        assert!(Bitfield::from_wire(&[], 0).is_some());
+    }
+
+    #[test]
+    fn merge_and_unset() {
+        let mut a = Bitfield::new(10);
+        a.set(1);
+        let mut b = Bitfield::new(10);
+        b.set(9);
+        a.merge(&b);
+        assert!(a.has(1) && a.has(9));
+        a.unset(1);
+        assert!(!a.has(1) && a.has(9));
+    }
+
+    #[test]
+    fn from_bytes_clears_spare_bits() {
+        let bf = Bitfield::from_bytes(&[0xff, 0xff], 10);
+        assert_eq!(bf.as_bytes(), &[0xff, 0xc0]);
+        assert_eq!(bf.count(), 10);
     }
 
     #[test]

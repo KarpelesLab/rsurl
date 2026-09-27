@@ -13,7 +13,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
@@ -125,25 +125,31 @@ pub fn fetch_info(
         return Err(merr("peer does not support the extension protocol"));
     }
 
+    // Each step (the extended handshake, then every piece) must complete
+    // within `peer_timeout`, however much unrelated traffic (haves, keep-
+    // alives) the peer sends meanwhile; that traffic resets only the per-read
+    // socket timeout.
     peer::write_message(&mut sock, &ext_handshake())?;
-    let (peer_ut_id, size) = read_peer_handshake(&mut sock)?;
+    let (peer_ut_id, size) = read_peer_handshake(&mut sock, Instant::now() + peer_timeout)?;
     if size == 0 || size > MAX_METADATA {
         return Err(merr("peer reported an implausible metadata size"));
     }
     let num_pieces = size.div_ceil(METADATA_PIECE);
 
-    let mut info = Vec::with_capacity(size);
+    // Grown as verified-size pieces arrive rather than reserved up front: the
+    // size is the peer's claim, and up to MAX_PARALLEL workers run at once.
+    let mut info = Vec::new();
     for piece in 0..num_pieces {
         peer::write_message(&mut sock, &request_piece(peer_ut_id, piece))?;
-        let data = read_piece_data(&mut sock, piece)?;
-        info.extend_from_slice(&data);
-        if info.len() > size {
-            return Err(merr("metadata overran the reported size"));
+        let data = read_piece_data(&mut sock, piece, Instant::now() + peer_timeout)?;
+        // BEP 9: every piece is exactly 16 KiB except the last.
+        let expected = METADATA_PIECE.min(size - piece * METADATA_PIECE);
+        if data.len() != expected {
+            return Err(merr("metadata piece has the wrong size"));
         }
+        info.extend_from_slice(&data);
     }
-    if info.len() != size {
-        return Err(merr("metadata incomplete"));
-    }
+    debug_assert_eq!(info.len(), size);
     if sha1(&info) != info_hash {
         return Err(merr("metadata failed infohash verification"));
     }
@@ -178,8 +184,11 @@ fn request_piece(peer_ut_id: u8, piece: usize) -> Message {
 
 /// Read messages until the peer's extended handshake (ext id 0), returning its
 /// `ut_metadata` message id and advertised `metadata_size`.
-fn read_peer_handshake<R: Read>(r: &mut R) -> Result<(u8, usize)> {
+fn read_peer_handshake<R: Read>(r: &mut R, deadline: Instant) -> Result<(u8, usize)> {
     loop {
+        if Instant::now() >= deadline {
+            return Err(merr("timed out waiting for the extended handshake"));
+        }
         if let Message::Extended { ext_id: 0, payload } = peer::read_message(r)? {
             let v = bencode::parse(&payload)?;
             let ut_id = v
@@ -205,8 +214,11 @@ fn read_peer_handshake<R: Read>(r: &mut R) -> Result<(u8, usize)> {
 
 /// Read messages until a `ut_metadata` data reply for `piece`, returning the
 /// raw piece bytes (the part after the bencoded header dict).
-fn read_piece_data<R: Read>(r: &mut R, piece: usize) -> Result<Vec<u8>> {
+fn read_piece_data<R: Read>(r: &mut R, piece: usize, deadline: Instant) -> Result<Vec<u8>> {
     loop {
+        if Instant::now() >= deadline {
+            return Err(merr("timed out waiting for a metadata piece"));
+        }
         if let Message::Extended { ext_id, payload } = peer::read_message(r)? {
             if ext_id != OUR_UT_METADATA_ID {
                 continue;
@@ -253,7 +265,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         peer::write_message(&mut buf, &msg).unwrap();
-        let (id, size) = read_peer_handshake(&mut Cursor::new(buf)).unwrap();
+        let (id, size) = read_peer_handshake(&mut Cursor::new(buf), far()).unwrap();
         assert_eq!(id, 3);
         assert_eq!(size, 1234);
     }
@@ -272,7 +284,88 @@ mod tests {
         };
         let mut buf = Vec::new();
         peer::write_message(&mut buf, &msg).unwrap();
-        let data = read_piece_data(&mut Cursor::new(buf), 0).unwrap();
+        let data = read_piece_data(&mut Cursor::new(buf), 0, far()).unwrap();
         assert_eq!(data, b"hello");
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// A peer that keeps the socket busy with unrelated traffic can't hold a
+    /// step open past its deadline.
+    #[test]
+    fn piece_wait_is_bounded_by_deadline() {
+        let mut buf = Vec::new();
+        for _ in 0..100 {
+            peer::write_message(&mut buf, &Message::KeepAlive).unwrap();
+        }
+        let e = read_piece_data(&mut Cursor::new(buf.clone()), 0, Instant::now()).unwrap_err();
+        assert!(e.to_string().contains("timed out"), "{e}");
+        let e = read_peer_handshake(&mut Cursor::new(buf), Instant::now()).unwrap_err();
+        assert!(e.to_string().contains("timed out"), "{e}");
+    }
+
+    /// BEP 9: a non-final metadata piece shorter than 16 KiB is rejected
+    /// (rather than shifting every later piece's offset).
+    #[test]
+    fn rejects_wrong_size_metadata_piece() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let info_hash = [3u8; 20];
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            peer::read_handshake(&mut s).unwrap();
+            peer::write_handshake(&mut s, &Handshake::new(info_hash, [4u8; 20])).unwrap();
+            let mut m = BTreeMap::new();
+            m.insert(b"ut_metadata".to_vec(), Value::Int(2));
+            let mut d = BTreeMap::new();
+            d.insert(b"m".to_vec(), Value::Dict(m));
+            // Two pieces: 16 KiB + 100 bytes.
+            d.insert(
+                b"metadata_size".to_vec(),
+                Value::Int((METADATA_PIECE + 100) as i64),
+            );
+            peer::write_message(
+                &mut s,
+                &Message::Extended {
+                    ext_id: 0,
+                    payload: bencode::encode(&Value::Dict(d)),
+                },
+            )
+            .unwrap();
+            // Answer piece 0 with a short 100-byte body.
+            loop {
+                if let Ok(Message::Extended { ext_id: 2, .. }) = peer::read_message(&mut s) {
+                    break;
+                }
+            }
+            let mut h = BTreeMap::new();
+            h.insert(b"msg_type".to_vec(), Value::Int(1));
+            h.insert(b"piece".to_vec(), Value::Int(0));
+            let mut payload = bencode::encode(&Value::Dict(h));
+            payload.extend_from_slice(&[0u8; 100]);
+            peer::write_message(
+                &mut s,
+                &Message::Extended {
+                    ext_id: OUR_UT_METADATA_ID,
+                    payload,
+                },
+            )
+            .unwrap();
+            // Hold the socket until the client hangs up.
+            let _ = peer::read_message(&mut s);
+        });
+        let e = fetch_info(
+            addr,
+            info_hash,
+            [5u8; 20],
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("wrong size"), "{e}");
+        server.join().unwrap();
     }
 }

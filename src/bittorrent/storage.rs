@@ -21,6 +21,9 @@ struct FileSlot {
     /// Global byte offset where this file begins in the torrent space.
     start: u64,
     handle: Option<File>,
+    /// A BEP 47 padding file: its (all-zero) bytes are hashed as part of the
+    /// piece but never written; reads of it yield zeros.
+    padding: bool,
 }
 
 pub struct Storage {
@@ -55,6 +58,7 @@ impl Storage {
                 length,
                 start,
                 handle: None,
+                padding: false,
             });
             start = start
                 .checked_add(length)
@@ -97,6 +101,7 @@ impl Storage {
             length: end - start,
             start,
             handle: None,
+            padding: false,
         }];
         let mut have = Bitfield::new(hashes.len());
         for i in 0..hashes.len() {
@@ -115,6 +120,47 @@ impl Storage {
             have,
             window: Some((start, end)),
         })
+    }
+
+    /// Mark layout entry `file` as a BEP 47 padding file, which is never
+    /// created or written (its bytes read back as zeros). Out-of-range indices
+    /// are ignored.
+    pub fn set_padding(&mut self, file: usize) {
+        if let Some(slot) = self.files.get_mut(file) {
+            slot.padding = true;
+        }
+    }
+
+    /// Bring every (non-padding) output file to exactly its layout length:
+    /// create files no piece ever touched (zero-length files), and truncate a
+    /// pre-existing larger file so no stale trailing bytes survive. Called once
+    /// the download completes.
+    pub fn finalize_files(&mut self) -> Result<()> {
+        for slot in self.files.iter_mut().filter(|s| !s.padding) {
+            let length = slot.length;
+            Self::open_slot(slot)?.set_len(length).map_err(Error::Io)?;
+        }
+        Ok(())
+    }
+
+    /// The slot's open handle, lazily creating parent dirs and the file.
+    fn open_slot(slot: &mut FileSlot) -> Result<&mut File> {
+        if slot.handle.is_none() {
+            if let Some(parent) = slot.path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(Error::Io)?;
+                }
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&slot.path)
+                .map_err(Error::Io)?;
+            slot.handle = Some(file);
+        }
+        Ok(slot.handle.as_mut().unwrap())
     }
 
     pub fn num_pieces(&self) -> usize {
@@ -255,26 +301,12 @@ impl Storage {
             let fend = slot.start + slot.length;
             let ov_start = offset.max(fstart);
             let ov_end = end.min(fend);
-            if ov_start >= ov_end {
+            // Padding is never on disk: writes are dropped and reads leave the
+            // caller's zero-filled buffer as is.
+            if ov_start >= ov_end || slot.padding {
                 continue;
             }
-            // Lazily open (creating parent dirs + the file).
-            if slot.handle.is_none() {
-                if let Some(parent) = slot.path.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent).map_err(Error::Io)?;
-                    }
-                }
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&slot.path)
-                    .map_err(Error::Io)?;
-                slot.handle = Some(file);
-            }
-            let file = slot.handle.as_mut().unwrap();
+            let file = Self::open_slot(slot)?;
             let within = ov_start - fstart;
             let buf_span = (ov_start - offset) as usize..(ov_end - offset) as usize;
             f(file, within, buf_span)?;
@@ -414,6 +446,50 @@ mod tests {
         assert_eq!(st.piece_size(1), 0);
         assert_eq!(st.piece_size(2), 0);
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// Completion sizes every file: stale trailing bytes of a pre-existing
+    /// larger file are cut, zero-length files are created, and padding files
+    /// never touch the disk.
+    #[test]
+    fn finalize_sizes_files_and_skips_padding() {
+        // Layout: a(3) pad(1) b(4) empty(0), piece length 4 => pieces 4,4.
+        let data: Vec<u8> = vec![1, 2, 3, 0, 5, 6, 7, 8];
+        let pieces = vec![sha1(&data[0..4]), sha1(&data[4..8])];
+        let a = tmp("fin_a");
+        let pad = tmp("fin_pad");
+        let b = tmp("fin_b");
+        let empty = tmp("fin_empty");
+        for p in [&a, &pad, &b, &empty] {
+            let _ = std::fs::remove_file(p);
+        }
+        // `a` pre-exists with far more (stale) data than the torrent's 3 bytes.
+        std::fs::write(&a, vec![0xee; 100]).unwrap();
+        let mut st = Storage::create(
+            vec![
+                (a.clone(), 3),
+                (pad.clone(), 1),
+                (b.clone(), 4),
+                (empty.clone(), 0),
+            ],
+            4,
+            pieces,
+        )
+        .unwrap();
+        st.set_padding(1);
+        assert!(st.write_piece(0, &data[0..4]).unwrap());
+        assert!(st.write_piece(1, &data[4..8]).unwrap());
+        // Seeding reads the padding back as zeros.
+        assert_eq!(st.read_block(0, 0, 4).unwrap(), &data[0..4]);
+        st.finalize_files().unwrap();
+
+        assert_eq!(std::fs::read(&a).unwrap(), vec![1, 2, 3]);
+        assert_eq!(std::fs::read(&b).unwrap(), vec![5, 6, 7, 8]);
+        assert_eq!(std::fs::read(&empty).unwrap(), Vec::<u8>::new());
+        assert!(!pad.exists(), "padding file must not be written");
+        for p in [&a, &b, &empty] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

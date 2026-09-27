@@ -195,11 +195,7 @@ const ACTION_ANNOUNCE: u32 = 1;
 const ACTION_ERROR: u32 = 3;
 
 fn udp_announce(url: &str, p: &AnnounceParams, timeout: Duration) -> Result<AnnounceResponse> {
-    // udp://host:port[/path] — resolve host:port.
-    let hostport = url
-        .strip_prefix("udp://")
-        .and_then(|r| r.split('/').next())
-        .ok_or_else(|| terr("malformed udp tracker url"))?;
+    let (hostport, url_data) = split_udp_url(url)?;
     let addr = std::net::ToSocketAddrs::to_socket_addrs(&hostport)
         .map_err(Error::Io)?
         .next()
@@ -209,23 +205,27 @@ fn udp_announce(url: &str, p: &AnnounceParams, timeout: Duration) -> Result<Anno
     sock.set_read_timeout(Some(timeout)).map_err(Error::Io)?;
     sock.set_write_timeout(Some(timeout)).map_err(Error::Io)?;
 
-    // 1) Connect.
-    let txn = rand_u32(p.key);
+    // 1) Connect. Transaction ids come from the CSPRNG (BEP 15): together
+    // with the source address check they are what stops an off-path attacker
+    // from forging the connect/announce replies and injecting peers.
+    let txn = super::random_u32()?;
     let mut req = Vec::with_capacity(16);
     req.extend_from_slice(&UDP_PROTOCOL_ID.to_be_bytes());
     req.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
     req.extend_from_slice(&txn.to_be_bytes());
-    let resp = udp_round_trip(&sock, addr, &req, 16)?;
-    if u32::from_be_bytes([resp[0], resp[1], resp[2], resp[3]]) != ACTION_CONNECT
-        || resp[4..8] != txn.to_be_bytes()
-    {
+    let resp = udp_round_trip(&sock, addr, &req, txn)?;
+    let action = be_u32(&resp[0..4]);
+    if action == ACTION_ERROR {
+        return Err(udp_error(&resp));
+    }
+    if action != ACTION_CONNECT || resp.len() < 16 {
         return Err(terr("bad UDP connect response"));
     }
     let connection_id = u64::from_be_bytes(resp[8..16].try_into().unwrap());
 
     // 2) Announce.
-    let txn2 = txn.wrapping_add(1);
-    let mut a = Vec::with_capacity(98);
+    let txn2 = super::random_u32()?;
+    let mut a = Vec::with_capacity(98 + url_data.len() + 8);
     a.extend_from_slice(&connection_id.to_be_bytes());
     a.extend_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
     a.extend_from_slice(&txn2.to_be_bytes());
@@ -239,63 +239,96 @@ fn udp_announce(url: &str, p: &AnnounceParams, timeout: Duration) -> Result<Anno
     a.extend_from_slice(&p.key.to_be_bytes());
     a.extend_from_slice(&p.num_want.to_be_bytes());
     a.extend_from_slice(&p.port.to_be_bytes());
+    append_url_data(&mut a, url_data.as_bytes());
 
-    let r = udp_round_trip(&sock, addr, &a, 20)?;
-    let action = u32::from_be_bytes([r[0], r[1], r[2], r[3]]);
-    if r[4..8] != txn2.to_be_bytes() {
-        return Err(terr("UDP announce transaction mismatch"));
-    }
+    let r = udp_round_trip(&sock, addr, &a, txn2)?;
+    let action = be_u32(&r[0..4]);
     if action == ACTION_ERROR {
-        let msg = String::from_utf8_lossy(&r[8..]).into_owned();
-        return Err(terr(format!("UDP tracker error: {msg}")));
+        return Err(udp_error(&r));
     }
-    if action != ACTION_ANNOUNCE {
-        return Err(terr("unexpected UDP announce action"));
+    if action != ACTION_ANNOUNCE || r.len() < 20 {
+        return Err(terr("unexpected UDP announce response"));
     }
-    let interval = u32::from_be_bytes([r[8], r[9], r[10], r[11]]).max(1);
-    // [12..16] leechers, [16..20] seeders, then 6-byte compact peers.
-    let peers = parse_compact_v4(&r[20..]);
+    let interval = be_u32(&r[8..12]).max(1);
+    // [12..16] leechers, [16..20] seeders, then compact peers: 6-byte for an
+    // IPv4 tracker, 18-byte for an IPv6 one (BEP 15).
+    let peers = if addr.is_ipv6() {
+        parse_compact_v6(&r[20..])
+    } else {
+        parse_compact_v4(&r[20..])
+    };
     Ok(AnnounceResponse { interval, peers })
 }
 
-/// Send `req`, retrying a few times, and return a response of at least
-/// `min_len` bytes (BEP 15 suggests retransmits with backoff).
-fn udp_round_trip(
-    sock: &DirectUdp,
-    addr: SocketAddr,
-    req: &[u8],
-    min_len: usize,
-) -> Result<Vec<u8>> {
+/// Split `udp://host:port[/path][?query]` into the `host:port` to resolve and
+/// the path+query (BEP 41 "URL data", e.g. a private tracker's passkey).
+fn split_udp_url(url: &str) -> Result<(String, String)> {
+    let rest = url
+        .strip_prefix("udp://")
+        .ok_or_else(|| terr("malformed udp tracker url"))?;
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let cut = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (hostport, data) = rest.split_at(cut);
+    if hostport.is_empty() {
+        return Err(terr("malformed udp tracker url"));
+    }
+    Ok((hostport.to_string(), data.to_string()))
+}
+
+/// BEP 41 option type carrying (part of) the announce URL's path and query.
+const OPT_URL_DATA: u8 = 0x2;
+
+/// Append `data` as BEP 41 `URLData` options (at most 255 bytes each).
+/// Trackers that predate BEP 41 ignore the trailing bytes.
+fn append_url_data(out: &mut Vec<u8>, data: &[u8]) {
+    for chunk in data.chunks(255) {
+        out.push(OPT_URL_DATA);
+        out.push(chunk.len() as u8);
+        out.extend_from_slice(chunk);
+    }
+}
+
+fn be_u32(b: &[u8]) -> u32 {
+    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// An `error` action reply: the rest of the datagram is the message.
+fn udp_error(resp: &[u8]) -> Error {
+    let msg = String::from_utf8_lossy(&resp[8..]).into_owned();
+    terr(format!("UDP tracker error: {msg}"))
+}
+
+/// Send `req`, retrying a few times (BEP 15 retransmits), and return the first
+/// reply from the tracker's exact address (IP *and* port) that echoes `txn`.
+/// Replies are at least the 8-byte action + transaction header; callers check
+/// the per-action length (an `error` reply may be that short). Datagrams from
+/// elsewhere, or with a stale transaction id, are skipped without consuming a
+/// retransmit.
+fn udp_round_trip(sock: &DirectUdp, addr: SocketAddr, req: &[u8], txn: u32) -> Result<Vec<u8>> {
+    /// Bound on stray datagrams read per attempt (so a flood can't pin us).
+    const MAX_STRAY: usize = 16;
     let mut last_err = terr("no UDP response");
     for _ in 0..3 {
         sock.send_to(req, addr).map_err(Error::Io)?;
         let mut buf = [0u8; 2048];
-        match sock.recv_from(&mut buf) {
-            Ok((n, from)) if from.ip() == addr.ip() && n >= min_len => {
-                return Ok(buf[..n].to_vec());
+        for _ in 0..MAX_STRAY {
+            match sock.recv_from(&mut buf) {
+                Ok((n, from)) if from == addr && n >= 8 && buf[4..8] == txn.to_be_bytes() => {
+                    return Ok(buf[..n].to_vec());
+                }
+                Ok(_) => continue, // spoofed / stale / truncated
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    last_err = terr("UDP tracker timed out");
+                    break;
+                }
+                Err(e) => return Err(Error::Io(e)),
             }
-            Ok(_) => continue,
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                last_err = terr("UDP tracker timed out");
-                continue;
-            }
-            Err(e) => return Err(Error::Io(e)),
         }
     }
     Err(last_err)
-}
-
-/// Cheap transaction-id source seeded from the announce key (no need for a
-/// CSPRNG here; the connection-id round-trip is the real anti-spoofing guard).
-fn rand_u32(seed: u32) -> u32 {
-    let mut x = seed ^ 0x9E37_79B9;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    x
 }
 
 #[cfg(test)]
@@ -387,5 +420,148 @@ mod tests {
         assert_eq!(r.interval, 1800);
         assert_eq!(r.peers, vec!["9.8.7.6:6881".parse().unwrap()]);
         handle.join().unwrap();
+    }
+
+    fn params() -> AnnounceParams {
+        AnnounceParams {
+            info_hash: [1u8; 20],
+            peer_id: [2u8; 20],
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 100,
+            event: Event::Started,
+            num_want: 50,
+            key: 0,
+        }
+    }
+
+    #[test]
+    fn splits_udp_url_host_from_url_data() {
+        assert_eq!(
+            split_udp_url("udp://t.example:6969/announce?passkey=abc").unwrap(),
+            ("t.example:6969".into(), "/announce?passkey=abc".into())
+        );
+        assert_eq!(
+            split_udp_url("udp://t.example:6969?passkey=abc").unwrap(),
+            ("t.example:6969".into(), "?passkey=abc".into())
+        );
+        assert_eq!(
+            split_udp_url("udp://[::1]:6969").unwrap(),
+            ("[::1]:6969".into(), String::new())
+        );
+        assert!(split_udp_url("udp:///x").is_err());
+    }
+
+    #[test]
+    fn url_data_is_chunked_into_bep41_options() {
+        let mut out = Vec::new();
+        let data = vec![b'x'; 300];
+        append_url_data(&mut out, &data);
+        assert_eq!(out[0], OPT_URL_DATA);
+        assert_eq!(out[1], 255);
+        assert_eq!(out[257], OPT_URL_DATA);
+        assert_eq!(out[258], 45);
+        assert_eq!(out.len(), 2 + 255 + 2 + 45);
+    }
+
+    /// Transaction ids are unpredictable (not derived from `key`, which the
+    /// CLI always passes as 0).
+    #[test]
+    fn udp_transaction_ids_are_random() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut txns = Vec::new();
+            let mut buf = [0u8; 2048];
+            for _ in 0..2 {
+                // Answer each connect with an error so the announce stops there.
+                let (_, peer) = server.recv_from(&mut buf).unwrap();
+                txns.push(buf[12..16].to_vec());
+                let mut resp = ACTION_ERROR.to_be_bytes().to_vec();
+                resp.extend_from_slice(&buf[12..16]);
+                resp.extend_from_slice(b"nope");
+                server.send_to(&resp, peer).unwrap();
+            }
+            txns
+        });
+        let url = format!("udp://127.0.0.1:{port}");
+        for _ in 0..2 {
+            let e = announce(&url, &params(), Duration::from_secs(5)).unwrap_err();
+            assert!(e.to_string().contains("nope"), "{e}");
+        }
+        let txns = handle.join().unwrap();
+        assert_ne!(txns[0], txns[1], "transaction id must not be constant");
+    }
+
+    /// A reply from the right IP but the wrong port, or with the wrong
+    /// transaction id, is ignored; a short `error` reply is still surfaced.
+    #[test]
+    fn udp_ignores_spoofed_replies_and_surfaces_short_errors() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let spoofer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (_, peer) = server.recv_from(&mut buf).unwrap();
+            let txn = buf[12..16].to_vec();
+            // Forged connect reply from another port on the same IP.
+            let mut forged = ACTION_CONNECT.to_be_bytes().to_vec();
+            forged.extend_from_slice(&txn);
+            forged.extend_from_slice(&0xdead_beefu64.to_be_bytes());
+            spoofer.send_to(&forged, peer).unwrap();
+            // Stale transaction id from the real server.
+            let mut stale = ACTION_CONNECT.to_be_bytes().to_vec();
+            stale.extend_from_slice(&[0, 0, 0, 0]);
+            stale.extend_from_slice(&0u64.to_be_bytes());
+            server.send_to(&stale, peer).unwrap();
+            // The genuine reply: a bare 8-byte error (no message).
+            let mut resp = ACTION_ERROR.to_be_bytes().to_vec();
+            resp.extend_from_slice(&txn);
+            server.send_to(&resp, peer).unwrap();
+        });
+        let e = announce(
+            &format!("udp://127.0.0.1:{port}"),
+            &params(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("UDP tracker error"), "{e}");
+        handle.join().unwrap();
+    }
+
+    /// The announce carries the URL's path+query as BEP 41 URL data, and an
+    /// announce `error` reply shorter than a full announce reply is reported.
+    #[test]
+    fn udp_announce_sends_url_data_and_reports_errors() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (_, peer) = server.recv_from(&mut buf).unwrap();
+            let mut resp = ACTION_CONNECT.to_be_bytes().to_vec();
+            resp.extend_from_slice(&buf[12..16]);
+            resp.extend_from_slice(&7u64.to_be_bytes());
+            server.send_to(&resp, peer).unwrap();
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            let opts = buf[98..n].to_vec();
+            let mut resp = ACTION_ERROR.to_be_bytes().to_vec();
+            resp.extend_from_slice(&buf[12..16]);
+            resp.extend_from_slice(b"bad");
+            server.send_to(&resp, peer).unwrap();
+            opts
+        });
+        let e = announce(
+            &format!("udp://127.0.0.1:{port}/announce?pk=1"),
+            &params(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("bad"), "{e}");
+        let opts = handle.join().unwrap();
+        let data = b"/announce?pk=1";
+        let mut want = vec![OPT_URL_DATA, data.len() as u8];
+        want.extend_from_slice(data);
+        assert_eq!(opts, want);
     }
 }

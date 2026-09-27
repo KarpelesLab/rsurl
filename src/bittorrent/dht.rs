@@ -78,18 +78,16 @@ pub fn find_peers(
     if bootstrap.is_empty() {
         return Err(derr("no bootstrap nodes"));
     }
-    let sock = DirectUdp::bind_for(bootstrap[0])?;
-    sock.set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(Error::Io)?;
-    sock.set_write_timeout(Some(Duration::from_secs(2)))
-        .map_err(Error::Io)?;
+    // One socket per address family, bound on first use: a socket bound for
+    // an IPv6 bootstrap entry cannot reach the IPv4 nodes the (v4-only,
+    // BEP 5) `nodes` replies return, and vice versa.
+    let mut socks = FamilySockets::default();
 
     let deadline = Instant::now() + overall_timeout;
     let mut peers: HashSet<SocketAddr> = HashSet::new();
     let mut queried: HashSet<SocketAddr> = HashSet::new();
     let mut known: Vec<([u8; 20], SocketAddr)> = Vec::new();
     let mut frontier: Vec<SocketAddr> = bootstrap.to_vec();
-    let mut txn: u16 = 0;
 
     while !frontier.is_empty() && Instant::now() < deadline {
         for addr in std::mem::take(&mut frontier) {
@@ -99,10 +97,15 @@ pub fn find_peers(
             if !queried.insert(addr) {
                 continue;
             }
-            txn = txn.wrapping_add(1);
-            let tid = txn.to_be_bytes();
+            // Random transaction ids, so an off-path attacker can't forge
+            // replies that inject peers or nodes.
+            let mut tid = [0u8; 4];
+            super::random_bytes(&mut tid)?;
             let req = build_get_peers(&tid, &node_id, &info_hash);
-            if let Ok(reply) = query(&sock, addr, &req, &tid) {
+            let Ok(sock) = socks.for_addr(addr) else {
+                continue; // e.g. no IPv6 on this host: skip that node
+            };
+            if let Ok(reply) = query(sock, addr, &req, &tid) {
                 for p in reply.peers {
                     peers.insert(p);
                 }
@@ -127,6 +130,32 @@ pub fn find_peers(
             .collect();
     }
     Ok(peers.into_iter().collect())
+}
+
+/// Lazily bound UDP sockets, one per address family.
+#[derive(Default)]
+struct FamilySockets {
+    v4: Option<DirectUdp>,
+    v6: Option<DirectUdp>,
+}
+
+impl FamilySockets {
+    fn for_addr(&mut self, addr: SocketAddr) -> Result<&DirectUdp> {
+        let slot = if addr.is_ipv4() {
+            &mut self.v4
+        } else {
+            &mut self.v6
+        };
+        if slot.is_none() {
+            let sock = DirectUdp::bind_for(addr)?;
+            sock.set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(Error::Io)?;
+            sock.set_write_timeout(Some(Duration::from_secs(2)))
+                .map_err(Error::Io)?;
+            *slot = Some(sock);
+        }
+        Ok(slot.as_ref().unwrap())
+    }
 }
 
 struct Reply {
@@ -155,7 +184,8 @@ fn query(sock: &DirectUdp, addr: SocketAddr, req: &[u8], txn: &[u8]) -> Result<R
     let mut buf = [0u8; 2048];
     for _ in 0..MAX_REPLIES_PER_QUERY {
         match sock.recv_from(&mut buf) {
-            Ok((n, from)) if from.ip() == addr.ip() => {
+            // The reply must come from the exact node (IP and port) queried.
+            Ok((n, from)) if from == addr => {
                 if let Some(reply) = parse_response(&buf[..n], txn) {
                     return Ok(reply);
                 }
@@ -276,6 +306,49 @@ mod tests {
         let boot: Vec<SocketAddr> = vec![format!("127.0.0.1:{port}").parse().unwrap()];
         let peers = find_peers([0x11; 20], &boot, [0x22; 20], Duration::from_secs(5)).unwrap();
         assert_eq!(peers, vec!["9.8.7.6:6882".parse().unwrap()]);
+        handle.join().unwrap();
+    }
+
+    /// An IPv6 first bootstrap entry must not leave the lookup unable to
+    /// reach IPv4 nodes (the socket used to be bound for `bootstrap[0]` only).
+    /// A reply from the right IP but the wrong port is ignored.
+    #[test]
+    fn ipv6_first_bootstrap_still_reaches_ipv4_nodes() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let spoofer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            let q = bencode::parse(&buf[..n]).unwrap();
+            let txn = q.get(b"t").and_then(Value::as_bytes).unwrap().to_vec();
+            assert_eq!(txn.len(), 4);
+            let reply = |ip: [u8; 4]| {
+                let mut r = BTreeMap::new();
+                r.insert(b"id".to_vec(), Value::Bytes(vec![0xab; 20]));
+                r.insert(
+                    b"values".to_vec(),
+                    Value::List(vec![Value::Bytes(vec![ip[0], ip[1], ip[2], ip[3], 0, 80])]),
+                );
+                let mut root = BTreeMap::new();
+                root.insert(b"r".to_vec(), Value::Dict(r));
+                root.insert(b"t".to_vec(), Value::Bytes(txn.clone()));
+                root.insert(b"y".to_vec(), Value::Bytes(b"r".to_vec()));
+                bencode::encode(&Value::Dict(root))
+            };
+            // Forged reply (same IP, different port) first, then the real one.
+            spoofer.send_to(&reply([6, 6, 6, 6]), peer).unwrap();
+            server.send_to(&reply([1, 2, 3, 4]), peer).unwrap();
+        });
+
+        // A closed IPv6 port first (it just times out, or is skipped where the
+        // host has no IPv6), then the live IPv4 node.
+        let boot: Vec<SocketAddr> = vec![
+            "[::1]:9".parse().unwrap(),
+            format!("127.0.0.1:{port}").parse().unwrap(),
+        ];
+        let peers = find_peers([0x11; 20], &boot, [0x22; 20], Duration::from_secs(10)).unwrap();
+        assert_eq!(peers, vec!["1.2.3.4:80".parse().unwrap()]);
         handle.join().unwrap();
     }
 }
