@@ -1284,7 +1284,6 @@ fn capture_one_request() -> (TestServer, CapturedSlot) {
 #[test]
 fn cli_data_binary_at_file_keeps_newlines() {
     use std::io::Write;
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
     let mut tmp = std::env::temp_dir();
@@ -1295,7 +1294,7 @@ fn cli_data_binary_at_file_keeps_newlines() {
     }
 
     let arg = format!("@{}", tmp.display());
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["--data-binary", &arg, &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1324,7 +1323,6 @@ fn cli_data_binary_at_file_keeps_newlines() {
 #[test]
 fn cli_data_urlencode_all_five_forms() {
     use std::io::Write;
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
     let mut tmp = std::env::temp_dir();
@@ -1337,7 +1335,7 @@ fn cli_data_urlencode_all_five_forms() {
     let at = format!("@{}", tmp.display());
     let name_at = format!("g@{}", tmp.display());
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "--data-urlencode",
             "hello world",
@@ -1378,10 +1376,9 @@ fn cli_data_urlencode_all_five_forms() {
 /// idiom.
 #[test]
 fn cli_multiple_d_join_with_ampersand() {
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-d", "a=1", "-d", "b=2", "-d", "c=3", &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1454,7 +1451,6 @@ fn find_part<'a>(body: &'a [u8], boundary: &str, needle: &str) -> &'a [u8] {
 #[test]
 fn cli_form_part_with_at_file_uploads_bytes() {
     use std::io::Write;
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
     let mut tmp = std::env::temp_dir();
@@ -1466,7 +1462,7 @@ fn cli_form_part_with_at_file_uploads_bytes() {
     let basename = tmp.file_name().unwrap().to_string_lossy().into_owned();
     let arg = format!("upload=@{}", tmp.display());
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-F", &arg, &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1508,10 +1504,9 @@ fn cli_form_part_with_at_file_uploads_bytes() {
 /// in the part value — no file read, no `@` magic, no `;modifier` parsing.
 #[test]
 fn cli_form_string_treats_at_as_literal() {
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "--form-string",
             "field=@notafile;type=ignored",
@@ -1550,7 +1545,6 @@ fn cli_form_string_treats_at_as_literal() {
 #[test]
 fn cli_form_extras_type_filename_headers() {
     use std::io::Write;
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
     let mut payload = std::env::temp_dir();
@@ -1569,7 +1563,7 @@ fn cli_form_extras_type_filename_headers() {
         payload.display(),
         hdrs.display()
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-F", &arg, &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1611,7 +1605,6 @@ fn cli_form_extras_type_filename_headers() {
 #[test]
 fn cli_upload_file_uses_put_and_octet_stream() {
     use std::io::Write;
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
     let mut tmp = std::env::temp_dir();
@@ -1622,7 +1615,7 @@ fn cli_upload_file_uses_put_and_octet_stream() {
         f.write_all(b"AAA\r\nBBB\n\0CCC").unwrap();
     }
     let path = tmp.to_string_lossy().into_owned();
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-T", &path, &server.url("/put")])
         .output()
         .expect("spawn rsurl");
@@ -1645,8 +1638,7 @@ fn cli_upload_file_uses_put_and_octet_stream() {
 /// uploads are supported and exercised separately.)
 #[test]
 fn cli_upload_file_rejects_unsupported_scheme() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-T",
             concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
@@ -1667,8 +1659,7 @@ fn cli_upload_file_rejects_unsupported_scheme() {
 /// so we only require a non-usage transfer failure.
 #[test]
 fn cli_upload_file_ftp_attempts_transfer() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-T",
             concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
@@ -1688,8 +1679,7 @@ fn cli_upload_file_ftp_attempts_transfer() {
 /// the append branch is reached rather than rejected as a usage error.
 #[test]
 fn cli_append_ftp_attempts_transfer() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-a",
             "-T",
@@ -1710,8 +1700,7 @@ fn cli_append_ftp_attempts_transfer() {
 /// Still reaches the FTP transfer path (resolve/connect failure, not usage).
 #[test]
 fn cli_append_with_continue_at_prefers_appe() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-a",
             "-C",
@@ -1734,8 +1723,7 @@ fn cli_append_with_continue_at_prefers_appe() {
 /// fails on the unreachable host rather than producing a usage error.
 #[test]
 fn cli_continue_at_dash_is_accepted() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-C",
             "-",
@@ -1756,8 +1744,7 @@ fn cli_continue_at_dash_is_accepted() {
 /// usage error rather than silently building something nonsensical.
 #[test]
 fn cli_form_and_data_are_mutually_exclusive() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-d", "a=1", "-F", "b=2", "http://127.0.0.1:1/post"])
         .output()
         .expect("spawn rsurl");
@@ -1772,8 +1759,7 @@ fn cli_form_and_data_are_mutually_exclusive() {
 /// `-d` and `-T` are mutually exclusive too — same exit-2 path.
 #[test]
 fn cli_data_and_upload_are_mutually_exclusive() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-d",
             "a=1",
@@ -1794,8 +1780,7 @@ fn cli_data_and_upload_are_mutually_exclusive() {
 /// `-F` and `-T` are mutually exclusive too — same exit-2 path.
 #[test]
 fn cli_form_and_upload_are_mutually_exclusive() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-F",
             "x=y",
@@ -1820,7 +1805,6 @@ fn cli_form_and_upload_are_mutually_exclusive() {
 #[test]
 fn cli_form_field_from_file_has_no_filename() {
     use std::io::Write;
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
     let mut tmp = std::env::temp_dir();
@@ -1830,7 +1814,7 @@ fn cli_form_field_from_file_has_no_filename() {
         f.write_all(b"FIELD-VALUE").unwrap();
     }
     let arg = format!("note=<{}", tmp.display());
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-F", &arg, &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1866,10 +1850,9 @@ fn cli_form_field_from_file_has_no_filename() {
 /// percent-encoding, so `"` becomes `%22` on the wire.
 #[test]
 fn cli_form_escape_percent_encodes_name() {
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["--form-escape", "-F", "weird\"name=v", &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1903,10 +1886,9 @@ fn cli_form_escape_percent_encodes_name() {
 /// "this string is a tiny file, treat it as such".
 #[test]
 fn cli_form_literal_with_filename_modifier_becomes_upload() {
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-F", "blob=hello;filename=hi.txt", &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1941,10 +1923,9 @@ fn cli_form_literal_with_filename_modifier_becomes_upload() {
 /// vs `-d` (which would try to open `notafile` and fail).
 #[test]
 fn cli_data_raw_leaves_at_literal_on_wire() {
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["--data-raw", "@notafile", &server.url("/post")])
         .output()
         .expect("spawn rsurl");
@@ -1975,10 +1956,9 @@ fn cli_data_raw_leaves_at_literal_on_wire() {
 /// three, so this locks in the contract for everyone.
 #[test]
 fn cli_custom_content_type_header_overrides_default() {
-    use std::process::Command;
     let (server, slot) = capture_one_request();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-H",
             "Content-Type: application/json",
@@ -2012,8 +1992,7 @@ fn cli_custom_content_type_header_overrides_default() {
 /// the test is hermetic and deterministic in CI.
 #[test]
 fn cli_http3_only_unresolvable_fails_cleanly() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["--http3-only", "https://host.invalid/"])
         .output()
         .expect("spawn rsurl");
@@ -2034,8 +2013,7 @@ fn cli_http3_only_unresolvable_fails_cleanly() {
 /// QUIC, which is encrypted by construction. Exit non-zero, no panic.
 #[test]
 fn cli_http3_only_rejects_plaintext_http() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["--http3-only", "http://host.invalid/"])
         .output()
         .expect("spawn rsurl");
@@ -2054,8 +2032,7 @@ fn cli_http3_only_rejects_plaintext_http() {
 /// exact code is environment-dependent; see the `--http3-only` test.)
 #[test]
 fn cli_http3_with_fallback_unresolvable_fails_cleanly() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["--http3", "https://host.invalid/"])
         .output()
         .expect("spawn rsurl");
@@ -2226,18 +2203,17 @@ fn client_custom_connector_drives_gopher() {
 /// `-f` makes an HTTP >= 400 exit 22 with no body; without it, exit is 0.
 #[test]
 fn cli_fail_flag_controls_exit_and_body() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::status(404).body("nope"));
     let url = server.url("/missing");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-f", "-s", &url])
         .output()
         .expect("spawn rsurl");
     assert_eq!(out.status.code(), Some(22), "-f on 404 should exit 22");
     assert!(out.stdout.is_empty(), "-f must suppress the body");
 
-    let out2 = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out2 = rsurl_cmd()
         .args(["-s", &url])
         .output()
         .expect("spawn rsurl");
@@ -2248,10 +2224,9 @@ fn cli_fail_flag_controls_exit_and_body() {
 /// `-G` folds `-d` data into the URL query and switches to GET.
 #[test]
 fn cli_get_moves_data_to_query() {
-    use std::process::Command;
     // Echo the request line so we can see method + path+query.
     let server = TestServer::start(|req: SReq| SResp::ok(format!("{} {}", req.method, req.path)));
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "-G", "-d", "a=1", "-d", "b=2", &server.url("/q")])
         .output()
         .expect("spawn rsurl");
@@ -2262,10 +2237,9 @@ fn cli_get_moves_data_to_query() {
 /// `-w` expands `%{...}` variables to stdout after the body.
 #[test]
 fn cli_write_out_expands_vars() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("hello"));
     let out_path = tmp_out_path("wo-vars");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "-o",
@@ -2285,7 +2259,6 @@ fn cli_write_out_expands_vars() {
 #[test]
 fn cli_netrc_supplies_basic_auth() {
     use std::io::Write;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -2305,7 +2278,7 @@ fn cli_netrc_supplies_basic_auth() {
         let mut f = std::fs::File::create(&netrc).unwrap();
         writeln!(f, "machine 127.0.0.1 login alice password s3cret").unwrap();
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--netrc-file",
@@ -2326,7 +2299,6 @@ fn cli_netrc_supplies_basic_auth() {
 /// `-O -J` names the saved file from a sanitized Content-Disposition filename.
 #[test]
 fn cli_remote_header_name_uses_content_disposition() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| {
         let mut r = SResp::ok("payload");
         r.headers.push((
@@ -2338,7 +2310,7 @@ fn cli_remote_header_name_uses_content_disposition() {
     });
     let dir = std::env::temp_dir().join(format!("rsurl-cd-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .current_dir(&dir)
         .args(["-s", "-O", "-J", &server.url("/file")])
         .output()
@@ -2357,10 +2329,9 @@ fn cli_remote_header_name_uses_content_disposition() {
 /// the local test server.
 #[test]
 fn cli_resolve_overrides_dns() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("resolved"));
     let port = server.addr.port();
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--resolve",
@@ -2380,10 +2351,9 @@ fn cli_resolve_overrides_dns() {
 /// `--next` runs a second request with its own options; both bodies are output.
 #[test]
 fn cli_next_runs_multiple_operations() {
-    use std::process::Command;
     let a = TestServer::start(|_r: SReq| SResp::ok("AAA"));
     let b = TestServer::start(|_r: SReq| SResp::ok("BBB"));
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", &a.url("/"), "--next", "-s", &b.url("/")])
         .output()
         .expect("spawn rsurl");
@@ -2395,7 +2365,6 @@ fn cli_next_runs_multiple_operations() {
 #[test]
 fn cli_config_file_supplies_options() {
     use std::io::Write;
-    use std::process::Command;
     let server = TestServer::start(|_r: SReq| SResp::ok("from-config"));
     let mut cfg = std::env::temp_dir();
     cfg.push(format!("rsurl-cfg-{}", std::process::id()));
@@ -2405,7 +2374,7 @@ fn cli_config_file_supplies_options() {
         writeln!(f, "silent").unwrap();
         writeln!(f, "url = \"{}\"", server.url("/")).unwrap();
     }
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-K", cfg.to_str().unwrap()])
         .output()
         .expect("spawn rsurl");
@@ -2421,12 +2390,11 @@ fn cli_config_file_supplies_options() {
 /// Bundled short flags and attached values: `-sSo FILE` = `-s -S -o FILE`.
 #[test]
 fn cli_bundled_short_flags() {
-    use std::process::Command;
     let server = TestServer::start(|_r: SReq| SResp::ok("bundled"));
     let dir = std::env::temp_dir().join(format!("rsurl-bundle-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let outfile = dir.join("o.txt");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .arg(format!("-sSo{}", outfile.display()))
         .arg(server.url("/"))
         .output()
@@ -2444,9 +2412,8 @@ fn cli_bundled_short_flags() {
 /// `--fail-with-body` exits 22 on an HTTP error but still writes the body.
 #[test]
 fn cli_fail_with_body() {
-    use std::process::Command;
     let server = TestServer::start(|_r: SReq| SResp::status(404).body("err-body"));
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "--fail-with-body", &server.url("/x")])
         .output()
         .expect("spawn rsurl");
@@ -2457,8 +2424,7 @@ fn cli_fail_with_body() {
 /// `--proto =https` rejects an http:// URL (exit 1) before connecting.
 #[test]
 fn cli_proto_restricts_scheme() {
-    use std::process::Command;
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "--proto", "=https", "http://example.invalid/"])
         .output()
         .expect("spawn rsurl");
@@ -2469,10 +2435,9 @@ fn cli_proto_restricts_scheme() {
 /// local server.
 #[test]
 fn cli_schemeless_url_defaults_to_http() {
-    use std::process::Command;
     let server = TestServer::start(|_r: SReq| SResp::ok("defaulted"));
     let port = server.addr.port();
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--resolve",
@@ -2492,7 +2457,6 @@ fn cli_schemeless_url_defaults_to_http() {
 /// `-z` sends an If-Modified-Since header carrying the given date.
 #[test]
 fn cli_time_cond_sends_if_modified_since() {
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
     let cap: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let c2 = Arc::clone(&cap);
@@ -2504,7 +2468,7 @@ fn cli_time_cond_sends_if_modified_since() {
             .map(|(_, v)| v.clone());
         SResp::ok("ok")
     });
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "-z",
@@ -2523,10 +2487,9 @@ fn cli_time_cond_sends_if_modified_since() {
 /// URL globbing: `[1-3]` expands into three transfers.
 #[test]
 fn cli_url_globbing_expands_range() {
-    use std::process::Command;
     let server = TestServer::start(|req: SReq| SResp::ok(req.path.clone()));
     let url = format!("{}[1-3]", server.url("/p"));
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", &url])
         .output()
         .expect("spawn rsurl");
@@ -2541,10 +2504,9 @@ fn cli_url_globbing_expands_range() {
 /// `-g/--globoff` disables globbing — the brackets reach the server literally.
 #[test]
 fn cli_globoff_keeps_brackets() {
-    use std::process::Command;
     let server = TestServer::start(|req: SReq| SResp::ok(req.path.clone()));
     let url = format!("{}[1-3]", server.url("/p"));
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "-g", &url])
         .output()
         .expect("spawn rsurl");
@@ -2556,7 +2518,6 @@ fn cli_globoff_keeps_brackets() {
 /// without it).
 #[test]
 fn cli_post302_preserves_method() {
-    use std::process::Command;
     let server = TestServer::start(|req: SReq| {
         if req.path == "/a" {
             let mut r = SResp::status(302);
@@ -2567,7 +2528,7 @@ fn cli_post302_preserves_method() {
         }
     });
     // With --post302: method preserved → /b sees POST.
-    let kept = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let kept = rsurl_cmd()
         .args(["-s", "-L", "--post302", "-d", "x=1", &server.url("/a")])
         .output()
         .expect("spawn");
@@ -2578,7 +2539,7 @@ fn cli_post302_preserves_method() {
         String::from_utf8_lossy(&kept.stderr)
     );
     // Without it: curl-default downgrade → /b sees GET.
-    let downgraded = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let downgraded = rsurl_cmd()
         .args(["-s", "-L", "-d", "x=1", &server.url("/a")])
         .output()
         .expect("spawn");
@@ -2588,7 +2549,6 @@ fn cli_post302_preserves_method() {
 /// `--connect-to` dials a different address while keeping the original Host:.
 #[test]
 fn cli_connect_to_redirects_dial_keeps_host() {
-    use std::process::Command;
     let server = TestServer::start(|req: SReq| {
         let host = req
             .headers
@@ -2599,7 +2559,7 @@ fn cli_connect_to_redirects_dial_keeps_host() {
         SResp::ok(host)
     });
     let port = server.addr.port();
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--connect-to",
@@ -2622,7 +2582,6 @@ fn cli_connect_to_redirects_dial_keeps_host() {
 fn cli_unix_socket_transport() {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
-    use std::process::Command;
 
     let dir = std::env::temp_dir().join(format!("rsurl-uds-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2644,7 +2603,7 @@ fn cli_unix_socket_transport() {
         s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nUDS!")
             .unwrap();
     });
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--unix-socket",
@@ -2669,7 +2628,6 @@ fn cli_unix_socket_transport() {
 fn cli_smtp_send() {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2720,7 +2678,7 @@ fn cli_smtp_send() {
     msg.push(format!("rsurl-smtp-{}.txt", std::process::id()));
     std::fs::write(&msg, b"Subject: hi\r\n\r\nHello over SMTP\r\n").unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--mail-from",
@@ -2762,7 +2720,6 @@ fn cli_smtp_send() {
 fn cli_telnet_strips_iac_and_refuses() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2781,7 +2738,7 @@ fn cli_telnet_strips_iac_and_refuses() {
             g2.lock().unwrap().extend_from_slice(&buf[..n]);
         }
     });
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", &format!("telnet://127.0.0.1:{}", addr.port())])
         .output()
         .expect("spawn rsurl");
@@ -2805,7 +2762,6 @@ fn cli_telnet_strips_iac_and_refuses() {
 /// A download to a file is streamed (chunked) to disk and the bytes match.
 #[test]
 fn cli_streamed_download_to_file() {
-    use std::process::Command;
     // 100 KiB across several chunks.
     let chunk = vec![b'z'; 16 * 1024];
     let chunks: Vec<Vec<u8>> = (0..7).map(|_| chunk.clone()).collect();
@@ -2819,7 +2775,7 @@ fn cli_streamed_download_to_file() {
     let dir = std::env::temp_dir().join(format!("rsurl-dl-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let out_path = dir.join("big.bin");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "-o", out_path.to_str().unwrap(), &server.url("/big")])
         .output()
         .expect("spawn rsurl");
@@ -2837,12 +2793,11 @@ fn cli_streamed_download_to_file() {
 /// `--max-filesize` aborts a streamed download that exceeds the cap (exit 63).
 #[test]
 fn cli_max_filesize_aborts_stream() {
-    use std::process::Command;
     let server = TestServer::start(|_r: SReq| SResp::ok(vec![b'x'; 50_000]));
     let dir = std::env::temp_dir().join(format!("rsurl-mfs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let out_path = dir.join("capped.bin");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--max-filesize",
@@ -2866,7 +2821,6 @@ fn cli_max_filesize_aborts_stream() {
 /// then resends with a computed Digest Authorization and succeeds.
 #[test]
 fn cli_digest_auth() {
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
     let auth_seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let a2 = Arc::clone(&auth_seen);
@@ -2891,7 +2845,7 @@ fn cli_digest_auth() {
             }
         }
     });
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "--digest", "-u", "alice:secret", &server.url("/")])
         .output()
         .expect("spawn rsurl");
@@ -2915,7 +2869,6 @@ fn cli_digest_auth() {
 /// `--oauth2-bearer` sends `Authorization: Bearer <token>`.
 #[test]
 fn cli_oauth2_bearer() {
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
     let cap: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let c2 = Arc::clone(&cap);
@@ -2927,7 +2880,7 @@ fn cli_oauth2_bearer() {
             .map(|(_, v)| v.clone());
         SResp::ok("ok")
     });
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "--oauth2-bearer", "tok123", &server.url("/")])
         .output()
         .expect("spawn rsurl");
@@ -2938,12 +2891,11 @@ fn cli_oauth2_bearer() {
 /// `-Z/--parallel` runs globbed transfers concurrently; each writes its file.
 #[test]
 fn cli_parallel_glob_downloads() {
-    use std::process::Command;
     let server = TestServer::start_keepalive(|req: SReq| SResp::ok(req.path.clone()));
     let dir = std::env::temp_dir().join(format!("rsurl-par-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let url = format!("{}[1-4]", server.url("/p"));
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .current_dir(&dir)
         .args(["-s", "-Z", "-o", "#1.out", &url])
         .output()
@@ -2963,7 +2915,6 @@ fn cli_parallel_glob_downloads() {
 /// `--aws-sigv4` adds an AWS4-HMAC-SHA256 Authorization plus x-amz-* headers.
 #[test]
 fn cli_aws_sigv4_signs() {
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
     let hdrs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let h2 = Arc::clone(&hdrs);
@@ -2971,7 +2922,7 @@ fn cli_aws_sigv4_signs() {
         *h2.lock().unwrap() = req.headers.clone();
         SResp::ok("ok")
     });
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--aws-sigv4",
@@ -3004,7 +2955,6 @@ fn cli_aws_sigv4_signs() {
 fn cli_low_speed_abort_exits_28() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::process::Command;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
@@ -3026,7 +2976,7 @@ fn cli_low_speed_abort_exits_28() {
 
     let mut out_path = std::env::temp_dir();
     out_path.push(format!("rsurl-lowspeed-{}.bin", std::process::id()));
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .args([
             "-s",
             "-Y",
@@ -3048,9 +2998,8 @@ fn cli_low_speed_abort_exits_28() {
 /// `--styled-output`) are accepted without error.
 #[test]
 fn cli_compat_noop_flags_accepted() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("ok"));
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-q",
             "--no-progress-meter",
@@ -3077,10 +3026,9 @@ fn cli_compat_noop_flags_accepted() {
 /// direct HTTP/1.1 path.
 #[test]
 fn cli_write_out_phase_timers() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("hello"));
     let out_path = tmp_out_path("wo-timers");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "-o",
@@ -3112,10 +3060,9 @@ fn cli_write_out_phase_timers() {
 /// reports 0 after a successful transfer.
 #[test]
 fn cli_write_out_header_var() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("body").header("X-Test", "abc123"));
     let out_path = tmp_out_path("wo-header");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "-o",
@@ -3135,15 +3082,14 @@ fn cli_write_out_header_var() {
 /// malformed URL exits 3 (CURLE_URL_MALFORMAT) — the centralized exit-code map.
 #[test]
 fn cli_exit_codes_connect_and_url() {
-    use std::process::Command;
     // Port 1 is privileged and almost certainly not listening → connect fails.
-    let refused = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let refused = rsurl_cmd()
         .args(["-s", "http://127.0.0.1:1/"])
         .status()
         .expect("spawn rsurl");
     assert_eq!(refused.code(), Some(7), "connection refused should exit 7");
 
-    let bad = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let bad = rsurl_cmd()
         .args(["-s", "http://"])
         .status()
         .expect("spawn rsurl");
@@ -3154,7 +3100,6 @@ fn cli_exit_codes_connect_and_url() {
 /// and defaults the method to POST.
 #[test]
 fn cli_json_flag_sets_content_type_and_accept() {
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
     // (method, headers, body) — aliased so clippy::type_complexity is happy.
     type Cap = Arc<Mutex<Option<(String, Vec<(String, String)>, Vec<u8>)>>>;
@@ -3164,7 +3109,7 @@ fn cli_json_flag_sets_content_type_and_accept() {
         *c2.lock().unwrap() = Some((req.method.clone(), req.headers.clone(), req.body.clone()));
         SResp::ok("ok")
     });
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args(["-s", "--json", r#"{"a":1}"#, &server.url("/")])
         .output()
         .expect("spawn rsurl");
@@ -3186,11 +3131,10 @@ fn cli_json_flag_sets_content_type_and_accept() {
 /// `--no-clobber` never overwrites an existing -o target; it picks `.1`.
 #[test]
 fn cli_no_clobber_picks_suffix() {
-    use std::process::Command;
     let server = TestServer::start(|_req: SReq| SResp::ok("fresh"));
     let base = tmp_out_path("noclobber");
     std::fs::write(&base, b"original").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "--no-clobber",
@@ -3214,7 +3158,6 @@ fn cli_no_clobber_picks_suffix() {
 fn cli_remove_on_error_deletes_partial() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::process::Command;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
@@ -3227,7 +3170,7 @@ fn cli_remove_on_error_deletes_partial() {
         // socket closes here → client sees a short/truncated body → error.
     });
     let out_path = tmp_out_path("removeonerr");
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .args([
             "-s",
             "--remove-on-error",
@@ -3253,7 +3196,6 @@ fn cli_remove_on_error_deletes_partial() {
 fn cli_ftp_download_streams_to_file() {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
-    use std::process::Command;
 
     let ctrl = TcpListener::bind("127.0.0.1:0").unwrap();
     let ctrl_port = ctrl.local_addr().unwrap().port();
@@ -3297,7 +3239,7 @@ fn cli_ftp_download_streams_to_file() {
     });
 
     let out_path = tmp_out_path("ftp-dl");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "-o",
@@ -3323,7 +3265,6 @@ fn cli_ftp_download_streams_to_file() {
 fn cli_ftp_create_dirs_upload() {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     let ctrl = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3375,7 +3316,7 @@ fn cli_ftp_create_dirs_upload() {
     let mut tmp = std::env::temp_dir();
     tmp.push(format!("rsurl-ftp-up-{}.bin", std::process::id()));
     std::fs::write(&tmp, b"UPLOAD-PAYLOAD").unwrap();
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .args([
             "-s",
             "--ftp-create-dirs",
@@ -3404,12 +3345,11 @@ fn cli_ftp_create_dirs_upload() {
 #[test]
 #[cfg(unix)]
 fn cli_file_scheme_download_to_file() {
-    use std::process::Command;
     let mut src = std::env::temp_dir();
     src.push(format!("rsurl-file-src-{}.txt", std::process::id()));
     std::fs::write(&src, b"LOCAL-FILE-CONTENTS").unwrap();
     let out_path = tmp_out_path("file-dl");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "-o",
@@ -3437,7 +3377,6 @@ fn cli_file_scheme_download_to_file() {
 fn cli_streaming_gzip_decode_to_file() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::process::Command;
     // gzip("STREAM-GZIP-DECODE-OK") — 41 bytes, generated with `gzip -c`.
     let gz: [u8; 41] = [
         31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 11, 14, 9, 114, 117, 244, 213, 117, 143, 242, 12, 208,
@@ -3458,7 +3397,7 @@ fn cli_streaming_gzip_decode_to_file() {
         let _ = sock.flush();
     });
     let out_path = tmp_out_path("gz-stream");
-    let out = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let out = rsurl_cmd()
         .args([
             "-s",
             "-o",
@@ -3488,7 +3427,6 @@ fn cli_streaming_gzip_decode_to_file() {
 fn cli_ftp_active_mode_download() {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    use std::process::Command;
 
     let ctrl = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let ctrl_port = ctrl.local_addr().unwrap().port();
@@ -3531,7 +3469,7 @@ fn cli_ftp_active_mode_download() {
     });
 
     let out_path = tmp_out_path("ftp-active");
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .args([
             "-s",
             "-P",
@@ -3603,4 +3541,25 @@ fn ffi_easy_extended_options() {
         Some("Basic YWxpY2U6czNjcmV0")
     );
     assert_eq!(get("referer").as_deref(), Some("https://ref.example/"));
+}
+
+/// The `rsurl` binary under test, isolated from the developer's environment:
+/// inherited `http_proxy`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` would otherwise
+/// route requests for non-loopback test hostnames (`--resolve`, `--connect-to`)
+/// through an unrelated proxy and fail the test spuriously.
+fn rsurl_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"));
+    for var in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
 }

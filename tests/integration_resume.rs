@@ -6,7 +6,6 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -156,7 +155,7 @@ fn resume_continues_from_partial() {
     )
     .unwrap();
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .arg("-C")
         .arg("-")
         .arg("-s")
@@ -188,7 +187,7 @@ fn fresh_resume_download_completes() {
     let _ = std::fs::remove_file(&part);
 
     // No prior partial: -C - still downloads cleanly and finalizes.
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .arg("-C")
         .arg("-")
         .arg("-s")
@@ -230,7 +229,7 @@ fn parallel_resume_skips_done_chunks() {
     let meta = ranged_meta(CHUNK as u32, total, &url, ETAG, "", &bitmap);
     rsurl::resume::write_state(&part, total, rsurl::resume::Kind::HttpRanged, &meta).unwrap();
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .args(["-C", "-", "--parallel-segments", "3", "-s", "-o"])
         .arg(&out)
         .arg(&url)
@@ -279,7 +278,7 @@ fn no_range_support_falls_back_to_plain_download() {
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&part);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .arg("-C")
         .arg("-")
         .arg("-s")
@@ -293,4 +292,25 @@ fn no_range_support_falls_back_to_plain_download() {
     assert_eq!(std::fs::read(&out).unwrap(), data);
     assert!(srv.range_starts.lock().unwrap().is_empty());
     let _ = std::fs::remove_file(&out);
+}
+
+/// The `rsurl` binary under test, isolated from the developer's environment:
+/// inherited `http_proxy`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` would otherwise
+/// route requests for non-loopback test hostnames (`--resolve`, `--connect-to`)
+/// through an unrelated proxy and fail the test spuriously.
+fn rsurl_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"));
+    for var in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
 }

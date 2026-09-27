@@ -169,7 +169,7 @@ fn cli_downloads_torrent_to_output() {
     std::fs::write(&torrent_path, &torrent_bytes).unwrap();
     let _ = std::fs::remove_file(&out);
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .arg("--torrent")
         .arg("--bt-peer")
         .arg(format!("127.0.0.1:{port}"))
@@ -621,10 +621,9 @@ fn cli_bt_info_concat_and_file() {
     let tdir = std::env::temp_dir();
     let torrent_path = tdir.join(format!("rsurl_bt3_{pid}.torrent"));
     std::fs::write(&torrent_path, &torrent_bytes).unwrap();
-    let bin = env!("CARGO_BIN_EXE_rsurl");
 
     // --bt-info: JSON to stdout, no peers needed for a .torrent.
-    let out = std::process::Command::new(bin)
+    let out = rsurl_cmd()
         .arg("--bt-info")
         .arg(&torrent_path)
         .output()
@@ -642,7 +641,7 @@ fn cli_bt_info_concat_and_file() {
     let port = start_seeder(data.clone(), meta.clone());
     let concat = tdir.join(format!("rsurl_bt3_concat_{pid}.bin"));
     let _ = std::fs::remove_file(&concat);
-    let s = std::process::Command::new(bin)
+    let s = rsurl_cmd()
         .args([
             "--bt-peer",
             &format!("127.0.0.1:{port}"),
@@ -661,7 +660,7 @@ fn cli_bt_info_concat_and_file() {
     let port2 = start_seeder(data.clone(), meta.clone());
     let one = tdir.join(format!("rsurl_bt3_file_{pid}.bin"));
     let _ = std::fs::remove_file(&one);
-    let s = std::process::Command::new(bin)
+    let s = rsurl_cmd()
         .args([
             "--bt-peer",
             &format!("127.0.0.1:{port2}"),
@@ -857,7 +856,7 @@ fn cli_downloads_magnet() {
     let out = std::env::temp_dir().join(format!("rsurl_magnet_{pid}.bin"));
     let _ = std::fs::remove_file(&out);
 
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let status = rsurl_cmd()
         .arg("-s")
         .arg("-o")
         .arg(&out)
@@ -903,7 +902,7 @@ fn cli_seeds_until_share_ratio() {
     // real one. Picking a "free" port here instead would be a guess — binding
     // :0 and dropping the socket hands the port straight back to the OS, and
     // nothing holds it until rsurl binds.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"))
+    let mut child = rsurl_cmd()
         .arg("--torrent")
         .arg("--bt-peer")
         .arg(format!("127.0.0.1:{src_port}"))
@@ -1005,4 +1004,25 @@ fn cli_seeds_until_share_ratio() {
 
     let _ = std::fs::remove_file(&out);
     let _ = std::fs::remove_file(&torrent_path);
+}
+
+/// The `rsurl` binary under test, isolated from the developer's environment:
+/// inherited `http_proxy`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` would otherwise
+/// route requests for non-loopback test hostnames (`--resolve`, `--connect-to`)
+/// through an unrelated proxy and fail the test spuriously.
+fn rsurl_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rsurl"));
+    for var in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
 }
