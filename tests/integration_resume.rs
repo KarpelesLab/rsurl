@@ -226,7 +226,10 @@ fn parallel_resume_skips_done_chunks() {
     std::fs::write(&part, &big[..CHUNK as usize]).unwrap();
     let mut bitmap = vec![0u8; num_chunks.div_ceil(8)];
     bitmap[0] |= 1;
-    let meta = ranged_meta(CHUNK as u32, total, &url, ETAG, "", &bitmap);
+    let plan: Vec<(u64, u64)> = (0..num_chunks as u64)
+        .map(|i| (i * CHUNK, ((i + 1) * CHUNK).min(total) - 1))
+        .collect();
+    let meta = ranged_meta(plan_key(&plan), total, &url, ETAG, "", &bitmap);
     rsurl::resume::write_state(&part, total, rsurl::resume::Kind::HttpRanged, &meta).unwrap();
 
     let status = rsurl_cmd()
@@ -249,6 +252,19 @@ fn parallel_resume_skips_done_chunks() {
     assert_eq!(starts, vec![CHUNK, 2 * CHUNK], "done chunk must be skipped");
 
     let _ = std::fs::remove_file(&out);
+}
+
+/// The chunk-layout key the binary stores in a ranged partial: FNV-1a over
+/// every chunk's `(start, end)` bounds (mirrors `download::plan_key`).
+fn plan_key(plan: &[(u64, u64)]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for (s, e) in plan {
+        for b in s.to_le_bytes().iter().chain(e.to_le_bytes().iter()) {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+    }
+    h
 }
 
 /// Encode an `http-ranged` resume meta block matching the binary's layout.

@@ -346,15 +346,17 @@ fn usize_len(n: u64) -> io::Result<usize> {
 }
 
 /// Replace an in-memory backing with an anonymous file holding the same bytes.
-/// A no-op if already spilled.
+/// A no-op if already spilled. The in-memory bytes are only released once the
+/// file holds them all: if creating or filling the file fails, the blob keeps
+/// its memory backing intact instead of losing its contents.
 fn spill_locked(g: &mut RwLockWriteGuard<'_, Backing>, dir: Option<&Path>) -> io::Result<()> {
-    let bytes = match &mut **g {
+    let bytes = match &**g {
         Backing::File(_) => return Ok(()),
-        Backing::Mem(v) => std::mem::take(v),
+        Backing::Mem(v) => v,
     };
     let file = anon_file(dir)?;
     if !bytes.is_empty() {
-        write_all_at(&file, 0, &bytes)?;
+        write_all_at(&file, 0, bytes)?;
     }
     **g = Backing::File(file);
     Ok(())
@@ -667,5 +669,19 @@ mod tests {
         let b = TempBlob::with_threshold(0);
         b.write_at(0, b"x").unwrap();
         b.close().unwrap();
+    }
+
+    #[test]
+    fn failed_spill_keeps_in_memory_contents() {
+        // Spilling into a directory that doesn't exist fails; the bytes already
+        // held in memory must survive the failed write.
+        let missing =
+            std::env::temp_dir().join(format!("rsurl_no_such_dir_{}/nested", std::process::id()));
+        let blob = TempBlob::with_threshold(8).in_dir(&missing);
+        blob.write_at(0, b"keep").unwrap();
+        assert!(blob.write_at(4, b"this write forces a spill").is_err());
+        assert!(blob.is_in_memory());
+        assert_eq!(blob.len(), 4);
+        assert_eq!(blob.to_vec().unwrap(), b"keep");
     }
 }

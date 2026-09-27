@@ -1,10 +1,12 @@
 //! `file://` URL support (RFC 8089, formerly RFC 1738).
 //!
 //! `file:///etc/hosts` reads the local file at `/etc/hosts`. Hosts other
-//! than the empty string or `localhost` are rejected per RFC 8089 §2.
+//! than the empty string or `localhost` are rejected per RFC 8089 §2. Like
+//! curl, the path is percent-decoded (`%20` → space), any `?query` is dropped,
+//! and on Windows `file:///C:/dir/f` (or the legacy `C|`) names `C:/dir/f`.
 
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 use crate::error::{Error, Result};
 use crate::url::Url;
@@ -27,14 +29,14 @@ pub(crate) fn fetch_to(url: &Url, sink: &mut dyn std::io::Write) -> Result<u64> 
         )));
     }
 
-    let path = Path::new(&url.path);
+    let path = local_path(&url.path)?;
 
     // Require a regular file. `fs::metadata` follows symlinks, so this also
     // covers a symlink pointing at a directory, FIFO, or device. Rejecting
     // non-regular files closes an unbounded read on e.g. /dev/zero or a FIFO,
     // which would otherwise stream forever into `sink` (there's no size cap
     // here). Directories are reported with their original, clearer message.
-    let meta = fs::metadata(path)?;
+    let meta = fs::metadata(&path)?;
     if meta.is_dir() {
         return Err(Error::BadResponse(format!(
             "path is a directory, not a file: {}",
@@ -48,8 +50,71 @@ pub(crate) fn fetch_to(url: &Url, sink: &mut dyn std::io::Write) -> Result<u64> 
         )));
     }
 
-    let mut f = fs::File::open(path)?;
+    let mut f = fs::File::open(&path)?;
     Ok(std::io::copy(&mut f, sink)?)
+}
+
+/// Map a `file://` URL path to a local filesystem path: drop the query and
+/// fragment, percent-decode (rejecting an encoded NUL, which no OS path can
+/// hold), and on Windows turn `/C:/x` / `/C|/x` into the drive path `C:/x`.
+fn local_path(url_path: &str) -> Result<PathBuf> {
+    let raw = match url_path.find(['?', '#']) {
+        Some(i) => &url_path[..i],
+        None => url_path,
+    };
+    let bytes = percent_decode(raw);
+    if bytes.contains(&0) {
+        return Err(Error::InvalidUrl(format!(
+            "file:// path contains NUL: {raw}"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        let path = String::from_utf8(bytes)
+            .map_err(|_| Error::InvalidUrl(format!("file:// path is not UTF-8: {raw}")))?;
+        #[cfg(windows)]
+        let path = {
+            let b = path.as_bytes();
+            if b.len() >= 3
+                && b[0] == b'/'
+                && b[1].is_ascii_alphabetic()
+                && matches!(b[2], b':' | b'|')
+            {
+                format!("{}:{}", &path[1..2], &path[3..])
+            } else {
+                path
+            }
+        };
+        Ok(PathBuf::from(path))
+    }
+}
+
+/// `%XX` → byte; a `%` not followed by two hex digits is kept literally.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hex(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
 }
 
 #[cfg(test)]
@@ -158,5 +223,35 @@ mod tests {
             }
             other => panic!("expected BadResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn percent_encoded_path_and_query_are_handled() {
+        let dir = unique_temp_path("pct");
+        fs::create_dir(&dir).expect("create dir");
+        let p = dir.join("a b.txt");
+        fs::write(&p, b"spaced").unwrap();
+        let encoded = format!("{}/a%20b.txt?v=1#frag", dir.to_str().unwrap());
+        let got = fetch(&url_for(&encoded, ""));
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_dir(&dir);
+        assert_eq!(got.expect("decoded path"), b"spaced");
+    }
+
+    #[test]
+    fn local_path_decoding_rules() {
+        assert_eq!(
+            local_path("/a%2Fb%zz%4").unwrap(),
+            PathBuf::from("/a/b%zz%4")
+        );
+        assert_eq!(local_path("/x?y=%00").unwrap(), PathBuf::from("/x"));
+        assert!(local_path("/x%00y").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_letter_paths() {
+        assert_eq!(local_path("/C:/dir/f").unwrap(), PathBuf::from("C:/dir/f"));
+        assert_eq!(local_path("/c|/dir/f").unwrap(), PathBuf::from("c:/dir/f"));
     }
 }

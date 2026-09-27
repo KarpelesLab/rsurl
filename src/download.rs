@@ -53,7 +53,7 @@
 //! which backing is underneath.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -212,7 +212,10 @@ pub fn download(url: &str, path: &Path, mut opts: DownloadOptions) -> Result<Dow
     if let Some(decoded) = decode_data_uri(url) {
         let bytes = checked_data_uri(decoded, &mut opts)?;
         let n = bytes.len() as u64;
-        std::fs::write(path, &bytes).map_err(Error::Io)?;
+        write_atomically(path, |f| {
+            f.write_all(&bytes).map_err(Error::Io)?;
+            Ok(n)
+        })?;
         return Ok(DownloadOutcome {
             bytes_written: n,
             total: Some(n),
@@ -366,23 +369,49 @@ pub fn fetch_to_tmp(url: &str, mut opts: DownloadOptions) -> Result<TempBlob> {
 fn fetch_via_transfer(url: &str, path: &Path, opts: &mut DownloadOptions) -> Result<u64> {
     let mut parsed = crate::url::Url::parse(url)?;
     parsed.set_idn(true)?;
-    let n = {
-        let mut file = std::fs::File::create(path).map_err(Error::Io)?;
-        crate::transfer::transfer_url_to_with(
+    write_atomically(path, |file| {
+        let n = crate::transfer::transfer_url_to_with(
             &parsed,
             &crate::net::NetConfig::default(),
-            &mut file,
-        )?
-    };
-    one_shot_checks(
-        n,
-        opts,
-        |len| hash_prefix(path, len),
-        || {
-            let _ = std::fs::remove_file(path);
-        },
-    )?;
-    Ok(n)
+            file,
+        )?;
+        file.flush().map_err(Error::Io)?;
+        let hash_file = file.try_clone().map_err(Error::Io)?;
+        one_shot_checks(n, opts, |len| hash_file_prefix(hash_file, len), || {})?;
+        Ok(n)
+    })
+}
+
+/// Produce `path` atomically: `fill` writes into a fresh sibling temp file,
+/// which is renamed over `path` only if it succeeds. On any failure the temp
+/// file is removed and a pre-existing `path` is left untouched — a failed or
+/// rejected one-shot transfer never truncates or half-replaces the output.
+fn write_atomically(path: &Path, fill: impl FnOnce(&mut File) -> Result<u64>) -> Result<u64> {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(
+        ".{name}.rsurltmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(Error::Io)?;
+    let res = fill(&mut file).and_then(|n| {
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(Error::Io)?;
+        Ok(n)
+    });
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// The post-transfer policy shared by the one-shot (non-range-based) schemes:
@@ -672,9 +701,11 @@ struct Validators {
 }
 
 impl Validators {
-    /// The value to send as `If-Range` (prefer the strong `ETag`).
+    /// The value to send as `If-Range`: the `ETag` when it is strong, else the
+    /// `Last-Modified` date. RFC 9110 §13.1.5 forbids a weak entity tag here
+    /// (a server must then ignore the range), so `W/"…"` is never sent.
     fn if_range(&self) -> Option<&str> {
-        if !self.etag.is_empty() {
+        if !self.etag.is_empty() && !self.etag.starts_with("W/") {
             Some(&self.etag)
         } else if !self.last_modified.is_empty() {
             Some(&self.last_modified)
@@ -779,13 +810,13 @@ impl Downloader {
     // ---- single-stream mode ------------------------------------------------
 
     fn run_single(&mut self) -> Result<DownloadOutcome> {
-        let (mut have, mut validators) = self.load_stream_state();
+        let (mut have, mut validators, mut known_total) = self.load_stream_state();
         let resumed_from = have;
         let mut budget = self.opts.max_retries;
         let mut attempt_no: u32 = 0;
 
         loop {
-            match self.attempt_single(have, &mut validators) {
+            match self.attempt_single(have, &mut validators, &mut known_total) {
                 Attempt::Done { written, total } => {
                     self.verify_and_finalize(written, total)?;
                     return Ok(DownloadOutcome {
@@ -801,7 +832,9 @@ impl Downloader {
                     err,
                 } => {
                     let progressed = resumable && written > have;
-                    if resumable {
+                    // `written < have` without resumability means the attempt
+                    // discarded the partial: continue from scratch.
+                    if resumable || written < have {
                         have = written;
                     }
                     if progressed {
@@ -820,7 +853,14 @@ impl Downloader {
 
     /// Run one GET (ranged when `have > 0`) and stream its body to the part
     /// file, updating `validators` if the server returned a full body.
-    fn attempt_single(&mut self, have: u64, validators: &mut Validators) -> Attempt {
+    /// `known_total` is the resource size the bytes held so far belong to (from
+    /// the partial on disk, or the last response); kept current here.
+    fn attempt_single(
+        &mut self,
+        have: u64,
+        validators: &mut Validators,
+        known_total: &mut Option<u64>,
+    ) -> Attempt {
         let mut req = self.base.clone();
         if have > 0 {
             req = req.header("Range", &format!("bytes={have}-"));
@@ -836,12 +876,28 @@ impl Downloader {
         };
         let status = reader.status();
 
-        // Already complete: the range is unsatisfiable because we hold it all.
+        // A 416 only means "already complete" when the resource's size is
+        // exactly what we hold. Anything else (the resource shrank, a proxy
+        // refused the range) must not finalize a truncated partial as done.
         if status == 416 {
-            return Attempt::Done {
-                written: have,
-                total: Some(have),
-            };
+            let total = parse_unsatisfied_total(reader.header("content-range"));
+            if have > 0 && total.or(*known_total) == Some(have) {
+                return Attempt::Done {
+                    written: have,
+                    total: Some(have),
+                };
+            }
+            if have > 0 && total.is_some() {
+                // The resource's size changed under us: restart from zero.
+                self.store.discard();
+                *known_total = None;
+                return Attempt::Transient {
+                    written: 0,
+                    resumable: false,
+                    err: Error::BadResponse("resource changed size during resume".into()),
+                };
+            }
+            return Attempt::Fatal(status_error(status, &reader));
         }
         if (300..400).contains(&status) {
             // Redirects are followed internally; a surviving 3xx is a dead end.
@@ -863,11 +919,17 @@ impl Downloader {
         // 2xx. Decide the write offset and total.
         let (offset, total, resumable) = if status == 206 {
             match parse_content_range(reader.header("content-range")) {
-                Some((start, tot)) if start == have => (have, tot, true),
+                Some(cr)
+                    if cr.start == have && (known_total.is_none() || cr.total == *known_total) =>
+                {
+                    *known_total = cr.total;
+                    (have, cr.total, true)
+                }
                 // The server's range doesn't line up with what we hold; discard
                 // and restart from zero on the next attempt.
                 _ => {
                     self.store.discard();
+                    *known_total = None;
                     return Attempt::Transient {
                         written: 0,
                         resumable: false,
@@ -888,6 +950,7 @@ impl Downloader {
             let accepts_ranges = reader
                 .header("accept-ranges")
                 .is_some_and(|v| v.to_ascii_lowercase().contains("bytes"));
+            *known_total = total;
             (0, total, have == 0 && accepts_ranges)
         };
 
@@ -999,19 +1062,19 @@ impl Downloader {
         }
     }
 
-    /// Load a prior single-stream offset + validators, if the partial matches
-    /// this resource.
-    fn load_stream_state(&self) -> (u64, Validators) {
+    /// Load a prior single-stream offset, validators and total, if the partial
+    /// matches this resource.
+    fn load_stream_state(&self) -> (u64, Validators, Option<u64>) {
         if let Some(st) = self.store.load_state() {
             if st.kind == Kind::HttpStream {
                 if let Some((done, v)) = parse_stream_meta(&st.meta) {
                     if v.url == self.url_key && done <= st.real_size {
-                        return (done, v);
+                        return (done, v, Some(st.real_size));
                     }
                 }
             }
         }
-        (0, Validators::default())
+        (0, Validators::default(), None)
     }
 
     // ---- segmented mode ----------------------------------------------------
@@ -1189,9 +1252,14 @@ impl Downloader {
                 ))));
             }
 
-            // 206: learn the total from Content-Range.
+            // 206: learn the total from Content-Range. It must describe the
+            // range we asked for (starting at 0) with a known total.
             let total = match parse_content_range(reader.header("content-range")) {
-                Some((_, Some(t))) => t,
+                Some(ContentRange {
+                    start: 0,
+                    total: Some(t),
+                    ..
+                }) => t,
                 _ => return Err(SegErr::Fallback), // no usable total → single-stream
             };
             if total == 0 {
@@ -1245,7 +1313,8 @@ impl Downloader {
                     self.store.as_ref(),
                     got0,
                     end0,
-                    &validators.etag,
+                    total,
+                    validators.if_range().unwrap_or(""),
                     self.retry(),
                     meter,
                 ) {
@@ -1294,7 +1363,7 @@ impl Downloader {
                 return Err(SegErr::Fallback);
             }
             let seg = total / n as u64;
-            let plan = (0..n)
+            let plan: Vec<(u64, u64)> = (0..n)
                 .map(|i| {
                     let start = i as u64 * seg;
                     let end = if i == n - 1 {
@@ -1305,17 +1374,17 @@ impl Downloader {
                     (start, end)
                 })
                 .collect();
-            Ok((seg.min(u32::MAX as u64) as u32, plan))
+            Ok((plan_key(&plan), plan))
         } else if let Some(size) = self.opts.segment_size.filter(|s| *s > 0) {
             let n = total.div_ceil(size) as usize;
-            let plan = (0..n)
+            let plan: Vec<(u64, u64)> = (0..n)
                 .map(|i| {
                     let start = i as u64 * size;
                     let end = (start + size).min(total) - 1;
                     (start, end)
                 })
                 .collect();
-            Ok((size.min(u32::MAX as u64) as u32, plan))
+            Ok((plan_key(&plan), plan))
         } else {
             Err(SegErr::Fallback)
         }
@@ -1350,8 +1419,9 @@ impl Downloader {
         let validators = Arc::new(validators.clone());
         // `If-Range` guards every chunk request: if the resource changed since
         // we learned its size/validators, the server answers `200` instead of
-        // `206` and we restart rather than splice mismatched bytes.
-        let if_range = Arc::new(validators.etag.clone());
+        // `206` and we restart rather than splice mismatched bytes. Falls back
+        // to `Last-Modified` when there is no strong `ETag`.
+        let if_range = Arc::new(validators.if_range().unwrap_or("").to_string());
         let retry = self.retry();
 
         let mut handles = Vec::with_capacity(workers);
@@ -1383,6 +1453,7 @@ impl Downloader {
                     store.as_ref(),
                     start,
                     end,
+                    total,
                     &if_range,
                     retry,
                     &meter,
@@ -1400,8 +1471,17 @@ impl Downloader {
                 }
             }));
         }
+        // A worker that panicked (e.g. a progress callback panicking) left its
+        // claimed chunk unfinished; the file has a hole and must not be
+        // finalized.
+        let mut panicked = false;
         for h in handles {
-            let _ = h.join();
+            panicked |= h.join().is_err();
+        }
+        if panicked {
+            return Err(SegErr::Fatal(Error::BadResponse(
+                "segment worker panicked; download incomplete".into(),
+            )));
         }
 
         if let Some(e) = Arc::try_unwrap(failed)
@@ -1622,11 +1702,13 @@ struct Retry {
     cap: Duration,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_chunk_streaming(
     base: &Request,
     store: &dyn PartStore,
     start: u64,
     end: u64,
+    total: u64,
     if_range: &str,
     retry: Retry,
     meter: &ByteMeter,
@@ -1641,7 +1723,7 @@ fn fetch_chunk_streaming(
         if !if_range.is_empty() {
             req = req.header("If-Range", if_range);
         }
-        match stream_chunk_once(req, store, from, want - got, meter) {
+        match stream_chunk_once(req, store, from, want - got, total, meter) {
             StreamOnce::Fallback => return ChunkResult::Fallback,
             StreamOnce::Fatal(e) => return ChunkResult::Fatal(e),
             StreamOnce::Advanced {
@@ -1704,6 +1786,7 @@ fn stream_chunk_once(
     store: &dyn PartStore,
     at: u64,
     want: u64,
+    total: u64,
     meter: &ByteMeter,
 ) -> StreamOnce {
     let mut reader = match req.send_reader() {
@@ -1732,6 +1815,14 @@ fn stream_chunk_once(
             }
         }
         s => return StreamOnce::Fatal(Error::BadResponse(format!("unexpected status {s}"))),
+    }
+    // The 206 must carry exactly the bytes we asked for, of the resource size
+    // we planned against: writing a misplaced range at `at` would silently
+    // corrupt the file. A mismatch (buggy server/CDN, or the resource changed
+    // without validators to catch it) restarts as a single stream.
+    match parse_content_range(reader.header("content-range")) {
+        Some(cr) if cr.start == at && cr.total == Some(total) => {}
+        _ => return StreamOnce::Fallback,
     }
     let p = pump_to_store(&mut reader, store, at, want, Some(meter));
     match p.err {
@@ -1912,21 +2003,76 @@ fn is_transient(err: &Error) -> bool {
     }
 }
 
-/// Parse `Content-Range: bytes a-b/total` → `(a, Some(total))`, or `total`
-/// `None` for a `*` total. Returns `None` if unparseable.
-fn parse_content_range(v: Option<&str>) -> Option<(u64, Option<u64>)> {
+/// A parsed `Content-Range: bytes a-b/total` of a `206` response.
+#[derive(Debug, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    /// `None` for a `*` (unknown) total.
+    total: Option<u64>,
+}
+
+/// Parse `Content-Range: bytes a-b/total` (or `a-b/*`). Returns `None` if
+/// unparseable or inconsistent (`a > b`, or `b` not below a known total).
+fn parse_content_range(v: Option<&str>) -> Option<ContentRange> {
     let v = v?.trim();
     let rest = v
         .strip_prefix("bytes ")
         .or_else(|| v.strip_prefix("bytes="))?;
     let (range, total) = rest.split_once('/')?;
-    let (start, _end) = range.split_once('-')?;
+    let (start, end) = range.split_once('-')?;
     let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
     let total = match total.trim() {
         "*" => None,
         t => Some(t.parse::<u64>().ok()?),
     };
-    Some((start, total))
+    if start > end || total.is_some_and(|t| end >= t) {
+        return None;
+    }
+    Some(ContentRange { start, end, total })
+}
+
+/// Parse the `Content-Range: bytes */total` of a `416` response.
+fn parse_unsatisfied_total(v: Option<&str>) -> Option<u64> {
+    let v = v?.trim();
+    let rest = v
+        .strip_prefix("bytes ")
+        .or_else(|| v.strip_prefix("bytes="))?;
+    rest.trim().strip_prefix("*/")?.trim().parse().ok()
+}
+
+/// A resume key identifying a chunk layout (FNV-1a over every chunk's bounds),
+/// stored in the partial so a resumed run only trusts its chunk bitmap when the
+/// layout is identical — not merely one with the same chunk size or count.
+fn plan_key(plan: &[(u64, u64)]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for (s, e) in plan {
+        for b in s.to_le_bytes().iter().chain(e.to_le_bytes().iter()) {
+            h ^= u32::from(*b);
+            h = h.wrapping_mul(0x0100_0193);
+        }
+    }
+    h
+}
+
+/// SHA-256 of the first `len` bytes of an open file.
+fn hash_file_prefix(mut f: File, len: u64) -> io::Result<[u8; 32]> {
+    use std::io::Seek as _;
+    f.seek(io::SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut left = len;
+    let mut buf = [0u8; 64 * 1024];
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let n = f.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        hasher.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Ok(hasher.finalize())
 }
 
 /// Stream the first `len` bytes of `blob` through SHA-256 — [`hash_prefix`]'s
@@ -2101,6 +2247,9 @@ mod tests {
         slow_range_start: Option<u64>,
         /// Range header value of every request received, in order.
         ranges: Vec<String>,
+        /// Answer (once) a ranged request starting here with the bytes and
+        /// `Content-Range` of offset 0 instead — a buggy server/CDN.
+        misrange_start: Option<u64>,
     }
 
     impl Origin {
@@ -2116,6 +2265,7 @@ mod tests {
                 slow_left: 0,
                 slow_range_start: None,
                 ranges: Vec::new(),
+                misrange_start: None,
             }))
         }
     }
@@ -2208,10 +2358,15 @@ mod tests {
         let if_range_ok = if_range.as_deref().map(|v| v == o.etag).unwrap_or(true);
         let use_range = range.is_some() && o.accept_ranges && !o.ignore_range && if_range_ok;
 
-        let (start, end) = match (use_range, range.as_deref().and_then(parse_req_range)) {
+        let (mut start, mut end) = match (use_range, range.as_deref().and_then(parse_req_range)) {
             (true, Some((s, e))) => (s, e.unwrap_or(len - 1).min(len - 1)),
             _ => (0u64, len.saturating_sub(1)),
         };
+        if use_range && o.misrange_start == Some(start) {
+            o.misrange_start = None;
+            end -= start;
+            start = 0;
+        }
 
         // Unsatisfiable range → 416.
         if use_range && start >= len {
@@ -2632,9 +2787,25 @@ mod tests {
     fn parse_content_range_variants() {
         assert_eq!(
             parse_content_range(Some("bytes 100-199/1000")),
-            Some((100, Some(1000)))
+            Some(ContentRange {
+                start: 100,
+                end: 199,
+                total: Some(1000)
+            })
         );
-        assert_eq!(parse_content_range(Some("bytes 0-0/*")), Some((0, None)));
+        assert_eq!(
+            parse_content_range(Some("bytes 0-0/*")),
+            Some(ContentRange {
+                start: 0,
+                end: 0,
+                total: None
+            })
+        );
+        // Inconsistent ranges are rejected.
+        assert_eq!(parse_content_range(Some("bytes 5-4/10")), None);
+        assert_eq!(parse_content_range(Some("bytes 0-10/10")), None);
+        assert_eq!(parse_unsatisfied_total(Some("bytes */1000")), Some(1000));
+        assert_eq!(parse_unsatisfied_total(Some("bytes 0-1/1000")), None);
         assert_eq!(parse_content_range(Some("garbage")), None);
         assert_eq!(parse_content_range(None), None);
     }
@@ -2745,7 +2916,18 @@ mod tests {
             &part,
             5_000,
             Kind::HttpRanged,
-            &ranged_meta(1000, 5_000, &validators, &bitmap),
+            &ranged_meta(
+                plan_key(&[
+                    (0, 999),
+                    (1000, 1999),
+                    (2000, 2999),
+                    (3000, 3999),
+                    (4000, 4999),
+                ]) as u64,
+                5_000,
+                &validators,
+                &bitmap,
+            ),
         )
         .unwrap();
 
@@ -3203,5 +3385,187 @@ mod tests {
             fetch_to_tmp("magnet:?xt=urn:btih:0000", no_backoff()).unwrap_err(),
             Error::UnsupportedScheme(_)
         ));
+    }
+    #[test]
+    fn chunk_with_misplaced_content_range_is_not_spliced() {
+        // The server answers chunk 2's range with chunk 0's bytes (and says so
+        // in Content-Range). Those bytes must not land at offset 2000.
+        let body = make_body(5_000, 0x5151);
+        let origin = Origin::shared(body.clone(), "mr");
+        origin.lock().unwrap().misrange_start = Some(2_000);
+        let port = start(origin.clone());
+        let out = tmp("misrange");
+
+        let mut opts = no_backoff();
+        opts.segment_size = Some(1000);
+        opts.parallelism = 1;
+        download(&format!("http://127.0.0.1:{port}/file"), &out, opts).expect("download");
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        cleanup(&out);
+    }
+
+    /// Leave a single-stream `.rsurlpart` holding `done` of `total` bytes.
+    fn write_stream_partial(out: &Path, url: &str, body: &[u8], done: u64, total: u64, etag: &str) {
+        let part = resume::part_path(out);
+        let u = Request::get(url).unwrap();
+        let u = u.url();
+        let validators = Validators {
+            url: format!("{}://{}:{}{}", u.scheme, u.host, u.port, u.path),
+            etag: etag.into(),
+            last_modified: String::new(),
+        };
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&part)
+                .unwrap();
+            f.set_len(total).unwrap();
+            f.write_all(&body[..done as usize]).unwrap();
+        }
+        resume::write_state(
+            &part,
+            total,
+            Kind::HttpStream,
+            &stream_meta(total, done, &validators),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resume_416_for_a_shrunken_resource_restarts_instead_of_truncating() {
+        // A partial of 600/1000 bytes; the resource is now only 400 bytes, so
+        // `Range: bytes=600-` is unsatisfiable (`*/400`). That is not "done".
+        let old = make_body(1_000, 0x7070);
+        let new = make_body(400, 0x0707);
+        let origin = Origin::shared(new.clone(), "same");
+        let port = start(origin.clone());
+        let out = tmp("shrunk");
+        let url = format!("http://127.0.0.1:{port}/file");
+        write_stream_partial(&out, &url, &old, 600, 1_000, "same");
+
+        let outcome = download(&url, &out, no_backoff()).expect("download");
+        assert_eq!(outcome.bytes_written, 400);
+        assert_eq!(std::fs::read(&out).unwrap(), new);
+        cleanup(&out);
+    }
+
+    #[test]
+    fn resume_416_with_matching_total_is_complete() {
+        let body = make_body(1_000, 0x7171);
+        let origin = Origin::shared(body.clone(), "e");
+        let port = start(origin.clone());
+        let out = tmp("complete416");
+        let url = format!("http://127.0.0.1:{port}/file");
+        write_stream_partial(&out, &url, &body, 1_000, 1_000, "e");
+
+        let outcome = download(&url, &out, no_backoff()).expect("download");
+        assert_eq!(outcome.bytes_written, 1_000);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        cleanup(&out);
+    }
+
+    #[test]
+    fn if_range_falls_back_to_last_modified_for_weak_or_missing_etag() {
+        let lm = "Wed, 21 Oct 2015 07:28:00 GMT";
+        let mut v = Validators {
+            url: String::new(),
+            etag: "W/\"weak\"".into(),
+            last_modified: lm.into(),
+        };
+        assert_eq!(v.if_range(), Some(lm));
+        v.etag.clear();
+        assert_eq!(v.if_range(), Some(lm));
+        v.etag = "\"strong\"".into();
+        assert_eq!(v.if_range(), Some("\"strong\""));
+        v.etag = "W/\"weak\"".into();
+        v.last_modified.clear();
+        assert_eq!(v.if_range(), None);
+    }
+
+    #[test]
+    fn plan_key_distinguishes_layouts_with_equal_chunk_size() {
+        // `segments = 3` over 10 bytes → chunk size 3 with a 4-byte tail;
+        // `segment_size = 3` → four chunks. Same size, different layouts.
+        let seg = [(0, 2), (3, 5), (6, 9)];
+        let size = [(0, 2), (3, 5), (6, 8), (9, 9)];
+        assert_ne!(plan_key(&seg), plan_key(&size));
+        assert_eq!(plan_key(&seg), plan_key(&[(0, 2), (3, 5), (6, 9)]));
+    }
+
+    #[test]
+    fn panicking_segment_worker_fails_the_download() {
+        // A progress callback that panics on a worker thread (worker threads are
+        // unnamed; the test thread is not) leaves that worker's chunk unfinished.
+        // The download must fail rather than finalize a file with a hole.
+        let body = make_body(6_000, 0x6161);
+        let origin = Origin::shared(body, "p");
+        let port = start(origin);
+        let out = tmp("panic");
+
+        let mut opts = no_backoff();
+        opts.segment_size = Some(1000);
+        opts.parallelism = 2;
+        opts.progress = Some(Box::new(|_, _| {
+            if std::thread::current().name().is_none() {
+                panic!("progress callback panicked (expected by test)");
+            }
+        }));
+        let res = download(&format!("http://127.0.0.1:{port}/file"), &out, opts);
+        assert!(res.is_err(), "worker panic must fail the download");
+        assert!(!out.exists(), "no output may be finalized");
+        cleanup(&out);
+    }
+
+    /// A `file://` URL for a local path (`file:///C:/...` on Windows).
+    fn file_url(p: &Path) -> String {
+        let s = p.display().to_string().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
+    #[test]
+    fn failed_one_shot_transfer_keeps_existing_output() {
+        // `file://` of a missing path fails; the existing output must survive
+        // untouched and no temp file may be left beside it.
+        let out = tmp("keep");
+        std::fs::write(&out, b"precious").unwrap();
+        let missing = tmp("missing-src");
+        let url = file_url(&missing);
+        assert!(fetch_to_file(&url, &out, DownloadOptions::default()).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"precious");
+        let dir = out.parent().unwrap();
+        let prefix = format!(".{}.rsurltmp.", out.file_name().unwrap().to_string_lossy());
+        let leftovers = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(leftovers, 0);
+        cleanup(&out);
+    }
+
+    #[test]
+    fn one_shot_sha256_mismatch_keeps_existing_output() {
+        let src = tmp("sha-src");
+        std::fs::write(&src, b"new contents").unwrap();
+        let out = tmp("sha-out");
+        std::fs::write(&out, b"old").unwrap();
+        let opts = DownloadOptions {
+            expected_sha256: Some([0u8; 32]),
+            ..Default::default()
+        };
+        let url = file_url(&src);
+        assert!(fetch_to_file(&url, &out, opts).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"old");
+        // And a good transfer replaces it.
+        fetch_to_file(&url, &out, DownloadOptions::default()).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"new contents");
+        cleanup(&out);
+        let _ = std::fs::remove_file(&src);
     }
 }

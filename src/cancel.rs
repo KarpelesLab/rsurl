@@ -27,7 +27,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A clonable cancellation handle. Clones share one underlying state, so
 /// cancelling any clone cancels them all.
@@ -54,6 +54,15 @@ struct Inner {
     hooks: Mutex<Vec<Option<Hook>>>,
 }
 
+impl Inner {
+    /// The hook table, recovering it if a panic poisoned the lock: the slots
+    /// stay consistent (every mutation is a single assignment), and refusing
+    /// the lock would silently disable cancellation — or panic in `register`.
+    fn hooks(&self) -> MutexGuard<'_, Vec<Option<Hook>>> {
+        self.hooks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 impl CancelToken {
     /// A fresh, not-yet-cancelled token.
     pub fn new() -> Self {
@@ -64,10 +73,8 @@ impl CancelToken {
     /// Invokes all registered shutdown hooks to tear down live connections.
     pub fn cancel(&self) {
         self.inner.cancelled.store(true, Ordering::SeqCst);
-        if let Ok(hooks) = self.inner.hooks.lock() {
-            for h in hooks.iter().flatten() {
-                h();
-            }
+        for h in self.inner.hooks().iter().flatten() {
+            h();
         }
     }
 
@@ -87,7 +94,7 @@ impl CancelToken {
                 idx: usize::MAX,
             };
         }
-        let mut hooks = self.inner.hooks.lock().unwrap();
+        let mut hooks = self.inner.hooks();
         // Reuse a vacated slot if one exists, else append.
         let idx = match hooks.iter().position(|h| h.is_none()) {
             Some(i) => {
@@ -102,10 +109,8 @@ impl CancelToken {
         drop(hooks);
         // Lost-the-race guard: cancelled between the check above and insertion.
         if self.is_cancelled() {
-            if let Ok(hooks) = self.inner.hooks.lock() {
-                if let Some(Some(h)) = hooks.get(idx) {
-                    h();
-                }
+            if let Some(Some(h)) = self.inner.hooks().get(idx) {
+                h();
             }
         }
         CancelGuard {
@@ -127,10 +132,8 @@ impl Drop for CancelGuard {
         if self.idx == usize::MAX {
             return;
         }
-        if let Ok(mut hooks) = self.token.inner.hooks.lock() {
-            if let Some(slot) = hooks.get_mut(self.idx) {
-                *slot = None;
-            }
+        if let Some(slot) = self.token.inner.hooks().get_mut(self.idx) {
+            *slot = None;
         }
     }
 }
@@ -198,5 +201,26 @@ mod tests {
         t.cancel();
         // g1 removed, g2 removed, g3 active => exactly one fire.
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poisoned_hook_lock_does_not_disable_cancellation() {
+        let t = CancelToken::new();
+        // Poison the hook table by panicking while holding its lock.
+        let t2 = t.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = t2.inner.hooks.lock().unwrap();
+            panic!("poison the lock (expected by test)");
+        })
+        .join();
+        assert!(t.inner.hooks.is_poisoned());
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&fired);
+        let guard = t.register(Box::new(move || f.store(true, Ordering::SeqCst)));
+        t.cancel();
+        assert!(fired.load(Ordering::SeqCst), "hook must still fire");
+        drop(guard);
+        assert!(t.inner.hooks().iter().all(|h| h.is_none()));
     }
 }

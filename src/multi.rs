@@ -108,8 +108,15 @@ impl Multi {
             let tx = self.tx.clone();
             let handle = std::thread::spawn(move || {
                 // `send` consumes the request and blocks until done; the result
-                // (Ok or Err) is posted exactly once.
-                let _ = tx.send((id, req.send()));
+                // (Ok or Err) is posted exactly once. A panic inside the
+                // transfer (e.g. from a user-supplied resolver or connector) is
+                // caught and posted as an error: otherwise nothing would ever
+                // arrive and `poll(None)` / `wait_all` would block forever.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| req.send()))
+                    .unwrap_or_else(|_| {
+                        Err(crate::error::Error::BadResponse("transfer panicked".into()))
+                    });
+                let _ = tx.send((id, result));
             });
             self.workers.push((id, handle));
             self.running += 1;
@@ -239,5 +246,30 @@ mod tests {
         let mut m = Multi::new();
         assert!(!m.poll(Some(Duration::from_millis(10))));
         assert!(m.next_completed().is_none());
+    }
+
+    /// A resolver that panics, standing in for any user hook that panics
+    /// mid-transfer.
+    #[derive(Debug)]
+    struct PanickingResolver;
+
+    impl crate::net::Resolver for PanickingResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> Result<Vec<std::net::SocketAddr>> {
+            panic!("resolver panicked (expected by test)");
+        }
+    }
+
+    #[test]
+    fn panicking_transfer_reports_error_instead_of_hanging() {
+        let mut m = Multi::new();
+        let req = Request::get("http://example.invalid/")
+            .unwrap()
+            .resolver(std::sync::Arc::new(PanickingResolver));
+        let id = m.add(req);
+        let done = m.wait_all();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].0, id);
+        assert!(done[0].1.is_err());
+        assert!(m.is_empty());
     }
 }
