@@ -272,8 +272,13 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
 /// invocation honest: a `SETUP` only ever succeeds with a real session, and a
 /// `PLAY` only ever runs after a `SETUP` returned one.
 pub fn run_method(url: &Url, method: &str) -> Result<Vec<u8>> {
+    run_method_with(url, method, &NetConfig::default())
+}
+
+/// [`run_method`] through an explicit transport (proxy, timeouts, deadline).
+pub(crate) fn run_method_with(url: &Url, method: &str, cfg: &NetConfig) -> Result<Vec<u8>> {
     let upper = method.to_ascii_uppercase();
-    let mut session = Session::connect(url)?;
+    let mut session = Session::connect_with(url, cfg)?;
     match upper.as_str() {
         "OPTIONS" => session.options().map(|r| r.body),
         "DESCRIBE" => session.describe().map(|r| r.body),
@@ -319,7 +324,7 @@ fn fill<R: Read>(stream: &mut R, buf: &mut [u8]) -> Result<bool> {
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
+                ) && !crate::net::is_deadline_exceeded(&e) =>
             {
                 return Ok(false); // idle past the read timeout
             }

@@ -932,3 +932,31 @@ fn proxy_cacert_missing_file_exits_77() {
     ]);
     assert_eq!(out.status.code(), Some(77));
 }
+
+/// `-m` is a whole-transfer deadline for non-HTTP schemes too: a DICT server
+/// that trickles its banner one byte every 100 ms (so no single read ever
+/// idles out) must still be cut off after ~1 s with curl's exit 28.
+#[test]
+fn max_time_bounds_a_trickling_non_http_transfer() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let Ok((mut s, _)) = listener.accept() else {
+            return;
+        };
+        for _ in 0..100 {
+            if s.write_all(b"2").is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let start = std::time::Instant::now();
+    let out = run(&["-s", "-m", "1", &format!("dict://127.0.0.1:{port}/d:word")]);
+    let took = start.elapsed();
+    assert_eq!(out.status.code(), Some(28), "{out:?}");
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_millis(2500),
+        "took {took:?}"
+    );
+}

@@ -221,6 +221,10 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
                 MAX_TOTAL_DURATION.as_secs()
             )));
         }
+        if cfg.deadline.is_some() {
+            // `-m`/--max-time: never wait past the transfer deadline.
+            socket.set_read_timeout(cfg.op_timeout(Some(READ_TIMEOUT))?)?;
+        }
         let (n, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e) => {
@@ -389,6 +393,10 @@ pub(crate) fn store_with(url: &Url, data: &[u8], cfg: &crate::net::NetConfig) ->
                 "tftp: transfer exceeded {}s deadline",
                 MAX_TOTAL_DURATION.as_secs()
             )));
+        }
+        if cfg.deadline.is_some() {
+            // `-m`/--max-time: never wait past the transfer deadline.
+            socket.set_read_timeout(cfg.op_timeout(Some(READ_TIMEOUT))?)?;
         }
         let (n, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,

@@ -551,11 +551,13 @@ fn read_packet_or_idle<R: Read>(r: &mut R) -> Result<Option<(u8, Vec<u8>)>> {
     Ok(Some((first[0] >> 4, body)))
 }
 
+/// An idle read timeout (retryable), as opposed to the hard stop of an
+/// exceeded `-m`/`--max-time` deadline, which must end the subscribe wait.
 fn is_timeout(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
+    ) && !crate::net::is_deadline_exceeded(e)
 }
 
 /// Reader that retries read timeouts a few times (mid-packet), then gives up.
@@ -1051,5 +1053,40 @@ mod tests {
             .unwrap();
         assert!(run_session(&mut s, "t", None, None).is_err());
         h.join().unwrap();
+    }
+
+    /// The subscribe wait (which otherwise idles in PING_INTERVAL steps
+    /// forever) ends with a `TimedOut` error at the `Client::max_time`
+    /// deadline when the broker stays silent after SUBACK.
+    #[test]
+    fn subscribe_wait_is_bounded_by_max_time() {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            read_packet(&mut s).unwrap();
+            s.write_all(&[PKT_CONNACK << 4, 2, 0, 0]).unwrap();
+            let (_, body) = read_packet(&mut s).unwrap();
+            s.write_all(&[PKT_SUBACK << 4, 3, body[0], body[1], 0])
+                .unwrap();
+            // Silent broker: hold the connection open well past the deadline.
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let start = Instant::now();
+        let err = crate::Client::new()
+            .max_time(Duration::from_millis(600))
+            .transfer(&format!("mqtt://127.0.0.1:{port}/t"))
+            .unwrap_err();
+        let took = start.elapsed();
+        match &err {
+            Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}"),
+            other => panic!("expected a TimedOut I/O error, got {other:?}"),
+        }
+        assert!(
+            took >= Duration::from_millis(550) && took < Duration::from_millis(1500),
+            "took {took:?}"
+        );
     }
 }

@@ -35,24 +35,30 @@ pub fn transfer_url(url: &Url) -> Result<Vec<u8>> {
 /// milestone; `tftp` gains UDP-proxy support in a later phase.
 pub(crate) fn transfer_url_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     match url.scheme.as_str() {
-        "http" | "https" => crate::Request::get(&format!(
-            "{}://{}{}{}",
-            url.scheme,
-            url.host,
-            if (url.scheme == "http" && url.port == 80)
-                || (url.scheme == "https" && url.port == 443)
-            {
-                String::new()
-            } else {
-                format!(":{}", url.port)
-            },
-            url.path
-        ))?
-        .connector(cfg.connector.clone())
-        .with_tls_settings(&cfg.tls)
-        .read_timeout(cfg.read_timeout)
-        .send()
-        .map(|r| r.body),
+        "http" | "https" => {
+            let req = crate::Request::get(&format!(
+                "{}://{}{}{}",
+                url.scheme,
+                url.host,
+                if (url.scheme == "http" && url.port == 80)
+                    || (url.scheme == "https" && url.port == 443)
+                {
+                    String::new()
+                } else {
+                    format!(":{}", url.port)
+                },
+                url.path
+            ))?
+            .connector(cfg.connector.clone())
+            .with_tls_settings(&cfg.tls)
+            .read_timeout(cfg.read_timeout);
+            // `Client::max_time`: the HTTP arm uses the request's own clock.
+            let req = match cfg.op_timeout(None)? {
+                Some(left) => req.max_time(left),
+                None => req,
+            };
+            req.send().map(|r| r.body)
+        }
         "ftp" | "ftps" => crate::ftp::fetch_with(url, cfg),
         "dict" => crate::dict::fetch_with(url, cfg),
         "file" => crate::file::fetch(url),

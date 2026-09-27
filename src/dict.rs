@@ -554,4 +554,38 @@ mod tests {
         let err = read_text_block(&mut reader, &mut out).unwrap_err();
         assert!(matches!(err, Error::UnexpectedEof));
     }
+
+    /// `Client::max_time` bounds the whole DICT transfer: a server trickling
+    /// its banner one byte per 100 ms (so no read ever idles out) is cut off
+    /// at the 500 ms deadline with a `TimedOut` I/O error.
+    #[test]
+    fn max_time_cuts_off_a_trickling_server() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            for _ in 0..50 {
+                if s.write_all(b"2").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let start = Instant::now();
+        let err = crate::Client::new()
+            .max_time(Duration::from_millis(500))
+            .transfer(&format!("dict://127.0.0.1:{port}/d:word"))
+            .unwrap_err();
+        let took = start.elapsed();
+        match &err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}"),
+            other => panic!("expected a TimedOut I/O error, got {other:?}"),
+        }
+        assert!(
+            took >= Duration::from_millis(450) && took < Duration::from_millis(1500),
+            "took {took:?}"
+        );
+    }
 }

@@ -114,13 +114,57 @@ pub struct SshOptions {
     pub known_hosts_path: Option<PathBuf>,
     /// Per-operation socket timeout.
     pub timeout: Option<Duration>,
+    /// Whole-operation limit (curl `-m`/`--max-time`): connect, handshake,
+    /// auth and the transfer must all finish within it, else the operation
+    /// fails with an I/O error of kind `TimedOut`.
+    pub max_time: Option<Duration>,
+}
+
+/// A puressh transport over a deadline-bounded socket (see
+/// [`SshOptions::max_time`]): every read/write stops at the deadline.
+struct DeadlineTransport(Box<dyn crate::net::NetStream>);
+
+impl std::io::Read for DeadlineTransport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl std::io::Write for DeadlineTransport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl puressh::client::Transport for DeadlineTransport {
+    fn set_read_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+        self.0.set_read_timeout(t)
+    }
+    fn set_write_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+        self.0.set_write_timeout(t)
+    }
 }
 
 /// Map a `puressh::Error` to our crate error, keeping the message but never
 /// leaking credentials (puressh's errors are static strings / io errors and
 /// carry no secret).
 fn ssh_err(e: puressh::Error) -> Error {
-    Error::Ssh(e.to_string())
+    match e {
+        // Keep socket timeouts (idle or `max_time`) as I/O errors so callers
+        // (and the CLI's exit code 28) can recognise them.
+        puressh::Error::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Error::Io(io)
+        }
+        e => Error::Ssh(e.to_string()),
+    }
 }
 
 /// Reject a URL-derived string carrying an ASCII control byte (CR/LF/NUL/DEL,
@@ -450,7 +494,7 @@ fn connect_auth(
         let _ = writeln!(t, "* Trying {}:{}...", url.host, url.port);
     }
     let (cfg, note) = build_config(opts)?;
-    let mut client = Client::connect_to_host(&url.host, url.port, cfg).map_err(|e| match e {
+    let map_err = |e: puressh::Error| match e {
         puressh::Error::HostKeyRejected => {
             let why = note
                 .lock()
@@ -467,7 +511,26 @@ fn connect_auth(
             Error::Ssh(format!("{SSH_HOST_KEY_FAILED}: {why}"))
         }
         e => ssh_err(e),
-    })?;
+    };
+    let mut client = match opts.max_time {
+        None => Client::connect_to_host(&url.host, url.port, cfg).map_err(map_err)?,
+        Some(max) => {
+            // Dial ourselves so the socket (and so every SSH read/write) is
+            // bounded by the deadline; puressh then runs over it.
+            use std::net::ToSocketAddrs;
+            let deadline = Some(std::time::Instant::now() + max);
+            let addrs: Vec<std::net::SocketAddr> = (url.host_unbracketed(), url.port)
+                .to_socket_addrs()?
+                .collect();
+            let tcp = crate::net::connect_any(&addrs, crate::net::op_timeout(deadline, None)?)?;
+            tcp.set_nodelay(true)?;
+            let sock = crate::net::DeadlineStream::wrap(Box::new(tcp), deadline);
+            sock.set_read_timeout(opts.timeout)?;
+            sock.set_write_timeout(opts.timeout)?;
+            let transport = Box::new(DeadlineTransport(sock));
+            Client::connect_via(transport, &url.host, url.port, cfg).map_err(map_err)?
+        }
+    };
     if let Some(t) = trace.as_mut() {
         let _ = writeln!(t, "* SSH connected to {}:{}", url.host, url.port);
     }
@@ -1020,5 +1083,36 @@ mod tests {
         assert_eq!(remote_path(&u, "p").unwrap(), "notes.txt");
         let u = Url::parse("scp://h/a%0ab").unwrap();
         assert!(remote_path(&u, "p").is_err());
+    }
+
+    /// `max_time` bounds the SSH handshake: a server that accepts TCP but
+    /// never sends its banner fails with a `TimedOut` I/O error at the
+    /// deadline (the CLI's exit 28) instead of hanging.
+    #[test]
+    fn max_time_bounds_a_silent_server() {
+        use std::time::Instant;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (_s, _) = l.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let url = Url::parse(&format!("sftp://127.0.0.1:{port}/f")).unwrap();
+        let opts = SshOptions {
+            password: Some("pw".into()),
+            insecure: true,
+            max_time: Some(Duration::from_millis(500)),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let err = match fetch(&url, &opts, "u") {
+            Ok(_) => panic!("fetch from a silent server succeeded"),
+            Err(e) => e,
+        };
+        match &err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}"),
+            other => panic!("expected a TimedOut I/O error, got {other:?}"),
+        }
+        assert!(start.elapsed() < Duration::from_millis(1500));
     }
 }

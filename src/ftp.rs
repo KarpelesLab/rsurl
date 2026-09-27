@@ -319,9 +319,13 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
 /// [`ACCEPT_TIMEOUT`] instead of blocking forever when it never connects.
 fn accept_with_timeout(
     listener: &std::net::TcpListener,
+    max_deadline: Option<std::time::Instant>,
 ) -> Result<(std::net::TcpStream, std::net::SocketAddr)> {
     listener.set_nonblocking(true)?;
-    let deadline = std::time::Instant::now() + ACCEPT_TIMEOUT;
+    // Also stop at the transfer's `-m` deadline, if that comes first.
+    let wait =
+        crate::net::op_timeout(max_deadline, Some(ACCEPT_TIMEOUT))?.unwrap_or(ACCEPT_TIMEOUT);
+    let deadline = std::time::Instant::now() + wait;
     loop {
         match listener.accept() {
             Ok((sock, addr)) => {
@@ -359,6 +363,8 @@ enum DataConn {
         tls: Option<Box<(String, crate::tls::TlsSettings)>>,
         /// Per-read timeout for the accepted data socket.
         read_timeout: Option<std::time::Duration>,
+        /// The transfer's `-m` deadline, bounding the accept and the socket.
+        max_deadline: Option<std::time::Instant>,
     },
 }
 
@@ -374,8 +380,10 @@ impl DataConn {
                 peer_ip,
                 tls,
                 read_timeout,
+                max_deadline,
             } => {
-                let (sock, addr) = accept_with_timeout(&listener)?;
+                let (sock, addr) = accept_with_timeout(&listener, max_deadline)?;
+                let sock = crate::net::DeadlineStream::wrap(Box::new(sock), max_deadline);
                 sock.set_read_timeout(read_timeout)?;
                 sock.set_write_timeout(Some(IO_TIMEOUT))?;
                 // Only the control server may open the data connection; reject
@@ -386,7 +394,7 @@ impl DataConn {
                         addr.ip()
                     )));
                 }
-                let boxed: Box<dyn NetStream> = Box::new(sock);
+                let boxed: Box<dyn NetStream> = sock;
                 Ok(match tls {
                     Some(t) => {
                         let (host, settings) = *t;
@@ -427,6 +435,7 @@ fn open_data<R: Read + Write>(
             peer_ip: ctrl_peer_ip,
             tls: tls.then(|| Box::new((url.host.clone(), cfg.tls.clone()))),
             read_timeout: cfg.io_timeout(),
+            max_deadline: cfg.deadline,
         });
     }
     let (data_host, data_port) = open_passive(

@@ -4,12 +4,12 @@
 //! are thin wrappers over a default `Client`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::net::connector::ProxySpec;
 use crate::net::stream::NetStream;
-use crate::net::{Connector, DirectConnector};
+use crate::net::{Connector, DeadlineStream, DirectConnector};
 use crate::url::Url;
 
 /// Internal bundle of network settings handed to the protocol backends so they
@@ -24,6 +24,11 @@ pub(crate) struct NetConfig {
     /// Per-read inactivity timeout for the protocol sockets. `None` blocks
     /// indefinitely; see [`NetConfig::io_timeout`].
     pub(crate) read_timeout: Option<Duration>,
+    /// Absolute whole-transfer deadline (curl `-m`/`--max-time`), or `None`.
+    /// [`NetConfig::connect`] bounds the dial by it and wraps the stream in a
+    /// [`DeadlineStream`], so every later read/write (TLS included) stops
+    /// there; see also [`NetConfig::op_timeout`].
+    pub(crate) deadline: Option<Instant>,
     /// Try `EPSV` before `PASV` for FTP passive data connections. Cleared by
     /// curl's `--disable-epsv`; the FTP backend then goes straight to `PASV`.
     pub(crate) ftp_use_epsv: bool,
@@ -48,6 +53,7 @@ impl Default for NetConfig {
             connect_timeout: Some(Duration::from_secs(30)),
             tls: crate::tls::TlsSettings::default(),
             read_timeout: Some(DEFAULT_READ_TIMEOUT),
+            deadline: None,
             ftp_use_epsv: true,
             ftp_create_dirs: false,
             ftp_active: false,
@@ -61,9 +67,24 @@ impl Default for NetConfig {
 pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl NetConfig {
-    /// Dial `host:port` through the configured connector.
+    /// Dial `host:port` through the configured connector. With a
+    /// [`deadline`](Self::deadline) the dial is bounded by the time left and
+    /// the returned stream is a [`DeadlineStream`] (reads/writes stop at the
+    /// deadline, including those of any TLS layered on top).
     pub(crate) fn connect(&self, host: &str, port: u16) -> Result<Box<dyn NetStream>> {
-        self.connector.connect(host, port, self.connect_timeout)
+        let connect_timeout = match self.deadline {
+            None => self.connect_timeout,
+            Some(_) => self.op_timeout(self.connect_timeout)?,
+        };
+        let stream = self.connector.connect(host, port, connect_timeout)?;
+        Ok(DeadlineStream::wrap(stream, self.deadline))
+    }
+
+    /// The timeout for one blocking operation whose own bound is `idle`:
+    /// `min(idle, time left before the deadline)`, or `idle` with no deadline.
+    /// Errors with kind `TimedOut` once the deadline has passed.
+    pub(crate) fn op_timeout(&self, idle: Option<Duration>) -> std::io::Result<Option<Duration>> {
+        super::deadline::op_timeout(self.deadline, idle)
     }
 
     /// TLS-handshake `transport` for `host` with this config's TLS settings
@@ -130,6 +151,7 @@ pub struct Client {
     proxy_tls: crate::tls::TlsSettings,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
+    max_time: Option<Duration>,
     tls: crate::tls::TlsSettings,
     idn: bool,
     no_proxy: Vec<String>,
@@ -148,6 +170,7 @@ impl Default for Client {
             proxy_tls: crate::tls::TlsSettings::default(),
             connect_timeout: Some(Duration::from_secs(30)),
             read_timeout: Some(DEFAULT_READ_TIMEOUT),
+            max_time: None,
             tls: crate::tls::TlsSettings::default(),
             idn: true,
             no_proxy: Vec::new(),
@@ -200,6 +223,23 @@ impl Client {
     /// indefinitely. See [`Request::read_timeout`](crate::Request::read_timeout).
     pub fn read_timeout(mut self, d: Option<Duration>) -> Self {
         self.read_timeout = d;
+        self
+    }
+
+    /// Whole-operation time limit (curl `-m`/`--max-time`; default none).
+    ///
+    /// Each operation started through this client (a [`transfer`](Self::transfer),
+    /// an upload, a mail send, an MQTT subscribe, ...) must finish within `d`
+    /// of its start, or it fails with an I/O error of kind
+    /// [`TimedOut`](std::io::ErrorKind::TimedOut) — even if the peer keeps
+    /// trickling bytes (which the per-read [`read_timeout`](Self::read_timeout)
+    /// alone cannot catch). Connect, TLS handshake, every read and every write
+    /// are bounded. HTTP requests built by [`request`](Self::request) get
+    /// [`Request::max_time`](crate::Request::max_time). A
+    /// [`websocket`](Self::websocket) opened by this client is closed by the
+    /// limit too, `d` after it was opened.
+    pub fn max_time(mut self, d: Duration) -> Self {
+        self.max_time = Some(d);
         self
     }
 
@@ -373,6 +413,7 @@ impl Client {
             connect_timeout: self.connect_timeout,
             tls: self.tls.clone(),
             read_timeout: self.read_timeout,
+            deadline: self.max_time.map(|d| Instant::now() + d),
             ftp_use_epsv: self.ftp_use_epsv,
             ftp_create_dirs: self.ftp_create_dirs,
             ftp_active: self.ftp_active,
@@ -403,6 +444,9 @@ impl Client {
             }
         };
         r = r.read_timeout(self.read_timeout);
+        if let Some(d) = self.max_time {
+            r = r.max_time(d);
+        }
         if let Some(t) = self.connect_timeout {
             r = r.connect_timeout(t);
         }
@@ -510,6 +554,13 @@ impl Client {
     /// URL), honoring this client's proxy / custom connector.
     pub fn mqtt_publish(&self, url: &Url, payload: &[u8], qos: u8) -> Result<()> {
         crate::mqtt::publish_with(url, payload, qos, &self.net_config_for(&url.host))
+    }
+
+    /// RTSP: run `method` against `url` and return the body to print (see
+    /// [`rtsp::run_method`](crate::rtsp::run_method)), through this client's
+    /// transport and timeouts.
+    pub fn rtsp(&self, url: &Url, method: &str) -> Result<Vec<u8>> {
+        crate::rtsp::run_method_with(url, method, &self.net_config_for(&url.host))
     }
 
     /// TELNET: send `input`, return the received data (curl `telnet://`).

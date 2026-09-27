@@ -475,12 +475,13 @@ struct WsTransport {
 }
 
 /// A socket read timeout/`WouldBlock` — i.e. a poll tick elapsed with no data,
-/// not a hard error. Unix reports `WouldBlock`, Windows `TimedOut`.
+/// not a hard error. Unix reports `WouldBlock`, Windows `TimedOut`. An
+/// exceeded `Client::max_time` deadline is a hard error, not a tick.
 fn is_read_timeout(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
+    ) && !crate::net::is_deadline_exceeded(e)
 }
 
 impl WsTransport {

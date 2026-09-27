@@ -3725,6 +3725,7 @@ fn build_ssh_options(url: &Url, args: &Args) -> Result<(rsurl::ssh::SshOptions, 
         host_pubkey_md5: args.hostpubmd5.clone(),
         known_hosts_path: None,
         timeout: args.max_time,
+        max_time: args.max_time,
     };
     Ok((opts, user))
 }
@@ -3844,13 +3845,21 @@ fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
 
 /// Exit code for a failed SFTP/SCP transfer: 60
 /// (`CURLE_PEER_FAILED_VERIFICATION`) for a host-key verification failure,
-/// like curl; 7 for anything else (rsurl's historical SSH transfer code).
+/// like curl; 28 for a timeout (`-m`); 7 for anything else (rsurl's
+/// historical SSH transfer code).
 #[cfg(feature = "ssh")]
 fn ssh_exit_code(e: &rsurl::Error) -> u8 {
-    if e.is_ssh_host_key_failure() {
-        60
-    } else {
-        7
+    match e {
+        e if e.is_ssh_host_key_failure() => 60,
+        rsurl::Error::Io(io)
+            if matches!(
+                io.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            28 // CURLE_OPERATION_TIMEDOUT
+        }
+        _ => 7,
     }
 }
 
@@ -3922,7 +3931,16 @@ fn run_mqtt_publish(url: &Url, args: &Args) -> u8 {
 /// The named method's response body is written like any other transfer.
 fn run_rtsp(url: &Url, args: &Args) -> u8 {
     let method = args.method.as_deref().unwrap_or("DESCRIBE");
-    match rsurl::rtsp::run_method(url, method) {
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: --proxy: {e}");
+            }
+            return 5;
+        }
+    };
+    match client.rtsp(url, method) {
         Ok(bytes) => {
             let mut out: Box<dyn Write> = match &args.output {
                 Some(path) if path != "-" => match create_output_file(path, args) {
@@ -3948,7 +3966,7 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
-            7
+            transfer_exit_code(&e)
         }
     }
 }
@@ -4031,11 +4049,11 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
     if let Some(d) = args.connect_timeout {
         c = c.connect_timeout(Some(d));
     }
-    // `-m`/--max-time bounds every blocking read of the transfer, so an idle
-    // stall can't outlive it. (The non-HTTP backends have no whole-transfer
-    // clock; a peer trickling bytes can still exceed `-m` in total.)
+    // `-m`/--max-time is a whole-transfer deadline for the non-HTTP backends:
+    // connect, TLS, and every read/write stop there, so a peer trickling bytes
+    // can't outlive it either. (HTTP applies `-m` via `Request::max_time`.)
     if let Some(d) = args.max_time {
-        c = c.read_timeout(Some(d));
+        c = c.max_time(d);
     }
     // The same TLS flags the HTTP path applies (`--cacert`, `-E`, pins, ...)
     // reach ftps/imaps/smtps/pop3s/ldaps/mqtts/gophers and STARTTLS upgrades.
