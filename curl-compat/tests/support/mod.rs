@@ -66,7 +66,15 @@ pub fn compile(src: &str, tag: &str) -> Option<(PathBuf, PathBuf)> {
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let exe = std::env::temp_dir().join(format!("rsurl_curl_{tag}_{}", std::process::id()));
+    // The test binary's target decides the C program's ABI: a 32-bit x86
+    // build (the i686 CI lane, run on an x86-64 host) links a 32-bit libcurl.
+    let arch_flags: &[&str] = if cfg!(target_arch = "x86") {
+        &["-m32"]
+    } else {
+        &[]
+    };
     let compile = Command::new(cc)
+        .args(arch_flags)
         .arg(manifest.join(src))
         .arg("-I")
         .arg(manifest.join("include"))

@@ -483,13 +483,15 @@ impl TempFile {
 
 /// `mkdir` that fails if the path exists, with mode 0700 on unix.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
+        std::fs::DirBuilder::new().mode(0o700).create(dir)
     }
-    b.create(dir)
+    #[cfg(not(unix))]
+    {
+        std::fs::DirBuilder::new().create(dir)
+    }
 }
 
 impl Drop for TempFile {
