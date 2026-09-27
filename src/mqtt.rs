@@ -22,6 +22,7 @@ use std::io::{self, Read, Write};
 use purecrypto::rng::{OsRng, RngCore};
 
 use crate::error::{Error, Result};
+use crate::url::percent_decode;
 use crate::url::Url;
 
 // MQTT v3.1.1 control packet types (high nibble of the fixed-header byte).
@@ -31,6 +32,7 @@ const PKT_PUBLISH: u8 = 3;
 const PKT_PUBACK: u8 = 4;
 const PKT_SUBSCRIBE: u8 = 8;
 const PKT_SUBACK: u8 = 9;
+const PKT_PINGREQ: u8 = 12;
 const PKT_PINGRESP: u8 = 13;
 const PKT_DISCONNECT: u8 = 14;
 
@@ -49,24 +51,52 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
-    let topic = url.path.strip_prefix('/').unwrap_or(&url.path);
+    let topic = topic_of(url)?;
+    // A subscription *filter* may use the `+`/`#` wildcards (`#` arrives as
+    // `%23`, since a raw `#` starts the URL fragment), but never NUL/control
+    // bytes.
+    reject_ctl(&topic, "topic")?;
+
+    let (user, pass) = split_userinfo(url.userinfo.as_deref());
+    let (user, pass) = (user.map(percent_decode), pass.map(percent_decode));
+
+    let tcp = cfg.connect(&url.host, url.port)?;
+    // Reads time out every PING_INTERVAL so the subscribe wait can send
+    // PINGREQ and keep the broker from dropping an idle connection.
+    tcp.set_read_timeout(Some(PING_INTERVAL))?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+    if url.is_tls() {
+        let mut stream = crate::tls::connect_over(tcp, &url.host)?;
+        run_session(&mut stream, &topic, user.as_deref(), pass.as_deref())
+    } else {
+        let mut stream = tcp;
+        run_session(&mut stream, &topic, user.as_deref(), pass.as_deref())
+    }
+}
+
+/// Keep-alive we request in CONNECT (seconds). The broker may drop us after
+/// 1.5× this without traffic, so the subscribe wait pings well within it.
+const KEEP_ALIVE_SECS: u16 = 60;
+
+/// Idle interval after which the subscribe wait sends a PINGREQ.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Idle timeout for request/response steps (CONNACK, SUBACK, PUBACK).
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The topic from the URL path: leading `/` stripped, percent-decoded (as
+/// curl does). Errors on an empty topic.
+fn topic_of(url: &Url) -> Result<String> {
+    let raw = url.path.split('?').next().unwrap_or("");
+    let raw = raw.strip_prefix('/').unwrap_or(raw);
+    let topic = percent_decode(raw);
     if topic.is_empty() {
         return Err(Error::InvalidUrl(format!(
             "mqtt: no topic in URL path ({:?})",
             url.path
         )));
     }
-
-    let (user, pass) = split_userinfo(url.userinfo.as_deref());
-
-    let tcp = cfg.connect(&url.host, url.port)?;
-    if url.is_tls() {
-        let mut stream = crate::tls::connect_over(tcp, &url.host)?;
-        run_session(&mut stream, topic, user, pass)
-    } else {
-        let mut stream = tcp;
-        run_session(&mut stream, topic, user, pass)
-    }
+    Ok(topic)
 }
 
 /// CONNECT, PUBLISH `payload` to the topic in `url.path` at the requested
@@ -88,14 +118,8 @@ pub(crate) fn publish_with(
     qos: u8,
     cfg: &crate::net::NetConfig,
 ) -> Result<()> {
-    let topic = url.path.strip_prefix('/').unwrap_or(&url.path);
-    if topic.is_empty() {
-        return Err(Error::InvalidUrl(format!(
-            "mqtt: no topic in URL path ({:?})",
-            url.path
-        )));
-    }
-    validate_publish_topic(topic)?;
+    let topic = topic_of(url)?;
+    validate_publish_topic(&topic)?;
     if qos > 1 {
         return Err(Error::BadResponse(format!(
             "mqtt: unsupported publish QoS {qos} (only 0 and 1)"
@@ -103,14 +127,18 @@ pub(crate) fn publish_with(
     }
 
     let (user, pass) = split_userinfo(url.userinfo.as_deref());
+    let (user, pass) = (user.map(percent_decode), pass.map(percent_decode));
+    let (user, pass) = (user.as_deref(), pass.as_deref());
 
     let tcp = cfg.connect(&url.host, url.port)?;
+    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     if url.is_tls() {
         let mut stream = crate::tls::connect_over(tcp, &url.host)?;
-        run_publish(&mut stream, topic, payload, qos, user, pass)
+        run_publish(&mut stream, &topic, payload, qos, user, pass)
     } else {
         let mut stream = tcp;
-        run_publish(&mut stream, topic, payload, qos, user, pass)
+        run_publish(&mut stream, &topic, payload, qos, user, pass)
     }
 }
 
@@ -122,7 +150,7 @@ fn connect_handshake<S: Read + Write>(
     pass: Option<&str>,
 ) -> Result<()> {
     let client_id = random_client_id();
-    let connect = build_connect(&client_id, user, pass, 60)?;
+    let connect = build_connect(&client_id, user, pass, KEEP_ALIVE_SECS)?;
     stream.write_all(&connect)?;
     stream.flush()?;
 
@@ -222,14 +250,30 @@ fn run_session<S: Read + Write>(
         return Err(Error::BadResponse("mqtt: suback failure (0x80)".into()));
     }
 
-    // Drain packets until we get a PUBLISH. We just ignore anything else
-    // (e.g. PINGRESP if the server pings us first), which is enough for the
-    // simple "subscribe and get one message" flow.
+    // Wait for a PUBLISH, however long it takes (as curl does). The stream's
+    // read timeout (PING_INTERVAL) marks idle periods: each one sends a
+    // PINGREQ so the broker's keep-alive doesn't drop us, and a second idle
+    // period with the ping still unanswered means the broker is gone.
+    let mut ping_outstanding = false;
     let payload = loop {
-        let (ctype, body) = read_packet(stream)?;
+        let Some((ctype, body)) = read_packet_or_idle(stream)? else {
+            if ping_outstanding {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "mqtt: broker did not answer PINGREQ",
+                )));
+            }
+            stream.write_all(&[PKT_PINGREQ << 4, 0x00])?;
+            stream.flush()?;
+            ping_outstanding = true;
+            continue;
+        };
         match ctype {
             PKT_PUBLISH => break extract_publish_payload(&body)?,
-            PKT_PINGRESP => continue,
+            PKT_PINGRESP => {
+                ping_outstanding = false;
+                continue;
+            }
             other => {
                 return Err(Error::BadResponse(format!(
                     "mqtt: unexpected packet type {other} before PUBLISH"
@@ -352,7 +396,7 @@ pub(crate) fn build_connect(
 
     let mut out = Vec::with_capacity(2 + vh.len() + pl.len());
     out.push(PKT_CONNECT << 4); // 0x10
-    write_remaining_length(&mut out, vh.len() + pl.len());
+    write_remaining_length(&mut out, vh.len() + pl.len())?;
     out.extend_from_slice(&vh);
     out.extend_from_slice(&pl);
     Ok(out)
@@ -368,7 +412,7 @@ pub(crate) fn build_subscribe(packet_id: u16, topic: &str) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(2 + body.len());
     // SUBSCRIBE requires the lower nibble to be 0b0010 per MQTT v3.1.1 §3.8.1.
     out.push((PKT_SUBSCRIBE << 4) | 0x02); // 0x82
-    write_remaining_length(&mut out, body.len());
+    write_remaining_length(&mut out, body.len())?;
     out.extend_from_slice(&body);
     Ok(out)
 }
@@ -428,7 +472,7 @@ pub(crate) fn build_publish(
     // High nibble = PKT_PUBLISH (3); low nibble carries DUP(8) RETAIN(1) and
     // the 2-bit QoS in bits 1..2. We only ever set QoS.
     out.push((PKT_PUBLISH << 4) | ((qos & 0x03) << 1));
-    write_remaining_length(&mut out, body.len());
+    write_remaining_length(&mut out, body.len())?;
     out.extend_from_slice(&body);
     Ok(out)
 }
@@ -478,6 +522,59 @@ fn read_packet<R: Read>(r: &mut R) -> Result<(u8, Vec<u8>)> {
     Ok((ctype, body))
 }
 
+/// Like [`read_packet`], but a read timeout *before the first byte* of a
+/// packet is reported as `Ok(None)` (the connection is idle) instead of an
+/// error. Once a packet has started, timeouts are retried so a slow packet is
+/// never split — only a bounded number of times, so a stalled broker still
+/// fails.
+fn read_packet_or_idle<R: Read>(r: &mut R) -> Result<Option<(u8, Vec<u8>)>> {
+    let mut first = [0u8; 1];
+    loop {
+        match r.read(&mut first) {
+            Ok(0) => return Err(Error::UnexpectedEof),
+            Ok(_) => break,
+            Err(e) if is_timeout(&e) => return Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    let mut rest = PatientReader { inner: r, idle: 0 };
+    let rem = read_remaining_length(&mut rest)?;
+    if rem > MAX_PACKET_BYTES {
+        return Err(Error::BadResponse("mqtt: packet too large".into()));
+    }
+    let mut body = Vec::new();
+    (&mut rest).take(rem as u64).read_to_end(&mut body)?;
+    if body.len() < rem {
+        return Err(Error::UnexpectedEof);
+    }
+    Ok(Some((first[0] >> 4, body)))
+}
+
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// Reader that retries read timeouts a few times (mid-packet), then gives up.
+struct PatientReader<'a, R> {
+    inner: &'a mut R,
+    idle: u32,
+}
+
+impl<R: Read> Read for PatientReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.inner.read(buf) {
+                Err(e) if is_timeout(&e) && self.idle < 2 => self.idle += 1,
+                other => return other,
+            }
+        }
+    }
+}
+
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
     match r.read_exact(buf) {
         Ok(()) => Ok(()),
@@ -516,10 +613,16 @@ pub(crate) fn read_remaining_length<R: Read>(r: &mut R) -> io::Result<usize> {
 
 /// Encode `len` as a MQTT "remaining length" varint and append it to `out`.
 ///
-/// `len` must fit in 28 bits (`<= 268_435_455`); larger values are clamped at
-/// the maximum since the caller controls the packets we produce.
-pub(crate) fn write_remaining_length(out: &mut Vec<u8>, len: usize) {
-    let mut x = len.min(268_435_455);
+/// `len` must fit in 28 bits (`<= 268_435_455`, MQTT's packet-size ceiling);
+/// a larger packet cannot be framed, so it is an error rather than a silently
+/// clamped (and therefore corrupt) length.
+pub(crate) fn write_remaining_length(out: &mut Vec<u8>, len: usize) -> Result<()> {
+    if len > 268_435_455 {
+        return Err(Error::BadResponse(format!(
+            "mqtt: packet of {len} bytes exceeds the MQTT maximum (256 MiB)"
+        )));
+    }
+    let mut x = len;
     loop {
         let mut byte = (x & 0x7F) as u8;
         x >>= 7;
@@ -528,7 +631,7 @@ pub(crate) fn write_remaining_length(out: &mut Vec<u8>, len: usize) {
             out.push(byte);
         } else {
             out.push(byte);
-            return;
+            return Ok(());
         }
     }
 }
@@ -589,7 +692,7 @@ mod tests {
     fn write_remaining_length_matches_spec_bytes() {
         for (value, expected) in RL_CASES {
             let mut buf = Vec::new();
-            write_remaining_length(&mut buf, *value);
+            write_remaining_length(&mut buf, *value).unwrap();
             assert_eq!(
                 buf.as_slice(),
                 *expected,
@@ -605,7 +708,7 @@ mod tests {
         for (value, expected) in RL_CASES {
             // Round-trip: write then read.
             let mut buf = Vec::new();
-            write_remaining_length(&mut buf, *value);
+            write_remaining_length(&mut buf, *value).unwrap();
             let mut cur = std::io::Cursor::new(&buf);
             let got = read_remaining_length(&mut cur).expect("decode");
             assert_eq!(got, *value, "round trip for {value}");
@@ -631,7 +734,7 @@ mod tests {
         // allocated, rather than eagerly reserving ~64 MiB+ for a body that may
         // never arrive (memory-exhaustion DoS via a forged/MITM broker).
         let mut hdr = vec![PKT_PUBLISH << 4];
-        write_remaining_length(&mut hdr, MAX_PACKET_BYTES + 1);
+        write_remaining_length(&mut hdr, MAX_PACKET_BYTES + 1).unwrap();
         // No body bytes follow: if the cap weren't enforced we'd allocate the
         // huge buffer and only then hit EOF.
         let mut cur = std::io::Cursor::new(hdr);
@@ -874,5 +977,79 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // Two calls should not collide (48 bits of entropy).
         assert_ne!(random_client_id(), random_client_id());
+    }
+
+    #[test]
+    fn write_remaining_length_rejects_oversize() {
+        let mut buf = Vec::new();
+        assert!(write_remaining_length(&mut buf, 268_435_456).is_err());
+    }
+
+    #[test]
+    fn topic_is_percent_decoded_so_hash_wildcard_is_reachable() {
+        // A raw `#` starts the URL fragment, so the wildcard arrives as `%23`.
+        let u = Url::parse("mqtt://h/sensors%2Fa/%23").unwrap();
+        assert_eq!(topic_of(&u).unwrap(), "sensors/a/#");
+        assert!(topic_of(&Url::parse("mqtt://h/").unwrap()).is_err());
+        // Publishing to a decoded wildcard is still refused.
+        assert!(validate_publish_topic(&topic_of(&u).unwrap()).is_err());
+    }
+
+    /// While waiting for a PUBLISH on an idle subscription, the client must
+    /// send PINGREQ so the broker's keep-alive doesn't disconnect it.
+    #[test]
+    fn subscribe_wait_sends_pingreq_when_idle() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (c, _) = read_packet(&mut s).unwrap();
+            assert_eq!(c, PKT_CONNECT);
+            s.write_all(&[PKT_CONNACK << 4, 2, 0, 0]).unwrap();
+            let (c, body) = read_packet(&mut s).unwrap();
+            assert_eq!(c, PKT_SUBSCRIBE);
+            s.write_all(&[PKT_SUBACK << 4, 3, body[0], body[1], 0])
+                .unwrap();
+            // Stay silent: the client must ping us.
+            let (c, _) = read_packet(&mut s).unwrap();
+            assert_eq!(c, PKT_PINGREQ);
+            s.write_all(&[PKT_PINGRESP << 4, 0]).unwrap();
+            s.write_all(&build_publish("t", b"late", 0, 0).unwrap())
+                .unwrap();
+            let (c, _) = read_packet(&mut s).unwrap();
+            assert_eq!(c, PKT_DISCONNECT);
+        });
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let got = run_session(&mut s, "t", None, None).unwrap();
+        h.join().unwrap();
+        assert_eq!(got, b"late");
+    }
+
+    #[test]
+    fn subscribe_wait_fails_when_ping_goes_unanswered() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            read_packet(&mut s).unwrap();
+            s.write_all(&[PKT_CONNACK << 4, 2, 0, 0]).unwrap();
+            let (_, body) = read_packet(&mut s).unwrap();
+            s.write_all(&[PKT_SUBACK << 4, 3, body[0], body[1], 0])
+                .unwrap();
+            // Swallow the PINGREQ and never answer.
+            let _ = read_packet(&mut s);
+            std::thread::sleep(Duration::from_millis(800));
+        });
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        assert!(run_session(&mut s, "t", None, None).is_err());
+        h.join().unwrap();
     }
 }

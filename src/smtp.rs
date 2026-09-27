@@ -47,6 +47,9 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
     }
 
     let tcp = cfg.connect(&url.host, url.port)?;
+    // Idle bound so a stalled server fails the send instead of hanging it.
+    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     let stream = if url.scheme == "smtps" {
         Stream::Tls(Box::new(connect_over(tcp, &url.host)?))
     } else {
@@ -93,9 +96,14 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
     // `Stream::Tls` here and so already satisfies the requirement.
     require_tls_ok(cfg.require_tls, matches!(io.get_ref(), Stream::Plain(_)))?;
 
-    // AUTH, if credentials were supplied.
+    // AUTH, if credentials were supplied and the server advertises AUTH. As in
+    // curl, no AUTH capability means no authentication attempt: a server that
+    // hides AUTH until STARTTLS (or a MITM that stripped STARTTLS) must never
+    // be handed credentials over the plaintext connection.
     if let (Some(user), Some(pass)) = (opts.user, opts.pass) {
-        authenticate(&mut io, &caps, user, pass)?;
+        if auth_mechanisms(&caps).is_some() {
+            authenticate(&mut io, &caps, user, pass)?;
+        }
     }
 
     // Envelope.
@@ -103,7 +111,11 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
     expect(&mut io, 250, "MAIL FROM")?;
     for r in opts.rcpts {
         send_line(&mut io, &format!("RCPT TO:<{r}>"))?;
-        expect(&mut io, 250, "RCPT TO")?;
+        // 251 "user not local; will forward" is a success too (RFC 5321 §4.2.2).
+        let (code, text) = read_reply(&mut io)?;
+        if code != 250 && code != 251 {
+            return Err(Error::BadResponse(format!("smtp RCPT TO: {code} {text}")));
+        }
     }
 
     // DATA + dot-stuffed body terminated by CRLF "." CRLF.
@@ -113,7 +125,7 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
     {
         let w = io.get_mut();
         w.write_all(&payload)?;
-        w.write_all(b"\r\n.\r\n")?;
+        w.write_all(end_of_data(&payload))?;
         w.flush()?;
     }
     expect(&mut io, 250, "end of DATA")?;
@@ -121,6 +133,21 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
     let _ = send_line(&mut io, "QUIT");
     let _ = read_reply(&mut io);
     Ok(())
+}
+
+/// Idle timeout for every read/write on the SMTP connection.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The end-of-data marker to append after the (dot-stuffed) payload. The
+/// marker is `CRLF . CRLF`, but its leading CRLF may be the payload's own
+/// final line ending — adding another would append a spurious blank line to
+/// every message that already ends in a newline.
+fn end_of_data(payload: &[u8]) -> &'static [u8] {
+    if payload.is_empty() || payload.ends_with(b"\r\n") {
+        b".\r\n"
+    } else {
+        b"\r\n.\r\n"
+    }
 }
 
 /// Enforce curl's `--ssl-reqd` for SMTP: when `require_tls` is set, the
@@ -156,15 +183,31 @@ fn ehlo<R: Read + Write>(io: &mut BufReader<R>, host: &str) -> Result<Vec<String
         .collect())
 }
 
+/// The SASL mechanisms from the EHLO `AUTH` capability (also the legacy
+/// `AUTH=` form), or `None` if the server advertises no AUTH at all.
+fn auth_mechanisms(caps: &[String]) -> Option<Vec<&str>> {
+    let mut found = None;
+    for c in caps {
+        let rest = match c.strip_prefix("AUTH") {
+            Some(r) if r.is_empty() || r.starts_with([' ', '=']) => r,
+            _ => continue,
+        };
+        found
+            .get_or_insert_with(Vec::new)
+            .extend(rest.trim_start_matches('=').split_whitespace());
+    }
+    found
+}
+
 fn authenticate<R: Read + Write>(
     io: &mut BufReader<R>,
     caps: &[String],
     user: &str,
     pass: &str,
 ) -> Result<()> {
-    let auth_line = caps.iter().find(|c| c.starts_with("AUTH"));
-    let supports = |m: &str| auth_line.is_some_and(|l| l.contains(m));
-    if supports("PLAIN") || auth_line.is_none() {
+    let mechs = auth_mechanisms(caps).unwrap_or_default();
+    let supports = |m: &str| mechs.contains(&m);
+    if supports("PLAIN") {
         // AUTH PLAIN: base64("\0user\0pass").
         let mut raw = Vec::new();
         raw.push(0);
@@ -295,6 +338,120 @@ mod tests {
         assert_eq!(dot_stuff(b".hidden\n"), b"..hidden\r\n");
         assert_eq!(dot_stuff(b"a\nb"), b"a\r\nb");
         assert_eq!(dot_stuff(b"a\r\nb"), b"a\r\nb");
+    }
+
+    #[test]
+    fn end_of_data_does_not_double_the_final_crlf() {
+        assert_eq!(end_of_data(b"hi\r\n"), b".\r\n");
+        assert_eq!(end_of_data(b"hi"), b"\r\n.\r\n");
+        assert_eq!(end_of_data(b""), b".\r\n");
+    }
+
+    #[test]
+    fn auth_mechanisms_parses_both_forms() {
+        let caps = vec!["SIZE 100".to_string(), "AUTH LOGIN PLAIN".to_string()];
+        assert_eq!(auth_mechanisms(&caps).unwrap(), vec!["LOGIN", "PLAIN"]);
+        let caps = vec!["AUTH=LOGIN".to_string()];
+        assert_eq!(auth_mechanisms(&caps).unwrap(), vec!["LOGIN"]);
+        let caps = vec!["AUTHX FOO".to_string(), "8BITMIME".to_string()];
+        assert!(auth_mechanisms(&caps).is_none());
+    }
+
+    /// Scripted SMTP server on loopback driving the production [`send`].
+    /// `ehlo_caps` are the EHLO capability lines; `rcpt_code` answers RCPT.
+    /// Returns the port and a handle yielding everything the client sent.
+    fn mock_smtp(
+        ehlo_caps: &'static [&'static str],
+        rcpt_code: u16,
+    ) -> (u16, std::thread::JoinHandle<String>) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut log = String::new();
+            w.write_all(b"220 hi\r\n").unwrap();
+            let mut in_data = false;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return log;
+                }
+                log.push_str(&line);
+                if in_data {
+                    if line == ".\r\n" {
+                        in_data = false;
+                        w.write_all(b"250 queued\r\n").unwrap();
+                    }
+                    continue;
+                }
+                let reply = match &line[..4.min(line.len())] {
+                    "EHLO" => {
+                        let mut s = String::from("250-mock\r\n");
+                        for c in ehlo_caps {
+                            s.push_str(&format!("250-{c}\r\n"));
+                        }
+                        s.push_str("250 OK\r\n");
+                        s
+                    }
+                    "AUTH" => "235 ok\r\n".into(),
+                    "MAIL" => "250 ok\r\n".into(),
+                    "RCPT" => format!("{rcpt_code} ok\r\n"),
+                    "DATA" => {
+                        in_data = true;
+                        "354 go\r\n".into()
+                    }
+                    "QUIT" => {
+                        w.write_all(b"221 bye\r\n").unwrap();
+                        return log;
+                    }
+                    _ => "500 ?\r\n".into(),
+                };
+                w.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        (port, h)
+    }
+
+    fn run_send(port: u16, body: &[u8]) -> Result<()> {
+        let url = Url::parse(&format!("smtp://127.0.0.1:{port}")).unwrap();
+        let rcpts = vec!["to@example.com".to_string()];
+        let opts = SmtpOptions {
+            from: "me@example.com",
+            rcpts: &rcpts,
+            user: Some("u"),
+            pass: Some("p"),
+        };
+        send(&url, body, &opts, &NetConfig::default())
+    }
+
+    #[test]
+    fn no_auth_capability_means_no_credentials_sent() {
+        // A server hiding AUTH (e.g. until STARTTLS) must not receive them.
+        let (port, h) = mock_smtp(&["SIZE 1000"], 250);
+        run_send(port, b"hi\r\n").unwrap();
+        let log = h.join().unwrap();
+        assert!(!log.contains("AUTH"), "{log}");
+        assert!(log.contains("MAIL FROM:<me@example.com>"));
+    }
+
+    #[test]
+    fn advertised_plain_is_used_and_251_rcpt_accepted() {
+        let (port, h) = mock_smtp(&["AUTH LOGIN PLAIN"], 251);
+        run_send(port, b"line\r\n").unwrap();
+        let log = h.join().unwrap();
+        assert!(log.contains("AUTH PLAIN "), "{log}");
+        // Body already ends in CRLF: only ".\r\n" follows, no blank line.
+        assert!(log.contains("line\r\n.\r\n"), "{log:?}");
+        assert!(!log.contains("line\r\n\r\n.\r\n"), "{log:?}");
+    }
+
+    #[test]
+    fn rejected_rcpt_fails() {
+        let (port, h) = mock_smtp(&[], 550);
+        assert!(run_send(port, b"x").is_err());
+        drop(h);
     }
 
     #[test]

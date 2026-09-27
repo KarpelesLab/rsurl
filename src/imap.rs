@@ -14,6 +14,11 @@
 //!   * `imap[s]://[user[:pass]@]host[:port]/`          → LIST "" "*"
 //!   * `imap[s]://[user[:pass]@]host[:port]/MAILBOX`   → SELECT, FETCH 1:* (UID)
 //!   * `imap[s]://[user[:pass]@]host[:port]/MAILBOX;UID=N` → SELECT, UID FETCH N BODY[]
+//!   * `.../MAILBOX/;UID=N/;SECTION=S` (RFC 5092 form) → `UID FETCH N BODY[S]`
+//!   * `.../MAILBOX;MAILINDEX=N` → SELECT, `FETCH N BODY[]`
+//!   * `.../MAILBOX?CRITERIA` → SELECT, SEARCH CRITERIA
+//!
+//! A `;UIDVALIDITY=V` parameter must match the selected mailbox's.
 //!
 //! After the greeting we probe `CAPABILITY` (or read it from a greeting
 //! `[CAPABILITY ...]` response code), use it to drive STARTTLS upgrade on a
@@ -47,6 +52,9 @@ const MAX_LITERAL_BYTES: usize = 64 * 1024 * 1024;
 /// at the same 64 MiB so a hostile/buggy server can't make us buffer forever.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Idle timeout for every read/write on the IMAP connection.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// LOGIN/AUTHENTICATE (using userinfo or fall back to anonymous), SELECT the
 /// mailbox from `url.path`, then either LIST mailboxes or FETCH a specific
 /// message and return the raw RFC 5322 message bytes (or the LIST output).
@@ -55,13 +63,17 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
+    // Idle bound so a stalled server fails the transfer instead of hanging it.
+    let dial = || -> Result<Box<dyn crate::net::NetStream>> {
+        let sock = cfg.connect(&url.host, url.port)?;
+        sock.set_read_timeout(Some(IO_TIMEOUT))?;
+        sock.set_write_timeout(Some(IO_TIMEOUT))?;
+        Ok(sock)
+    };
     match url.scheme.as_str() {
-        "imap" => {
-            let sock = cfg.connect(&url.host, url.port)?;
-            run(Stream::Plain(sock), url, cfg.require_tls)
-        }
+        "imap" => run(Stream::Plain(dial()?), url, cfg.require_tls),
         "imaps" => {
-            let sock = cfg.connect(&url.host, url.port)?;
+            let sock = dial()?;
             let tls = connect_over(sock, &url.host)?;
             run(Stream::Tls(Box::new(tls)), url, cfg.require_tls)
         }
@@ -128,23 +140,34 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
     if !preauth {
         if let Some(userinfo) = url.userinfo.as_deref() {
             let (user, pass) = crate::url::split_userinfo(userinfo);
+            // URL userinfo is percent-encoded (`%40` for `@`, ...), as in curl.
+            let (user, pass) = (percent_decode(user), percent_decode(pass));
             // Security: never interpolate URL-derived control bytes into a
             // command (CRLF injection / command smuggling). Credentials are
             // never logged.
-            reject_ctl(user, "imap user")?;
-            reject_ctl(pass, "imap password")?;
-            authenticate(&mut sock, &mut buf, &mut tagger, &caps, user, pass)?;
+            reject_ctl(&user, "imap user")?;
+            reject_ctl(&pass, "imap password")?;
+            authenticate(&mut sock, &mut buf, &mut tagger, &caps, &user, &pass)?;
         }
     }
 
-    let (mailbox, uid) = parse_path(&url.path);
-    if let Some(mbox) = mailbox.as_deref() {
+    let target = parse_path(&url.path)?;
+    if let Some(mbox) = target.mailbox.as_deref() {
         reject_ctl(mbox, "imap mailbox")?;
     }
+    if let Some(s) = target.section.as_deref() {
+        reject_ctl(s, "imap section")?;
+    }
+    if let Some(q) = target.query.as_deref() {
+        reject_ctl(q, "imap search query")?;
+    }
+    // `BODY[...]` names the part; empty is the whole message. PEEK would avoid
+    // setting \Seen, but curl uses plain BODY and so do we.
+    let section = target.section.as_deref().unwrap_or("");
 
-    let body = match (mailbox.as_deref(), uid) {
-        // Plain `/` (or empty) and no UID: list mailboxes.
-        (None, None) => {
+    let body = match (target.mailbox.as_deref(), target.uid, target.mailindex) {
+        // Plain `/` (or empty) and no message: list mailboxes.
+        (None, None, None) => {
             let tag = tagger.next();
             let cmd = format!("{tag} LIST \"\" \"*\"\r\n");
             sock.write_all(cmd.as_bytes())?;
@@ -154,9 +177,21 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
             collect_untagged(&resp, "LIST").into_bytes()
         }
 
-        // Mailbox, no UID: SELECT and dump UIDs of every message.
-        (Some(mbox), None) => {
-            select_mailbox(&mut sock, &mut buf, &mut tagger, mbox)?;
+        // Mailbox + `?query`: SEARCH and return the untagged SEARCH result.
+        (Some(mbox), None, None) if target.query.is_some() => {
+            select_mailbox(&mut sock, &mut buf, &mut tagger, mbox, target.uidvalidity)?;
+            let tag = tagger.next();
+            let q = target.query.as_deref().unwrap_or("");
+            sock.write_all(format!("{tag} SEARCH {q}\r\n").as_bytes())?;
+            sock.flush()?;
+            let resp = buf.read_response(&mut sock, &tag)?;
+            require_ok(&resp, &tag, "SEARCH")?;
+            collect_untagged(&resp, "SEARCH").into_bytes()
+        }
+
+        // Mailbox, no message: SELECT and dump UIDs of every message.
+        (Some(mbox), None, None) => {
+            select_mailbox(&mut sock, &mut buf, &mut tagger, mbox, target.uidvalidity)?;
             let tag = tagger.next();
             let cmd = format!("{tag} FETCH 1:* (UID)\r\n");
             sock.write_all(cmd.as_bytes())?;
@@ -166,15 +201,19 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
             collect_untagged(&resp, "FETCH").into_bytes()
         }
 
-        // Mailbox + UID: pull just that message body.
-        (Some(mbox), Some(n)) => {
-            select_mailbox(&mut sock, &mut buf, &mut tagger, mbox)?;
+        // Mailbox + UID or MAILINDEX: pull just that message (or section).
+        (Some(mbox), uid, mindex) => {
+            select_mailbox(&mut sock, &mut buf, &mut tagger, mbox, target.uidvalidity)?;
             let tag = tagger.next();
-            let cmd = format!("{tag} UID FETCH {n} BODY[]\r\n");
+            let cmd = match (uid, mindex) {
+                (Some(n), _) => format!("{tag} UID FETCH {n} BODY[{section}]\r\n"),
+                (None, Some(n)) => format!("{tag} FETCH {n} BODY[{section}]\r\n"),
+                (None, None) => unreachable!("handled by the arms above"),
+            };
             sock.write_all(cmd.as_bytes())?;
             sock.flush()?;
             let (resp, literals) = buf.read_response_with_literals(&mut sock, &tag)?;
-            require_ok(&resp, &tag, "UID FETCH")?;
+            require_ok(&resp, &tag, "FETCH")?;
             // Per RFC 5092, the URL targets a single message: return that
             // message's literal verbatim, or empty bytes if the server gave
             // us nothing back (UID didn't exist).
@@ -183,7 +222,7 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
 
         // Path of the form `/;UID=N` (no mailbox). RFC 5092 doesn't really
         // allow this — fall through to "list mailboxes" as a safe default.
-        (None, Some(_)) => {
+        (None, _, _) => {
             let tag = tagger.next();
             let cmd = format!("{tag} LIST \"\" \"*\"\r\n");
             sock.write_all(cmd.as_bytes())?;
@@ -275,7 +314,9 @@ fn authenticate<S: Read + Write>(
     pass: &str,
 ) -> Result<()> {
     match choose_auth(caps) {
-        Some(AuthMethod::SaslPlain) => auth_plain(sock, buf, tagger, user, pass),
+        Some(AuthMethod::SaslPlain) => {
+            auth_plain(sock, buf, tagger, caps.has("SASL-IR"), user, pass)
+        }
         Some(AuthMethod::SaslLogin) => auth_login_sasl(sock, buf, tagger, user, pass),
         Some(AuthMethod::LoginCommand) => login_command(sock, buf, tagger, user, pass),
         None => Err(Error::BadResponse(
@@ -294,16 +335,30 @@ fn auth_plain<S: Read + Write>(
     sock: &mut S,
     buf: &mut LineReader,
     tagger: &mut Tagger,
+    sasl_ir: bool,
     user: &str,
     pass: &str,
 ) -> Result<()> {
     let tag = tagger.next();
     let initial = sasl_plain_initial(user, pass);
-    // We send the initial response on the same line (IMAP4rev2 / SASL-IR). This
-    // line carries credentials — never log it.
-    let cmd = format!("{tag} AUTHENTICATE PLAIN {initial}\r\n");
-    sock.write_all(cmd.as_bytes())?;
-    sock.flush()?;
+    // These lines carry credentials — never log them.
+    if sasl_ir {
+        // RFC 4959: the initial response may ride on the command line only
+        // when the server advertises SASL-IR.
+        let cmd = format!("{tag} AUTHENTICATE PLAIN {initial}\r\n");
+        sock.write_all(cmd.as_bytes())?;
+        sock.flush()?;
+    } else {
+        sock.write_all(format!("{tag} AUTHENTICATE PLAIN\r\n").as_bytes())?;
+        sock.flush()?;
+        // Wait for the empty `+` continuation, then answer it.
+        let cont = buf.read_response(sock, &tag)?;
+        if is_tagged_done(&cont, &tag) {
+            return require_ok(&cont, &tag, "AUTHENTICATE PLAIN");
+        }
+        sock.write_all(format!("{initial}\r\n").as_bytes())?;
+        sock.flush()?;
+    }
     let resp = buf.read_response(sock, &tag)?;
     require_ok(&resp, &tag, "AUTHENTICATE PLAIN")
 }
@@ -448,18 +503,31 @@ fn parse_capability_line(resp: &str) -> Option<Vec<String>> {
     None
 }
 
+/// SELECT `mbox`; when the URL pinned a `UIDVALIDITY`, the server's must
+/// match (otherwise the UIDs in the URL name different messages — curl fails
+/// the transfer the same way).
 fn select_mailbox(
     sock: &mut Stream,
     buf: &mut LineReader,
     tagger: &mut Tagger,
     mbox: &str,
+    uidvalidity: Option<u32>,
 ) -> Result<()> {
     let tag = tagger.next();
     let cmd = format!("{tag} SELECT {}\r\n", quote_imap_string(mbox));
     sock.write_all(cmd.as_bytes())?;
     sock.flush()?;
     let resp = buf.read_response(sock, &tag)?;
-    require_ok(&resp, &tag, "SELECT")
+    require_ok(&resp, &tag, "SELECT")?;
+    if let Some(want) = uidvalidity {
+        let got = parse_uidvalidity(&resp);
+        if got != Some(want) {
+            return Err(Error::BadResponse(format!(
+                "imap: UIDVALIDITY mismatch (URL {want}, server {got:?})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn require_ok(resp: &str, tag: &str, what: &str) -> Result<()> {
@@ -523,40 +591,77 @@ fn quote_imap_string(s: &str) -> String {
     out
 }
 
-/// Parse the IMAP URL path (RFC 5092 subset) into `(mailbox, uid)`.
+/// An IMAP URL path (RFC 5092, as curl reads it).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ImapPath {
+    mailbox: Option<String>,
+    /// `;UIDVALIDITY=n` — must match the selected mailbox's, or we fail.
+    uidvalidity: Option<u32>,
+    /// `;UID=n` — fetch one message by UID.
+    uid: Option<u32>,
+    /// `;MAILINDEX=n` — fetch one message by sequence number (curl extension).
+    mailindex: Option<u32>,
+    /// `;SECTION=s` — the `BODY[s]` part to fetch (default: whole message).
+    section: Option<String>,
+    /// `?query` — a `SEARCH` criteria string.
+    query: Option<String>,
+}
+
+/// Parse the IMAP URL path the way curl does: the mailbox is everything up to
+/// the first `;` (a trailing `/` stripped — the RFC 5092 form is
+/// `/INBOX/;UID=1`), followed by `;NAME=value` parameters separated by `/` or
+/// `;`, and an optional `?query`. Names are case-insensitive; values are
+/// percent-decoded; unknown parameters are ignored.
 ///
-/// Accepts:
-///   * `""` or `"/"`                  → `(None, None)`
-///   * `"/INBOX"`                     → `(Some("INBOX"), None)`
-///   * `"/INBOX;UID=42"`              → `(Some("INBOX"), Some(42))`
-///   * `"/Stuff/Sub;UID=7"`           → `(Some("Stuff/Sub"), Some(7))`
-fn parse_path(path: &str) -> (Option<String>, Option<u32>) {
+///   * `""` / `"/"`                         → nothing (list mailboxes)
+///   * `"/INBOX"`                           → mailbox
+///   * `"/INBOX/;UID=42/;SECTION=TEXT"`     → mailbox + UID + section
+///   * `"/INBOX;MAILINDEX=1"`               → mailbox + sequence number
+///   * `"/INBOX?NEW"`                       → mailbox + SEARCH NEW
+fn parse_path(path: &str) -> Result<ImapPath> {
+    let (path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(percent_decode(q))),
+        None => (path, None),
+    };
     let trimmed = path.strip_prefix('/').unwrap_or(path);
-    if trimmed.is_empty() {
-        return (None, None);
-    }
-    // Pull off the first `;`-delimited parameter that matches `UID=<n>`.
     let (mbox_part, params) = match trimmed.find(';') {
         Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
         None => (trimmed, ""),
     };
-    let mut uid = None;
-    for param in params.split(';') {
-        if let Some(v) = param
-            .strip_prefix("UID=")
-            .or_else(|| param.strip_prefix("uid="))
-        {
-            if let Ok(n) = v.parse::<u32>() {
-                uid = Some(n);
-            }
+    let mbox_part = mbox_part.strip_suffix('/').unwrap_or(mbox_part);
+    let mut p = ImapPath {
+        mailbox: (!mbox_part.is_empty()).then(|| percent_decode(mbox_part)),
+        query: query.filter(|q| !q.is_empty()),
+        ..ImapPath::default()
+    };
+    let num = |name: &str, v: &str| {
+        v.parse::<u32>()
+            .map_err(|_| Error::InvalidUrl(format!("imap: bad {name} value {v:?}")))
+    };
+    for param in params.split(';').filter(|s| !s.is_empty()) {
+        let param = param.strip_suffix('/').unwrap_or(param);
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        let value = percent_decode(value);
+        match name.to_ascii_uppercase().as_str() {
+            "UID" => p.uid = Some(num(name, &value)?),
+            "UIDVALIDITY" => p.uidvalidity = Some(num(name, &value)?),
+            "MAILINDEX" => p.mailindex = Some(num(name, &value)?),
+            "SECTION" => p.section = Some(value),
+            _ => {}
         }
     }
-    let mbox = if mbox_part.is_empty() {
-        None
-    } else {
-        Some(percent_decode(mbox_part))
-    };
-    (mbox, uid)
+    Ok(p)
+}
+
+/// The `UIDVALIDITY` value from a SELECT response's `[UIDVALIDITY n]` code.
+fn parse_uidvalidity(resp: &str) -> Option<u32> {
+    let upper = resp.to_ascii_uppercase();
+    let i = upper.find("[UIDVALIDITY ")?;
+    let rest = &resp[i + "[UIDVALIDITY ".len()..];
+    let end = rest.find(']')?;
+    rest[..end].trim().parse().ok()
 }
 
 /// Minimal percent-decoder for mailbox names in URL paths. Invalid escapes
@@ -791,6 +896,12 @@ mod tests {
     use super::*;
     use std::io;
 
+    /// `(mailbox, uid)` view of [`parse_path`] for the basic-form tests.
+    fn pp(path: &str) -> (Option<String>, Option<u32>) {
+        let p = parse_path(path).unwrap();
+        (p.mailbox, p.uid)
+    }
+
     // -- string quoting ----------------------------------------------------
 
     #[test]
@@ -834,28 +945,22 @@ mod tests {
 
     #[test]
     fn parse_path_root() {
-        assert_eq!(parse_path("/"), (None, None));
-        assert_eq!(parse_path(""), (None, None));
+        assert_eq!(pp("/"), (None, None));
+        assert_eq!(pp(""), (None, None));
     }
 
     #[test]
     fn parse_path_mailbox_only() {
-        assert_eq!(parse_path("/INBOX"), (Some("INBOX".into()), None));
-        assert_eq!(parse_path("/Stuff/Sub"), (Some("Stuff/Sub".into()), None));
+        assert_eq!(pp("/INBOX"), (Some("INBOX".into()), None));
+        assert_eq!(pp("/Stuff/Sub"), (Some("Stuff/Sub".into()), None));
     }
 
     #[test]
     fn parse_path_mailbox_with_uid() {
+        assert_eq!(pp("/INBOX;UID=42"), (Some("INBOX".into()), Some(42)));
+        assert_eq!(pp("/Drafts;uid=7"), (Some("Drafts".into()), Some(7)));
         assert_eq!(
-            parse_path("/INBOX;UID=42"),
-            (Some("INBOX".into()), Some(42))
-        );
-        assert_eq!(
-            parse_path("/Drafts;uid=7"),
-            (Some("Drafts".into()), Some(7))
-        );
-        assert_eq!(
-            parse_path("/Stuff/Sub;UID=999"),
+            pp("/Stuff/Sub;UID=999"),
             (Some("Stuff/Sub".into()), Some(999))
         );
     }
@@ -863,7 +968,7 @@ mod tests {
     #[test]
     fn parse_path_ignores_unknown_params() {
         assert_eq!(
-            parse_path("/INBOX;TYPE=LIST;UID=5"),
+            pp("/INBOX;TYPE=LIST;UID=5"),
             (Some("INBOX".into()), Some(5))
         );
     }
@@ -871,8 +976,8 @@ mod tests {
     #[test]
     fn parse_path_percent_decodes_mailbox() {
         // `%20` → space, `%2F` → `/`
-        assert_eq!(parse_path("/My%20Mail"), (Some("My Mail".into()), None));
-        assert_eq!(parse_path("/a%2Fb;UID=1"), (Some("a/b".into()), Some(1)));
+        assert_eq!(pp("/My%20Mail"), (Some("My Mail".into()), None));
+        assert_eq!(pp("/a%2Fb;UID=1"), (Some("a/b".into()), Some(1)));
     }
 
     // -- literal-length detection -----------------------------------------
@@ -1069,12 +1174,54 @@ mod tests {
         let mut io = MockIo::new(b"a001 OK authenticated\r\n");
         let mut lr = LineReader::new();
         let mut tagger = Tagger::new();
-        auth_plain(&mut io, &mut lr, &mut tagger, "alice", "secret").expect("auth plain ok");
+        auth_plain(&mut io, &mut lr, &mut tagger, true, "alice", "secret").expect("auth plain ok");
         let sent = io.sent();
         assert!(
             sent.starts_with("a001 AUTHENTICATE PLAIN AGFsaWNlAHNlY3JldA=="),
             "unexpected client output: {sent:?}"
         );
+    }
+
+    #[test]
+    fn auth_plain_without_sasl_ir_waits_for_continuation() {
+        // RFC 4959: no SASL-IR capability → the initial response must not ride
+        // on the command line; send it after the `+` continuation.
+        let mut io = MockIo::new(b"+ \r\na001 OK authenticated\r\n");
+        let mut lr = LineReader::new();
+        let mut tagger = Tagger::new();
+        auth_plain(&mut io, &mut lr, &mut tagger, false, "alice", "secret").expect("auth plain ok");
+        assert_eq!(
+            io.sent(),
+            "a001 AUTHENTICATE PLAIN\r\nAGFsaWNlAHNlY3JldA==\r\n"
+        );
+    }
+
+    #[test]
+    fn parse_path_rfc5092_forms() {
+        let p = parse_path("/INBOX/;UID=1/;SECTION=TEXT").unwrap();
+        assert_eq!(p.mailbox.as_deref(), Some("INBOX"));
+        assert_eq!(p.uid, Some(1));
+        assert_eq!(p.section.as_deref(), Some("TEXT"));
+
+        let p = parse_path("/INBOX;UIDVALIDITY=50/;UID=3").unwrap();
+        assert_eq!((p.uidvalidity, p.uid), (Some(50), Some(3)));
+
+        let p = parse_path("/INBOX;MAILINDEX=2").unwrap();
+        assert_eq!((p.mailindex, p.uid), (Some(2), None));
+
+        let p = parse_path("/INBOX?NEW").unwrap();
+        assert_eq!(p.query.as_deref(), Some("NEW"));
+        let p = parse_path("/INBOX?SUBJECT%20hi").unwrap();
+        assert_eq!(p.query.as_deref(), Some("SUBJECT hi"));
+
+        assert!(parse_path("/INBOX;UID=abc").is_err());
+    }
+
+    #[test]
+    fn parse_uidvalidity_from_select_response() {
+        let resp = "* 3 EXISTS\r\n* OK [UIDVALIDITY 3857529045] UIDs valid\r\na001 OK done";
+        assert_eq!(parse_uidvalidity(resp), Some(3857529045));
+        assert_eq!(parse_uidvalidity("a001 OK"), None);
     }
 
     #[test]

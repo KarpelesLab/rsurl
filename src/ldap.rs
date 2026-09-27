@@ -387,18 +387,35 @@ enum Filter {
     And(Vec<Filter>),
     Or(Vec<Filter>),
     Not(Box<Filter>),
+    /// Assertion values are raw bytes: RFC 4515 `\XX` escapes may encode any
+    /// octet (binary attributes such as `objectGUID`).
     EqualityMatch {
         attr: String,
-        value: String,
+        value: Vec<u8>,
+    },
+    /// `(attr>=value)`, RFC 4511 greaterOrEqual `[5]`.
+    GreaterOrEqual {
+        attr: String,
+        value: Vec<u8>,
+    },
+    /// `(attr<=value)`, RFC 4511 lessOrEqual `[6]`.
+    LessOrEqual {
+        attr: String,
+        value: Vec<u8>,
+    },
+    /// `(attr~=value)`, RFC 4511 approxMatch `[8]`.
+    ApproxMatch {
+        attr: String,
+        value: Vec<u8>,
     },
     /// RFC 4511 §4.5.1 substrings filter. At most one `initial` (leading
     /// segment before the first `*`) and one `final` (trailing segment after
     /// the last `*`); zero or more `any` segments in between.
     Substrings {
         attr: String,
-        initial: Option<String>,
-        any: Vec<String>,
-        final_: Option<String>,
+        initial: Option<Vec<u8>>,
+        any: Vec<Vec<u8>>,
+        final_: Option<Vec<u8>>,
     },
     Present(String),
     /// RFC 4511 §4.5.1 extensibleMatch / RFC 4515 §3 string form
@@ -409,9 +426,41 @@ enum Filter {
     ExtensibleMatch {
         matching_rule: Option<String>,
         attr_type: Option<String>,
-        match_value: String,
+        match_value: Vec<u8>,
         dn_attributes: bool,
     },
+}
+
+/// Decode RFC 4515 §3 value escapes: `\XX` (two hex digits) is one octet.
+/// Any other use of `\` is a malformed filter (as in OpenLDAP / curl).
+fn unescape_value(raw: &str) -> Result<Vec<u8>> {
+    let b = raw.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            let pair = b.get(i + 1..i + 3).and_then(|p| {
+                let h = hex_val(p[0])?;
+                let l = hex_val(p[1])?;
+                Some((h << 4) | l)
+            });
+            match pair {
+                Some(v) => {
+                    out.push(v);
+                    i += 3;
+                }
+                None => {
+                    return Err(Error::BadResponse(
+                        "filter: bad escape (expected \\XX hex pair)".into(),
+                    ))
+                }
+            }
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
 }
 
 /// Maximum nesting depth of `&`/`|`/`!` filter groups. Bounds parser
@@ -496,28 +545,39 @@ impl<'a> FilterParser<'a> {
     }
 
     fn parse_simple(&mut self) -> Result<Filter> {
-        // Read the description part up to '=' (the value separator). We allow
-        // ':' here because the extensible-match form `(attr:dn:rule:=value)`
-        // embeds colons before its `:=` operator; `~=`, `>=`, `<=` are still
-        // unsupported.
+        // Read the description part up to the operator: `=`, or the two-char
+        // `>=`, `<=`, `~=`. We allow ':' here because the extensible-match form
+        // `(attr:dn:rule:=value)` embeds colons before its `:=` operator.
         let start = self.pos;
+        let mut ordering = None;
         while let Some(c) = self.peek() {
             if c == b'=' || c == b')' {
                 break;
             }
-            // `~=`, `>=`, `<=` aren't supported. A leading `:` (and the colons
-            // inside an extensible match) are fine and handled below.
             if c == b'~' || c == b'<' || c == b'>' {
-                return Err(Error::BadResponse(format!(
-                    "filter: operator {:?} not supported",
-                    c as char
-                )));
+                ordering = Some(c);
+                break;
             }
             self.bump();
         }
         let desc = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| Error::BadResponse("filter: non-utf8 attr".into()))?
             .to_string();
+        if let Some(op) = ordering {
+            self.bump();
+            self.expect(b'=')?;
+            if desc.is_empty() || desc.contains(':') {
+                return Err(Error::BadResponse("filter: bad attribute".into()));
+            }
+            let raw = self.read_value()?;
+            reject_ctl(&raw, "filter value")?;
+            let value = unescape_value(&raw)?;
+            return Ok(match op {
+                b'>' => Filter::GreaterOrEqual { attr: desc, value },
+                b'<' => Filter::LessOrEqual { attr: desc, value },
+                _ => Filter::ApproxMatch { attr: desc, value },
+            });
+        }
         self.expect(b'=')?;
         // Extensible match: the description ends with a `:` (forming the `:=`
         // operator) or contains `:` at all. RFC 4515 §3 string forms:
@@ -537,8 +597,9 @@ impl<'a> FilterParser<'a> {
             // The leading non-empty segment is `initial`; the trailing one is
             // `final`; non-empty interior segments are `any` (in order). Empty
             // segments (from leading/trailing/consecutive `*`) contribute
-            // nothing. The equality path does no RFC 4515 de-escaping, so for
-            // parity neither do we: every `*` is treated as a wildcard.
+            // nothing. Splitting happens on the *escaped* text, so a literal
+            // asterisk written as `\2a` is not a wildcard; each segment is then
+            // RFC 4515-unescaped.
             let segments: Vec<&str> = value_raw.split('*').collect();
             let last = segments.len() - 1;
             let mut initial = None;
@@ -551,12 +612,13 @@ impl<'a> FilterParser<'a> {
                 // Each assertion value is BER-encoded into the request; reject
                 // embedded control bytes the same as every other filter field.
                 reject_ctl(seg, "filter substring segment")?;
+                let seg = unescape_value(seg)?;
                 if i == 0 {
-                    initial = Some(seg.to_string());
+                    initial = Some(seg);
                 } else if i == last {
-                    final_ = Some(seg.to_string());
+                    final_ = Some(seg);
                 } else {
-                    any.push(seg.to_string());
+                    any.push(seg);
                 }
             }
             return Ok(Filter::Substrings {
@@ -566,9 +628,10 @@ impl<'a> FilterParser<'a> {
                 final_,
             });
         }
+        reject_ctl(&value_raw, "filter value")?;
         Ok(Filter::EqualityMatch {
             attr,
-            value: value_raw,
+            value: unescape_value(&value_raw)?,
         })
     }
 
@@ -663,9 +726,10 @@ impl<'a> FilterParser<'a> {
         }
         let match_value = self.read_value()?;
         // Every field is BER-encoded into the request; reject embedded control
-        // bytes the same as every other filter field. (Like equality, no RFC
-        // 4515 de-escaping is performed.)
+        // bytes the same as every other filter field, then decode RFC 4515
+        // escapes in the value.
         reject_ctl(&match_value, "filter extensible match value")?;
+        let match_value = unescape_value(&match_value)?;
         if let Some(t) = &attr_type {
             reject_ctl(t, "filter extensible match attribute")?;
         }
@@ -713,11 +777,21 @@ fn encode_filter(out: &mut Vec<u8>, f: &Filter) {
                 encode_filter(w, inner);
             });
         }
-        Filter::EqualityMatch { attr, value } => {
-            // [3] AttributeValueAssertion -- SEQUENCE { AttributeDescription, AssertionValue }
-            write_constructed(out, tag::ctx(3, true), |w| {
+        Filter::EqualityMatch { attr, value }
+        | Filter::GreaterOrEqual { attr, value }
+        | Filter::LessOrEqual { attr, value }
+        | Filter::ApproxMatch { attr, value } => {
+            // [3]/[5]/[6]/[8] AttributeValueAssertion --
+            //   SEQUENCE { AttributeDescription, AssertionValue }
+            let n = match f {
+                Filter::EqualityMatch { .. } => 3,
+                Filter::GreaterOrEqual { .. } => 5,
+                Filter::LessOrEqual { .. } => 6,
+                _ => 8,
+            };
+            write_constructed(out, tag::ctx(n, true), |w| {
                 write_octet_string(w, attr.as_bytes());
-                write_octet_string(w, value.as_bytes());
+                write_octet_string(w, value);
             });
         }
         Filter::Substrings {
@@ -737,15 +811,15 @@ fn encode_filter(out: &mut Vec<u8>, f: &Filter) {
                 write_constructed(w, tag::SEQUENCE, |subs| {
                     if let Some(s) = initial {
                         // initial [0] -- primitive octet string
-                        write_tlv(subs, tag::ctx(0, false), s.as_bytes());
+                        write_tlv(subs, tag::ctx(0, false), s);
                     }
                     for s in any {
                         // any [1] -- primitive octet string
-                        write_tlv(subs, tag::ctx(1, false), s.as_bytes());
+                        write_tlv(subs, tag::ctx(1, false), s);
                     }
                     if let Some(s) = final_ {
                         // final [2] -- primitive octet string
-                        write_tlv(subs, tag::ctx(2, false), s.as_bytes());
+                        write_tlv(subs, tag::ctx(2, false), s);
                     }
                 });
             });
@@ -778,7 +852,7 @@ fn encode_filter(out: &mut Vec<u8>, f: &Filter) {
                     write_tlv(w, tag::ctx(2, false), t.as_bytes());
                 }
                 // matchValue [3] -- primitive octet string (REQUIRED)
-                write_tlv(w, tag::ctx(3, false), match_value.as_bytes());
+                write_tlv(w, tag::ctx(3, false), match_value);
                 if *dn_attributes {
                     // dnAttributes [4] -- BOOLEAN, single 0xFF byte
                     write_tlv(w, tag::ctx(4, false), &[0xff]);
@@ -799,6 +873,12 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 /// length bounded only by `usize` — an unbounded allocation / DoS vector.
 /// 64 MiB matches the crate's other body caps (e.g. `rtsp`, `websocket`).
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cap on the aggregate LDIF output of one search.
+const MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+
+/// LDAP resultCode `sizeLimitExceeded` (RFC 4511 §4.1.9).
+const LDAP_SIZE_LIMIT_EXCEEDED: i64 = 4;
 
 /// Hold either a raw TCP stream or a TLS-wrapped one behind the same code path
 /// — the shared transport enum. (LDAPS is implicit here, so the in-place
@@ -846,9 +926,13 @@ fn read_message_from<R: Read>(t: &mut R) -> Result<Vec<u8>> {
             "ldap: message length {len} exceeds maximum {MAX_MESSAGE_BYTES}"
         )));
     }
-    // Body
-    let mut body = vec![0u8; len];
-    read_exact(t, &mut body)?;
+    // Body — grown as bytes arrive rather than preallocated from the declared
+    // length, so a lying header can't force a 64 MiB allocation up front.
+    let mut body = Vec::new();
+    t.take(len as u64).read_to_end(&mut body)?;
+    if body.len() < len {
+        return Err(Error::UnexpectedEof);
+    }
     Ok(body)
 }
 
@@ -903,8 +987,8 @@ fn build_search_request(message_id: i32, q: &ParsedUrlQuery) -> Result<Vec<u8>> 
             write_octet_string(s, q.dn.as_bytes());
             write_enumerated(s, q.scope.as_int()); // scope
             write_enumerated(s, 0); // derefAliases = neverDerefAliases
-            write_integer(s, 100); // sizeLimit
-            write_integer(s, 30); // timeLimit
+            write_integer(s, 0); // sizeLimit: none (curl sends 0)
+            write_integer(s, 0); // timeLimit: none (curl sends 0)
             write_boolean(s, false); // typesOnly
             encode_filter(s, &filter);
             // AttributeSelection ::= SEQUENCE OF LDAPString
@@ -1154,6 +1238,13 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
         if otag == tag::app(APP_SEARCH_RESULT_ENTRY, true) {
             let (dn, attrs) = parse_search_entry(obody)?;
             write_ldif_entry(&mut out, &dn, &attrs);
+            // Each message is capped, but a server can send unlimited entries;
+            // bound the aggregate LDIF we buffer too.
+            if out.len() > MAX_OUTPUT_BYTES {
+                return Err(Error::BadResponse(format!(
+                    "ldap: search results exceed {MAX_OUTPUT_BYTES} bytes"
+                )));
+            }
             continue;
         }
         if otag == tag::app(APP_SEARCH_RESULT_REFERENCE, true) {
@@ -1162,7 +1253,10 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
         }
         if otag == tag::app(APP_SEARCH_RESULT_DONE, true) {
             let (rc, diag) = parse_ldap_result(obody)?;
-            if rc != 0 {
+            // 4 = sizeLimitExceeded: the server's own limit truncated the
+            // result set. Like curl, keep the entries already received rather
+            // than discarding them.
+            if rc != 0 && rc != LDAP_SIZE_LIMIT_EXCEEDED {
                 return Err(Error::BadResponse(format!(
                     "ldap search failed: code {rc}: {diag}"
                 )));
@@ -1904,6 +1998,130 @@ mod tests {
     }
 
     #[test]
+    fn parse_filter_decodes_rfc4515_escapes() {
+        // `\2a` is a literal asterisk, not a wildcard; `\28`/`\29` parens.
+        assert_eq!(
+            parse_filter(r"(cn=a\2ab\28c\29)").unwrap(),
+            Filter::EqualityMatch {
+                attr: "cn".into(),
+                value: "a*b(c)".into(),
+            }
+        );
+        // Binary octets survive (objectGUID-style values).
+        assert_eq!(
+            parse_filter(r"(objectGUID=\00\ff)").unwrap(),
+            Filter::EqualityMatch {
+                attr: "objectGUID".into(),
+                value: vec![0x00, 0xff],
+            }
+        );
+        // Escapes inside substring segments, split only on unescaped `*`.
+        assert_eq!(
+            parse_filter(r"(cn=a\5c*z)").unwrap(),
+            Filter::Substrings {
+                attr: "cn".into(),
+                initial: Some("a\\".into()),
+                any: vec![],
+                final_: Some("z".into()),
+            }
+        );
+        assert!(parse_filter(r"(cn=bad\zz)").is_err());
+        assert!(parse_filter(r"(cn=trailing\)").is_err());
+    }
+
+    #[test]
+    fn parse_filter_ordering_and_approx_operators() {
+        assert_eq!(
+            parse_filter("(uidNumber>=1000)").unwrap(),
+            Filter::GreaterOrEqual {
+                attr: "uidNumber".into(),
+                value: "1000".into(),
+            }
+        );
+        assert_eq!(
+            parse_filter("(uidNumber<=5)").unwrap(),
+            Filter::LessOrEqual {
+                attr: "uidNumber".into(),
+                value: "5".into(),
+            }
+        );
+        assert_eq!(
+            parse_filter("(cn~=smith)").unwrap(),
+            Filter::ApproxMatch {
+                attr: "cn".into(),
+                value: "smith".into(),
+            }
+        );
+        // BER tags: [5], [6], [8] constructed.
+        for (f, t) in [("(a>=1)", 5), ("(a<=1)", 6), ("(a~=1)", 8)] {
+            let mut out = Vec::new();
+            encode_filter(&mut out, &parse_filter(f).unwrap());
+            assert_eq!(out[0], tag::ctx(t, true), "{f}");
+        }
+        assert!(parse_filter("(>=1)").is_err());
+        assert!(parse_filter("(a>1)").is_err());
+    }
+
+    /// Encode an LDAPResult-shaped response (`resultCode`, empty matchedDN and
+    /// diagnostic) for application tag `app`.
+    fn result_msg(mid: i64, app: u8, rc: i64) -> Vec<u8> {
+        let mut m = Vec::new();
+        write_constructed(&mut m, tag::SEQUENCE, |w| {
+            write_integer(w, mid);
+            write_constructed(w, tag::app(app, true), |b| {
+                write_enumerated(b, rc);
+                write_octet_string(b, b"");
+                write_octet_string(b, b"");
+            });
+        });
+        m
+    }
+
+    /// End-to-end search against a loopback mock whose `SearchResultDone`
+    /// carries `done_rc`, after one entry. Also returns the raw SearchRequest.
+    fn run_mock_search(done_rc: i64) -> (Result<Vec<u8>>, Vec<u8>) {
+        use std::io::Write as _;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _bind = read_message_from(&mut s).unwrap();
+            s.write_all(&result_msg(1, APP_BIND_RESPONSE, 0)).unwrap();
+            let search = read_message_from(&mut s).unwrap();
+            let mut entry = Vec::new();
+            write_constructed(&mut entry, tag::SEQUENCE, |w| {
+                write_integer(w, 2);
+                write_constructed(w, tag::app(APP_SEARCH_RESULT_ENTRY, true), |e| {
+                    write_octet_string(e, b"cn=a,dc=x");
+                    write_constructed(e, tag::SEQUENCE, |attrs| {
+                        write_constructed(attrs, tag::SEQUENCE, |pa| {
+                            write_octet_string(pa, b"cn");
+                            write_constructed(pa, tag::SET, |v| write_octet_string(v, b"a"));
+                        });
+                    });
+                });
+            });
+            s.write_all(&entry).unwrap();
+            s.write_all(&result_msg(2, APP_SEARCH_RESULT_DONE, done_rc))
+                .unwrap();
+            search
+        });
+        let url = Url::parse(&format!("ldap://127.0.0.1:{port}/dc=x??sub?(cn=*)")).unwrap();
+        let res = fetch_with(&url, &NetConfig::default());
+        (res, h.join().unwrap())
+    }
+
+    #[test]
+    fn size_limit_exceeded_keeps_partial_results() {
+        let (res, _) = run_mock_search(LDAP_SIZE_LIMIT_EXCEEDED);
+        let out = String::from_utf8(res.unwrap()).unwrap();
+        assert!(out.contains("cn=a,dc=x"), "{out}");
+        // Any other failure code still fails the transfer.
+        let (res, _) = run_mock_search(32);
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn build_search_request_decodes() {
         let q = ParsedUrlQuery {
             dn: "dc=example,dc=com".into(),
@@ -1921,9 +2139,9 @@ mod tests {
         assert_eq!(sr.read_octet_string().unwrap(), b"dc=example,dc=com");
         assert_eq!(sr.read_enumerated_i64().unwrap(), 2); // sub
         assert_eq!(sr.read_enumerated_i64().unwrap(), 0); // never deref
-        assert_eq!(sr.read_integer_i64().unwrap(), 100); // sizeLimit
-        assert_eq!(sr.read_integer_i64().unwrap(), 30); // timeLimit
-                                                        // typesOnly boolean
+        assert_eq!(sr.read_integer_i64().unwrap(), 0); // sizeLimit: none
+        assert_eq!(sr.read_integer_i64().unwrap(), 0); // timeLimit: none
+                                                       // typesOnly boolean
         let bool_tlv = sr.read_tlv().unwrap();
         assert_eq!(bool_tlv.tag, tag::BOOLEAN);
         assert_eq!(bool_tlv.value, &[0x00]);

@@ -3258,7 +3258,7 @@ fn cli_ftp_download_streams_to_file() {
     let _ = std::fs::remove_file(&out_path);
 }
 
-/// `--ftp-create-dirs` issues MKD for each directory prefix before STOR, and
+/// `--ftp-create-dirs` walks the path with CWD, MKD-ing refused dirs, and
 /// the upload body is delivered. A mock FTP server records the MKD commands and
 /// the stored bytes.
 #[test]
@@ -3278,6 +3278,7 @@ fn cli_ftp_create_dirs_upload() {
         let (sock, _) = ctrl.accept().unwrap();
         let mut w = sock.try_clone().unwrap();
         let mut r = BufReader::new(sock);
+        let mut made: Vec<String> = Vec::new();
         w.write_all(b"220 mock\r\n").unwrap();
         loop {
             let mut line = String::new();
@@ -3290,8 +3291,18 @@ fn cli_ftp_create_dirs_upload() {
             } else if cmd.starts_with("PASS") {
                 w.write_all(b"230 ok\r\n").unwrap();
             } else if let Some(dir) = cmd.strip_prefix("MKD ") {
-                seen2.lock().unwrap().0.push(dir.to_string());
+                seen2.lock().unwrap().0.push(format!("MKD {dir}"));
+                made.push(dir.to_string());
                 w.write_all(b"257 created\r\n").unwrap();
+            } else if let Some(dir) = cmd.strip_prefix("CWD ") {
+                // Only directories created by MKD exist (flat namespace is
+                // enough here: the test's dirs have distinct names).
+                seen2.lock().unwrap().0.push(format!("CWD {dir}"));
+                if made.iter().any(|d| d == dir) {
+                    w.write_all(b"250 ok\r\n").unwrap();
+                } else {
+                    w.write_all(b"550 no such directory\r\n").unwrap();
+                }
             } else if cmd.starts_with("EPSV") {
                 w.write_all(
                     format!("229 Entering Extended Passive Mode (|||{data_port}|)\r\n").as_bytes(),
@@ -3329,10 +3340,12 @@ fn cli_ftp_create_dirs_upload() {
     let _ = handle.join();
     assert!(status.success(), "ftp upload should succeed");
     let g = seen.lock().unwrap();
+    // curl's multicwd with --ftp-create-dirs: CWD, and on refusal MKD + CWD,
+    // one path component at a time.
     assert_eq!(
         g.0,
-        vec!["a".to_string(), "a/b".to_string()],
-        "MKD prefixes"
+        ["CWD a", "MKD a", "CWD a", "CWD b", "MKD b", "CWD b"],
+        "CWD/MKD sequence"
     );
     assert_eq!(g.1, b"UPLOAD-PAYLOAD");
     let _ = std::fs::remove_file(&tmp);

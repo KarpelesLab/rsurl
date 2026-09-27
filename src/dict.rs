@@ -4,10 +4,11 @@
 //! `dict://server/m:word[:database[:strategy]]` (match), or just
 //! `dict://server/word` (define against any database).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::url::percent_decode;
 use crate::url::Url;
 
 /// Default I/O timeout per RFC 2229; servers can be slow to respond on first
@@ -39,8 +40,13 @@ impl DictRequest {
     /// Encode the request as the on-the-wire command (without trailing CRLF).
     fn to_command(&self) -> String {
         match self.verb {
-            Verb::Define => format!("DEFINE {} {}", self.database, self.word),
-            Verb::Match => format!("MATCH {} {} {}", self.database, self.strategy, self.word),
+            Verb::Define => format!("DEFINE {} {}", self.database, quote_word(&self.word)),
+            Verb::Match => format!(
+                "MATCH {} {} {}",
+                self.database,
+                self.strategy,
+                quote_word(&self.word)
+            ),
             Verb::ShowDatabases => "SHOW DATABASES".to_string(),
         }
     }
@@ -67,30 +73,40 @@ fn parse_path(path: &str) -> Result<DictRequest> {
         });
     }
 
-    // RFC 2229 uses a leading `d:` or `m:` to mark the verb. Anything else is
-    // treated as a bare word (DEFINE * word).
-    let (verb, rest) = if let Some(r) = raw.strip_prefix("d:") {
-        (Verb::Define, r)
-    } else if let Some(r) = raw.strip_prefix("m:") {
-        (Verb::Match, r)
-    } else {
-        (Verb::Define, raw)
+    // RFC 2229 uses a leading `d:` or `m:` to mark the verb; like curl we also
+    // accept the long forms (`define:`/`lookup:`, `match:`/`find:`), in any
+    // case. Anything else is treated as a bare word (DEFINE * word).
+    let (verb, rest) = match raw.split_once(':') {
+        Some((v, r))
+            if ["d", "define", "lookup"]
+                .iter()
+                .any(|k| v.eq_ignore_ascii_case(k)) =>
+        {
+            (Verb::Define, r)
+        }
+        Some((v, r))
+            if ["m", "match", "find"]
+                .iter()
+                .any(|k| v.eq_ignore_ascii_case(k)) =>
+        {
+            (Verb::Match, r)
+        }
+        _ => (Verb::Define, raw),
     };
 
-    let mut parts = rest.split(':');
+    // Each field is percent-decoded (`d:hello%20world` looks up "hello
+    // world"); the word is quoted on the wire if it needs it.
+    let mut parts = rest.split(':').map(percent_decode);
     let word = parts
         .next()
-        .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Error::InvalidUrl(format!("dict: empty word in path '{path}'")))?;
     let database = parts
         .next()
-        .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "*".into());
     let strategy = parts
         .next()
-        .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| ".".into());
 
@@ -108,6 +124,25 @@ fn parse_path(path: &str) -> Result<DictRequest> {
         database,
         strategy,
     })
+}
+
+/// Render a word as an RFC 2229 §2.2 parameter: a bare atom when it has no
+/// space or quote characters, otherwise a double-quoted string with `"` and
+/// `\` backslash-escaped.
+fn quote_word(word: &str) -> String {
+    if !word.is_empty() && !word.contains([' ', '"', '\'', '\\']) {
+        return word.to_string();
+    }
+    let mut out = String::with_capacity(word.len() + 2);
+    out.push('"');
+    for c in word.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Reject any ASCII control byte (including CR, LF, and NUL) in a
@@ -162,19 +197,37 @@ fn is_error_code(code: u16) -> bool {
 /// Read one CRLF-terminated line from `reader`. Translates an EOF before any
 /// data is read into [`Error::UnexpectedEof`].
 fn read_line<R: BufRead>(reader: &mut R) -> Result<String> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    // Bounded: a newline-less flood must error, not grow a String forever
+    // (the per-read timeout doesn't stop a steady trickle). Non-UTF-8
+    // definitions are decoded lossily rather than failing the lookup.
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
     if n == 0 {
         return Err(Error::UnexpectedEof);
     }
-    Ok(line)
+    if buf.len() > MAX_LINE {
+        return Err(Error::BadResponse("dict: response line too long".into()));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
+
+/// Longest single response line we accept.
+const MAX_LINE: usize = 64 * 1024;
+
+/// Cap on the whole response text.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Read a multi-line textual response body terminated by a line containing
 /// only `.\r\n` (a single dot). Lines that begin with a dot are unescaped by
 /// removing the leading dot, per RFC 2229 §2.2.
 fn read_text_block<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> Result<()> {
     loop {
+        if out.len() > MAX_RESPONSE_BYTES {
+            return Err(Error::BadResponse("dict: response too large".into()));
+        }
         let line = read_line(reader)?;
         let body = line.trim_end_matches(['\r', '\n']);
         if body == "." {
@@ -365,6 +418,35 @@ mod tests {
     fn path_with_only_verb_prefix_is_rejected() {
         assert!(parse_path("/d:").is_err());
         assert!(parse_path("/m:").is_err());
+    }
+
+    #[test]
+    fn path_is_percent_decoded_and_word_quoted() {
+        let r = parse_path("/d:hello%20world:wn").unwrap();
+        assert_eq!(r.word, "hello world");
+        assert_eq!(r.database, "wn");
+        assert_eq!(r.to_command(), "DEFINE wn \"hello world\"");
+        assert_eq!(
+            parse_path("/d:plain").unwrap().to_command(),
+            "DEFINE * plain"
+        );
+        assert_eq!(quote_word(r#"a"b\c"#), r#""a\"b\\c""#);
+        // Encoded CR/LF is still rejected after decoding.
+        assert!(parse_path("/d:a%0d%0aQUIT").is_err());
+    }
+
+    #[test]
+    fn path_accepts_curl_verb_aliases() {
+        assert_eq!(parse_path("/MATCH:foo").unwrap().verb, Verb::Match);
+        assert_eq!(parse_path("/find:foo").unwrap().verb, Verb::Match);
+        assert_eq!(parse_path("/lookup:foo").unwrap().verb, Verb::Define);
+        assert_eq!(parse_path("/D:foo").unwrap().word, "foo");
+    }
+
+    #[test]
+    fn read_line_is_bounded() {
+        let mut r = std::io::Cursor::new(vec![b'x'; MAX_LINE + 5]);
+        assert!(read_line(&mut r).is_err());
     }
 
     #[test]

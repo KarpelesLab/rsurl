@@ -10,12 +10,13 @@
 //! accept 512-byte DATA blocks on read, and send 512-byte DATA blocks on write
 //! (a short final block — possibly empty — terminates the upload).
 
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::net::udp::open_udp_transport;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+use crate::url::percent_decode;
 use crate::url::Url;
 
 /// TFTP opcodes (RFC 1350 §5).
@@ -155,12 +156,14 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 
 /// Extract and validate the TFTP filename from `url.path`.
 ///
-/// Strips the leading '/' to get the TFTP filename. Anything past a '?' (a
-/// query, which TFTP doesn't actually have) is left in place — TFTP servers
-/// will just see it as part of the filename. Rejects an empty filename or one
-/// containing a NUL (which would corrupt the request packet's framing).
-fn filename_of(url: &Url) -> Result<&str> {
-    let filename = url.path.strip_prefix('/').unwrap_or(&url.path);
+/// Strips the leading '/' and percent-decodes the rest (as curl does) to get
+/// the TFTP filename. Anything past a '?' (a query, which TFTP doesn't
+/// actually have) is left in place — TFTP servers will just see it as part of
+/// the filename. Rejects an empty filename or one containing a NUL — even an
+/// encoded `%00` — which would corrupt the request packet's framing.
+fn filename_of(url: &Url) -> Result<String> {
+    let raw = url.path.strip_prefix('/').unwrap_or(&url.path);
+    let filename = percent_decode(raw);
     if filename.is_empty() {
         return Err(Error::InvalidUrl(format!(
             "tftp: empty filename in {}://{}/{}",
@@ -190,7 +193,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     let socket = open_udp_transport(cfg.connector.udp_proxy(), server)?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
 
-    let rrq = build_rrq(filename);
+    let rrq = build_rrq(&filename);
 
     // After the first DATA arrives, the server picks a fresh ephemeral port
     // (the TID) and all subsequent traffic uses it. We track it here.
@@ -299,19 +302,11 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
                 last_dest = from;
                 retries = 0;
 
-                // u16 wrap: 65535 -> 0 is permitted by common TFTP usage,
-                // but for safety we explicitly bail rather than risk an
-                // ambiguous loop. (A 256 MiB cap means a 512-byte block
-                // stream can need block numbers up to ~524288, which does
-                // wrap once. Punt as documented in the spec.)
-                expected_block = match expected_block.checked_add(1) {
-                    Some(b) => b,
-                    None => {
-                        return Err(Error::BadResponse(
-                            "tftp: block number wrapped; refusing oversized transfer".into(),
-                        ));
-                    }
-                };
+                // Block numbers are a u16: past 65535 (~32 MiB at 512-byte
+                // blocks) they roll over to 0, as curl and tftp-hpa do. The
+                // lockstep ACK protocol keeps that unambiguous; the 256 MiB
+                // cap above still bounds the whole transfer.
+                expected_block = expected_block.wrapping_add(1);
             }
             Some(OP_ERROR) => {
                 let msg = parse_error(pkt)?;
@@ -335,11 +330,18 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
 /// final block shorter than `BLOCK_SIZE` — possibly empty when `data` is an
 /// exact multiple of 512 — terminates the transfer per RFC 1350 §6.
 pub fn store(url: &Url, data: &[u8]) -> Result<()> {
+    store_with(url, data, &crate::net::NetConfig::default())
+}
+
+/// As [`store`], through the caller's transport: a direct UDP socket of the
+/// server's address family (so IPv6 servers work), or a SOCKS5 UDP ASSOCIATE
+/// relay — the same transport selection as [`fetch_with`], so a configured
+/// proxy is never silently bypassed for uploads.
+pub(crate) fn store_with(url: &Url, data: &[u8], cfg: &crate::net::NetConfig) -> Result<()> {
     let filename = filename_of(url)?;
 
-    // Cap uploads at the same ceiling as downloads. TFTP block numbers are a
-    // u16, so a 512-byte stream can address at most 65535 blocks before the
-    // first wrap; the 256 MiB cap stays well within a single wrap.
+    // Cap uploads at the same ceiling as downloads (block numbers wrap past
+    // 65535, so the cap — not the block counter — bounds the transfer).
     if data.len() > MAX_TOTAL_BYTES {
         return Err(Error::BadResponse(format!(
             "tftp: upload exceeds {MAX_TOTAL_BYTES} bytes"
@@ -347,10 +349,10 @@ pub fn store(url: &Url, data: &[u8]) -> Result<()> {
     }
 
     let server = resolve(&url.host, url.port)?;
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let socket = open_udp_transport(cfg.connector.udp_proxy(), server)?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
 
-    let wrq = build_wrq(filename);
+    let wrq = build_wrq(&filename);
 
     // The server picks a fresh ephemeral port (its TID) for its first reply
     // (ACK 0 or, if it negotiated options we didn't ask for, an OACK). We latch
@@ -375,9 +377,10 @@ pub fn store(url: &Url, data: &[u8]) -> Result<()> {
     // and so on. `sent_final` records that we've transmitted the short final
     // block, so the matching ACK ends the transfer.
     let mut block: u16 = 0;
-    // Offset into `data` of the block we last sent (only meaningful once
-    // `block >= 1`).
-    let mut sent_offset: usize = 0;
+    // How many DATA blocks we've sent; the next block's payload starts at
+    // `blocks_sent * BLOCK_SIZE`. Kept separately from the (wrapping) u16
+    // block number so the offset stays right after a rollover.
+    let mut blocks_sent: usize = 0;
     let mut sent_final = false;
 
     loop {
@@ -440,21 +443,10 @@ pub fn store(url: &Url, data: &[u8]) -> Result<()> {
                     return Ok(());
                 }
 
-                // Advance to the next block. After ACK 0 we've sent nothing
-                // yet; otherwise step past the block we just sent.
-                let next_offset = if block == 0 {
-                    0
-                } else {
-                    sent_offset + BLOCK_SIZE
-                };
-                let next_block = match block.checked_add(1) {
-                    Some(b) => b,
-                    None => {
-                        return Err(Error::BadResponse(
-                            "tftp: block number wrapped; refusing oversized transfer".into(),
-                        ));
-                    }
-                };
+                // Advance to the next block. The u16 block number rolls over
+                // from 65535 to 0 on long uploads (as curl does).
+                let next_offset = blocks_sent * BLOCK_SIZE;
+                let next_block = block.wrapping_add(1);
 
                 let end = (next_offset + BLOCK_SIZE).min(data.len());
                 let payload = &data[next_offset..end];
@@ -462,7 +454,7 @@ pub fn store(url: &Url, data: &[u8]) -> Result<()> {
                 socket.send_to(&dgram, from)?;
 
                 block = next_block;
-                sent_offset = next_offset;
+                blocks_sent += 1;
                 sent_final = payload.len() < BLOCK_SIZE;
                 last_packet = dgram;
                 last_dest = from;
@@ -832,6 +824,53 @@ mod tests {
 
     fn upload_roundtrip(payload: Vec<u8>) {
         upload_roundtrip_inner(payload, false);
+    }
+
+    /// More than 65535 blocks: the block number must roll over to 0 (curl
+    /// behaviour) rather than aborting at ~32 MiB.
+    #[test]
+    fn store_wraps_block_number_past_65535() {
+        let payload: Vec<u8> = (0..(65536 * BLOCK_SIZE + 100))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        upload_roundtrip(payload);
+    }
+
+    #[test]
+    fn fetch_wraps_block_number_past_65535() {
+        let total = 65536 * BLOCK_SIZE + 7;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 253) as u8).collect();
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let expect = payload.clone();
+        let h = thread::spawn(move || {
+            let mut buf = [0u8; 600];
+            let (n, client) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(parse_opcode(&buf[..n]), Some(OP_RRQ));
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut block: u16 = 1;
+            for chunk in payload.chunks(BLOCK_SIZE) {
+                server.send_to(&build_data(block, chunk), client).unwrap();
+                let (n, _) = server.recv_from(&mut buf).unwrap();
+                assert_eq!(parse_ack(&buf[..n]).unwrap(), block);
+                block = block.wrapping_add(1);
+            }
+        });
+        let got = fetch(&test_url(port, "/big.bin")).unwrap();
+        h.join().unwrap();
+        assert_eq!(got.len(), expect.len());
+        assert!(got == expect);
+    }
+
+    #[test]
+    fn filename_is_percent_decoded_and_nul_rejected() {
+        assert_eq!(
+            filename_of(&test_url(69, "/my%20file.bin")).unwrap(),
+            "my file.bin"
+        );
+        assert!(filename_of(&test_url(69, "/a%00b")).is_err());
     }
 
     #[test]

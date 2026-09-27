@@ -21,6 +21,34 @@ use crate::url::Url;
 /// mailboxes and messages.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Longest status line (`+OK ...` / `-ERR ...`) we accept. RFC 1939 caps
+/// responses at 512 octets; allow generous slack for chatty servers.
+const MAX_STATUS_LINE: usize = 8 * 1024;
+
+/// Idle timeout for every read/write on the POP3 connection.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Read one status line (capped at [`MAX_STATUS_LINE`]) with the trailing
+/// CR/LF removed. Non-UTF-8 text is decoded lossily — only the `+OK`/`-ERR`
+/// prefix matters.
+fn read_status_line<R: BufRead>(io: &mut R) -> Result<String> {
+    let mut buf = Vec::new();
+    let n = io
+        .by_ref()
+        .take(MAX_STATUS_LINE as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Err(Error::UnexpectedEof);
+    }
+    if buf.len() > MAX_STATUS_LINE {
+        return Err(Error::BadResponse("pop3: status line too long".into()));
+    }
+    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+        buf.pop();
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// USER + PASS auth, then either LIST mailboxes (if no message number in
 /// path) or RETR a specific message. Returns the raw bytes (RFC 5322 message
 /// or the textual LIST output).
@@ -34,11 +62,16 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
         .as_deref()
         .ok_or_else(|| Error::BadResponse("pop3: missing userinfo".into()))?;
     let (user, pass) = crate::url::split_userinfo(userinfo);
+    // URL userinfo is percent-encoded (`%40` for `@`, ...), as in curl.
+    let (user, pass) = (percent_decode(user), percent_decode(pass));
+    let (user, pass) = (user.as_str(), pass.as_str());
 
     let action = parse_path(&url.path)
         .ok_or_else(|| Error::InvalidUrl(format!("pop3 path: {}", url.path)))?;
 
     let tcp = cfg.connect(&url.host, url.port)?;
+    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     if url.is_tls() {
         // Implicit TLS (pop3s://): handshake before the greeting. This already
         // satisfies `require_tls`.
@@ -68,16 +101,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
 /// the greeting and STLS reply before the `Session` is constructed). Mirrors
 /// [`Session::read_status`].
 fn read_status_buf<R: Read + Write>(io: &mut BufReader<R>) -> Result<String> {
-    let mut buf = Vec::new();
-    let n = io.read_until(b'\n', &mut buf)?;
-    if n == 0 {
-        return Err(Error::UnexpectedEof);
-    }
-    while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-        buf.pop();
-    }
-    let line = String::from_utf8(buf)
-        .map_err(|_| Error::BadResponse("pop3: non-UTF8 status line".into()))?;
+    let line = read_status_line(io)?;
     if let Some(rest) = line.strip_prefix("+OK") {
         Ok(rest.strip_prefix(' ').unwrap_or(rest).to_string())
     } else if let Some(rest) = line.strip_prefix("-ERR") {
@@ -192,6 +216,7 @@ fn un_dot_stuff(body: &[u8]) -> Vec<u8> {
 /// Read+Write transport, either plain or TLS-wrapped, with in-place STLS
 /// upgrade — the shared transport enum (see [`crate::net::MaybeTlsStream`]).
 use crate::net::MaybeTlsStream as IoAdapter;
+use crate::url::percent_decode;
 
 /// Buffered POP3 conversation. Wraps a transport in a `BufReader` so we can
 /// pull whole CRLF-terminated lines without an extra allocation per byte.
@@ -226,16 +251,7 @@ impl<R: Read + Write> Session<R> {
     /// Read a single CRLF-terminated reply line, trim the CRLF, and return
     /// it as a UTF-8 string. POP3 status lines are ASCII per the RFC.
     fn read_line(&mut self) -> Result<String> {
-        let mut buf = Vec::new();
-        let n = self.io.read_until(b'\n', &mut buf)?;
-        if n == 0 {
-            return Err(Error::UnexpectedEof);
-        }
-        // Strip trailing \r\n or \n.
-        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
-            buf.pop();
-        }
-        String::from_utf8(buf).map_err(|_| Error::BadResponse("pop3: non-UTF8 status line".into()))
+        read_status_line(&mut self.io)
     }
 
     /// Read a status line and require it to start with `+OK`. Returns the
@@ -347,6 +363,21 @@ fn run<R: Read + Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_line_is_capped_and_lossy() {
+        let mut flood = std::io::Cursor::new(vec![b'+'; MAX_STATUS_LINE + 10]);
+        assert!(read_status_line(&mut flood).is_err());
+        // A Latin-1 greeting doesn't fail the session.
+        let mut r = std::io::Cursor::new(b"+OK caf\xe9 ready\r\n".to_vec());
+        assert!(read_status_line(&mut r).unwrap().starts_with("+OK caf"));
+    }
+
+    #[test]
+    fn userinfo_percent_decoding() {
+        assert_eq!(percent_decode("us%40er"), "us@er");
+        assert_eq!(percent_decode("p%3Ass%zz"), "p:ss%zz");
+    }
 
     #[test]
     fn un_dot_stuff_strips_leading_dot_on_each_line() {

@@ -42,11 +42,15 @@ use puressh::known_hosts::KnownHosts;
 use puressh::sftp::{Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE};
 
 use crate::error::{Error, Result};
+use crate::url::percent_decode;
 use crate::url::Url;
 
 /// Chunk size for SFTP reads and writes. 32 KiB stays well under the SSH
 /// channel window and the SFTP packet ceiling while keeping round-trips low.
 const SFTP_CHUNK: usize = 32 * 1024;
+
+/// Cap on an SFTP download, which is buffered in memory whole (1 GiB).
+const MAX_SFTP_DOWNLOAD: usize = 1024 * 1024 * 1024;
 
 /// Connection/auth knobs derived from the CLI and URL. Carries no secret
 /// beyond `password`, which is never logged.
@@ -296,15 +300,22 @@ fn connect_auth(
     Ok(client)
 }
 
-/// The remote path for SFTP/SCP: the URL path with a single leading `/`
-/// preserved (SFTP paths are absolute from the server root). Empty path is an
-/// error — there's no file to name.
-fn remote_path<'a>(url: &'a Url, what: &str) -> Result<&'a str> {
-    reject_ctl(&url.path, what)?;
-    if url.path.is_empty() || url.path == "/" {
+/// The remote path for SFTP/SCP, percent-decoded (as curl does). The URL path
+/// is absolute from the server root, except curl's `/~/` prefix, which names a
+/// path relative to the user's home directory (`sftp://h/~/f` → `f`). Empty
+/// path is an error — there's no file to name. Control bytes are rejected
+/// after decoding, so `%0a` can't reach the remote `scp` command line.
+fn remote_path(url: &Url, what: &str) -> Result<String> {
+    let path = url.path.split('?').next().unwrap_or("");
+    let path = match path.strip_prefix("/~/") {
+        Some(rel) => percent_decode(rel),
+        None => percent_decode(path),
+    };
+    reject_ctl(&path, what)?;
+    if path.is_empty() || path == "/" {
         return Err(Error::Ssh(format!("{what}: URL names no remote file")));
     }
-    Ok(&url.path)
+    Ok(path)
 }
 
 /// Download the file at `url.path`. For `sftp://` this opens+reads over the
@@ -321,7 +332,7 @@ pub fn fetch_traced(
     user: &str,
     mut trace: Option<&mut (dyn std::io::Write + '_)>,
 ) -> Result<Vec<u8>> {
-    let path = remote_path(url, "sftp/scp path")?.to_string();
+    let path = remote_path(url, "sftp/scp path")?;
     let mut client = connect_auth(url, user, opts, trace.as_deref_mut())?;
     match url.scheme.as_str() {
         "sftp" => {
@@ -356,7 +367,7 @@ pub fn upload_traced(
     user: &str,
     mut trace: Option<&mut (dyn std::io::Write + '_)>,
 ) -> Result<()> {
-    let path = remote_path(url, "sftp/scp path")?.to_string();
+    let path = remote_path(url, "sftp/scp path")?;
     let mut client = connect_auth(url, user, opts, trace.as_deref_mut())?;
     match url.scheme.as_str() {
         "sftp" => {
@@ -394,6 +405,13 @@ fn sftp_download(client: &mut Client, path: &str) -> Result<Vec<u8>> {
             break;
         }
         offset += chunk.len() as u64;
+        // The whole file is buffered; bound it so a server streaming an
+        // endless "file" (e.g. /dev/zero) fails instead of exhausting memory.
+        if out.len() + chunk.len() > MAX_SFTP_DOWNLOAD {
+            return Err(Error::Ssh(format!(
+                "sftp read {path:?}: file exceeds {MAX_SFTP_DOWNLOAD} bytes"
+            )));
+        }
         out.extend_from_slice(&chunk);
         // A short read does not necessarily mean EOF in SFTP; only an empty
         // (EOF status) read does. Keep looping until the empty read above.
@@ -423,35 +441,68 @@ fn sftp_upload(client: &mut Client, path: &str, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// A temp file that removes itself on drop, so the SCP bridge never leaves
-/// stray files behind even on an early `?` return.
+/// A temp file for the SCP bridge, inside a freshly created private directory,
+/// both removed on drop so no stray files are left even on an early `?`.
+///
+/// puressh's SCP API opens the local path itself, so we can't hand it an
+/// already-open `O_EXCL` file. Instead the file lives in a directory we create
+/// atomically (`create_dir` fails if the name exists) under an unpredictable
+/// CSPRNG name with owner-only permissions: another local user can neither
+/// pre-plant a symlink at the path nor read or swap the contents mid-transfer
+/// — the classic shared-`/tmp` race a predictable `rsurl-scp-<pid>-<n>` name
+/// was open to.
 struct TempFile {
+    dir: PathBuf,
     path: PathBuf,
 }
 
 impl TempFile {
-    /// Create a unique temp path under the system temp dir. Uses pid + a
-    /// monotonically increasing counter for uniqueness without extra deps.
-    fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!("rsurl-scp-{}-{}-{}", std::process::id(), tag, n));
-        TempFile { path }
+    fn new(tag: &str) -> Result<Self> {
+        use purecrypto::rng::{OsRng, RngCore};
+        let mut last_err = None;
+        for _ in 0..8 {
+            let mut rnd = [0u8; 16];
+            OsRng.fill_bytes(&mut rnd);
+            let name: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = std::env::temp_dir().join(format!("rsurl-scp-{name}"));
+            match create_private_dir(&dir) {
+                Ok(()) => {
+                    let path = dir.join(tag);
+                    return Ok(TempFile { dir, path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+                Err(e) => return Err(Error::Ssh(format!("scp: creating temp dir: {e}"))),
+            }
+        }
+        Err(Error::Ssh(format!(
+            "scp: creating temp dir: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )))
     }
+}
+
+/// `mkdir` that fails if the path exists, with mode 0700 on unix.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
 }
 
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.dir);
     }
 }
 
 /// SCP download: drive `scp -f` into a temp file, then read the bytes back.
 /// The temp file is removed by [`TempFile`]'s `Drop`.
 fn scp_download(client: &mut Client, path: &str) -> Result<Vec<u8>> {
-    let tmp = TempFile::new("recv");
+    let tmp = TempFile::new("recv")?;
     // We're fetching a single file to a concrete local path, not into a dir.
     let mut opts = puressh::scp::ScpRecvOptions::default();
     opts.target_is_file = true;
@@ -466,7 +517,7 @@ fn scp_download(client: &mut Client, path: &str) -> Result<Vec<u8>> {
 /// SCP upload: write `body` to a temp file, then `scp -t` it to the remote
 /// path. The temp file is removed by [`TempFile`]'s `Drop`.
 fn scp_upload(client: &mut Client, path: &str, body: &[u8]) -> Result<()> {
-    let tmp = TempFile::new("send");
+    let tmp = TempFile::new("send")?;
     std::fs::write(&tmp.path, body)
         .map_err(|e| Error::Ssh(format!("scp send: writing temp file: {e}")))?;
     let opts = puressh::scp::ScpSendOptions::default();
@@ -672,13 +723,43 @@ mod tests {
 
     #[test]
     fn temp_file_removed_on_drop() {
-        let path;
+        let (path, dir);
         {
-            let tmp = TempFile::new("droptest");
+            let tmp = TempFile::new("droptest").unwrap();
             path = tmp.path.clone();
+            dir = tmp.dir.clone();
             std::fs::write(&tmp.path, b"data").unwrap();
             assert!(path.exists());
         }
         assert!(!path.exists(), "temp file should be removed on drop");
+        assert!(!dir.exists(), "private temp dir should be removed on drop");
+    }
+
+    #[test]
+    fn temp_file_lives_in_fresh_private_dir() {
+        let a = TempFile::new("x").unwrap();
+        let b = TempFile::new("x").unwrap();
+        // Unpredictable, distinct directories.
+        assert_ne!(a.dir, b.dir);
+        assert!(a.path.starts_with(&a.dir));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a.dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "temp dir must be owner-only: {mode:o}");
+        }
+        // Creating over an existing name fails rather than reusing it.
+        assert!(create_private_dir(&a.dir).is_err());
+    }
+
+    #[test]
+    fn remote_path_decodes_and_handles_home_prefix() {
+        let u = Url::parse("sftp://h/dir/my%20file").unwrap();
+        assert_eq!(remote_path(&u, "p").unwrap(), "/dir/my file");
+        // curl's `/~/` → relative to the login (home) directory.
+        let u = Url::parse("sftp://h/~/notes.txt").unwrap();
+        assert_eq!(remote_path(&u, "p").unwrap(), "notes.txt");
+        let u = Url::parse("scp://h/a%0ab").unwrap();
+        assert!(remote_path(&u, "p").is_err());
     }
 }

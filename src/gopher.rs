@@ -7,17 +7,17 @@
 //! Gopher has no length framing: the server writes the response and then
 //! closes the connection, so the client reads to EOF.
 //!
-//! Item-type `7` (search) is supported: a query supplied as the URL's
-//! `?<words>` component is appended to the selector with a TAB separator, so
-//! `gopher://host/7<selector>?<words>` sends `<selector>\t<words>\r\n` on the
-//! wire (RFC 1436 §3.4). This matches curl's behaviour of carrying the search
-//! string in the URL. A literal TAB cannot reach here because the URL parser
-//! rejects control bytes, so the `?<words>` convention is the supported one.
+//! The selector is percent-decoded, as curl does, so a search item is sent the
+//! curl way as `gopher://host/7<selector>%09<words>` → `<selector>\t<words>`
+//! (RFC 1436 §3.4). For item type `7` only, `?<words>` is accepted as a
+//! convenient alternative; for every other type a `?` is an ordinary selector
+//! character.
 
 use std::io::{Read, Write};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
+use crate::url::percent_decode;
 use crate::url::Url;
 
 /// I/O timeout for the Gopher control connection. Gopher has no length
@@ -82,86 +82,50 @@ fn read_capped<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
 /// A Gopher URL path is `/<itemtype><selector>` where `<itemtype>` is a single
 /// byte and the selector is everything after it. The item-type byte is *not*
 /// part of the wire selector; it's only a hint to the client about how to
-/// render the response.
+/// render the response. The rest is percent-decoded, as curl does (RFC 4266
+/// §2.1), so a search string can be sent the curl way as `%09<words>`.
 ///
 /// * `""` or `"/"` → empty selector (root menu, defaults to type `1`).
 /// * `"/1"` → empty selector (root menu, explicit directory type).
 /// * `"/0foo"` → `"foo"` (text file selector).
-/// * `"/1docs/index"` → `"docs/index"` (directory selector).
+/// * `"/1docs/my%20index"` → `"docs/my index"`.
+/// * `"/0cgi?x=1"` → `"cgi?x=1"` (a `?` is part of an ordinary selector).
 ///
 /// # Item-type 7 (search)
 ///
 /// For a search item the client sends `<selector>\t<search-words>` (RFC 1436
-/// §3.4). curl carries the search words in the URL, so we treat the URL's
-/// query component (everything after the first `?`) as the search words and
-/// join them to the selector with a TAB:
+/// §3.4). Besides curl's `%09` form, a type-7 URL may carry the words after
+/// the first `?`, which is joined to the selector with a TAB:
 ///
 /// * `"/7find?cats"` → `"find\tcats"`.
-/// * `"/7?cats"` → `"\tcats"` (empty selector, just a query).
-///
-/// The split on `?` happens regardless of item type, so `?` is reserved as the
-/// search separator for every Gopher URL. A non-search selector with no `?`
-/// gets no trailing TAB. A literal TAB cannot reach here — the URL parser
-/// rejects control bytes — so `?<words>` is the only supported convention.
+/// * `"/7find%09cats"` → `"find\tcats"`.
 ///
 /// The result is written verbatim into a `\r\n`-terminated request line, so a
-/// raw CR, LF, NUL, or other control byte in the selector or search words
-/// would let an attacker inject a second request or corrupt the wire framing.
-/// The TAB we insert as the separator is allowed; any other control byte
-/// (including a CR/LF/NUL inside the search words) is rejected with
-/// [`Error::InvalidUrl`]. The item-type byte is not validated because it is
-/// dropped before it can reach the wire.
+/// CR, LF, NUL, or other control byte — raw or percent-encoded — would let an
+/// attacker inject a second request or corrupt the wire framing; those are
+/// rejected with [`Error::InvalidUrl`]. TAB is the Gopher field separator and
+/// is allowed.
 fn selector_from_path(path: &str) -> Result<String> {
     // Strip leading slash if present.
     let without_slash = path.strip_prefix('/').unwrap_or(path);
     // Drop the item-type byte (first char), if any.
     let mut chars = without_slash.chars();
-    let after_type = match chars.next() {
-        Some(_) => chars.as_str(),
-        None => "",
+    let item_type = chars.next();
+    let after_type = chars.as_str();
+
+    let line = match (item_type, after_type.split_once('?')) {
+        (Some('7'), Some((sel, words))) => {
+            format!("{}\t{}", percent_decode(sel), percent_decode(words))
+        }
+        _ => percent_decode(after_type),
     };
 
-    // Determine the selector and an optional search query.
-    //
-    // A `?` is the curl-style separator: everything after the first `?` is the
-    // search words. As a fallback we also accept a selector that already
-    // carries a literal TAB separator (`<selector>\t<words>`) — the TAB is then
-    // the separator that is already in place. The `?` form takes precedence so
-    // a `?` always wins when both are present.
-    let (selector, query) = match after_type.split_once('?') {
-        Some((sel, q)) => (sel, Some(q)),
-        None => match after_type.split_once('\t') {
-            Some((sel, q)) => (sel, Some(q)),
-            None => (after_type, None),
-        },
-    };
-
-    if selector.bytes().any(|b| b.is_ascii_control()) {
+    if line.bytes().any(|b| b.is_ascii_control() && b != b'\t') {
         return Err(Error::InvalidUrl(format!(
             "gopher: control byte in selector of path '{path}'"
         )));
     }
-
-    match query {
-        Some(q) => {
-            // The query is joined back with a single TAB separator, so embedded
-            // CR/LF/NUL/etc. would still corrupt framing or inject a second
-            // request line — reject them. A further TAB inside the query is a
-            // control byte and is likewise rejected; only the one separator TAB
-            // we insert is permitted.
-            if q.bytes().any(|b| b.is_ascii_control()) {
-                return Err(Error::InvalidUrl(format!(
-                    "gopher: control byte in search query of path '{path}'"
-                )));
-            }
-            let mut line = String::with_capacity(selector.len() + 1 + q.len());
-            line.push_str(selector);
-            line.push('\t');
-            line.push_str(q);
-            Ok(line)
-        }
-        None => Ok(selector.to_string()),
-    }
+    Ok(line)
 }
 
 #[cfg(test)]
@@ -221,9 +185,21 @@ mod tests {
     }
 
     #[test]
-    fn search_query_works_for_any_item_type() {
-        // The `?` separator is honoured regardless of item type.
-        assert_eq!(selector_from_path("/1dir?term").unwrap(), "dir\tterm");
+    fn question_mark_is_literal_outside_search_items() {
+        // Only a type-7 search treats `?` as the words separator; elsewhere it
+        // is part of the selector (CGI-style gopher selectors), as in curl.
+        assert_eq!(selector_from_path("/1dir?term").unwrap(), "dir?term");
+        assert_eq!(selector_from_path("/0cgi?x=1").unwrap(), "cgi?x=1");
+    }
+
+    #[test]
+    fn selector_is_percent_decoded() {
+        assert_eq!(selector_from_path("/0my%20file").unwrap(), "my file");
+        // curl's search form: an encoded TAB separates selector and words.
+        assert_eq!(selector_from_path("/7find%09cats").unwrap(), "find\tcats");
+        // Encoded CR/LF/NUL are still rejected after decoding.
+        assert!(selector_from_path("/0a%0d%0ab").is_err());
+        assert!(selector_from_path("/0a%00").is_err());
     }
 
     #[test]
@@ -268,10 +244,10 @@ mod tests {
     }
 
     #[test]
-    fn search_query_rejects_embedded_tab() {
-        // Only the separator TAB we insert is allowed; a TAB inside the query
-        // is a control byte and is rejected.
-        assert!(selector_from_path("/7find?a\tb").is_err());
+    fn search_query_allows_further_tabs() {
+        // TAB is Gopher's field separator (Gopher+ appends more fields); it
+        // cannot break the CRLF framing, so it is allowed.
+        assert_eq!(selector_from_path("/7find?a\tb").unwrap(), "find\ta\tb");
     }
 
     #[test]

@@ -79,7 +79,11 @@ impl RtspResponse {
 /// `CSeq` is parsed and verified against the request's; a mismatch is an
 /// error.
 pub struct Session {
-    stream: Box<dyn NetStream>,
+    /// The control connection, buffered for the *whole* session: servers send
+    /// the first interleaved `$` frames in the same segment as the `PLAY`
+    /// response, so a per-request reader would discard them with its
+    /// read-ahead.
+    stream: BufReader<Box<dyn NetStream>>,
     /// Absolute request-URI used on every request line.
     uri: String,
     /// Next CSeq value to emit. Starts at 1, increments per request.
@@ -113,7 +117,7 @@ impl Session {
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
         Ok(Session {
-            stream,
+            stream: BufReader::new(stream),
             uri: request_uri(url),
             cseq: 1,
             session_id: None,
@@ -134,11 +138,11 @@ impl Session {
         self.cseq += 1;
         let request = build_request(method, &self.uri, cseq, extra_headers);
 
-        self.stream.write_all(request.as_bytes())?;
-        self.stream.flush()?;
+        let w = self.stream.get_mut();
+        w.write_all(request.as_bytes())?;
+        w.flush()?;
 
-        let reader = BufReader::new(&mut self.stream);
-        let resp = read_response(reader)?;
+        let resp = read_response(&mut self.stream)?;
 
         // Verify the echoed CSeq matches what we sent.
         let resp_cseq = resp
@@ -173,11 +177,13 @@ impl Session {
     /// `MAX_INTERLEAVED_BYTES` is reached, or on the first non-`$` byte (an
     /// interleaved RTSP message, which this minimal receiver does not parse).
     pub fn read_interleaved(&mut self, sink: &mut dyn Write) -> Result<u64> {
-        self.stream.set_read_timeout(Some(INTERLEAVED_IDLE))?;
+        self.stream
+            .get_ref()
+            .set_read_timeout(Some(INTERLEAVED_IDLE))?;
         let mut total: u64 = 0;
         loop {
             let mut hdr = [0u8; 4];
-            if !fill(&mut *self.stream, &mut hdr)? {
+            if !fill(&mut self.stream, &mut hdr)? {
                 break; // EOF or idle — done.
             }
             if hdr[0] != b'$' {
@@ -185,7 +191,7 @@ impl Session {
             }
             let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
             let mut payload = vec![0u8; len];
-            if !fill(&mut *self.stream, &mut payload)? {
+            if !fill(&mut self.stream, &mut payload)? {
                 break; // Truncated frame — stop.
             }
             sink.write_all(&payload)?;
@@ -303,7 +309,7 @@ pub fn run_method(url: &Url, method: &str) -> Result<Vec<u8>> {
 /// Read exactly `buf.len()` bytes, returning `false` (rather than erroring)
 /// when the stream closes (EOF) or goes idle (read timeout) — the two clean
 /// ways an interleaved capture ends. A genuine I/O error still propagates.
-fn fill(stream: &mut dyn NetStream, buf: &mut [u8]) -> Result<bool> {
+fn fill<R: Read>(stream: &mut R, buf: &mut [u8]) -> Result<bool> {
     let mut off = 0;
     while off < buf.len() {
         match stream.read(&mut buf[off..]) {
@@ -396,27 +402,39 @@ fn parse_status_line(line: &str) -> Result<(String, u16, String)> {
     Ok((version, status, reason))
 }
 
-/// Read a full RTSP response from `r`: the status line, the headers (until the
-/// blank line), and the `Content-Length`-bounded body (RTSP does not use
-/// chunked encoding). Status validation and CSeq checks are the caller's job.
-fn read_response<R: Read>(reader: BufReader<R>) -> Result<RtspResponse> {
-    let mut r = reader;
-
-    let mut status_line = String::new();
-    let n = r.read_line(&mut status_line)?;
+/// Read one line (up to and including `\n`) of at most `cap` bytes, decoding
+/// lossily. EOF before any byte is [`Error::UnexpectedEof`]; a longer line is
+/// rejected as oversized headers.
+fn read_capped_line<R: BufRead>(r: &mut R, cap: usize) -> Result<String> {
+    let mut buf = Vec::new();
+    let n = r
+        .by_ref()
+        .take(cap as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
     if n == 0 {
         return Err(Error::UnexpectedEof);
     }
+    if buf.len() > cap {
+        return Err(Error::BadResponse("headers exceed 64 KiB".into()));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read a full RTSP response from `r`: the status line, the headers (until the
+/// blank line), and the `Content-Length`-bounded body (RTSP does not use
+/// chunked encoding). Status validation and CSeq checks are the caller's job.
+fn read_response<R: BufRead>(r: &mut R) -> Result<RtspResponse> {
+    let mut header_bytes = 0usize;
+    let status_line = read_capped_line(r, MAX_HEADER_BYTES)?;
+    header_bytes += status_line.len();
     let (version, status, reason) = parse_status_line(status_line.trim_end_matches(['\r', '\n']))?;
 
     let mut headers: Vec<(String, String)> = Vec::new();
-    let mut header_bytes = 0usize;
     loop {
-        let mut line = String::new();
-        let n = r.read_line(&mut line)?;
-        if n == 0 {
-            return Err(Error::UnexpectedEof);
-        }
+        // Bound the line read itself by the remaining header budget, so a
+        // newline-less flood errors instead of growing a String forever.
+        let line = read_capped_line(r, MAX_HEADER_BYTES.saturating_sub(header_bytes))?;
+        let n = line.len();
         header_bytes += n;
         if header_bytes > MAX_HEADER_BYTES {
             return Err(Error::BadResponse("headers exceed 64 KiB".into()));
@@ -450,7 +468,7 @@ fn read_response<R: Read>(reader: BufReader<R>) -> Result<RtspResponse> {
 
     let mut body = Vec::with_capacity(content_length as usize);
     if content_length > 0 {
-        r.take(content_length).read_to_end(&mut body)?;
+        r.by_ref().take(content_length).read_to_end(&mut body)?;
         if (body.len() as u64) < content_length {
             return Err(Error::UnexpectedEof);
         }
@@ -639,8 +657,8 @@ mod tests {
              {sdp}",
             sdp.len()
         );
-        let reader = BufReader::new(Cursor::new(response.into_bytes()));
-        let resp = read_response(reader).unwrap();
+        let mut reader = BufReader::new(Cursor::new(response.into_bytes()));
+        let resp = read_response(&mut reader).unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.header("CSeq"), Some("1"));
         assert_eq!(resp.body, sdp.as_bytes());
@@ -653,8 +671,8 @@ mod tests {
         let response = b"RTSP/1.0 200 OK\r\n\
                          CSeq: 2\r\n\
                          \r\n";
-        let reader = BufReader::new(Cursor::new(response.to_vec()));
-        let resp = read_response(reader).unwrap();
+        let mut reader = BufReader::new(Cursor::new(response.to_vec()));
+        let resp = read_response(&mut reader).unwrap();
         assert!(resp.body.is_empty());
     }
 
@@ -665,8 +683,8 @@ mod tests {
                          Content-Length: 100\r\n\
                          \r\n\
                          short";
-        let reader = BufReader::new(Cursor::new(response.to_vec()));
-        let err = read_response(reader).unwrap_err();
+        let mut reader = BufReader::new(Cursor::new(response.to_vec()));
+        let err = read_response(&mut reader).unwrap_err();
         assert!(matches!(err, Error::UnexpectedEof));
     }
 
@@ -681,8 +699,8 @@ mod tests {
         let response = b"RTSP/1.0 200 OK\r\n\
                          Content-Length: 4294967297\r\n\
                          \r\n";
-        let reader = BufReader::new(Cursor::new(response.to_vec()));
-        let err = read_response(reader).unwrap_err();
+        let mut reader = BufReader::new(Cursor::new(response.to_vec()));
+        let err = read_response(&mut reader).unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("body too large"), "msg = {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
@@ -691,8 +709,8 @@ mod tests {
 
     #[test]
     fn read_response_unexpected_eof_before_status() {
-        let reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
-        let err = read_response(reader).unwrap_err();
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+        let err = read_response(&mut reader).unwrap_err();
         assert!(matches!(err, Error::UnexpectedEof));
     }
 
@@ -765,6 +783,33 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(out, b"RTPARTCP!");
         assert_eq!(n, 9);
+    }
+
+    #[test]
+    fn play_response_and_first_frame_in_one_segment_are_both_kept() {
+        // Real servers put the first `$` frame in the same TCP segment as the
+        // PLAY reply; the session's reader must not drop that read-ahead.
+        let mut play = b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n".to_vec();
+        play.extend_from_slice(&[0x24, 0x00, 0x00, 0x03]);
+        play.extend_from_slice(b"RTP");
+        let (u, handle) = mock_server(vec![play]);
+        let mut session = Session::connect(&u).unwrap();
+        session.session_id = Some("s1".into());
+        session.play().unwrap();
+        let mut out = Vec::new();
+        let n = session.read_interleaved(&mut out).unwrap();
+        drop(session);
+        handle.join().unwrap();
+        assert_eq!(out, b"RTP");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn read_response_rejects_newline_less_header_flood() {
+        let mut data = b"RTSP/1.0 200 OK\r\n".to_vec();
+        data.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES + 10));
+        let mut reader = BufReader::new(Cursor::new(data));
+        assert!(read_response(&mut reader).is_err());
     }
 
     #[test]

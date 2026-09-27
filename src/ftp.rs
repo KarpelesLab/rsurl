@@ -16,8 +16,18 @@
 //! Uploads use `STOR` (see [`store`]), with optional `REST <offset>` resume
 //! when the caller supplies a byte offset, or `APPE` (see [`append`]) to
 //! append to an existing remote file; `--ftp-create-dirs` issues `MKD` for the
-//! upload path's directories first. Explicit `AUTH TLS` upgrade is intentionally
-//! not implemented yet.
+//! upload path's directories first. Explicit FTPS (`AUTH TLS`, RFC 4217) is
+//! used for a plain `ftp://` URL when TLS is required (curl `--ssl-reqd`); the
+//! transfer fails rather than falling back to cleartext if the server refuses.
+//! Once the control channel is TLS (implicit or explicit), `PBSZ 0` + `PROT P`
+//! request a protected data channel, which is then TLS-wrapped too.
+//!
+//! Paths follow curl's default `multicwd` method: each directory component of
+//! the (percent-decoded) URL path is entered with its own `CWD`, relative to the
+//! login directory, and the transfer command names only the final component. A
+//! path starting with `//` is absolute (`CWD /` first). A trailing `;type=A`,
+//! `;type=I` or `;type=D` (RFC 1738) selects ASCII, binary, or a name-only
+//! directory listing (`NLST`).
 //!
 //! For TLS we use [`crate::tls::connect_over`] on both the control channel
 //! (on connect, for implicit FTPS) and the data channel (using the host
@@ -32,39 +42,183 @@ use crate::url::Url;
 
 /// A duplex byte stream that's either a plain (possibly proxied) socket or a
 /// TLS-wrapped one — the shared transport enum. Lets us drive the same FTP
-/// state machine over both schemes. (FTPS is implicit here, so the transport's
-/// in-place upgrade is unused.)
+/// state machine over both schemes, and its in-place upgrade implements
+/// explicit `AUTH TLS`.
 use crate::net::MaybeTlsStream as Stream;
+use crate::url::percent_decode;
 
-/// A logged-in FTP control channel, set to binary mode, ready for a transfer
-/// command. Carries the control connection's peer IP so the data connection
-/// can be safely dialed back to it (see [`open_passive`]).
+/// Idle timeout applied to every read/write on the control and data sockets,
+/// so a server that stalls (or never answers) fails the transfer instead of
+/// hanging it forever.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long active mode (`-P`) waits for the server to open the data
+/// connection back to us — curl's `--ftp-port` default accept timeout.
+const ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Longest single control-channel reply line we accept.
+const MAX_LINE: usize = 8 * 1024;
+
+/// Cap on the total text of one (multi-line) reply, so a hostile server can't
+/// grow memory without bound by never sending the terminating `NNN ` line.
+const MAX_REPLY: usize = 256 * 1024;
+
+/// A logged-in FTP control channel, set to the requested transfer type, ready
+/// for a transfer command. Carries the control connection's peer IP so the
+/// data connection can be safely dialed back to it (see [`open_passive`]).
 struct Control {
     ctrl: BufReader<Stream>,
     ctrl_peer_ip: std::net::IpAddr,
     /// Our local IP on the control connection — advertised to the server in
     /// `EPRT`/`PORT` for active-mode data connections.
     ctrl_local_ip: std::net::IpAddr,
+    /// The control channel is TLS (implicit `ftps://` or an `AUTH TLS`
+    /// upgrade) and `PROT P` was accepted: data connections are TLS-wrapped.
+    tls: bool,
 }
 
-/// Connect, read the banner, log in (anonymous or `user[:pass]@`), and switch
-/// to binary mode (`TYPE I`). Shared by [`fetch`] (RETR/LIST) and [`store`]
-/// (STOR). Returns the ready control channel.
-fn connect_login(url: &Url, cfg: &NetConfig) -> Result<Control> {
+/// RFC 1738 `;type=` transfer type selected by the URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeCode {
+    /// `;type=I` (and the default): binary image.
+    Image,
+    /// `;type=A`: ASCII.
+    Ascii,
+    /// `;type=D`: directory listing of names only (`NLST`).
+    Dir,
+}
+
+/// A URL path split the way curl's default `multicwd` method walks it.
+#[derive(Debug, PartialEq, Eq)]
+struct FtpPath {
+    /// Directories to `CWD` into, in order (percent-decoded). A leading `"/"`
+    /// entry comes from an absolute `//path` URL.
+    dirs: Vec<String>,
+    /// The final component (percent-decoded); empty for a directory URL.
+    file: String,
+    typecode: TypeCode,
+}
+
+/// Split and percent-decode an FTP URL path. Rejects control bytes (CR/LF/NUL
+/// and friends) *after* decoding, so `%0d%0a` can't smuggle a second command
+/// onto the control channel.
+fn parse_ftp_path(path: &str) -> Result<FtpPath> {
+    // FTP URLs carry no query; anything after `?` is not part of the path.
+    let path = path.split('?').next().unwrap_or("");
+    let mut path = path.strip_prefix('/').unwrap_or(path);
+    let mut typecode = TypeCode::Image;
+    if let Some(i) = path.rfind(";type=") {
+        let code = &path[i + 6..];
+        typecode = match code {
+            "a" | "A" => TypeCode::Ascii,
+            "i" | "I" => TypeCode::Image,
+            "d" | "D" => TypeCode::Dir,
+            _ => {
+                return Err(Error::InvalidUrl(format!(
+                    "ftp: unknown ;type= code {code:?}"
+                )))
+            }
+        };
+        path = &path[..i];
+    }
+    let mut comps: Vec<&str> = path.split('/').collect();
+    let file_raw = comps.pop().unwrap_or("");
+    let mut dirs = Vec::new();
+    for (i, c) in comps.iter().enumerate() {
+        if c.is_empty() {
+            // `ftp://host//etc/x`: the leading empty component makes the path
+            // absolute. Other empty components (`a//b`) are skipped.
+            if i == 0 {
+                dirs.push("/".to_string());
+            }
+            continue;
+        }
+        let d = percent_decode(c);
+        reject_ctl(&d, "ftp path")?;
+        dirs.push(d);
+    }
+    let file = percent_decode(file_raw);
+    reject_ctl(&file, "ftp path")?;
+    Ok(FtpPath {
+        dirs,
+        file,
+        typecode,
+    })
+}
+
+/// `CWD` into each directory of `dirs`. With `create` (curl
+/// `--ftp-create-dirs`, uploads only) a refused `CWD` is followed by `MKD` and
+/// a second `CWD`, exactly as curl does; otherwise a refused `CWD` fails the
+/// transfer (curl's "access denied" to the remote dir).
+fn cwd_path<R: Read + Write>(ctrl: &mut BufReader<R>, dirs: &[String], create: bool) -> Result<()> {
+    for dir in dirs {
+        send(ctrl, &format!("CWD {dir}"))?;
+        let (c, m) = read_reply(ctrl)?;
+        if is_positive(c) {
+            continue;
+        }
+        if create && dir != "/" {
+            send(ctrl, &format!("MKD {dir}"))?;
+            let _ = read_reply(ctrl)?; // 257 created, or 5xx (raced/exists)
+            send(ctrl, &format!("CWD {dir}"))?;
+            let (c2, m2) = read_reply(ctrl)?;
+            if is_positive(c2) {
+                continue;
+            }
+            return Err(Error::BadResponse(format!("ftp CWD {dir}: {c2} {m2}")));
+        }
+        return Err(Error::BadResponse(format!("ftp CWD {dir}: {c} {m}")));
+    }
+    Ok(())
+}
+
+/// Explicit FTPS (RFC 4217 §4): ask for `AUTH TLS` (then the legacy
+/// `AUTH SSL`, as curl does) and upgrade the control channel in place. Any
+/// refusal is an error — the caller only asks when TLS is *required*, so
+/// falling back to cleartext would leak the credentials.
+fn auth_tls(ctrl: &mut BufReader<Stream>, host: &str) -> Result<()> {
+    for mech in ["TLS", "SSL"] {
+        send(ctrl, &format!("AUTH {mech}"))?;
+        let (c, _) = read_reply(ctrl)?;
+        if c == 234 || c == 334 {
+            // Nothing may follow the 234 before the handshake: bytes already
+            // buffered here were sent in plaintext and would otherwise be read
+            // as if they came over TLS (STARTTLS response injection).
+            if !ctrl.buffer().is_empty() {
+                return Err(Error::BadResponse(
+                    "ftp: server sent data after AUTH TLS reply".into(),
+                ));
+            }
+            ctrl.get_mut().upgrade(host)?;
+            return Ok(());
+        }
+    }
+    Err(Error::BadResponse(
+        "ftp: TLS required (--ssl-reqd) but the server refused AUTH TLS".into(),
+    ))
+}
+
+/// Connect, read the banner, upgrade to TLS if required, log in (anonymous or
+/// `user[:pass]@`), negotiate a protected data channel when the control
+/// channel is TLS, and set the transfer type. Shared by [`fetch`] (RETR/LIST)
+/// and [`store`] (STOR). Returns the ready control channel.
+fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Control> {
     if url.scheme != "ftp" && url.scheme != "ftps" {
         return Err(Error::UnsupportedScheme(url.scheme.clone()));
     }
 
-    // 1) Control channel, dialed through the configured transport.
+    // 1) Control channel, dialed through the configured transport, bounded by
+    //    an idle timeout so a silent server can't hang the transfer.
     let tcp = cfg.connect(&url.host, url.port)?;
+    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     // Remember the control connection's peer address. For a *direct* dial PASV
     // replies carry a server-chosen data IP which we deliberately ignore (a
     // hostile control server could point it at an internal service — the
     // classic FTP "bounce"/SSRF); curl's safe default is to dial the data
     // connection to the control peer using only the server-supplied port. When
-    // a proxy/custom connector is in play the proxy is the trust boundary and
-    // `peer_addr` is the proxy (or unavailable), so we instead reach the
-    // PASV/EPSV-advertised endpoint through the connector (see `open_data`).
+    // a proxy/custom connector is in play the proxy dials the control *host*
+    // name instead (see `open_passive`).
     let ctrl_peer_ip = if cfg.connector.is_direct() {
         tcp.peer_addr()?.ip()
     } else {
@@ -89,8 +243,17 @@ fn connect_login(url: &Url, cfg: &NetConfig) -> Result<Control> {
         return Err(Error::BadResponse(format!("ftp banner: {code}")));
     }
 
-    // 3) Login. Anonymous by default; honor `user[:pass]@` from the URL.
+    // 2b) Explicit FTPS: `--ssl-reqd` on a plain `ftp://` URL must upgrade
+    //     before USER/PASS go out, or fail.
+    if url.scheme == "ftp" && cfg.require_tls {
+        auth_tls(&mut ctrl, &url.host)?;
+    }
+    let tls = !ctrl.get_ref().is_plain();
+
+    // 3) Login. Anonymous by default; honor `user[:pass]@` from the URL
+    //    (percent-decoded, like curl).
     let (user, pass) = split_userinfo(url.userinfo.as_deref());
+    let (user, pass) = (percent_decode(&user), percent_decode(&pass));
     // Reject control characters in URL-derived credentials so a CR/LF can't
     // smuggle extra FTP commands onto the control channel (`send` also guards
     // the assembled line, but validating the inputs gives a clearer error).
@@ -116,18 +279,67 @@ fn connect_login(url: &Url, cfg: &NetConfig) -> Result<Control> {
         _ => return Err(Error::BadResponse(format!("ftp USER: {c}"))),
     }
 
-    // 4) Binary mode.
-    send(&mut ctrl, "TYPE I")?;
+    // 4) Protected data channel (RFC 4217 §8-9). Servers that enforce TLS on
+    //    data connections refuse RETR/STOR (522) until `PROT P`, and one that
+    //    doesn't would otherwise send plaintext while we attempt a handshake.
+    if tls {
+        send(&mut ctrl, "PBSZ 0")?;
+        let (c, m) = read_reply(&mut ctrl)?;
+        if !is_positive(c) {
+            return Err(Error::BadResponse(format!("ftp PBSZ 0: {c} {m}")));
+        }
+        send(&mut ctrl, "PROT P")?;
+        let (c, m) = read_reply(&mut ctrl)?;
+        if !is_positive(c) {
+            return Err(Error::BadResponse(format!("ftp PROT P: {c} {m}")));
+        }
+    }
+
+    // 5) Transfer type: binary unless `;type=A` asked for ASCII. Listings are
+    //    ASCII by nature.
+    let ty = match typecode {
+        TypeCode::Image => "I",
+        TypeCode::Ascii | TypeCode::Dir => "A",
+    };
+    send(&mut ctrl, &format!("TYPE {ty}"))?;
     let (c, m) = read_reply(&mut ctrl)?;
     if c != 200 {
-        return Err(Error::BadResponse(format!("ftp TYPE I: {c} {m}")));
+        return Err(Error::BadResponse(format!("ftp TYPE {ty}: {c} {m}")));
     }
 
     Ok(Control {
         ctrl,
         ctrl_peer_ip,
         ctrl_local_ip,
+        tls,
     })
+}
+
+/// Accept the server's active-mode data connection, giving up after
+/// [`ACCEPT_TIMEOUT`] instead of blocking forever when it never connects.
+fn accept_with_timeout(
+    listener: &std::net::TcpListener,
+) -> Result<(std::net::TcpStream, std::net::SocketAddr)> {
+    listener.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + ACCEPT_TIMEOUT;
+    loop {
+        match listener.accept() {
+            Ok((sock, addr)) => {
+                sock.set_nonblocking(false)?;
+                return Ok((sock, addr));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "ftp active: server never opened the data connection",
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// A data connection that's either already dialed (passive) or waiting for the
@@ -160,7 +372,9 @@ impl DataConn {
                 peer_ip,
                 tls_host,
             } => {
-                let (sock, addr) = listener.accept()?;
+                let (sock, addr) = accept_with_timeout(&listener)?;
+                sock.set_read_timeout(Some(IO_TIMEOUT))?;
+                sock.set_write_timeout(Some(IO_TIMEOUT))?;
                 // Only the control server may open the data connection; reject
                 // any other source (a port-scanner or off-path attacker).
                 if addr.ip() != peer_ip {
@@ -188,6 +402,7 @@ fn open_data<R: Read + Write>(
     url: &Url,
     ctrl_peer_ip: std::net::IpAddr,
     ctrl_local_ip: std::net::IpAddr,
+    tls: bool,
     cfg: &NetConfig,
 ) -> Result<DataConn> {
     if cfg.ftp_active {
@@ -201,7 +416,7 @@ fn open_data<R: Read + Write>(
         let listener = std::net::TcpListener::bind((ctrl_local_ip, 0))?;
         let port = listener.local_addr()?.port();
         announce_active(ctrl, ctrl_local_ip, port)?;
-        let tls_host = (url.scheme == "ftps").then(|| url.host.clone());
+        let tls_host = tls.then(|| url.host.clone());
         return Ok(DataConn::Active {
             listener,
             peer_ip: ctrl_peer_ip,
@@ -216,7 +431,12 @@ fn open_data<R: Read + Write>(
         cfg.ftp_use_epsv,
     )?;
     let data_tcp = cfg.connect(&data_host, data_port)?;
-    Ok(DataConn::Ready(if url.scheme == "ftps" {
+    data_tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    data_tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+    // Note: the data-channel TLS session is a fresh handshake; the TLS layer
+    // exposes no session-resumption hook, so servers enforcing
+    // `require_ssl_reuse` (vsftpd's default) will refuse it.
+    Ok(DataConn::Ready(if tls {
         // Per RFC 4217 §10.2: SNI must be the original hostname, not the
         // address we got from PASV/EPSV (which is often an IP literal).
         Stream::Tls(Box::new(crate::tls::connect_over(data_tcp, &url.host)?))
@@ -277,24 +497,32 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
 /// CLI download can enforce `--limit-rate`/`-#`/`--max-filesize`/`-y`/`-Y` and
 /// avoid holding a large file in memory.
 pub(crate) fn fetch_to_with(url: &Url, cfg: &NetConfig, sink: &mut dyn Write) -> Result<u64> {
-    let mut con = connect_login(url, cfg)?;
+    let fp = parse_ftp_path(&url.path)?;
+    let mut con = connect_login(url, cfg, fp.typecode)?;
 
-    // 5+6) Set up the data connection: passive (EPSV→PASV, we dial) or active
-    //       (EPRT/PORT, the server dials back). Active mode's accept() happens
-    //       after the transfer command below.
-    let dataconn = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, con.ctrl_local_ip, cfg)?;
+    // 5) Walk into the directory (curl's multicwd), relative to the login dir.
+    cwd_path(&mut con.ctrl, &fp.dirs, false)?;
+
+    // 6) Set up the data connection: passive (EPSV→PASV, we dial) or active
+    //    (EPRT/PORT, the server dials back). Active mode's accept() happens
+    //    after the transfer command below.
+    let dataconn = open_data(
+        &mut con.ctrl,
+        url,
+        con.ctrl_peer_ip,
+        con.ctrl_local_ip,
+        con.tls,
+        cfg,
+    )?;
     let ctrl = &mut con.ctrl;
 
-    // 7) RETR for files, LIST for directories. We treat a trailing '/' or
-    //    the bare root path as "list this directory". Reject control bytes in
-    //    the path first so it can't break out of the RETR/LIST command line.
-    reject_ctl(&url.path, "ftp path")?;
-    let cmd = if url.path.is_empty() || url.path == "/" {
-        "LIST".to_string()
-    } else if url.path.ends_with('/') {
-        format!("LIST {}", url.path)
-    } else {
-        format!("RETR {}", url.path)
+    // 7) RETR for files, LIST for directories (a trailing '/'), NLST for
+    //    `;type=D`. The name was control-byte checked by `parse_ftp_path`.
+    let cmd = match (fp.typecode, fp.file.is_empty()) {
+        (TypeCode::Dir, true) => "NLST".to_string(),
+        (TypeCode::Dir, false) => format!("NLST {}", fp.file),
+        (_, true) => "LIST".to_string(),
+        (_, false) => format!("RETR {}", fp.file),
     };
     send(ctrl, &cmd)?;
 
@@ -354,57 +582,20 @@ impl UploadMode {
     }
 }
 
-/// Build the `STOR <path>` / `APPE <path>` command for an upload, stripping a
-/// single leading '/' the way curl does (the FTP path after login is relative
-/// to the login directory). Returns `None` for an empty or directory-only
-/// path, which can't name a file to upload.
-fn upload_command(mode: UploadMode, path: &str) -> Option<String> {
-    let name = path.strip_prefix('/').unwrap_or(path);
-    if name.is_empty() || name.ends_with('/') {
+/// Build the `STOR <name>` / `APPE <name>` command for an upload. The name is
+/// the final path component only — the directories were entered with `CWD`
+/// first (curl's multicwd). Returns `None` for an empty (directory) name,
+/// which can't name a file to upload.
+fn upload_command(mode: UploadMode, file: &str) -> Option<String> {
+    if file.is_empty() {
         return None;
     }
-    Some(format!("{} {name}", mode.verb()))
-}
-
-/// Build the `STOR <path>` command. Thin wrapper over [`upload_command`] kept
-/// for the descriptive name at the test sites that pin STOR's exact wire form.
-#[cfg(test)]
-fn stor_command(path: &str) -> Option<String> {
-    upload_command(UploadMode::Stor, path)
-}
-
-/// Build the `APPE <path>` command (same path validation as [`stor_command`]).
-#[cfg(test)]
-fn appe_command(path: &str) -> Option<String> {
-    upload_command(UploadMode::Appe, path)
+    Some(format!("{} {file}", mode.verb()))
 }
 
 /// Format the `REST <offset>` resume command.
 fn rest_command(offset: u64) -> String {
     format!("REST {offset}")
-}
-
-/// `--ftp-create-dirs`: issue `MKD` for each directory prefix of the upload
-/// path (`a`, then `a/b` for `/a/b/file`), ignoring the reply code so an
-/// already-existing directory (a 5xx reply) is not treated as an error. Mirrors
-/// [`upload_command`]'s path handling: a single leading '/' is stripped.
-fn create_upload_dirs<R: Read + Write>(ctrl: &mut BufReader<R>, path: &str) -> Result<()> {
-    let rel = path.strip_prefix('/').unwrap_or(path);
-    let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-    if comps.len() < 2 {
-        return Ok(()); // no directory component — just a filename
-    }
-    let mut prefix = String::new();
-    for dir in &comps[..comps.len() - 1] {
-        if !prefix.is_empty() {
-            prefix.push('/');
-        }
-        prefix.push_str(dir);
-        // reject_ctl validated the whole path already; send() also guards CR/LF.
-        send(ctrl, &format!("MKD {prefix}"))?;
-        let _ = read_reply(ctrl)?; // 257 created or 5xx exists — ignore the code
-    }
-    Ok(())
 }
 
 /// Upload `body` to the file at `url.path` via `STOR`. If `resume_at` is
@@ -463,24 +654,21 @@ fn upload(
     resume_at: Option<u64>,
     cfg: &NetConfig,
 ) -> Result<()> {
-    let mut con = connect_login(url, cfg)?;
-
-    // Determine the remote filename up front and reject control bytes so it
-    // can't break out of the STOR/APPE command line.
-    reject_ctl(&url.path, "ftp path")?;
-    let cmd = upload_command(mode, &url.path).ok_or_else(|| {
+    // Determine the remote filename up front (percent-decoded and control-byte
+    // checked) so it can't break out of the STOR/APPE command line.
+    let fp = parse_ftp_path(&url.path)?;
+    let cmd = upload_command(mode, &fp.file).ok_or_else(|| {
         Error::BadResponse(format!(
             "ftp {}: URL path {:?} does not name a file to upload",
             mode.verb(),
             url.path
         ))
     })?;
+    let mut con = connect_login(url, cfg, fp.typecode)?;
 
-    // --ftp-create-dirs: best-effort MKD of each directory prefix of the upload
-    // path before storing. Failures are ignored (the directory likely exists).
-    if cfg.ftp_create_dirs {
-        create_upload_dirs(&mut con.ctrl, &url.path)?;
-    }
+    // Walk into the target directory; `--ftp-create-dirs` MKDs any that are
+    // missing (curl's CWD → MKD → CWD sequence).
+    cwd_path(&mut con.ctrl, &fp.dirs, cfg.ftp_create_dirs)?;
 
     // REST before STOR for resume. Per RFC 3659 the server answers 350
     // ("restart marker accepted"); the next command (STOR) then proceeds from
@@ -497,7 +685,14 @@ fn upload(
 
     // Set up the data connection (passive dial, or active EPRT/PORT callback;
     // same logic as RETR). Active mode's accept() happens after STOR/APPE.
-    let dataconn = open_data(&mut con.ctrl, url, con.ctrl_peer_ip, con.ctrl_local_ip, cfg)?;
+    let dataconn = open_data(
+        &mut con.ctrl,
+        url,
+        con.ctrl_peer_ip,
+        con.ctrl_local_ip,
+        con.tls,
+        cfg,
+    )?;
     let ctrl = &mut con.ctrl;
 
     // Issue STOR/APPE, then expect the 1xx preliminary reply before streaming.
@@ -568,17 +763,17 @@ fn open_passive<R: Read + Write>(
     if c2 != 227 {
         return Err(Error::BadResponse(format!("ftp PASV: {c2} {m2}")));
     }
-    // For a direct dial, the server-supplied IP is ignored to prevent an FTP
-    // bounce/SSRF: we dial the control connection's peer instead (curl's safe
-    // default). Through a proxy/custom connector the proxy is the trust
-    // boundary and cannot reach the control peer's IP directly, so we use the
-    // server-advertised data host and let the connector reach it.
-    let (advertised_host, port) = parse_pasv(&m2)
+    // The server-supplied IP is always ignored to prevent an FTP bounce/SSRF
+    // (curl's default `--ftp-skip-pasv-ip`): a direct dial goes to the control
+    // connection's peer; through a proxy/custom connector (whose peer is the
+    // proxy) the proxy is asked for the control *host* name — never for
+    // whatever internal address a hostile server advertised.
+    let (_advertised_host, port) = parse_pasv(&m2)
         .ok_or_else(|| Error::BadResponse(format!("ftp PASV: cannot parse: {m2}")))?;
     let host = if direct {
         ctrl_peer_ip.to_string()
     } else {
-        advertised_host
+        fallback_host.to_string()
     };
     Ok((host, port))
 }
@@ -629,6 +824,9 @@ fn read_reply<R: BufRead>(r: &mut R) -> Result<(u16, String)> {
     }
     // sep == '-': multi-line continuation until "<code> ..." is seen.
     loop {
+        if text.len() > MAX_REPLY {
+            return Err(Error::BadResponse("ftp reply too long".into()));
+        }
         let line = read_line(r)?;
         // A continuation line may or may not start with the code. The
         // terminator is specifically `NNN ` (code + space).
@@ -645,15 +843,23 @@ fn read_reply<R: BufRead>(r: &mut R) -> Result<(u16, String)> {
     }
 }
 
-/// Read one CRLF-terminated line, stripping the trailing CRLF. EOF before
-/// any newline is an error.
+/// Read one LF-terminated line (the CRLF is left for the caller to trim),
+/// capped at [`MAX_LINE`] bytes. Non-UTF-8 bytes (Latin-1 banners and file
+/// names are common) are decoded lossily rather than failing the transfer.
+/// EOF before any byte is an error.
 fn read_line<R: BufRead>(r: &mut R) -> Result<String> {
-    let mut buf = String::new();
-    let n = r.read_line(&mut buf)?;
+    let mut buf = Vec::new();
+    let n = r
+        .by_ref()
+        .take(MAX_LINE as u64 + 1)
+        .read_until(b'\n', &mut buf)?;
     if n == 0 {
         return Err(Error::UnexpectedEof);
     }
-    Ok(buf)
+    if buf.len() > MAX_LINE {
+        return Err(Error::BadResponse("ftp reply line too long".into()));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Parse the leading 3-digit code from an FTP reply line. Returns
@@ -1038,39 +1244,6 @@ mod tests {
     }
 
     #[test]
-    fn stor_command_strips_leading_slash() {
-        // The URL path is absolute; STOR names a path relative to the login
-        // directory, so a single leading '/' is dropped (curl's behavior).
-        assert_eq!(stor_command("/pub/file.bin").unwrap(), "STOR pub/file.bin");
-        assert_eq!(stor_command("file.bin").unwrap(), "STOR file.bin");
-        assert_eq!(stor_command("/a.txt").unwrap(), "STOR a.txt");
-    }
-
-    #[test]
-    fn stor_command_rejects_directory_path() {
-        // No filename to store.
-        assert!(stor_command("").is_none());
-        assert!(stor_command("/").is_none());
-        assert!(stor_command("/pub/").is_none());
-    }
-
-    #[test]
-    fn appe_command_strips_leading_slash() {
-        // Same path handling as STOR, just a different verb.
-        assert_eq!(appe_command("/pub/file.bin").unwrap(), "APPE pub/file.bin");
-        assert_eq!(appe_command("file.bin").unwrap(), "APPE file.bin");
-        assert_eq!(appe_command("/a.txt").unwrap(), "APPE a.txt");
-    }
-
-    #[test]
-    fn appe_command_rejects_directory_path() {
-        // No filename to append to.
-        assert!(appe_command("").is_none());
-        assert!(appe_command("/").is_none());
-        assert!(appe_command("/pub/").is_none());
-    }
-
-    #[test]
     fn appe_command_rejects_control_bytes() {
         // The command builder itself only strips/validates the path shape;
         // control bytes in the path are caught by `reject_ctl` on the upload
@@ -1097,178 +1270,365 @@ mod tests {
         assert_eq!(rest_command(u64::MAX), format!("REST {}", u64::MAX));
     }
 
-    /// Drive `store`'s control sequence over a mock control channel while a
-    /// real loopback TCP listener stands in for the passive data connection.
-    /// Asserts the exact commands sent and the bytes received on the data
-    /// socket. Plain FTP only (no TLS), which exercises the full STOR path.
-    fn run_store_mock(
-        url: &str,
-        body: &[u8],
-        resume_at: Option<u64>,
-    ) -> (Result<()>, Vec<u8>, Vec<u8>) {
-        run_upload_mock(url, body, UploadMode::Stor, resume_at)
-    }
-
-    /// Generalized version of [`run_store_mock`] that drives either `STOR` or
-    /// `APPE` (mirroring the production [`upload`] driver) over a mock control
-    /// channel plus a real loopback data socket. `resume_at` is honored only
-    /// for `STOR` (just like [`upload`]).
-    fn run_upload_mock(
-        url: &str,
-        body: &[u8],
-        mode: UploadMode,
-        resume_at: Option<u64>,
-    ) -> (Result<()>, Vec<u8>, Vec<u8>) {
-        use std::net::{Ipv4Addr, TcpListener};
-        use std::sync::mpsc;
-
-        // Loopback listener for the data connection. The PASV reply advertises
-        // its port; `open_passive` dials the control peer (127.0.0.1 here).
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let data_port = listener.local_addr().unwrap().port();
-        let (p1, p2) = ((data_port >> 8) as u8, (data_port & 0xff) as u8);
-
-        // Collect whatever the server receives on the data socket.
-        let (tx, rx) = mpsc::channel();
-        let data_thread = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = Vec::new();
-            sock.read_to_end(&mut buf).unwrap();
-            tx.send(buf).unwrap();
-        });
-
-        // Scripted control-channel replies. EPSV is refused so PASV is used;
-        // PASV advertises the loopback data port. REST (if any) → 350.
-        let mut script = String::from(
-            "220 ready\r\n\
-             331 need pass\r\n\
-             230 logged in\r\n\
-             200 type ok\r\n",
+    #[test]
+    fn upload_command_names_only_the_final_component() {
+        assert_eq!(
+            upload_command(UploadMode::Stor, "file.bin").unwrap(),
+            "STOR file.bin"
         );
-        // REST is only sent for STOR resume; APPE never negotiates an offset.
-        if mode == UploadMode::Stor && resume_at.is_some() {
-            script.push_str("350 restart ok\r\n");
-        }
-        script.push_str(&format!(
-            "500 epsv?\r\n\
-             227 Entering Passive Mode (127,0,0,1,{p1},{p2})\r\n\
-             150 ok to send\r\n\
-             226 transfer complete\r\n\
-             221 bye\r\n"
-        ));
-
-        let mut ctrl = BufReader::new(MockIo {
-            to_read: std::io::Cursor::new(script.into_bytes()),
-            written: Vec::new(),
-        });
-        let ctrl_peer = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let parsed = Url::parse(url).unwrap();
-
-        // Replicate the post-login portion of `store` against the mock control
-        // channel and the real loopback data socket. `open_data` is the same
-        // function `store` calls, so the passive handshake and STOR sequencing
-        // under test are the production ones.
-        let result = (|| -> Result<()> {
-            // Consume banner + login + TYPE replies that connect_login would.
-            for _ in 0..4 {
-                read_reply(&mut ctrl)?;
-            }
-            reject_ctl(&parsed.path, "ftp path")?;
-            let cmd = upload_command(mode, &parsed.path)
-                .ok_or_else(|| Error::BadResponse("no file".into()))?;
-            if mode == UploadMode::Stor {
-                if let Some(offset) = resume_at {
-                    send(&mut ctrl, &rest_command(offset))?;
-                    let (c, _) = read_reply(&mut ctrl)?;
-                    if c != 350 {
-                        return Err(Error::BadResponse(format!("REST: {c}")));
-                    }
-                }
-            }
-            let unspec = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-            let dataconn = open_data(&mut ctrl, &parsed, ctrl_peer, unspec, &NetConfig::default())?;
-            send(&mut ctrl, &cmd)?;
-            let (c, m) = read_reply(&mut ctrl)?;
-            if !(c == 125 || c == 150) {
-                return Err(Error::BadResponse(format!("{cmd}: {c} {m}")));
-            }
-            let mut data = dataconn.into_stream()?;
-            data.write_all(body)?;
-            data.flush()?;
-            drop(data);
-            let (cf, mf) = read_reply(&mut ctrl)?;
-            if !is_positive(cf) {
-                return Err(Error::BadResponse(format!("end: {cf} {mf}")));
-            }
-            let _ = send(&mut ctrl, "QUIT");
-            let _ = read_reply(&mut ctrl);
-            Ok(())
-        })();
-
-        let received = rx.recv().unwrap();
-        data_thread.join().unwrap();
-        let written = ctrl.get_ref().written.clone();
-        (result, written, received)
+        assert_eq!(
+            upload_command(UploadMode::Appe, "a.txt").unwrap(),
+            "APPE a.txt"
+        );
+        assert!(upload_command(UploadMode::Stor, "").is_none());
     }
 
     #[test]
-    fn store_streams_body_and_sends_stor() {
-        let (res, written, received) =
-            run_store_mock("ftp://h.example/pub/up.bin", b"hello ftp", None);
-        res.unwrap();
-        let sent = String::from_utf8(written).unwrap();
-        assert!(sent.contains("STOR pub/up.bin\r\n"), "sent: {sent:?}");
-        assert!(!sent.contains("REST"), "no REST without offset: {sent:?}");
-        assert!(sent.contains("QUIT\r\n"));
-        assert_eq!(received, b"hello ftp");
+    fn parse_ftp_path_splits_decodes_and_types() {
+        let p = parse_ftp_path("/pub/my%20dir/file.bin").unwrap();
+        assert_eq!(p.dirs, vec!["pub", "my dir"]);
+        assert_eq!(p.file, "file.bin");
+        assert_eq!(p.typecode, TypeCode::Image);
+
+        let p = parse_ftp_path("/dir/").unwrap();
+        assert_eq!(p.dirs, vec!["dir"]);
+        assert_eq!(p.file, "");
+
+        let p = parse_ftp_path("/").unwrap();
+        assert!(p.dirs.is_empty() && p.file.is_empty());
+
+        // `//` makes the path absolute: CWD / first.
+        let p = parse_ftp_path("//etc/motd").unwrap();
+        assert_eq!(p.dirs, vec!["/", "etc"]);
+        assert_eq!(p.file, "motd");
+
+        assert_eq!(
+            parse_ftp_path("/f.txt;type=A").unwrap().typecode,
+            TypeCode::Ascii
+        );
+        let p = parse_ftp_path("/d/;type=d").unwrap();
+        assert_eq!((p.typecode, p.file.as_str()), (TypeCode::Dir, ""));
+        assert!(parse_ftp_path("/f;type=x").is_err());
+    }
+
+    #[test]
+    fn parse_ftp_path_rejects_encoded_control_bytes() {
+        // Decoded CR/LF would inject a second command onto the control channel.
+        assert!(parse_ftp_path("/a%0d%0aDELE%20x").is_err());
+        assert!(parse_ftp_path("/dir%0a/f").is_err());
+        assert!(parse_ftp_path("/f%00").is_err());
+    }
+
+    #[test]
+    fn read_line_is_capped_and_lossy() {
+        let long = format!("220 {}\r\n", "x".repeat(MAX_LINE + 10));
+        assert!(read_reply(&mut cur(&long)).is_err());
+        // Latin-1 banner bytes don't fail the reply.
+        let mut r = BufReader::new(Cursor::new(b"220 caf\xe9\r\n".to_vec()));
+        let (code, text) = read_reply(&mut r).unwrap();
+        assert_eq!(code, 220);
+        assert!(text.starts_with("caf"));
+    }
+
+    #[test]
+    fn open_passive_through_proxy_uses_control_host_not_pasv_ip() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // A hostile server points PASV at an internal address; through a proxy
+        // we must ask for the control host, never 10.0.0.5.
+        let script = "227 Entering Passive Mode (10,0,0,5,0,22)\r\n";
+        let mut io = BufReader::new(MockIo {
+            to_read: std::io::Cursor::new(script.as_bytes().to_vec()),
+            written: Vec::new(),
+        });
+        let unspec = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let (host, port) = open_passive(&mut io, "ftp.example.com", unspec, false, false).unwrap();
+        assert_eq!(host, "ftp.example.com");
+        assert_eq!(port, 22);
+    }
+
+    /// What the scripted server did, for assertions.
+    #[derive(Default)]
+    struct MockLog {
+        cmds: Vec<String>,
+        stored: Vec<u8>,
+    }
+
+    /// A tiny scripted FTP server on loopback, driven by the *production*
+    /// client entry points. It knows a set of directories and files (keyed by
+    /// `dir/…/name` relative to the login dir), answers PASV with a bogus
+    /// `10.0.0.1` (which the client must ignore) and refuses EPSV and AUTH.
+    fn mock_ftp(
+        files: &[(&str, &[u8])],
+        dirs: &[&str],
+    ) -> (
+        u16,
+        std::sync::Arc<std::sync::Mutex<MockLog>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::collections::{HashMap, HashSet};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let files: HashMap<String, Vec<u8>> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .collect();
+        let mut known: HashSet<String> = dirs.iter().map(|d| d.to_string()).collect();
+        let log = Arc::new(Mutex::new(MockLog::default()));
+        let log2 = Arc::clone(&log);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut w = sock.try_clone().unwrap();
+            let mut r = BufReader::new(sock);
+            let mut cwd: Vec<String> = Vec::new();
+            let mut data_l: Option<TcpListener> = None;
+            let _ = w.write_all(b"220 mock\r\n");
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let line = line.trim_end().to_string();
+                log2.lock().unwrap().cmds.push(line.clone());
+                let (verb, arg) = line.split_once(' ').unwrap_or((&line, ""));
+                let join = |cwd: &[String], name: &str| {
+                    let mut v = cwd.to_vec();
+                    v.push(name.to_string());
+                    v.join("/")
+                };
+                let reply: String = match verb {
+                    "USER" => "331 pass?".into(),
+                    "PASS" => "230 in".into(),
+                    "TYPE" => "200 ok".into(),
+                    "EPSV" | "AUTH" => "500 no".into(),
+                    "CWD" if arg == "/" => {
+                        cwd.clear();
+                        "250 ok".into()
+                    }
+                    "CWD" => {
+                        let d = join(&cwd, arg);
+                        if known.contains(&d) {
+                            cwd.push(arg.to_string());
+                            "250 ok".into()
+                        } else {
+                            "550 no such dir".into()
+                        }
+                    }
+                    "MKD" => {
+                        known.insert(join(&cwd, arg));
+                        "257 made".into()
+                    }
+                    "REST" => "350 ok".into(),
+                    "PASV" => {
+                        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+                        let p = l.local_addr().unwrap().port();
+                        data_l = Some(l);
+                        format!(
+                            "227 Entering Passive Mode (10,0,0,1,{},{})",
+                            p >> 8,
+                            p & 0xff
+                        )
+                    }
+                    "RETR" | "LIST" | "NLST" => {
+                        let body = if verb == "RETR" {
+                            match files.get(&join(&cwd, arg)) {
+                                Some(b) => b.clone(),
+                                None => {
+                                    let _ = w.write_all(b"550 not found\r\n");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            format!("{verb} of /{}\r\n", cwd.join("/")).into_bytes()
+                        };
+                        let _ = w.write_all(b"150 here\r\n");
+                        let (mut d, _) = data_l.take().unwrap().accept().unwrap();
+                        let _ = d.write_all(&body);
+                        drop(d);
+                        "226 done".into()
+                    }
+                    "STOR" | "APPE" => {
+                        let _ = w.write_all(b"150 send\r\n");
+                        let (mut d, _) = data_l.take().unwrap().accept().unwrap();
+                        let mut buf = Vec::new();
+                        let _ = d.read_to_end(&mut buf);
+                        log2.lock().unwrap().stored = buf;
+                        "226 stored".into()
+                    }
+                    "QUIT" => {
+                        let _ = w.write_all(b"221 bye\r\n");
+                        return;
+                    }
+                    _ => "502 ?".into(),
+                };
+                let _ = w.write_all(format!("{reply}\r\n").as_bytes());
+            }
+        });
+        (port, log, h)
+    }
+
+    fn cmds(log: &std::sync::Arc<std::sync::Mutex<MockLog>>) -> Vec<String> {
+        log.lock().unwrap().cmds.clone()
+    }
+
+    #[test]
+    fn fetch_cwds_each_decoded_component_then_retrs_the_name() {
+        let (port, log, h) = mock_ftp(&[("pub/my dir/f.txt", b"hello")], &["pub", "pub/my dir"]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/pub/my%20dir/f.txt")).unwrap();
+        // Dialing the bogus 10.0.0.1 from PASV would fail: success proves the
+        // data connection went to the control peer.
+        let body = fetch_with(&url, &NetConfig::default()).unwrap();
+        h.join().unwrap();
+        assert_eq!(body, b"hello");
+        let c = cmds(&log);
+        assert!(c.contains(&"CWD pub".to_string()), "{c:?}");
+        assert!(c.contains(&"CWD my dir".to_string()), "{c:?}");
+        assert!(c.contains(&"RETR f.txt".to_string()), "{c:?}");
+        assert!(c.contains(&"TYPE I".to_string()), "{c:?}");
+    }
+
+    #[test]
+    fn fetch_directory_lists_after_cwd_and_honours_typecodes() {
+        let (port, log, h) = mock_ftp(&[], &["pub"]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/pub/")).unwrap();
+        let body = fetch_with(&url, &NetConfig::default()).unwrap();
+        h.join().unwrap();
+        assert_eq!(body, b"LIST of /pub\r\n");
+        assert!(cmds(&log).contains(&"LIST".to_string()));
+
+        let (port, log, h) = mock_ftp(&[], &["pub"]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/pub/;type=D")).unwrap();
+        let body = fetch_with(&url, &NetConfig::default()).unwrap();
+        h.join().unwrap();
+        assert_eq!(body, b"NLST of /pub\r\n");
+        assert!(cmds(&log).contains(&"TYPE A".to_string()));
+
+        let (port, log, h) = mock_ftp(&[("t.txt", b"text")], &[]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/t.txt;type=a")).unwrap();
+        assert_eq!(fetch_with(&url, &NetConfig::default()).unwrap(), b"text");
+        h.join().unwrap();
+        let c = cmds(&log);
+        assert!(c.contains(&"TYPE A".to_string()) && c.contains(&"RETR t.txt".to_string()));
+    }
+
+    #[test]
+    fn fetch_absolute_path_cwds_root_first() {
+        let (port, log, h) = mock_ftp(&[("etc/motd", b"m")], &["etc"]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}//etc/motd")).unwrap();
+        assert_eq!(fetch_with(&url, &NetConfig::default()).unwrap(), b"m");
+        h.join().unwrap();
+        let c = cmds(&log);
+        let root = c.iter().position(|x| x == "CWD /").expect("CWD /");
+        let etc = c.iter().position(|x| x == "CWD etc").expect("CWD etc");
+        assert!(root < etc);
+    }
+
+    #[test]
+    fn fetch_missing_directory_fails() {
+        let (port, _log, h) = mock_ftp(&[], &[]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/nope/f")).unwrap();
+        let err = fetch_with(&url, &NetConfig::default()).unwrap_err();
+        drop(h); // the server is left waiting; the socket closes with the client
+        assert!(err.to_string().contains("CWD nope"), "{err}");
+    }
+
+    #[test]
+    fn userinfo_is_percent_decoded() {
+        let (port, log, h) = mock_ftp(&[("f", b"x")], &[]);
+        let url = Url::parse(&format!("ftp://us%40er:p%3Ass@127.0.0.1:{port}/f")).unwrap();
+        fetch_with(&url, &NetConfig::default()).unwrap();
+        h.join().unwrap();
+        let c = cmds(&log);
+        assert!(c.contains(&"USER us@er".to_string()), "{c:?}");
+        assert!(c.contains(&"PASS p:ss".to_string()), "{c:?}");
+    }
+
+    #[test]
+    fn ssl_reqd_fails_closed_before_sending_credentials() {
+        let (port, log, h) = mock_ftp(&[("f", b"x")], &[]);
+        let url = Url::parse(&format!("ftp://u:secret@127.0.0.1:{port}/f")).unwrap();
+        let cfg = NetConfig {
+            require_tls: true,
+            ..NetConfig::default()
+        };
+        assert!(fetch_with(&url, &cfg).is_err());
+        drop(h);
+        let c = cmds(&log);
+        assert!(c.iter().any(|x| x.starts_with("AUTH TLS")), "{c:?}");
+        assert!(!c
+            .iter()
+            .any(|x| x.starts_with("USER") || x.starts_with("PASS")));
+    }
+
+    #[test]
+    fn store_cwds_then_stors_the_name() {
+        let (port, log, h) = mock_ftp(&[], &["pub"]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/pub/up.bin")).unwrap();
+        store_with(&url, b"hello ftp", None, &NetConfig::default()).unwrap();
+        h.join().unwrap();
+        let l = log.lock().unwrap();
+        assert!(l.cmds.contains(&"CWD pub".to_string()), "{:?}", l.cmds);
+        assert!(l.cmds.contains(&"STOR up.bin".to_string()), "{:?}", l.cmds);
+        assert!(!l.cmds.iter().any(|c| c.starts_with("REST")));
+        assert_eq!(l.stored, b"hello ftp");
     }
 
     #[test]
     fn store_with_resume_sends_rest_before_stor() {
-        let (res, written, received) =
-            run_store_mock("ftp://h.example/up.bin", b"TAIL", Some(4096));
-        res.unwrap();
-        let sent = String::from_utf8(written).unwrap();
-        let rest_at = sent.find("REST 4096\r\n").expect("REST sent");
-        let stor_at = sent.find("STOR up.bin\r\n").expect("STOR sent");
-        assert!(rest_at < stor_at, "REST must precede STOR: {sent:?}");
-        assert_eq!(received, b"TAIL");
+        let (port, log, h) = mock_ftp(&[], &[]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/up.bin")).unwrap();
+        store_with(&url, b"TAIL", Some(4096), &NetConfig::default()).unwrap();
+        h.join().unwrap();
+        let l = log.lock().unwrap();
+        let rest = l.cmds.iter().position(|c| c == "REST 4096").expect("REST");
+        let stor = l
+            .cmds
+            .iter()
+            .position(|c| c == "STOR up.bin")
+            .expect("STOR");
+        assert!(rest < stor);
+        assert_eq!(l.stored, b"TAIL");
     }
 
     #[test]
-    fn append_streams_body_and_sends_appe() {
-        let (res, written, received) = run_upload_mock(
-            "ftp://h.example/pub/up.bin",
-            b"more data",
-            UploadMode::Appe,
-            None,
-        );
-        res.unwrap();
-        let sent = String::from_utf8(written).unwrap();
-        // APPE, not STOR, and never a REST (append negotiates no offset).
-        assert!(sent.contains("APPE pub/up.bin\r\n"), "sent: {sent:?}");
-        assert!(!sent.contains("STOR"), "must not send STOR: {sent:?}");
-        assert!(!sent.contains("REST"), "must not send REST: {sent:?}");
-        assert!(sent.contains("QUIT\r\n"));
-        assert_eq!(received, b"more data");
+    fn store_create_dirs_mkds_missing_directories() {
+        let (port, log, h) = mock_ftp(&[], &[]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/new/sub/up.bin")).unwrap();
+        let cfg = NetConfig {
+            ftp_create_dirs: true,
+            ..NetConfig::default()
+        };
+        store_with(&url, b"x", None, &cfg).unwrap();
+        h.join().unwrap();
+        let l = log.lock().unwrap();
+        let want = [
+            "CWD new", "MKD new", "CWD new", "CWD sub", "MKD sub", "CWD sub",
+        ];
+        let got: Vec<&str> = l
+            .cmds
+            .iter()
+            .map(String::as_str)
+            .filter(|c| c.starts_with("CWD") || c.starts_with("MKD"))
+            .collect();
+        assert_eq!(got, want);
+        assert!(l.cmds.contains(&"STOR up.bin".to_string()));
     }
 
     #[test]
-    fn append_ignores_resume_offset() {
-        // Even if a resume offset were threaded through, APPE never emits REST
-        // and streams the whole body — the public `append` always passes None,
-        // but the driver must enforce this regardless.
-        let (res, written, received) = run_upload_mock(
-            "ftp://h.example/up.bin",
-            b"WHOLE",
-            UploadMode::Appe,
-            Some(4096),
-        );
-        res.unwrap();
-        let sent = String::from_utf8(written).unwrap();
-        assert!(!sent.contains("REST"), "APPE must not send REST: {sent:?}");
-        assert!(sent.contains("APPE up.bin\r\n"), "sent: {sent:?}");
-        assert_eq!(received, b"WHOLE");
+    fn append_sends_appe_and_never_rest() {
+        let (port, log, h) = mock_ftp(&[], &["pub"]);
+        let url = Url::parse(&format!("ftp://127.0.0.1:{port}/pub/up.bin")).unwrap();
+        append_with(&url, b"more data", &NetConfig::default()).unwrap();
+        h.join().unwrap();
+        let l = log.lock().unwrap();
+        assert!(l.cmds.contains(&"APPE up.bin".to_string()), "{:?}", l.cmds);
+        assert!(!l
+            .cmds
+            .iter()
+            .any(|c| c.starts_with("REST") || c.starts_with("STOR")));
+        assert_eq!(l.stored, b"more data");
     }
 
     #[test]
