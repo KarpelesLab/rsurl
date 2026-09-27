@@ -22,12 +22,36 @@
 //! if one was supplied — and handed to a single `authenticate` call, which
 //! tries each until one is accepted.
 //!
-//! ## Host-key verification (TOFU)
+//! ## Host-key verification (strict by default, like curl)
 //!
-//! By default we verify against `~/.ssh/known_hosts` with trust-on-first-use:
-//! an unknown host is accepted and persisted; a host whose key has *changed*
-//! is rejected. `-k`/`--insecure` downgrades to accept-any (OpenSSH
-//! `StrictHostKeyChecking=no`).
+//! By default the server's host key is checked against `~/.ssh/known_hosts`
+//! (or [`SshOptions::known_hosts_path`]) **strictly**, as curl does: a host
+//! with no entry (looked up as `host`, or `[host]:port` for a non-22 port) is
+//! refused, and so is a host whose key has *changed* or is marked `@revoked`.
+//! A missing `known_hosts` file therefore rejects every host. Nothing is ever
+//! written to `known_hosts` in this mode.
+//!
+//! **Breaking change:** earlier rsurl releases defaulted to trust-on-first-use
+//! (accept and save an unknown host's key). That is now opt-in via
+//! [`SshOptions::accept_new`] (the CLI's `--ssh-accept-new`, an rsurl
+//! extension equivalent to OpenSSH `StrictHostKeyChecking=accept-new`).
+//!
+//! The other knobs, in order of precedence:
+//!
+//!   * [`SshOptions::host_pubkey_sha256`] / [`SshOptions::host_pubkey_md5`]
+//!     (curl's `--hostpubsha256` / `--hostpubmd5`): pin the host key's
+//!     fingerprint. When a pin is set `known_hosts` is not consulted at all
+//!     (curl skips it after a pin matches): a matching key is accepted even
+//!     for an unknown host, a mismatching one is refused. Pins apply even with
+//!     `insecure`, as in curl.
+//!   * [`SshOptions::insecure`] (`-k`/`--insecure`): skip `known_hosts`
+//!     verification entirely (curl documents `-k` as doing this for SFTP and
+//!     SCP) and never write to it.
+//!   * [`SshOptions::accept_new`]: trust-on-first-use, as described above.
+//!
+//! Every host-key rejection surfaces as an [`Error::Ssh`] for which
+//! [`Error::is_ssh_host_key_failure`] is `true` (curl's exit code 60,
+//! `CURLE_PEER_FAILED_VERIFICATION`).
 //!
 //! [`puressh`]: https://crates.io/crates/puressh
 
@@ -36,12 +60,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use puressh::auth::ClientCredential;
-use puressh::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
+use puressh::client::{Client, Config, HostKeyPolicy, HostKeyPrompt, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
 use puressh::sftp::{Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, SSH_HOST_KEY_FAILED};
 use crate::url::percent_decode;
 use crate::url::Url;
 
@@ -64,8 +88,28 @@ pub struct SshOptions {
     /// Passphrase for an encrypted identity file (from `-u`'s password half,
     /// reused; OpenSSH-style prompting is not available in a one-shot CLI).
     pub key_passphrase: Option<String>,
-    /// `-k`/`--insecure`: accept any host key instead of TOFU/known_hosts.
+    /// `-k`/`--insecure`: skip `known_hosts` verification (accept any host
+    /// key) and never write to `known_hosts`. A `host_pubkey_*` pin is still
+    /// enforced, as in curl.
     pub insecure: bool,
+    /// Trust-on-first-use (rsurl extension, CLI `--ssh-accept-new`): accept a
+    /// host that has no `known_hosts` entry and append its key to the file,
+    /// like OpenSSH `StrictHostKeyChecking=accept-new`. A changed or
+    /// `@revoked` key is still refused.
+    ///
+    /// Defaults to `false`: an unknown host is **rejected**, matching curl.
+    /// (Before this option existed, trust-on-first-use was the default.)
+    pub accept_new: bool,
+    /// curl's `--hostpubsha256`: the base64-encoded SHA-256 of the server's
+    /// public host key (as printed by `ssh-keygen -l`, without the `SHA256:`
+    /// prefix; trailing `=` padding is optional). When set (alone or with
+    /// `host_pubkey_md5`), `known_hosts` is not consulted: a matching key is
+    /// accepted, anything else is refused.
+    pub host_pubkey_sha256: Option<String>,
+    /// curl's `--hostpubmd5`: the 32-hex-digit MD5 of the server's public host
+    /// key (case-insensitive). Same semantics as `host_pubkey_sha256`; when
+    /// both are set, both must match.
+    pub host_pubkey_md5: Option<String>,
     /// Override the `known_hosts` path (defaults to `~/.ssh/known_hosts`).
     pub known_hosts_path: Option<PathBuf>,
     /// Per-operation socket timeout.
@@ -187,40 +231,158 @@ fn discover_default_keys(ssh_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Build the host-key policy `Config` for this connection. `-k` ⇒ accept-any;
-/// otherwise TOFU against known_hosts (accept+persist unknown, reject changed).
-fn build_config(opts: &SshOptions) -> Result<Config> {
+/// How the server's host key is verified, derived from [`SshOptions`] (see the
+/// module docs for the precedence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostKeyMode {
+    /// `host_pubkey_sha256`/`host_pubkey_md5` set: check only the pin(s),
+    /// ignore `known_hosts` (curl behaviour, also under `-k`).
+    Pinned,
+    /// `-k`: no verification, nothing written.
+    NoCheck,
+    /// `--ssh-accept-new`: trust-on-first-use against `known_hosts`.
+    AcceptNew,
+    /// Default: `known_hosts` must already hold a matching key.
+    Strict,
+}
+
+fn host_key_mode(opts: &SshOptions) -> HostKeyMode {
+    if opts.host_pubkey_sha256.is_some() || opts.host_pubkey_md5.is_some() {
+        HostKeyMode::Pinned
+    } else if opts.insecure {
+        HostKeyMode::NoCheck
+    } else if opts.accept_new {
+        HostKeyMode::AcceptNew
+    } else {
+        HostKeyMode::Strict
+    }
+}
+
+/// Why a host key was refused, filled in by the verification callback so the
+/// resulting error can say more than puressh's bare "host key rejected".
+type RejectNote = Arc<Mutex<Option<String>>>;
+
+/// Check the presented host-key `blob` against curl-style fingerprint pins.
+/// SHA-256 is compared as base64 with `=` padding ignored on both sides (what
+/// curl does); MD5 as case-insensitive hex. `Err` carries curl's wording.
+fn check_pins(
+    blob: &[u8],
+    sha256: Option<&str>,
+    md5: Option<&str>,
+) -> std::result::Result<(), String> {
+    use purecrypto::hash::{Digest, Sha256};
+    if let Some(want) = sha256 {
+        let got = crate::websocket::base64_encode(Sha256::digest(blob).as_ref());
+        let unpad = |s: &str| s.split('=').next().unwrap_or("").to_string();
+        if unpad(&got) != unpad(want) {
+            return Err(format!(
+                "mismatch sha256 fingerprint. Remote {got} is not equal to {want}"
+            ));
+        }
+    }
+    if let Some(want) = md5 {
+        let got = crate::digest::hex(&purecrypto::hash::md5(blob));
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(format!(
+                "mismatch md5 fingerprint. Remote {got} is not equal to {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `host` or `[host]:port`, the way `known_hosts` names a target.
+fn known_hosts_name(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+/// Build the host-key policy `Config` for this connection (see
+/// [`HostKeyMode`]), plus the note the verifier fills in on a rejection.
+fn build_config(opts: &SshOptions) -> Result<(Config, RejectNote)> {
     // puressh marks `Config` / `KnownHostsPolicy` `#[non_exhaustive]` (0.1.7),
     // so both are built through a constructor and then adjusted by field
     // assignment rather than with a struct literal.
-    if opts.insecure {
+    let note: RejectNote = Arc::new(Mutex::new(None));
+    let mode = host_key_mode(opts);
+    if mode == HostKeyMode::NoCheck {
         let mut cfg = Config::insecure();
         cfg.timeout = opts.timeout;
-        return Ok(cfg);
+        return Ok((cfg, note));
+    }
+    if mode == HostKeyMode::Pinned {
+        // An empty in-memory store makes every host "unknown", so the
+        // callback sees every key; nothing is persisted (`save_path: None`).
+        // `known_hosts` itself is deliberately not consulted, as in curl.
+        let sha = opts.host_pubkey_sha256.clone();
+        let md5 = opts.host_pubkey_md5.clone();
+        let rec = Arc::clone(&note);
+        let mut policy = KnownHostsPolicy::strict(Arc::new(Mutex::new(KnownHosts::new())));
+        policy.on_unknown = TofuAction::PromptDetailed(Arc::new(move |p: &HostKeyPrompt<'_>| {
+            match check_pins(p.key_blob, sha.as_deref(), md5.as_deref()) {
+                Ok(()) => true,
+                Err(why) => {
+                    if let Ok(mut n) = rec.lock() {
+                        *n = Some(why);
+                    }
+                    false
+                }
+            }
+        }));
+        let mut cfg = Config::new(HostKeyPolicy::KnownHosts(policy));
+        cfg.timeout = opts.timeout;
+        return Ok((cfg, note));
     }
     let kh_path = opts.known_hosts_path.clone().or_else(default_known_hosts);
-    // Load the existing store if present; start empty otherwise (a fresh
-    // known_hosts the first TOFU accept will create). `KnownHosts::load` maps a
-    // missing file to `Ok(empty)`, so an `Err` here means the file EXISTS but is
-    // genuinely unreadable (EACCES, EIO, a directory in its place, ...). Fail
-    // closed in that case instead of degrading to an empty accept-all store —
-    // otherwise a populated, pinned known_hosts would silently become TOFU
-    // accept-all and persist the new key, defeating host-key pinning.
+    // Load the existing store if present; start empty otherwise. `KnownHosts::
+    // load` maps a missing file to `Ok(empty)` (so strict mode then rejects
+    // every host, like curl; accept-new creates the file on first accept). An
+    // `Err` here means the file EXISTS but is genuinely unreadable (EACCES,
+    // EIO, a directory in its place, ...). Fail closed in that case instead of
+    // degrading to an empty store — under accept-new that would silently
+    // re-trust and persist a new key, defeating host-key pinning.
     let store = match &kh_path {
         Some(p) => KnownHosts::load(p)
             .map_err(|e| Error::Ssh(format!("reading known_hosts {}: {e}", p.display())))?,
         None => KnownHosts::new(),
     };
-    // `strict` is reject-unknown / reject-mismatch; curl-style TOFU only
-    // relaxes the *unknown* case (accept and persist). A changed key stays a
-    // hard reject, as does `hash_new: false` (plain-text entries, matching what
-    // `ssh-keygen -F` and a human reader expect).
+    // `strict` is reject-unknown / reject-mismatch. A changed key is always a
+    // hard reject; `@revoked` is refused by puressh regardless of policy.
     let mut policy = KnownHostsPolicy::strict(Arc::new(Mutex::new(store)));
-    policy.save_path = kh_path;
-    policy.on_unknown = TofuAction::Accept;
+    if mode == HostKeyMode::AcceptNew {
+        // TOFU: accept and persist an unknown host (plain-text entry,
+        // `hash_new: false`, matching what `ssh-keygen -F` and a human reader
+        // expect).
+        policy.save_path = kh_path;
+        policy.on_unknown = TofuAction::Accept;
+    } else {
+        // Strict (the default): refuse, recording why for the error message.
+        // Nothing is written (`save_path` stays `None`).
+        let rec = Arc::clone(&note);
+        let file = kh_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "known_hosts".to_string());
+        policy.on_unknown = TofuAction::PromptDetailed(Arc::new(move |p: &HostKeyPrompt<'_>| {
+            if let Ok(mut n) = rec.lock() {
+                *n = Some(format!(
+                    "{} is not in {file} (server {} key fingerprint {}); add it \
+                     there, pin it with --hostpubsha256, or trust it on first use \
+                     with --ssh-accept-new",
+                    known_hosts_name(p.host, p.port),
+                    p.key_type,
+                    p.fingerprint,
+                ));
+            }
+            false
+        }));
+    }
     let mut cfg = Config::new(HostKeyPolicy::KnownHosts(policy));
     cfg.timeout = opts.timeout;
-    Ok(cfg)
+    Ok((cfg, note))
 }
 
 /// Load one identity file into a `ClientCredential::PublicKey`. Encrypted keys
@@ -287,8 +449,25 @@ fn connect_auth(
     if let Some(t) = trace.as_mut() {
         let _ = writeln!(t, "* Trying {}:{}...", url.host, url.port);
     }
-    let cfg = build_config(opts)?;
-    let mut client = Client::connect_to_host(&url.host, url.port, cfg).map_err(ssh_err)?;
+    let (cfg, note) = build_config(opts)?;
+    let mut client = Client::connect_to_host(&url.host, url.port, cfg).map_err(|e| match e {
+        puressh::Error::HostKeyRejected => {
+            let why = note
+                .lock()
+                .ok()
+                .and_then(|mut n| n.take())
+                .unwrap_or_else(|| {
+                    // Not an unknown-host/pin decision: puressh refused a changed
+                    // or `@revoked` key (and printed its banner on stderr).
+                    format!(
+                        "the host key for {} does not match known_hosts (changed or revoked)",
+                        known_hosts_name(&url.host, url.port)
+                    )
+                });
+            Error::Ssh(format!("{SSH_HOST_KEY_FAILED}: {why}"))
+        }
+        e => ssh_err(e),
+    })?;
     if let Some(t) = trace.as_mut() {
         let _ = writeln!(t, "* SSH connected to {}:{}", url.host, url.port);
     }
@@ -670,18 +849,96 @@ mod tests {
             insecure: true,
             ..Default::default()
         };
-        let cfg = build_config(&opts).expect("insecure config builds");
+        let (cfg, _) = build_config(&opts).expect("insecure config builds");
         assert!(matches!(cfg.host_key_policy, HostKeyPolicy::AcceptAny));
     }
 
     #[test]
-    fn build_config_tofu_uses_known_hosts_policy() {
+    fn host_key_mode_policy_mapping() {
+        // Default: strict, like curl (an unknown host fails).
+        assert_eq!(host_key_mode(&SshOptions::default()), HostKeyMode::Strict);
+        // -k: no known_hosts check.
+        let k = SshOptions {
+            insecure: true,
+            ..Default::default()
+        };
+        assert_eq!(host_key_mode(&k), HostKeyMode::NoCheck);
+        // --ssh-accept-new: TOFU.
+        let tofu = SshOptions {
+            accept_new: true,
+            ..Default::default()
+        };
+        assert_eq!(host_key_mode(&tofu), HostKeyMode::AcceptNew);
+        // -k wins over accept-new (nothing checked, nothing written).
+        let both = SshOptions {
+            insecure: true,
+            accept_new: true,
+            ..Default::default()
+        };
+        assert_eq!(host_key_mode(&both), HostKeyMode::NoCheck);
+        // A pin always wins, even with -k (curl checks pins regardless).
+        for opts in [
+            SshOptions {
+                host_pubkey_sha256: Some("x".into()),
+                insecure: true,
+                ..Default::default()
+            },
+            SshOptions {
+                host_pubkey_md5: Some("0".repeat(32)),
+                accept_new: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(host_key_mode(&opts), HostKeyMode::Pinned);
+        }
+    }
+
+    #[test]
+    fn build_config_default_is_strict_and_never_saves() {
         let opts = SshOptions {
-            insecure: false,
             known_hosts_path: Some(std::env::temp_dir().join("rsurl-kh-nonexistent")),
             ..Default::default()
         };
-        let cfg = build_config(&opts).expect("tofu config builds for a missing known_hosts");
+        let (cfg, _) = build_config(&opts).expect("strict config builds for a missing known_hosts");
+        match cfg.host_key_policy {
+            HostKeyPolicy::KnownHosts(p) => {
+                // The strict callback always refuses (it only records why).
+                assert!(matches!(p.on_unknown, TofuAction::PromptDetailed(_)));
+                assert!(matches!(p.on_mismatch, TofuAction::Reject));
+                assert!(
+                    p.save_path.is_none(),
+                    "strict mode must not write known_hosts"
+                );
+            }
+            _ => panic!("expected KnownHosts policy"),
+        }
+    }
+
+    #[test]
+    fn check_pins_matches_curl_semantics() {
+        use purecrypto::hash::{Digest, Sha256};
+        let blob = b"\x00\x00\x00\x0bssh-ed25519 fake key blob";
+        let b64 = crate::websocket::base64_encode(Sha256::digest(blob).as_ref());
+        let md5 = crate::digest::hex(&purecrypto::hash::md5(blob));
+        assert!(check_pins(blob, Some(&b64), None).is_ok());
+        // Padding is optional, as in curl.
+        assert!(check_pins(blob, Some(b64.trim_end_matches('=')), None).is_ok());
+        assert!(check_pins(blob, None, Some(&md5.to_ascii_uppercase())).is_ok());
+        assert!(check_pins(blob, Some(&b64), Some(&md5)).is_ok());
+        // Any mismatch refuses; both pins must match when both are given.
+        assert!(check_pins(blob, Some("AAAA"), None).is_err());
+        assert!(check_pins(blob, None, Some(&"0".repeat(32))).is_err());
+        assert!(check_pins(blob, Some(&b64), Some(&"0".repeat(32))).is_err());
+    }
+
+    #[test]
+    fn build_config_accept_new_uses_tofu_policy() {
+        let opts = SshOptions {
+            accept_new: true,
+            known_hosts_path: Some(std::env::temp_dir().join("rsurl-kh-nonexistent")),
+            ..Default::default()
+        };
+        let (cfg, _) = build_config(&opts).expect("tofu config builds for a missing known_hosts");
         match cfg.host_key_policy {
             HostKeyPolicy::KnownHosts(p) => {
                 assert!(matches!(p.on_unknown, TofuAction::Accept));
@@ -701,7 +958,7 @@ mod tests {
         let dir = std::env::temp_dir().join("rsurl-kh-dir-as-file");
         std::fs::create_dir_all(&dir).expect("create stand-in directory");
         let opts = SshOptions {
-            insecure: false,
+            accept_new: true,
             known_hosts_path: Some(dir.clone()),
             ..Default::default()
         };

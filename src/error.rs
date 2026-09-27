@@ -61,6 +61,21 @@ impl fmt::Display for Error {
     }
 }
 
+/// Prefix of every [`Error::Ssh`] message produced by a failed SSH host-key
+/// verification (see [`Error::is_ssh_host_key_failure`]).
+pub(crate) const SSH_HOST_KEY_FAILED: &str = "host key verification failed";
+
+impl Error {
+    /// `true` when this is an SSH (`sftp://`/`scp://`) host-key verification
+    /// failure: the server is not in `known_hosts` (the default policy rejects
+    /// unknown hosts, like curl), its key changed or is `@revoked`, or it did
+    /// not match a `host_pubkey_sha256`/`host_pubkey_md5` pin. curl reports
+    /// this as `CURLE_PEER_FAILED_VERIFICATION` (exit code 60).
+    pub fn is_ssh_host_key_failure(&self) -> bool {
+        matches!(self, Error::Ssh(m) if m.starts_with(SSH_HOST_KEY_FAILED))
+    }
+}
+
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

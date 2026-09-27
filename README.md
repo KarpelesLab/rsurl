@@ -32,7 +32,8 @@ shift before 1.0). What works today:
 - **FTP/FTPS**, **FILE**, **DICT**, **GOPHER(S)**, **IMAP(S)**, **LDAP(S)**,
   **MQTT(S)**, **POP3(S)**, **RTSP**, **TFTP**, **WS/WSS** — uploads (`-T`),
   resume, STARTTLS, and the usual per-protocol verbs.
-- **SSH** — SFTP and SCP download/upload, key + password auth, known_hosts TOFU
+- **SSH** — SFTP and SCP download/upload, key + password auth, strict
+  known_hosts checking like curl, `--hostpubsha256`/`--hostpubmd5` pins
   (optional `ssh` feature).
 - **BitTorrent** — `.torrent` / `magnet:`, trackers, DHT, peer wire, seeding,
   metadata inspection, selective / concatenated downloads (optional
@@ -283,9 +284,15 @@ SSH (`sftp://` / `scp://`) takes the user from the URL userinfo, else
 `-u`, else `$USER`. Public-key auth uses `--key <file>` (curl's `--key`;
 note `-i` stays bound to `--include` here) or, if absent, the existing
 `~/.ssh/id_ed25519` / `id_ecdsa` / `id_rsa`. Host keys are verified
-against `~/.ssh/known_hosts` with trust-on-first-use — an unknown host is
-accepted and persisted, a *changed* host key is refused — and `-k`
-downgrades to accept-any. Encrypted private keys reuse the `-u` password
+against `~/.ssh/known_hosts` strictly, as curl does: a host with no entry
+(`host`, or `[host]:port` off port 22), a *changed* key, or a `@revoked` key
+fails the transfer with exit code 60, and nothing is written to the file.
+`--hostpubsha256 <base64>` / `--hostpubmd5 <hex>` pin the host key instead
+of consulting known_hosts, and `-k` skips the check. **Breaking change:**
+earlier releases trusted unknown hosts on first use; that is now opt-in with
+`--ssh-accept-new` (an rsurl extension, like OpenSSH
+`StrictHostKeyChecking=accept-new`), or `SshOptions::accept_new` in the
+library. Encrypted private keys reuse the `-u` password
 as the passphrase (there is no interactive prompt in this one-shot CLI).
 
 Supported curl-style flags include `-L`/`--location`, `--max-redirs`,

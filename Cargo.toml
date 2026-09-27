@@ -231,6 +231,12 @@ purecrypto = "0.9.0"
 # demonstrate concurrent transfer fan-out. Dev-only — never in the library.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# In-process SSH/SFTP server for the SSH host-key end-to-end tests
+# (tests/integration_ssh.rs). Dev-only (the `server` feature never reaches the
+# library build, which stays client-only); no `pam`, so still no C toolchain.
+puressh = { version = "0.1.8", default-features = false, features = ["client", "compress", "server"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

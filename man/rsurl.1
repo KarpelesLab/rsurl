@@ -108,13 +108,38 @@ Read credentials from \fI~/.netrc\fR (or \fB\-\-netrc\-file\fR).
 .SS TLS
 .TP
 .BR \-k ", " \-\-insecure
-Do not verify the server certificate.
+Do not verify the server certificate. For SFTP and SCP, skip the
+\fI~/.ssh/known_hosts\fR host\-key check (nothing is written to it).
 .TP
 .BI \-\-cacert " file"
 Use \fIfile\fR as the CA certificate bundle.
 .TP
 .BR \-\-tlsv1.2 ", " \-\-tlsv1.3 ", " \-\-tls\-max " <ver>"
 Pin the minimum / maximum TLS version.
+.SS SSH (SFTP and SCP)
+By default, as in curl, the server's host key must already be listed in
+\fI~/.ssh/known_hosts\fR (as \fIhost\fR, or \fI[host]:port\fR for a port other
+than 22); an unknown host, a changed key, or a \fB@revoked\fR key fails the
+transfer with exit code 60.
+.TP
+.BI \-\-key " file"
+Private key used for SSH public\-key authentication (repeatable). Without it,
+the default \fI~/.ssh/id_ed25519\fR, \fIid_ecdsa\fR, and \fIid_rsa\fR are tried.
+.TP
+.BI \-\-hostpubsha256 " base64"
+Accept only a host key whose SHA\-256 hash is this base64 string (as printed
+by \fBssh\-keygen \-l\fR, without the \fBSHA256:\fR prefix). \fIknown_hosts\fR
+is not consulted, so a matching key is accepted even for an unknown host.
+.TP
+.BI \-\-hostpubmd5 " hex"
+Accept only a host key whose MD5 hash is these 32 hexadecimal digits.
+\fIknown_hosts\fR is not consulted.
+.TP
+.B \-\-ssh\-accept\-new
+(rsurl extension, not in curl.) Trust on first use: accept a host that has no
+\fIknown_hosts\fR entry and append its key to the file, like OpenSSH
+\fBStrictHostKeyChecking=accept\-new\fR. A changed or revoked key is still
+refused. Older rsurl releases behaved this way by default.
 .SS Transfer and output
 .TP
 .BI \-o " file" "\fR, \fB\-\-output " file
@@ -252,6 +277,10 @@ Operation timed out (includes \fB\-y\fR/\fB\-Y\fR low\-speed abort).
 .TP
 .B 47
 Too many redirects.
+.TP
+.B 60
+Peer verification failed (TLS certificate, or SSH host key not in
+\fIknown_hosts\fR, changed, revoked, or not matching a pin).
 .TP
 .B 63
 Maximum file size exceeded.

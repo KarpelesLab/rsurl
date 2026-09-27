@@ -65,8 +65,8 @@ pub(crate) fn transfer_url_with(url: &Url, cfg: &crate::net::NetConfig) -> Resul
         #[cfg(feature = "ssh")]
         "sftp" | "scp" => {
             // Library default: derive the user from the URL/`$USER`, take any
-            // password from the URL userinfo, and use TOFU known_hosts (no
-            // `-k`). The CLI calls `ssh::fetch_traced` directly so it can also
+            // password from the URL userinfo, and verify the host key strictly
+            // against known_hosts (an unknown host fails, like curl; no `-k`). The CLI calls `ssh::fetch_traced` directly so it can also
             // thread `-u`, `--key`, and `-k`. SSH does not honor a custom
             // connector yet.
             let user = crate::ssh::resolve_user(url, None)?;

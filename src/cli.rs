@@ -26,6 +26,12 @@
 //!                              WRQ, MQTT PUBLISH, or SFTP/SCP write)
 //!         --key <file>         SSH private-key identity for sftp://, scp://
 //!                              public-key auth (repeatable; curl's --key)
+//!         --hostpubsha256 <b64> SFTP/SCP: accept only a host key with this
+//!                              base64 SHA-256 (skips known_hosts)
+//!         --hostpubmd5 <hex>   SFTP/SCP: accept only a host key with this MD5
+//!         --ssh-accept-new     SFTP/SCP: trust an unknown host key on first use
+//!                              and save it to known_hosts (rsurl extension;
+//!                              by default unknown hosts fail with exit 60)
 //!     -C, --continue-at <off>  resume at byte <off> (FTP REST; '-C -' resumes HTTP)
 //!     -a, --append             FTP/FTPS upload: append (APPE) instead of STOR
 //!     -A, --user-agent <ua>    set User-Agent
@@ -33,7 +39,8 @@
 //!     -L, --location           follow 3xx redirects
 //!         --max-redirs <n>     cap on redirect hops (default 50)
 //!     -u, --user <user:pass>   HTTP Basic auth credentials
-//!     -k, --insecure           don't verify the TLS certificate chain
+//!     -k, --insecure           don't verify the TLS certificate chain (SFTP/SCP:
+//!                              skip the known_hosts host-key check)
 //!         --cacert <file>      PEM bundle to use instead of system trust
 //!         --no-idn             don't convert international (IDN) hostnames to punycode
 //!         --max-time <secs>    cap on the whole operation's wall time
@@ -238,6 +245,14 @@ struct Args {
     /// Note: curl's `-i` is `--include` here, so the SSH identity flag is the
     /// long form `--key` only (no `-i` alias, to avoid the collision).
     ssh_keys: Vec<String>,
+    /// `--ssh-accept-new` (rsurl extension): trust-on-first-use for SSH host
+    /// keys — accept an unknown host and save its key to `known_hosts`. Off by
+    /// default, so an unknown host fails with exit 60 like curl.
+    ssh_accept_new: bool,
+    /// `--hostpubsha256 <base64>`: pin the SSH host key's SHA-256 (curl).
+    hostpubsha256: Option<String>,
+    /// `--hostpubmd5 <hex>`: pin the SSH host key's MD5, 32 hex digits (curl).
+    hostpubmd5: Option<String>,
     /// `-f`/`--fail`: on HTTP >= 400, emit no body and exit 22.
     fail: bool,
     /// `-S`/`--show-error`: show errors even under `-s`.
@@ -2943,6 +2958,16 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                 a.basic_auth = Some((u, p));
             }
             "-k" | "--insecure" => a.insecure = true,
+            "--ssh-accept-new" => a.ssh_accept_new = true,
+            "--hostpubsha256" => a.hostpubsha256 = Some(next_val(&mut it, arg)?),
+            "--hostpubmd5" => {
+                // curl rejects anything but exactly 32 characters (exit 2).
+                let v = next_val(&mut it, arg)?;
+                if v.len() != 32 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("--hostpubmd5: expected 32 hex digits, got {v:?}"));
+                }
+                a.hostpubmd5 = Some(v);
+            }
             "--tlsv1" | "--tlsv1.0" | "--tlsv1.1" | "--tlsv1.2" => {
                 a.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_2)
             }
@@ -3232,7 +3257,9 @@ fn transfer_exit_code(e: &rsurl::Error) -> u8 {
         rsurl::Error::InvalidUrl(_) => 3,        // CURLE_URL_MALFORMAT
         rsurl::Error::UnsupportedScheme(_) => 1, // CURLE_UNSUPPORTED_PROTOCOL
         rsurl::Error::UnexpectedEof => 52,       // CURLE_GOT_NOTHING
-        rsurl::Error::Ssh(_) => 79,              // CURLE_SSH
+        // A host-key verification failure is curl's CURLE_PEER_FAILED_VERIFICATION.
+        e if e.is_ssh_host_key_failure() => 60,
+        rsurl::Error::Ssh(_) => 79, // CURLE_SSH
         rsurl::Error::H2NotNegotiated => 7,
         // Library-API conveniences; they don't arise from the CLI transfer
         // path, but the match must stay exhaustive.
@@ -3669,7 +3696,9 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
 /// Build the [`rsurl::ssh::SshOptions`] for an `sftp://`/`scp://` transfer from
 /// the parsed CLI args and URL. The password comes from the URL userinfo, else
 /// the `-u` password half; identities from `--key` (else default `~/.ssh`
-/// keys); `-k` toggles accept-any host keys. An encrypted-key passphrase reuses
+/// keys); host-key checking is strict by default, `-k` skips it,
+/// `--ssh-accept-new` enables TOFU, and `--hostpubsha256`/`--hostpubmd5` pin
+/// the key. An encrypted-key passphrase reuses
 /// the `-u` password if one was given (a one-shot CLI can't prompt). Returns
 /// `(options, user)`; a missing user is a fatal usage error (curl-style code 2).
 #[cfg(feature = "ssh")]
@@ -3691,6 +3720,9 @@ fn build_ssh_options(url: &Url, args: &Args) -> Result<(rsurl::ssh::SshOptions, 
         identity_files: args.ssh_keys.iter().map(std::path::PathBuf::from).collect(),
         key_passphrase: password,
         insecure: args.insecure,
+        accept_new: args.ssh_accept_new,
+        host_pubkey_sha256: args.hostpubsha256.clone(),
+        host_pubkey_md5: args.hostpubmd5.clone(),
         known_hosts_path: None,
         timeout: args.max_time,
     };
@@ -3699,7 +3731,8 @@ fn build_ssh_options(url: &Url, args: &Args) -> Result<(rsurl::ssh::SshOptions, 
 
 /// Download an `sftp://`/`scp://` URL and write the bytes to `-o`/stdout (or
 /// `-O`). Mirrors [`run_transfer`] but threads SSH auth options and, under
-/// `-v`, prints the SSH trace to stderr. Exit codes: 0 ok, 2 usage, 7 transfer.
+/// `-v`, prints the SSH trace to stderr. Exit codes: 0 ok, 2 usage, 7 transfer,
+/// 60 host-key verification failure.
 #[cfg(feature = "ssh")]
 fn run_ssh(url: &Url, args: &Args) -> u8 {
     let (opts, user) = match build_ssh_options(url, args) {
@@ -3763,14 +3796,15 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
-            7
+            ssh_exit_code(&e)
         }
     }
 }
 
 /// Upload a local file to an `sftp://`/`scp://` URL. Reads the whole file into
 /// memory (matching the other `-T` paths), then writes it remotely. `-v` prints
-/// the SSH trace. Exit codes: 0 ok, 2 usage, 7 transfer, 26 local-read error.
+/// the SSH trace. Exit codes: 0 ok, 2 usage, 7 transfer, 26 local-read error,
+/// 60 host-key verification failure.
 #[cfg(feature = "ssh")]
 fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
     let bytes = match read_local(path) {
@@ -3803,8 +3837,20 @@ fn run_ssh_upload(url: &Url, path: &str, args: &Args) -> u8 {
             if show_errors(args) {
                 eprintln!("rsurl: {e}");
             }
-            7
+            ssh_exit_code(&e)
         }
+    }
+}
+
+/// Exit code for a failed SFTP/SCP transfer: 60
+/// (`CURLE_PEER_FAILED_VERIFICATION`) for a host-key verification failure,
+/// like curl; 7 for anything else (rsurl's historical SSH transfer code).
+#[cfg(feature = "ssh")]
+fn ssh_exit_code(e: &rsurl::Error) -> u8 {
+    if e.is_ssh_host_key_failure() {
+        60
+    } else {
+        7
     }
 }
 
@@ -6356,6 +6402,15 @@ Options:
       --key <file>         SSH private-key identity file for sftp:// / scp://
                            public-key auth (repeatable). Without it, the
                            default ~/.ssh/id_ed25519|id_ecdsa|id_rsa are tried
+      --hostpubsha256 <b64>
+                           SFTP/SCP: accept only a host key whose SHA-256 is
+                           this base64 value (known_hosts is not consulted)
+      --hostpubmd5 <hex>   SFTP/SCP: accept only a host key whose MD5 is these
+                           32 hex digits (known_hosts is not consulted)
+      --ssh-accept-new     SFTP/SCP: trust an unknown host on first use and add
+                           its key to ~/.ssh/known_hosts (rsurl extension). By
+                           default, like curl, a host that is not in
+                           known_hosts fails with exit code 60
   -C, --continue-at <off>  resume at byte <off> (FTP: REST before STOR);
                            '-C -' auto-resumes an HTTP download via its
                            <name>.rsurlpart (needs server Range support; with
@@ -6370,7 +6425,8 @@ Options:
       --digest             use HTTP Digest auth with -u credentials
       --oauth2-bearer <t>  send Authorization: Bearer <token>
       --aws-sigv4 <spec>   sign with AWS SigV4 (e.g. aws:amz:us-east-1:s3, -u key:secret)
-  -k, --insecure           don't verify the TLS certificate chain
+  -k, --insecure           don't verify the TLS certificate chain; for
+                           SFTP/SCP, skip the known_hosts host-key check
       --cacert <file>      PEM bundle to use instead of system trust
       --tlsv1.2/1.3        require at least this TLS version (floor)
       --tls-max <ver>      cap the TLS version (1.2 or 1.3)
@@ -6523,6 +6579,12 @@ mod tests {
         assert_eq!(transfer_exit_code(&rsurl::Error::UnexpectedEof), 52);
         assert_eq!(transfer_exit_code(&rsurl::Error::Ssh("auth".into())), 79);
         assert_eq!(
+            transfer_exit_code(&rsurl::Error::Ssh(
+                "host key verification failed: [h]:2222 is not in known_hosts".into()
+            )),
+            60
+        );
+        assert_eq!(
             transfer_exit_code(&rsurl::Error::BadResponse("operation timed out".into())),
             28
         );
@@ -6637,6 +6699,61 @@ mod tests {
 
     fn toks(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_ssh_host_key_flags() {
+        let a = parse_args(&toks(&["sftp://h/f"])).unwrap();
+        assert!(!a.ssh_accept_new && !a.insecure);
+        assert!(a.hostpubsha256.is_none() && a.hostpubmd5.is_none());
+
+        let md5 = "0123456789abcdefABCDEF0123456789";
+        let a = parse_args(&toks(&[
+            "--ssh-accept-new",
+            "--hostpubsha256",
+            "q1w2e3r4t5y6u7i8o9p0",
+            "--hostpubmd5",
+            md5,
+            "sftp://h/f",
+        ]))
+        .unwrap();
+        assert!(a.ssh_accept_new);
+        assert_eq!(a.hostpubsha256.as_deref(), Some("q1w2e3r4t5y6u7i8o9p0"));
+        assert_eq!(a.hostpubmd5.as_deref(), Some(md5));
+
+        // curl requires exactly 32 characters for --hostpubmd5 (usage error).
+        assert!(parse_args(&toks(&["--hostpubmd5", "abc", "sftp://h/f"])).is_err());
+        assert!(parse_args(&toks(&["--hostpubmd5", &"g".repeat(32), "sftp://h/f"])).is_err());
+        // Both pins take a value; --ssh-accept-new does not.
+        assert!(option_takes_value("--hostpubsha256"));
+        assert!(option_takes_value("--hostpubmd5"));
+        assert!(!option_takes_value("--ssh-accept-new"));
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn build_ssh_options_maps_host_key_flags() {
+        let url = Url::parse("sftp://alice@h/f").unwrap();
+        // Default: strict (no accept-new, no -k, no pins).
+        let (o, user) = build_ssh_options(&url, &parse_args(&toks(&["u"])).unwrap()).unwrap();
+        assert_eq!(user, "alice");
+        assert!(!o.accept_new && !o.insecure);
+        assert!(o.host_pubkey_sha256.is_none() && o.host_pubkey_md5.is_none());
+
+        let args = parse_args(&toks(&[
+            "-k",
+            "--ssh-accept-new",
+            "--hostpubsha256",
+            "AAAA",
+            "--hostpubmd5",
+            &"a".repeat(32),
+            "u",
+        ]))
+        .unwrap();
+        let (o, _) = build_ssh_options(&url, &args).unwrap();
+        assert!(o.insecure && o.accept_new);
+        assert_eq!(o.host_pubkey_sha256.as_deref(), Some("AAAA"));
+        assert_eq!(o.host_pubkey_md5.as_deref(), Some("a".repeat(32).as_str()));
     }
 
     #[test]
