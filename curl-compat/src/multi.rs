@@ -6,7 +6,7 @@
 //! `curl_multi_perform`, matching libcurl's callback-threading contract.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::raw::{c_int, c_long};
+use std::os::raw::c_int;
 use std::ptr;
 use std::time::Duration;
 
@@ -247,13 +247,10 @@ pub unsafe extern "C" fn curl_multi_info_read(
 }
 
 /// `curl_multi_setopt` — multi-handle tuning options. None of them change
-/// correctness in this model, so they are accepted and ignored.
-#[no_mangle]
-pub extern "C" fn curl_multi_setopt(
-    multi: *mut CURLM,
-    _option: c_int,
-    _value: c_long,
-) -> CURLMcode {
+/// correctness in this model, so they are accepted and ignored. Variadic in
+/// C; see `varargs.rs` for how the third argument is received.
+#[cfg_attr(not(all(target_arch = "aarch64", target_vendor = "apple")), no_mangle)]
+pub extern "C" fn curl_multi_setopt(multi: *mut CURLM, _option: c_int, _value: usize) -> CURLMcode {
     if multi.is_null() {
         return CURLM_BAD_HANDLE;
     }

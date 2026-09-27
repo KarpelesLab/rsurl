@@ -44,6 +44,15 @@ LD_LIBRARY_PATH=target/release LD_PRELOAD=target/release/libcurl.so.4 ./your-pro
   library only if its original libcurl used the same node name (distros that
   build libcurl against GnuTLS/NSS use a different node). Programs recompiled
   against this header — or linked at build time — are unaffected.
+- **Variadic entry points.** `curl_easy_setopt`, `curl_easy_getinfo` and
+  `curl_multi_setopt` are variadic in C; stable Rust cannot define such a
+  function, so each takes its third argument as one pointer-width slot. Where
+  the C ABI passes the first variadic integer/pointer argument exactly like a
+  fixed one (x86-64 SysV and Windows, AArch64 Linux/Windows, 32-bit x86 and
+  ARM) the function is exported directly. Apple AArch64 passes variadic
+  arguments on the stack, so there the exported symbols are small assembly
+  trampolines that load the stack slot into the argument register
+  (`src/varargs.rs`); the C smoke tests run on macOS to cover this.
 - **32-bit (ILP32) support, with one caveat.** `curl_easy_setopt` takes the
   variadic third argument as a single pointer-width slot. That is ABI-correct on
   any target for the pointer-width option classes — `long`, pointer, and

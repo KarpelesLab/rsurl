@@ -8,6 +8,19 @@ use std::path::Path;
 
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_vendor = env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+
+    // On Apple AArch64 the variadic entry points are `global_asm!` trampolines
+    // (see src/varargs.rs). rustc's cdylib export list only names Rust-declared
+    // `#[no_mangle]` items, so add the trampolines explicitly or the dylib
+    // would not export them.
+    if target_arch == "aarch64" && target_vendor == "apple" {
+        for sym in ["curl_easy_setopt", "curl_easy_getinfo", "curl_multi_setopt"] {
+            println!("cargo:rustc-cdylib-link-arg=-Wl,-exported_symbol,_{sym}");
+        }
+    }
+
     // Only emit cdylib link args; staticlib builds ignore them.
     let is_elf = !matches!(target_os.as_str(), "macos" | "ios" | "windows");
     if !is_elf {

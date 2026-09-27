@@ -1,41 +1,16 @@
-//! Easy-interface C smoke test: a real C program built against the drop-in
-//! does an HTTP GET (with a write callback, custom header, follow-location)
-//! against a tiny in-process server, then reads response info. Skips if no C
-//! compiler / the shared library isn't built.
+//! Easy-interface C smoke tests: real C programs built against the drop-in
+//! (through `curl/curl.h`'s *variadic* prototypes) run transfers against a tiny
+//! in-process server. Skips if no C compiler / the shared library isn't built.
 
 #![cfg(unix)]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
 
 const BODY: &str = "hello from server";
-
-fn find_cc() -> Option<&'static str> {
-    ["cc", "gcc", "clang"].into_iter().find(|cc| {
-        Command::new(cc)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-fn libdir_with_so() -> Option<PathBuf> {
-    let base = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("target")
-        });
-    ["debug", "release"]
-        .into_iter()
-        .map(|p| base.join(p))
-        .find(|d| d.join("libcurl.so").exists())
-}
 
 /// One-shot HTTP/1.1 server: serves `BODY` once, then exits.
 fn start_http() -> u16 {
@@ -56,49 +31,65 @@ fn start_http() -> u16 {
     port
 }
 
+/// Echo server: every request is answered with a body describing it —
+/// `M=<method> R=<Range header> L=<body length>` —
+/// so the C program can check what actually went on the wire.
+fn start_echo() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            thread::spawn(move || {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                let head_end = loop {
+                    let Ok(n) = s.read(&mut buf) else { return };
+                    if n == 0 {
+                        return;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&req[..head_end]).to_string();
+                let header = |name: &str| {
+                    head.lines()
+                        .filter_map(|l| l.split_once(':'))
+                        .find(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+                        .map(|(_, v)| v.trim().to_string())
+                        .unwrap_or_else(|| "-".into())
+                };
+                let clen: usize = header("content-length").parse().unwrap_or(0);
+                while req.len() < head_end + clen {
+                    let Ok(n) = s.read(&mut buf) else { return };
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let method = head.split(' ').next().unwrap_or("").to_string();
+                let body = format!("M={method} R={} L={clen}", header("range"));
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        }
+    });
+    port
+}
+
 #[test]
 fn easy_get_against_local_server() {
-    let Some(cc) = find_cc() else {
-        eprintln!("skipping easy_smoke: no C compiler");
+    let Some((exe, libdir)) = support::compile("tests/easy.c", "easy") else {
         return;
     };
-    let Some(libdir) = libdir_with_so() else {
-        eprintln!("skipping easy_smoke: libcurl.so not built — run `cargo build -p curl-compat`");
-        return;
-    };
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-
-    let so4 = libdir.join("libcurl.so.4");
-    if !so4.exists() {
-        let _ = std::os::unix::fs::symlink(Path::new("libcurl.so"), &so4);
-    }
-
-    let exe = std::env::temp_dir().join(format!("rsurl_curl_easy_{}", std::process::id()));
-    let compile = Command::new(cc)
-        .arg(manifest.join("tests/easy.c"))
-        .arg("-I")
-        .arg(manifest.join("include"))
-        .arg("-L")
-        .arg(&libdir)
-        .arg("-lcurl")
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .expect("cc");
-    assert!(
-        compile.status.success(),
-        "compile failed:\n{}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
     let port = start_http();
     let url = format!("http://127.0.0.1:{port}/hello");
-    let run = Command::new(&exe)
-        .arg(&url)
-        .env("LD_LIBRARY_PATH", &libdir)
-        .output()
-        .expect("run easy");
-    let _ = std::fs::remove_file(&exe);
+    let run = support::run(&exe, &libdir, &[&url]);
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
 
@@ -122,4 +113,67 @@ fn easy_get_against_local_server() {
         stdout.contains(&format!("eu={url}")),
         "effective-url mismatch: {stdout:?}"
     );
+}
+
+/// Option semantics a libcurl program relies on: the default `fwrite` write
+/// callback into a `WRITEDATA`/`HEADERDATA` `FILE*`, `CURLOPT_PRIVATE`
+/// round-trip, `TIMEOUT 0` = no timeout, `HTTPGET` dropping an earlier POST
+/// body, `RANGE` gaining its `bytes=` unit, and `HEADER_SIZE`. Every call goes
+/// through the variadic prototypes, so on Apple arm64 this also exercises the
+/// stack-slot trampolines.
+#[test]
+fn easy_option_semantics() {
+    let Some((exe, libdir)) = support::compile("tests/options.c", "options") else {
+        return;
+    };
+    let port = start_echo();
+    let url = format!("http://127.0.0.1:{port}/o");
+    let dir = std::env::temp_dir().join(format!("rsurl_curl_opts_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let body_path = dir.join("body.txt");
+    let head_path = dir.join("head.txt");
+    let run = support::run(
+        &exe,
+        &libdir,
+        &[
+            &url,
+            body_path.to_str().unwrap(),
+            head_path.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let body = std::fs::read_to_string(&body_path).unwrap_or_default();
+    let head = std::fs::read_to_string(&head_path).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        run.status.success(),
+        "options program failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    // WRITEDATA FILE* without a WRITEFUNCTION: body lands in the file, not stdout.
+    assert_eq!(
+        body, "M=GET R=- L=0",
+        "body file: {body:?} stdout={stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|l| l.starts_with("M=")),
+        "body leaked to stdout: {stdout:?}"
+    );
+    // HEADERDATA FILE* without a HEADERFUNCTION: headers land in their file.
+    assert!(
+        head.starts_with("HTTP/1.1 200") && head.contains("Content-Type: text/plain\r\n"),
+        "header file: {head:?}"
+    );
+    for want in [
+        "private=ok",
+        "timeout0=0",
+        "httpget=M=GET R=- L=0",
+        "range=M=GET R=bytes=0-3 L=0",
+        "post=M=POST R=- L=5",
+        "header_size_ok=1",
+        "unknown_opt=48",
+    ] {
+        assert!(stdout.contains(want), "missing {want:?} in {stdout:?}");
+    }
 }

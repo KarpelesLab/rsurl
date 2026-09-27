@@ -178,7 +178,11 @@ impl Handle {
 // contract (sharing a handle across threads without external locking) is
 // undefined behavior.
 
-fn handle_mut<'a>(h: *mut RSURL) -> Option<&'a mut Handle> {
+/// # Safety
+///
+/// `h` must be NULL or a live handle from [`rsurl_easy_init`], not aliased by
+/// any other live borrow (one handle per thread).
+unsafe fn handle_mut<'a>(h: *mut RSURL) -> Option<&'a mut Handle> {
     if h.is_null() {
         return None;
     }
@@ -187,7 +191,11 @@ fn handle_mut<'a>(h: *mut RSURL) -> Option<&'a mut Handle> {
     Some(unsafe { &mut *(h as *mut Handle) })
 }
 
-fn handle_ref<'a>(h: *const RSURL) -> Option<&'a Handle> {
+/// # Safety
+///
+/// `h` must be NULL or a live handle from [`rsurl_easy_init`], not mutably
+/// borrowed elsewhere (one handle per thread).
+unsafe fn handle_ref<'a>(h: *const RSURL) -> Option<&'a Handle> {
     if h.is_null() {
         return None;
     }
@@ -207,8 +215,15 @@ pub extern "C" fn rsurl_easy_init() -> *mut RSURL {
 }
 
 /// Free an easy handle. NULL is a no-op.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a pointer returned by [`rsurl_easy_init`] and not
+/// yet freed by [`rsurl_easy_cleanup`], and must not be in use concurrently on
+/// another thread.
+/// The handle (and any pointer borrowed from it) is invalid afterwards.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_cleanup(handle: *mut RSURL) {
+pub unsafe extern "C" fn rsurl_easy_cleanup(handle: *mut RSURL) {
     ffi_guard((), || {
         if handle.is_null() {
             return;
@@ -222,10 +237,17 @@ pub extern "C" fn rsurl_easy_cleanup(handle: *mut RSURL) {
 
 /// Reset all options on a handle but keep it allocated. Clears any previous
 /// response data.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a pointer returned by [`rsurl_easy_init`] and not
+/// yet freed by [`rsurl_easy_cleanup`], and must not be in use concurrently on
+/// another thread.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_reset(handle: *mut RSURL) -> RsurlCode {
+pub unsafe extern "C" fn rsurl_easy_reset(handle: *mut RSURL) -> RsurlCode {
     ffi_guard(RsurlCode::Network, || {
-        let Some(h) = handle_mut(handle) else {
+        // SAFETY: `handle` validity is this function's documented contract.
+        let Some(h) = (unsafe { handle_mut(handle) }) else {
             return RsurlCode::InvalidHandle;
         };
         *h = Handle::new();
@@ -249,7 +271,8 @@ pub unsafe extern "C" fn rsurl_easy_setopt_str(
     value: *const c_char,
 ) -> RsurlCode {
     ffi_guard(RsurlCode::Network, || {
-        let Some(h) = handle_mut(handle) else {
+        // SAFETY: `handle` validity is this function's documented contract.
+        let Some(h) = (unsafe { handle_mut(handle) }) else {
             return RsurlCode::InvalidHandle;
         };
         let s = if value.is_null() {
@@ -303,14 +326,21 @@ pub unsafe extern "C" fn rsurl_easy_setopt_str(
 }
 
 /// Set an option taking a `long` (e.g. timeouts).
+///
+/// # Safety
+///
+/// `handle` must be NULL or a pointer returned by [`rsurl_easy_init`] and not
+/// yet freed by [`rsurl_easy_cleanup`], and must not be in use concurrently on
+/// another thread.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_setopt_long(
+pub unsafe extern "C" fn rsurl_easy_setopt_long(
     handle: *mut RSURL,
     option: c_int,
     value: c_long,
 ) -> RsurlCode {
     ffi_guard(RsurlCode::Network, || {
-        let Some(h) = handle_mut(handle) else {
+        // SAFETY: `handle` validity is this function's documented contract.
+        let Some(h) = (unsafe { handle_mut(handle) }) else {
             return RsurlCode::InvalidHandle;
         };
         let Some(opt) = opt_from_int(option) else {
@@ -364,10 +394,17 @@ fn opt_from_int(v: c_int) -> Option<RsurlOpt> {
 
 /// Execute the request configured on the handle. Replaces any previous
 /// response stored on the handle.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a pointer returned by [`rsurl_easy_init`] and not
+/// yet freed by [`rsurl_easy_cleanup`], and must not be in use concurrently on
+/// another thread.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
+pub unsafe extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
     ffi_guard(RsurlCode::Network, || {
-        let Some(h) = handle_mut(handle) else {
+        // SAFETY: `handle` validity is this function's documented contract.
+        let Some(h) = (unsafe { handle_mut(handle) }) else {
             return RsurlCode::InvalidHandle;
         };
         let Some(url) = h.url.as_deref() else {
@@ -501,7 +538,8 @@ pub unsafe extern "C" fn rsurl_easy_response_body(
     out_len: *mut usize,
 ) -> RsurlCode {
     ffi_guard(RsurlCode::Network, || {
-        let Some(h) = handle_ref(handle) else {
+        // SAFETY: `handle` validity is this function's documented contract.
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
             return RsurlCode::InvalidHandle;
         };
         if out_ptr.is_null() || out_len.is_null() {
@@ -522,10 +560,17 @@ pub unsafe extern "C" fn rsurl_easy_response_body(
 }
 
 /// Return the response HTTP status code, or 0 if no response is available.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a pointer returned by [`rsurl_easy_init`] and not
+/// yet freed by [`rsurl_easy_cleanup`], and must not be in use concurrently on
+/// another thread.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_long {
+pub unsafe extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_long {
     ffi_guard(0, || {
-        handle_ref(handle)
+        // SAFETY: `handle` validity is this function's documented contract.
+        unsafe { handle_ref(handle) }
             .and_then(|h| h.last_response.as_ref())
             .map(|r| r.status as c_long)
             .unwrap_or(0)
@@ -549,9 +594,13 @@ pub extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_long {
 /// the caller and must not be used after the next perform/reset/cleanup on
 /// `handle`.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_response_header(handle: *const RSURL, index: usize) -> *const c_char {
+pub unsafe extern "C" fn rsurl_easy_response_header(
+    handle: *const RSURL,
+    index: usize,
+) -> *const c_char {
     ffi_guard(ptr::null(), || {
-        let Some(h) = handle_ref(handle) else {
+        // SAFETY: `handle` validity is this function's documented contract.
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
             return ptr::null();
         };
         h.header_buf
@@ -562,10 +611,19 @@ pub extern "C" fn rsurl_easy_response_header(handle: *const RSURL, index: usize)
 }
 
 /// Return the number of response headers available.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a pointer returned by [`rsurl_easy_init`] and not
+/// yet freed by [`rsurl_easy_cleanup`], and must not be in use concurrently on
+/// another thread.
 #[no_mangle]
-pub extern "C" fn rsurl_easy_response_header_count(handle: *const RSURL) -> usize {
+pub unsafe extern "C" fn rsurl_easy_response_header_count(handle: *const RSURL) -> usize {
     ffi_guard(0, || {
-        handle_ref(handle).map(|h| h.header_buf.len()).unwrap_or(0)
+        // SAFETY: `handle` validity is this function's documented contract.
+        unsafe { handle_ref(handle) }
+            .map(|h| h.header_buf.len())
+            .unwrap_or(0)
     })
 }
 

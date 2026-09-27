@@ -10,8 +10,8 @@
 //! libcurl source or headers were consulted.
 //!
 //! Scope is the easy + multi interfaces over HTTP(S); see the README for the
-//! covered options and the known limitations (symbol-version node, 64-bit-Unix
-//! varargs ABI, and the option/info subset).
+//! covered options and the known limitations (symbol-version node, variadic
+//! entry points, and the option/info subset).
 //!
 //! Thread-safety follows libcurl's contract: an easy handle is single-threaded;
 //! distinct handles may be used from distinct threads.
@@ -22,6 +22,7 @@
 mod consts;
 mod easy;
 mod multi;
+mod varargs;
 mod version;
 
 pub use consts::*;

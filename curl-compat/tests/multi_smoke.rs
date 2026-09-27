@@ -4,37 +4,13 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
 
 const BODY: &str = "multi-body";
-
-fn find_cc() -> Option<&'static str> {
-    ["cc", "gcc", "clang"].into_iter().find(|cc| {
-        Command::new(cc)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-fn libdir_with_so() -> Option<PathBuf> {
-    let base = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("target")
-        });
-    ["debug", "release"]
-        .into_iter()
-        .map(|p| base.join(p))
-        .find(|d| d.join("libcurl.so").exists())
-}
 
 /// HTTP/1.1 server that serves `BODY` on every connection (until the process
 /// exits).
@@ -61,48 +37,12 @@ fn start_http() -> u16 {
 
 #[test]
 fn multi_two_concurrent_gets() {
-    let Some(cc) = find_cc() else {
-        eprintln!("skipping multi_smoke: no C compiler");
+    let Some((exe, libdir)) = support::compile("tests/multi.c", "multi") else {
         return;
     };
-    let Some(libdir) = libdir_with_so() else {
-        eprintln!("skipping multi_smoke: libcurl.so not built — run `cargo build -p curl-compat`");
-        return;
-    };
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-
-    let so4 = libdir.join("libcurl.so.4");
-    if !so4.exists() {
-        let _ = std::os::unix::fs::symlink(Path::new("libcurl.so"), &so4);
-    }
-
-    let exe = std::env::temp_dir().join(format!("rsurl_curl_multi_{}", std::process::id()));
-    let compile = Command::new(cc)
-        .arg(manifest.join("tests/multi.c"))
-        .arg("-I")
-        .arg(manifest.join("include"))
-        .arg("-L")
-        .arg(&libdir)
-        .arg("-lcurl")
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .expect("cc");
-    assert!(
-        compile.status.success(),
-        "compile failed:\n{}",
-        String::from_utf8_lossy(&compile.stderr)
-    );
-
     let port = start_http();
     let url = format!("http://127.0.0.1:{port}/x");
-    let run = Command::new(&exe)
-        .arg(&url)
-        .arg(&url)
-        .env("LD_LIBRARY_PATH", &libdir)
-        .output()
-        .expect("run multi");
-    let _ = std::fs::remove_file(&exe);
+    let run = support::run(&exe, &libdir, &[&url, &url]);
     let stdout = String::from_utf8_lossy(&run.stdout);
     let stderr = String::from_utf8_lossy(&run.stderr);
 
