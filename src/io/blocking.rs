@@ -103,8 +103,10 @@ where
             return Err(Error::UnexpectedEof);
         }
 
-        // 4. Bound the read by the machine's next timer, if it has one.
-        if let Some(deadline) = machine.next_timeout() {
+        // 4. Bound the read by the machine's next timer, if it has one. Only a
+        // read bounded this way may time out into `handle_timeout`; otherwise a
+        // timeout is the caller's own idle read timeout and must surface.
+        let timer_armed = if let Some(deadline) = machine.next_timeout() {
             let now = Instant::now();
             if now >= deadline {
                 machine.handle_timeout(now);
@@ -112,7 +114,10 @@ where
             }
             io.set_read_timeout(Some(deadline - now))
                 .map_err(Error::Io)?;
-        }
+            true
+        } else {
+            false
+        };
 
         // 5. Read more wire bytes.
         match io.read(&mut scratch) {
@@ -124,6 +129,14 @@ where
                 machine.handle_input(&scratch[..n])?;
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if !timer_armed {
+                    // The caller's read timeout elapsed (unix reports it as
+                    // `WouldBlock`); normalise so it maps to curl's exit 28.
+                    return Err(Error::Io(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "read timed out",
+                    )));
+                }
                 // The read deadline (a machine timer) elapsed.
                 machine.handle_timeout(Instant::now());
             }
@@ -238,5 +251,39 @@ mod tests {
         assert_eq!(kinds.last().copied(), Some("end"));
         assert!(kinds.contains(&"body"));
         assert_eq!(body, b"hello world");
+    }
+
+    /// A caller-set read timeout must abort a stalled exchange rather than be
+    /// swallowed as a (non-existent) machine timer and retried forever.
+    #[test]
+    fn read_timeout_without_machine_timer_surfaces() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf);
+            // Head plus a partial body, then stall well past the read timeout.
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc");
+            thread::sleep(std::time::Duration::from_secs(3));
+        });
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+
+        let req = ClientExchange::encode_request("GET", "/", &[("Host".into(), "x".into())], b"");
+        let mut x = ClientExchange::new("GET", req);
+        let started = std::time::Instant::now();
+        let err = super::drive(&mut x, &mut sock).unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "timeout was not honoured"
+        );
+        match err {
+            crate::error::Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        drop(sock);
+        server.join().unwrap();
     }
 }

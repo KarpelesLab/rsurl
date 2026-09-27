@@ -2743,7 +2743,8 @@ fn transfer_exit_code(e: &rsurl::Error) -> u8 {
             }
         }
         rsurl::Error::Io(io) => match io.kind() {
-            ErrorKind::TimedOut => 28,
+            // A unix socket read timeout surfaces as EAGAIN (`WouldBlock`).
+            ErrorKind::TimedOut | ErrorKind::WouldBlock => 28,
             ErrorKind::ConnectionRefused
             | ErrorKind::ConnectionReset
             | ErrorKind::ConnectionAborted => 7,
