@@ -202,7 +202,11 @@ impl Connector for HttpProxyConnector {
 }
 
 /// Like [`HttpProxyConnector`] but the proxy conversation itself runs over TLS
-/// (an `https://` proxy). The certificate of the *proxy* is verified.
+/// (an `https://` proxy). The certificate of the *proxy* is verified against
+/// the system roots. To verify the proxy with custom settings (curl's
+/// `--proxy-cacert`, `--proxy-insecure`, ...), configure them on
+/// [`crate::Client`] or [`crate::Request`] (`proxy_*` methods) and pass the
+/// proxy as a URL.
 #[derive(Debug, Clone)]
 pub struct HttpsProxyConnector {
     pub host: String,
@@ -217,18 +221,16 @@ impl Connector for HttpsProxyConnector {
         port: u16,
         timeout: Option<Duration>,
     ) -> Result<Box<dyn NetStream>> {
-        let tcp = open_tcp(&self.host, self.port, timeout)?;
-        // A second handle on the same socket: socket options (timeouts) are
-        // per-socket, so it lets `TlsProxyStream` re-arm the read/write
-        // timeouts after the TLS wrap owns the original handle.
-        let ctl = tcp.try_clone()?;
-        apply_handshake_timeout(&tcp, timeout)?;
-        let mut tls = crate::tls::connect_over(tcp, &self.host)?;
-        http_connect(&mut tls, host, port, self.auth.as_ref())?;
-        // Hand I/O timeouts back to the protocol layer (as the other proxy
-        // connectors do); it re-arms them via `NetStream::set_read_timeout`.
-        clear_handshake_timeout(&ctl)?;
-        Ok(Box::new(TlsProxyStream { tls, ctl }))
+        let tls = crate::tls::TlsSettings::default();
+        https_proxy_connect(
+            &self.host,
+            self.port,
+            self.auth.as_ref(),
+            &tls,
+            host,
+            port,
+            timeout,
+        )
     }
 
     fn http_forward_proxy(&self) -> Option<HttpProxyIntent> {
@@ -236,6 +238,69 @@ impl Connector for HttpsProxyConnector {
             auth: self.auth.clone(),
         })
     }
+}
+
+/// An `https://` proxy verified with caller-chosen TLS settings (the curl
+/// `--proxy-*` TLS family), independent of the origin's TLS settings.
+#[derive(Debug, Clone)]
+pub(crate) struct HttpsProxyTlsConnector {
+    host: String,
+    port: u16,
+    auth: Option<(String, String)>,
+    tls: crate::tls::TlsSettings,
+}
+
+impl Connector for HttpsProxyTlsConnector {
+    fn connect(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Option<Duration>,
+    ) -> Result<Box<dyn NetStream>> {
+        https_proxy_connect(
+            &self.host,
+            self.port,
+            self.auth.as_ref(),
+            &self.tls,
+            host,
+            port,
+            timeout,
+        )
+    }
+
+    fn http_forward_proxy(&self) -> Option<HttpProxyIntent> {
+        Some(HttpProxyIntent {
+            auth: self.auth.clone(),
+        })
+    }
+}
+
+/// Dial the `https://` proxy at `proxy_host:proxy_port`, handshake TLS with it
+/// under `tls` (the proxy's own trust settings), then `CONNECT host:port`.
+fn https_proxy_connect(
+    proxy_host: &str,
+    proxy_port: u16,
+    auth: Option<&(String, String)>,
+    tls: &crate::tls::TlsSettings,
+    host: &str,
+    port: u16,
+    timeout: Option<Duration>,
+) -> Result<Box<dyn NetStream>> {
+    // Read the proxy CA / cert / key / CRL files before dialing, so a bad
+    // path fails without touching the network.
+    let opts = tls.to_opts(&[])?;
+    let tcp = open_tcp(proxy_host, proxy_port, timeout)?;
+    // A second handle on the same socket: socket options (timeouts) are
+    // per-socket, so it lets `TlsProxyStream` re-arm the read/write
+    // timeouts after the TLS wrap owns the original handle.
+    let ctl = tcp.try_clone()?;
+    apply_handshake_timeout(&tcp, timeout)?;
+    let mut tls = crate::tls::connect_over_tls(tcp, proxy_host, opts)?;
+    http_connect(&mut tls, host, port, auth)?;
+    // Hand I/O timeouts back to the protocol layer (as the other proxy
+    // connectors do); it re-arms them via `NetStream::set_read_timeout`.
+    clear_handshake_timeout(&ctl)?;
+    Ok(Box::new(TlsProxyStream { tls, ctl }))
 }
 
 /// Wraps the TLS stream to an `https://` proxy as a [`NetStream`]. `ctl` is a
@@ -415,73 +480,75 @@ impl Connector for UnixConnector {
 /// assert!(!c.is_direct());
 /// ```
 pub fn connector_from_proxy_url(spec: &str) -> Result<Arc<dyn Connector>> {
-    let p = parse_proxy_spec(spec)?;
-    let socks_user = || p.auth.as_ref().map(|(u, _)| u.clone()).unwrap_or_default();
-    let conn: Arc<dyn Connector> = match p.scheme.as_str() {
-        "http" => Arc::new(HttpProxyConnector {
-            host: p.host,
-            port: p.port,
-            auth: p.auth,
-        }),
-        "https" => Arc::new(HttpsProxyConnector {
-            host: p.host,
-            port: p.port,
-            auth: p.auth,
-        }),
-        "socks4" => Arc::new(Socks4Connector {
-            user: socks_user(),
-            host: p.host,
-            port: p.port,
-            remote_dns: false,
-        }),
-        "socks4a" => Arc::new(Socks4Connector {
-            user: socks_user(),
-            host: p.host,
-            port: p.port,
-            remote_dns: true,
-        }),
-        "socks5" => Arc::new(Socks5Connector {
-            host: p.host,
-            port: p.port,
-            auth: p.auth,
-            remote_dns: false,
-        }),
-        "socks5h" => Arc::new(Socks5Connector {
-            host: p.host,
-            port: p.port,
-            auth: p.auth,
-            remote_dns: true,
-        }),
-        other => {
-            return Err(Error::UnsupportedScheme(format!(
-            "proxy scheme {other:?} not supported (use http/https/socks4/socks4a/socks5/socks5h)"
-        )))
-        }
-    };
-    Ok(conn)
+    Ok(ProxySpec::parse(spec)?.connector(&crate::tls::TlsSettings::default()))
 }
 
-/// For a plain `http://` (or scheme-less) proxy URL, the equivalent
-/// [`crate::http::ProxyConfig`] — the per-request proxy form, which the HTTP
-/// layer re-checks against the no-proxy list on every redirect hop. `None` for
-/// the other proxy schemes, which only exist as a [`Connector`].
-pub(crate) fn http_proxy_config(spec: &str) -> Result<Option<crate::http::ProxyConfig>> {
-    let p = parse_proxy_spec(spec)?;
-    if p.scheme != "http" {
-        return Ok(None);
-    }
-    Ok(Some(crate::http::ProxyConfig {
-        host: p.host,
-        port: p.port,
-        auth: p.auth,
-    }))
-}
-
-struct ProxySpec {
+/// A parsed, scheme-validated curl-style proxy URL. Kept (rather than a built
+/// [`Connector`]) by [`crate::Client`] and [`crate::Request`] so the connector
+/// can be rebuilt per redirect hop — with the current `--proxy-*` TLS
+/// settings, and only when the hop's host is not in the no-proxy list.
+#[derive(Debug, Clone)]
+pub(crate) struct ProxySpec {
     scheme: String,
     auth: Option<(String, String)>,
     host: String,
     port: u16,
+}
+
+impl ProxySpec {
+    /// Parse `spec` and reject schemes no connector exists for.
+    pub(crate) fn parse(spec: &str) -> Result<ProxySpec> {
+        let p = parse_proxy_spec(spec)?;
+        match p.scheme.as_str() {
+            "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h" => Ok(p),
+            other => Err(Error::UnsupportedScheme(format!(
+                "proxy scheme {other:?} not supported (use http/https/socks4/socks4a/socks5/socks5h)"
+            ))),
+        }
+    }
+
+    /// For a plain `http://` proxy, the per-request [`crate::http::ProxyConfig`]
+    /// form (absolute-form requests / `CONNECT` in the HTTP layer).
+    pub(crate) fn http_config(&self) -> Option<crate::http::ProxyConfig> {
+        (self.scheme == "http").then(|| crate::http::ProxyConfig {
+            host: self.host.clone(),
+            port: self.port,
+            auth: self.auth.clone(),
+        })
+    }
+
+    /// Build the connector for this proxy. `tls` configures the TLS session
+    /// *to the proxy* (only used by `https://` proxies).
+    pub(crate) fn connector(&self, tls: &crate::tls::TlsSettings) -> Arc<dyn Connector> {
+        let p = self.clone();
+        let socks_user = || p.auth.as_ref().map(|(u, _)| u.clone()).unwrap_or_default();
+        match p.scheme.as_str() {
+            "https" => Arc::new(HttpsProxyTlsConnector {
+                host: p.host,
+                port: p.port,
+                auth: p.auth,
+                tls: tls.clone(),
+            }),
+            "socks4" | "socks4a" => Arc::new(Socks4Connector {
+                user: socks_user(),
+                remote_dns: p.scheme == "socks4a",
+                host: p.host,
+                port: p.port,
+            }),
+            "socks5" | "socks5h" => Arc::new(Socks5Connector {
+                remote_dns: p.scheme == "socks5h",
+                host: p.host,
+                port: p.port,
+                auth: p.auth,
+            }),
+            // `parse` admits only the schemes above plus `http`.
+            _ => Arc::new(HttpProxyConnector {
+                host: p.host,
+                port: p.port,
+                auth: p.auth,
+            }),
+        }
+    }
 }
 
 fn parse_proxy_spec(spec: &str) -> Result<ProxySpec> {
@@ -615,15 +682,14 @@ mod tests {
     }
 
     #[test]
-    fn http_proxy_config_only_for_http_scheme() {
-        let c = http_proxy_config("http://u:p%21@proxy:3128/")
-            .unwrap()
-            .unwrap();
+    fn http_config_only_for_http_scheme() {
+        let cfg = |s: &str| ProxySpec::parse(s).unwrap().http_config();
+        let c = cfg("http://u:p%21@proxy:3128/").unwrap();
         assert_eq!((c.host.as_str(), c.port), ("proxy", 3128));
         assert_eq!(c.auth, Some(("u".into(), "p!".into())));
-        assert!(http_proxy_config("proxy:8080").unwrap().is_some());
-        assert!(http_proxy_config("socks5://proxy:1080").unwrap().is_none());
-        assert!(http_proxy_config("https://proxy:443").unwrap().is_none());
+        assert!(cfg("proxy:8080").is_some());
+        assert!(cfg("socks5://proxy:1080").is_none());
+        assert!(cfg("https://proxy:443").is_none());
     }
 
     /// The proxy dial must accept an IPv6 proxy host (stored unbracketed) and

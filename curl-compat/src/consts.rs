@@ -132,6 +132,8 @@ pub const CURLOPT_POSTREDIR: c_int = 161;
 pub const CURLOPT_TCP_KEEPALIVE: c_int = 213;
 pub const CURLOPT_SSL_OPTIONS: c_int = 216;
 pub const CURLOPT_SSL_VERIFYSTATUS: c_int = 232;
+pub const CURLOPT_PROXY_SSL_VERIFYPEER: c_int = 248;
+pub const CURLOPT_PROXY_SSL_VERIFYHOST: c_int = 249;
 
 // OBJECTPOINT / STRINGPOINT / SLISTPOINT options (base 10000)
 pub const CURLOPT_WRITEDATA: c_int = 10001;
@@ -173,7 +175,16 @@ pub const CURLOPT_PINNEDPUBLICKEY: c_int = 10230;
 pub const CURLOPT_UNIX_SOCKET_PATH: c_int = 10231;
 pub const CURLOPT_DEFAULT_PROTOCOL: c_int = 10238;
 pub const CURLOPT_CONNECT_TO: c_int = 10243;
+pub const CURLOPT_PROXY_CAINFO: c_int = 10246;
+pub const CURLOPT_PROXY_CAPATH: c_int = 10247;
+pub const CURLOPT_PROXY_SSLCERT: c_int = 10254;
+pub const CURLOPT_PROXY_SSLKEY: c_int = 10256;
+pub const CURLOPT_PROXY_KEYPASSWD: c_int = 10258;
+pub const CURLOPT_PROXY_SSL_CIPHER_LIST: c_int = 10259;
+pub const CURLOPT_PROXY_CRLFILE: c_int = 10260;
+pub const CURLOPT_PROXY_PINNEDPUBLICKEY: c_int = 10263;
 pub const CURLOPT_TLS13_CIPHERS: c_int = 10276;
+pub const CURLOPT_PROXY_TLS13_CIPHERS: c_int = 10277;
 
 // FUNCTIONPOINT options (base 20000)
 pub const CURLOPT_WRITEFUNCTION: c_int = 20011;

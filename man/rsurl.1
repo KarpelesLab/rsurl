@@ -169,6 +169,32 @@ Force IPv4 or IPv6.
 Route through a proxy. Schemes: \fIhttp\fR, \fIhttps\fR, \fIsocks4\fR,
 \fIsocks4a\fR, \fIsocks5\fR, \fIsocks5h\fR.
 .TP
+.BI \-\-noproxy " hosts"
+Comma\-separated hosts (suffixes, IPs or CIDR blocks) that bypass the proxy;
+\fB*\fR bypasses everything. Checked again on every redirect hop, for every
+proxy kind.
+.TP
+.BR \-\-proxy\-insecure
+Do not verify the certificate of an \fIhttps://\fR proxy. Independent of
+\fB\-k\fR, which only affects the origin server.
+.TP
+.BI \-\-proxy\-cacert " file" "\fR, \fB\-\-proxy\-capath " dir "\fR, \fB\-\-proxy\-crlfile " file
+CA bundle, extra CA directory and CRL used to verify an \fIhttps://\fR proxy.
+.TP
+.BI \-\-proxy\-cert " cert[:pass]" "\fR, \fB\-\-proxy\-key " file "\fR, \fB\-\-proxy\-pass " phrase
+Client certificate, key and key passphrase presented to an \fIhttps://\fR
+proxy (\fB\-\-proxy\-cert\-type\fR / \fB\-\-proxy\-key\-type\fR select
+PEM or DER).
+.TP
+.BI \-\-proxy\-pinnedpubkey " hashes"
+Pin the public key of an \fIhttps://\fR proxy (\fBsha256//\fIBASE64\fR).
+.TP
+.BI \-\-proxy\-ciphers " list" "\fR, \fB\-\-proxy\-tls13\-ciphers " list
+Restrict the cipher suites offered to an \fIhttps://\fR proxy.
+.TP
+.BR \-\-proxy\-tlsv1.2 ", " \-\-proxy\-tlsv1.3 ", " \-\-proxy\-tls\-max " <ver>"
+Minimum / maximum TLS version for an \fIhttps://\fR proxy.
+.TP
 .BI \-\-resolve " host:port:addr"
 Provide a static address for \fIhost:port\fR.
 .TP

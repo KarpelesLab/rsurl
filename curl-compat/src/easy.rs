@@ -23,6 +23,39 @@ pub type WriteCb = unsafe extern "C" fn(*mut c_char, usize, usize, *mut c_void) 
 /// `CURL_MAX_WRITE_SIZE`).
 const MAX_WRITE_SIZE: usize = 16 * 1024;
 
+/// TLS options for the session to an `https://` proxy (`CURLOPT_PROXY_*`),
+/// independent of the origin's.
+#[derive(Clone)]
+struct ProxyTls {
+    verify_peer: bool,
+    cainfo: Option<String>,
+    capath: Option<String>,
+    sslcert: Option<String>,
+    sslkey: Option<String>,
+    keypasswd: Option<String>,
+    pinnedpubkey: Option<String>,
+    crlfile: Option<String>,
+    cipher_list: Option<String>,
+    tls13_ciphers: Option<String>,
+}
+
+impl Default for ProxyTls {
+    fn default() -> Self {
+        ProxyTls {
+            verify_peer: true,
+            cainfo: None,
+            capath: None,
+            sslcert: None,
+            sslkey: None,
+            keypasswd: None,
+            pinnedpubkey: None,
+            crlfile: None,
+            cipher_list: None,
+            tls13_ciphers: None,
+        }
+    }
+}
+
 pub struct EasyHandle {
     // request shape
     pub url: Option<String>,
@@ -60,6 +93,10 @@ pub struct EasyHandle {
     crlfile: Option<String>,
     cipher_list: Option<String>,
     tls13_ciphers: Option<String>,
+    /// `CURLOPT_NOPROXY`: comma-separated hosts that bypass the proxy.
+    noproxy: Option<String>,
+    /// `CURLOPT_PROXY_*` TLS options for an `https://` proxy.
+    proxy_tls: ProxyTls,
     #[allow(dead_code)]
     unix_socket: Option<String>,
     // post body: either a borrowed pointer+len (POSTFIELDS) or an owned copy.
@@ -121,6 +158,8 @@ impl EasyHandle {
             crlfile: None,
             cipher_list: None,
             tls13_ciphers: None,
+            noproxy: None,
+            proxy_tls: ProxyTls::default(),
             unix_socket: None,
             post_ptr: ptr::null(),
             post_len: None,
@@ -206,6 +245,8 @@ pub extern "C" fn curl_easy_duphandle(handle: *mut CURL) -> *mut CURL {
             crlfile: src.crlfile.clone(),
             cipher_list: src.cipher_list.clone(),
             tls13_ciphers: src.tls13_ciphers.clone(),
+            noproxy: src.noproxy.clone(),
+            proxy_tls: src.proxy_tls.clone(),
             unix_socket: src.unix_socket.clone(),
             post_copy: src.post_copy.clone(),
             last: None,
@@ -310,6 +351,16 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLOPT_CRLFILE => h.crlfile = opt_string(value),
             CURLOPT_SSL_CIPHER_LIST => h.cipher_list = opt_string(value),
             CURLOPT_TLS13_CIPHERS => h.tls13_ciphers = opt_string(value),
+            CURLOPT_NOPROXY => h.noproxy = opt_string(value),
+            CURLOPT_PROXY_CAINFO => h.proxy_tls.cainfo = opt_string(value),
+            CURLOPT_PROXY_CAPATH => h.proxy_tls.capath = opt_string(value),
+            CURLOPT_PROXY_SSLCERT => h.proxy_tls.sslcert = opt_string(value),
+            CURLOPT_PROXY_SSLKEY => h.proxy_tls.sslkey = opt_string(value),
+            CURLOPT_PROXY_KEYPASSWD => h.proxy_tls.keypasswd = opt_string(value),
+            CURLOPT_PROXY_PINNEDPUBLICKEY => h.proxy_tls.pinnedpubkey = opt_string(value),
+            CURLOPT_PROXY_CRLFILE => h.proxy_tls.crlfile = opt_string(value),
+            CURLOPT_PROXY_SSL_CIPHER_LIST => h.proxy_tls.cipher_list = opt_string(value),
+            CURLOPT_PROXY_TLS13_CIPHERS => h.proxy_tls.tls13_ciphers = opt_string(value),
             CURLOPT_UNIX_SOCKET_PATH => h.unix_socket = opt_string(value),
             CURLOPT_POSTFIELDS => {
                 // Borrowed by default (caller keeps it alive until perform).
@@ -377,6 +428,7 @@ pub unsafe extern "C" fn curl_easy_setopt(
                 }
             }
             CURLOPT_SSL_VERIFYPEER => h.verify_peer = lv != 0,
+            CURLOPT_PROXY_SSL_VERIFYPEER => h.proxy_tls.verify_peer = lv != 0,
             CURLOPT_HTTP_VERSION => h.http_version = lv,
             CURLOPT_HTTPAUTH => h.httpauth = lv,
             // libcurl: 0 means "no timeout" (the default); negative is an error.
@@ -419,6 +471,7 @@ pub unsafe extern "C" fn curl_easy_setopt(
             }
             // --- recognized but behaviorally irrelevant here: accept silently ---
             CURLOPT_SSL_VERIFYHOST
+            | CURLOPT_PROXY_SSL_VERIFYHOST
             | CURLOPT_NOSIGNAL
             | CURLOPT_NOPROGRESS
             | CURLOPT_TCP_NODELAY
@@ -617,9 +670,42 @@ pub fn build_request(h: &EasyHandle) -> Result<Request, CURLcode> {
         req = req.tls13_ciphers(v);
     }
 
-    // Proxy.
+    // Proxy. The no-proxy list is re-checked on every redirect hop.
     if let Some(spec) = &h.proxy {
         req = req.proxy(spec).map_err(|e| map_error(&e))?;
+    }
+    if let Some(list) = &h.noproxy {
+        req = req.no_proxy(list.split(',').map(str::trim).filter(|s| !s.is_empty()));
+    }
+    // TLS to an `https://` proxy — independent of the origin's settings.
+    let pt = &h.proxy_tls;
+    req = req.proxy_verify_tls(pt.verify_peer);
+    if let Some(v) = &pt.cainfo {
+        req = req.proxy_ca_bundle(v);
+    }
+    if let Some(v) = &pt.capath {
+        req = req.proxy_ca_path(v);
+    }
+    if let Some(v) = &pt.sslcert {
+        req = req.proxy_client_cert(v);
+    }
+    if let Some(v) = &pt.sslkey {
+        req = req.proxy_client_key(v);
+    }
+    if let Some(v) = &pt.keypasswd {
+        req = req.proxy_client_key_pass(v);
+    }
+    if let Some(v) = &pt.pinnedpubkey {
+        req = req.proxy_pinned_pubkey(v);
+    }
+    if let Some(v) = &pt.crlfile {
+        req = req.proxy_crl_file(v);
+    }
+    if let Some(v) = &pt.cipher_list {
+        req = req.proxy_ciphers(v);
+    }
+    if let Some(v) = &pt.tls13_ciphers {
+        req = req.proxy_tls13_ciphers(v);
     }
 
     // --resolve / --connect-to.

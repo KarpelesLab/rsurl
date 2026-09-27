@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::net::{connector_from_proxy_url, Connector, DirectConnector, NetStream};
+use crate::net::{Connector, DirectConnector, NetStream};
 use crate::proto::http1::{ClientExchange, Event as Http1Event, Http1Head};
 use crate::url::Url;
 
@@ -81,6 +81,14 @@ pub struct Request {
     /// `NO_PROXY` / `--noproxy`: case-insensitive suffix match against
     /// the request URL host. `*` means "everything bypasses".
     pub(crate) no_proxy: Vec<String>,
+    /// A SOCKS or `https://` proxy set by [`Request::proxy`] (or a `Client`).
+    /// Unlike a caller-supplied [`Connector`], it is subject to `no_proxy`
+    /// on every redirect hop: `select_hop_connector` rebuilds `connector`
+    /// from it (or picks a direct dial) for the hop's host.
+    pub(crate) proxy_spec: Option<crate::net::connector::ProxySpec>,
+    /// TLS settings for the session *to an `https://` proxy* (curl's
+    /// `--proxy-*` TLS family), independent of the origin's TLS flags.
+    pub(crate) proxy_tls: crate::tls::TlsSettings,
     /// Convert international (IDN) hostnames to ASCII/punycode before use.
     /// On by default (curl's behaviour); `false` is curl's `--no-idn`. A no-op
     /// when the crate is built without the `idn` feature.
@@ -338,6 +346,8 @@ impl Request {
             max_time: None,
             proxy: None,
             no_proxy: Vec::new(),
+            proxy_spec: None,
+            proxy_tls: crate::tls::TlsSettings::default(),
             idn: true,
             connector: Arc::new(DirectConnector),
             ip_family: None,
@@ -416,18 +426,47 @@ impl Request {
         };
         if let crate::net::ProxyChoice::Proxy(spec) = resolver.resolve(&self.url) {
             // Reuse the same spec-application logic as the `proxy()` builder.
-            let is_http_proxy = match spec.split_once("://") {
-                Some((scheme, _)) => scheme.eq_ignore_ascii_case("http"),
-                None => true,
-            };
-            if is_http_proxy {
-                self.proxy = Some(ProxyConfig::parse(&spec)?);
-            } else {
-                self.connector = connector_from_proxy_url(&spec)?;
-            }
+            self.set_proxy_spec(crate::net::connector::ProxySpec::parse(&spec)?);
         }
         Ok(())
     }
+
+    /// Install a parsed proxy: an `http://` proxy becomes the per-request
+    /// [`ProxyConfig`]; a SOCKS/`https://` proxy is kept as `proxy_spec` and
+    /// its connector installed (rebuilt per hop by `select_hop_connector`).
+    pub(crate) fn set_proxy_spec(&mut self, p: crate::net::connector::ProxySpec) {
+        match p.http_config() {
+            Some(cfg) => {
+                self.proxy = Some(cfg);
+                if self.proxy_spec.take().is_some() {
+                    self.connector = Arc::new(DirectConnector);
+                }
+            }
+            None => {
+                self.proxy = None;
+                self.connector = p.connector(&self.proxy_tls);
+                self.proxy_spec = Some(p);
+            }
+        }
+    }
+
+    /// Choose this hop's transport for a SOCKS/`https://` proxy: a direct dial
+    /// when the current URL host is in the no-proxy list, else the proxy
+    /// (built with the current `--proxy-*` TLS settings). Called for every hop,
+    /// so a redirect across the no-proxy boundary switches transport — the
+    /// same per-hop decision the `http://` proxy path makes via
+    /// `proxy_bypassed`. A no-op without a `proxy_spec`.
+    pub(crate) fn select_hop_connector(&mut self) {
+        if let Some(p) = &self.proxy_spec {
+            self.connector = if proxy_bypassed(self) {
+                Arc::new(DirectConnector)
+            } else {
+                p.connector(&self.proxy_tls)
+            };
+        }
+    }
+
+    crate::tls::proxy_tls_builder_methods!();
 
     /// Override DNS resolution with a custom [`Resolver`](crate::net::Resolver)
     /// (caching, split-horizon, DoH, …). Static `--resolve` pins set via
@@ -866,15 +905,23 @@ impl Request {
     /// `http://` proxies use the absolute-form / `CONNECT` path. The other
     /// schemes install a [`Connector`] (see [`Request::connector`]); in this
     /// milestone they force HTTP/1.1 and disable connection pooling.
+    ///
+    /// Every proxy kind honours [`no_proxy`](Self::no_proxy) per redirect hop,
+    /// and an `https://` proxy is verified with the `proxy_*` TLS settings
+    /// (e.g. [`proxy_ca_bundle`](Self::proxy_ca_bundle)), not the origin's.
     pub fn proxy(mut self, spec: &str) -> Result<Self> {
         let is_http_proxy = match spec.split_once("://") {
             Some((scheme, _)) => scheme.eq_ignore_ascii_case("http"),
             None => true, // bare host:port == http://
         };
         if is_http_proxy {
+            // Keep ProxyConfig's own parse for the http form.
             self.proxy = Some(ProxyConfig::parse(spec)?);
+            if self.proxy_spec.take().is_some() {
+                self.connector = Arc::new(DirectConnector);
+            }
         } else {
-            self.connector = connector_from_proxy_url(spec)?;
+            self.set_proxy_spec(crate::net::connector::ProxySpec::parse(spec)?);
         }
         Ok(self)
     }
@@ -884,6 +931,7 @@ impl Request {
     /// pooling in this milestone. See [`crate::net::Connector`].
     pub fn connector(mut self, connector: Arc<dyn Connector>) -> Self {
         self.connector = connector;
+        self.proxy_spec = None;
         self
     }
 
@@ -1472,6 +1520,7 @@ impl Request {
 
     /// Single-shot send with no redirect handling. Pure protocol dispatch.
     fn send_once(mut self, trace: &mut dyn Write) -> Result<Response> {
+        self.select_hop_connector();
         self.apply_aws_sigv4();
         if !self.verify_tls && self.url.scheme == "https" {
             let _ = writeln!(trace, "* WARNING: certificate verification disabled (-k)");

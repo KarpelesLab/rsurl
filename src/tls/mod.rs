@@ -41,7 +41,7 @@ pub(crate) use client_auth::{cipher_names_to_ids, parse_pinned_pubkey};
 #[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
 mod settings;
 #[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
-pub(crate) use settings::TlsSettings;
+pub(crate) use settings::{proxy_tls_builder_methods, TlsSettings};
 
 #[cfg(feature = "rustls-tls")]
 mod rustls;

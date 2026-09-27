@@ -509,3 +509,426 @@ fn tftp_upload_reaches_ipv6_server() {
     assert_eq!(data, b"over ipv6");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Per-hop NO_PROXY for SOCKS proxies
+// ---------------------------------------------------------------------------
+
+/// A minimal SOCKS5 (no-auth) proxy: records each requested `host:port` and
+/// pipes the connection to it. Returns the proxy port and the target log.
+fn start_socks5_mock() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let Ok(mut c) = sock else { return };
+            let log = log2.clone();
+            std::thread::spawn(move || {
+                let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut hdr = [0u8; 2];
+                if c.read_exact(&mut hdr).is_err() {
+                    return;
+                }
+                let mut methods = vec![0u8; hdr[1] as usize];
+                c.read_exact(&mut methods).unwrap();
+                c.write_all(&[5, 0]).unwrap();
+                let mut req = [0u8; 4];
+                c.read_exact(&mut req).unwrap();
+                let host = match req[3] {
+                    1 => {
+                        let mut a = [0u8; 4];
+                        c.read_exact(&mut a).unwrap();
+                        std::net::Ipv4Addr::from(a).to_string()
+                    }
+                    3 => {
+                        let mut l = [0u8; 1];
+                        c.read_exact(&mut l).unwrap();
+                        let mut n = vec![0u8; l[0] as usize];
+                        c.read_exact(&mut n).unwrap();
+                        String::from_utf8(n).unwrap()
+                    }
+                    _ => {
+                        let mut a = [0u8; 16];
+                        c.read_exact(&mut a).unwrap();
+                        format!("[{}]", std::net::Ipv6Addr::from(a))
+                    }
+                };
+                let mut p = [0u8; 2];
+                c.read_exact(&mut p).unwrap();
+                let tport = u16::from_be_bytes(p);
+                log.lock().unwrap().push(format!("{host}:{tport}"));
+                let Ok(up) = TcpStream::connect((host.trim_matches(['[', ']']), tport)) else {
+                    let _ = c.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]);
+                    return;
+                };
+                c.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+                let _ = c.set_read_timeout(None);
+                let (mut c2, mut up2) = (c.try_clone().unwrap(), up.try_clone().unwrap());
+                let mut up = up;
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c2, &mut up2);
+                    let _ = up2.shutdown(std::net::Shutdown::Write);
+                });
+                let _ = std::io::copy(&mut up, &mut c);
+                let _ = c.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    (port, log)
+}
+
+/// A redirect from a NO_PROXY host (`localhost`, dialed directly) to an
+/// external one (`127.0.0.1`) must go through the SOCKS proxy. The connector
+/// used to be chosen once from the first host, so the second hop went out
+/// directly, bypassing a mandatory proxy.
+#[test]
+fn socks_noproxy_redirect_internal_to_external_uses_proxy() {
+    let external = TestServer::start(|_| SResp::ok("external"));
+    let ext_port = external.addr.port();
+    let internal = TestServer::start(move |_| {
+        SResp::status(302).header("Location", &format!("http://127.0.0.1:{ext_port}/final"))
+    });
+    let (sport, log) = start_socks5_mock();
+    let out = run(&[
+        "-s",
+        "-L",
+        "-x",
+        &format!("socks5h://127.0.0.1:{sport}"),
+        "--noproxy",
+        "localhost",
+        &format!("http://localhost:{}/start", internal.addr.port()),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"external");
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![format!("127.0.0.1:{ext_port}")],
+        "only the external hop may use the proxy"
+    );
+}
+
+/// And the reverse: a proxied first hop redirecting to a NO_PROXY host must
+/// reach that host directly, not through the proxy.
+#[test]
+fn socks_noproxy_redirect_external_to_internal_goes_direct() {
+    let internal = TestServer::start(|_| SResp::ok("internal"));
+    let int_port = internal.addr.port();
+    let external = TestServer::start(move |_| {
+        SResp::status(302).header("Location", &format!("http://localhost:{int_port}/final"))
+    });
+    let ext_port = external.addr.port();
+    let (sport, log) = start_socks5_mock();
+    let out = run(&[
+        "-s",
+        "-L",
+        "-x",
+        &format!("socks5h://127.0.0.1:{sport}"),
+        "--noproxy",
+        "localhost",
+        &format!("http://127.0.0.1:{ext_port}/start"),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"internal");
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![format!("127.0.0.1:{ext_port}")],
+        "the NO_PROXY hop must not use the proxy"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --proxy-* TLS options (HTTPS proxy)
+// ---------------------------------------------------------------------------
+
+/// A mock `https://` proxy presenting a `localhost` certificate issued by a
+/// private test CA (so it is untrusted by default). After `CONNECT` it serves
+/// the tunnelled request itself: plain HTTP answers `via-proxy`, and a TLS
+/// ClientHello gets a second (origin) TLS session with the same untrusted
+/// certificate, answering `via-proxy-tls`.
+#[cfg(feature = "rustls-tls")]
+mod https_proxy {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Same test CA / `localhost` leaf as the crate's rustls unit tests.
+    pub const CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBhzCCAS2gAwIBAgIUEJAJGguFhUu6Wi64F9FYb6oJ9bkwCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTAgFw0yNjA2MjEyMzI2MjFaGA8yMTI2
+MDUyODIzMjYyMVowGDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTBZMBMGByqGSM49
+AgEGCCqGSM49AwEHA0IABGvezLhNMu/DJw3ClBkhcK571eQz/QctqGAf1whkMiXf
+Sj46b9bBymWIV706DP/x2nXzSJgiXTv9rnTli35el0CjUzBRMB0GA1UdDgQWBBQU
+AOFhWcYfxuM+R86kRFZWr/KATzAfBgNVHSMEGDAWgBQUAOFhWcYfxuM+R86kRFZW
+r/KATzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0gAMEUCIBWUfubWKWST
+arQvZPn0jqXOwKG0x+xYs5UtcjVf3vOiAiEAlxoTAAh0nVLMrmTsnJXD131iPHz7
+Uk3Wt1xw1blCE/8=
+-----END CERTIFICATE-----
+";
+
+    const LEAF_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBuDCCAV2gAwIBAgIUcMudt8JBWAsDX8h+3CC46SiY14EwCgYIKoZIzj0EAwIw
+GDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTAgFw0yNjA2MjEyMzI2MjFaGA8yMTI2
+MDUyODIzMjYyMVowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAEuBVdUYNtZqpWDO9h4nw0HF9sTKT3R7p/WJYsNgIfeO4hi/AM
+9x+n7MP1tYi6zPlfR6qG/ZbEJLFDzZShfHPc/KOBhjCBgzAUBgNVHREEDTALggls
+b2NhbGhvc3QwCQYDVR0TBAIwADALBgNVHQ8EBAMCB4AwEwYDVR0lBAwwCgYIKwYB
+BQUHAwEwHQYDVR0OBBYEFAAZvjmK2EXoiEDqFV3wFGMS8GBJMB8GA1UdIwQYMBaA
+FBQA4WFZxh/G4z5HzqREVlav8oBPMAoGCCqGSM49BAMCA0kAMEYCIQCPQPF3G07F
+EhDmMDPLFGbF/ZdfuDFfBN6Sjs3DuIgSXAIhAMGqymq6vFwXRbvrhbGljFfJQjtz
+98VOQz3xfzdRnPC2
+-----END CERTIFICATE-----
+";
+
+    const LEAF_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8mp/gpytQtzNMwlE
+fXfhylHGgcKzHtmkPeil9MKfoSyhRANCAAS4FV1Rg21mqlYM72HifDQcX2xMpPdH
+un9Yliw2Ah947iGL8Az3H6fsw/W1iLrM+V9Hqob9lsQksUPNlKF8c9z8
+-----END PRIVATE KEY-----
+";
+
+    fn server_config() -> Arc<rustls::ServerConfig> {
+        let certs = rustls_pemfile::certs(&mut LEAF_CERT_PEM.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut LEAF_KEY_PEM.as_bytes())
+            .unwrap()
+            .unwrap();
+        Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        )
+    }
+
+    /// Read an HTTP head (up to the blank line) byte by byte.
+    fn read_head<R: Read>(r: &mut R) -> Option<String> {
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match r.read(&mut b) {
+                Ok(1) => head.push(b[0]),
+                _ => return None,
+            }
+        }
+        Some(String::from_utf8_lossy(&head).into_owned())
+    }
+
+    /// The tunnel after `CONNECT`, with one already-read byte pushed back.
+    struct Prefixed<S> {
+        first: Option<u8>,
+        inner: S,
+    }
+    impl<S: Read> Read for Prefixed<S> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.first.take() {
+                Some(b) if !buf.is_empty() => {
+                    buf[0] = b;
+                    Ok(1)
+                }
+                _ => self.inner.read(buf),
+            }
+        }
+    }
+    impl<S: Write> Write for Prefixed<S> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn respond<S: Write>(s: &mut S, body: &str) {
+        let _ = write!(
+            s,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = s.flush();
+    }
+
+    fn serve(sock: TcpStream, cfg: Arc<rustls::ServerConfig>) {
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+        let conn = rustls::ServerConnection::new(cfg.clone()).unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        // A client that rejects the proxy certificate aborts here.
+        let Some(head) = read_head(&mut tls) else {
+            return;
+        };
+        if !head.starts_with("CONNECT ") {
+            return;
+        }
+        let _ = tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+        let _ = tls.flush();
+        let mut first = [0u8; 1];
+        if tls.read_exact(&mut first).is_err() {
+            return;
+        }
+        let mut tunnel = Prefixed {
+            first: Some(first[0]),
+            inner: tls,
+        };
+        if first[0] == 0x16 {
+            // TLS to the origin, inside the proxy's TLS session.
+            let mut origin = rustls::ServerConnection::new(cfg).unwrap();
+            let mut s = rustls::Stream::new(&mut origin, &mut tunnel);
+            if read_head(&mut s).is_some() {
+                respond(&mut s, "via-proxy-tls");
+                s.conn.send_close_notify();
+                let _ = s.flush();
+            }
+        } else if read_head(&mut tunnel).is_some() {
+            respond(&mut tunnel, "via-proxy");
+        }
+        tunnel.inner.conn.send_close_notify();
+        let _ = tunnel.inner.flush();
+    }
+
+    /// Start the mock proxy; returns its port.
+    pub fn start() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = server_config();
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(sock) = sock else { return };
+                let cfg = cfg.clone();
+                std::thread::spawn(move || serve(sock, cfg));
+            }
+        });
+        port
+    }
+}
+
+#[cfg(feature = "rustls-tls")]
+fn run_via_https_proxy(extra: &[&str], url: &str) -> Output {
+    let port = https_proxy::start();
+    let proxy = format!("https://localhost:{port}");
+    let mut args = vec!["-s", "-x", &proxy];
+    args.extend_from_slice(extra);
+    args.push(url);
+    run(&args)
+}
+
+/// The untrusted proxy certificate is rejected by default, and `-k` (which
+/// only concerns the origin) must not relax proxy verification.
+#[cfg(feature = "rustls-tls")]
+#[test]
+fn https_proxy_untrusted_cert_rejected_by_default_and_with_k() {
+    for extra in [&[][..], &["-k"][..]] {
+        let out = run_via_https_proxy(extra, "http://origin.test/");
+        assert!(
+            !out.status.success(),
+            "{extra:?}: an untrusted https proxy must be rejected"
+        );
+        assert!(out.stdout.is_empty(), "{extra:?}");
+    }
+}
+
+/// `--proxy-insecure` accepts the untrusted proxy; `--proxy-cacert` trusts it.
+#[cfg(feature = "rustls-tls")]
+#[test]
+fn https_proxy_insecure_and_cacert_accept_proxy() {
+    let out = run_via_https_proxy(&["--proxy-insecure"], "http://origin.test/");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"via-proxy");
+
+    let dir = temp_dir("proxy-cacert");
+    let ca = dir.join("ca.pem");
+    std::fs::write(&ca, https_proxy::CA_CERT_PEM).unwrap();
+    let out = run_via_https_proxy(
+        &["--proxy-cacert", ca.to_str().unwrap()],
+        "http://origin.test/",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"via-proxy");
+
+    // A wrong proxy pin fails even with --proxy-insecure.
+    let out = run_via_https_proxy(
+        &[
+            "--proxy-insecure",
+            "--proxy-pinnedpubkey",
+            "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        ],
+        "http://origin.test/",
+    );
+    assert!(!out.status.success(), "a proxy pin mismatch must fail");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--proxy-insecure` must not relax *origin* verification: an https origin
+/// with an untrusted certificate behind the proxy is still rejected, and is
+/// accepted once the origin's own `--cacert` (or `-k`) trusts it.
+#[cfg(feature = "rustls-tls")]
+#[test]
+fn https_proxy_insecure_keeps_origin_verification() {
+    let out = run_via_https_proxy(&["--proxy-insecure"], "https://localhost/");
+    assert!(
+        !out.status.success(),
+        "--proxy-insecure must not disable origin verification"
+    );
+    assert!(out.stdout.is_empty());
+
+    let dir = temp_dir("proxy-origin-ca");
+    let ca = dir.join("ca.pem");
+    std::fs::write(&ca, https_proxy::CA_CERT_PEM).unwrap();
+    let out = run_via_https_proxy(
+        &["--proxy-insecure", "--cacert", ca.to_str().unwrap()],
+        "https://localhost/",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"via-proxy-tls");
+
+    // Proxy and origin each trusted by their own flag.
+    let out = run_via_https_proxy(
+        &["--proxy-cacert", ca.to_str().unwrap(), "-k"],
+        "https://localhost/",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"via-proxy-tls");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing `--proxy-cacert` file fails early with curl's exit code 77.
+#[test]
+fn proxy_cacert_missing_file_exits_77() {
+    let out = run(&[
+        "-s",
+        "-x",
+        "https://127.0.0.1:9",
+        "--proxy-cacert",
+        "/nonexistent/rsurl-proxy-ca.pem",
+        "http://origin.test/",
+    ]);
+    assert_eq!(out.status.code(), Some(77));
+}

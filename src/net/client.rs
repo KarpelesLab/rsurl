@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::Result;
+use crate::net::connector::ProxySpec;
 use crate::net::stream::NetStream;
-use crate::net::{connector_from_proxy_url, Connector, DirectConnector};
+use crate::net::{Connector, DirectConnector};
 use crate::url::Url;
 
 /// Internal bundle of network settings handed to the protocol backends so they
@@ -119,10 +120,14 @@ impl NetConfig {
 #[derive(Clone)]
 pub struct Client {
     connector: Arc<dyn Connector>,
-    /// Set when [`Client::proxy`] configured a plain `http://` proxy: HTTP
-    /// requests then carry it as a per-request proxy (plus the no-proxy list)
-    /// so the bypass decision is re-made for every redirect hop.
-    http_proxy: Option<crate::http::ProxyConfig>,
+    /// Set by [`Client::proxy`]. HTTP requests carry it (plus the no-proxy
+    /// list) so the bypass decision is re-made for every redirect hop, for
+    /// every proxy kind; the connector is built on demand so it picks up the
+    /// `proxy_*` TLS settings whatever the builder order.
+    proxy: Option<ProxySpec>,
+    /// TLS settings for an `https://` proxy (curl `--proxy-*`), independent
+    /// of `tls` (the origin's).
+    proxy_tls: crate::tls::TlsSettings,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
     tls: crate::tls::TlsSettings,
@@ -139,7 +144,8 @@ impl Default for Client {
     fn default() -> Self {
         Client {
             connector: Arc::new(DirectConnector),
-            http_proxy: None,
+            proxy: None,
+            proxy_tls: crate::tls::TlsSettings::default(),
             connect_timeout: Some(Duration::from_secs(30)),
             read_timeout: Some(DEFAULT_READ_TIMEOUT),
             tls: crate::tls::TlsSettings::default(),
@@ -162,19 +168,26 @@ impl Client {
 
     /// Route through a proxy given a curl-style URL (`http`, `https`,
     /// `socks4`, `socks4a`, `socks5`, `socks5h`). See
-    /// [`connector_from_proxy_url`].
+    /// [`connector_from_proxy_url`](crate::net::connector_from_proxy_url).
+    ///
+    /// The [`no_proxy`](Self::no_proxy) list is re-checked on every HTTP
+    /// redirect hop for every proxy kind, and an `https://` proxy is verified
+    /// with the `proxy_*` TLS settings (e.g.
+    /// [`proxy_ca_bundle`](Self::proxy_ca_bundle)), never the origin's.
     pub fn proxy(mut self, spec: &str) -> Result<Self> {
-        self.connector = connector_from_proxy_url(spec)?;
-        self.http_proxy = crate::net::connector::http_proxy_config(spec)?;
+        self.proxy = Some(ProxySpec::parse(spec)?);
+        self.connector = Arc::new(DirectConnector);
         Ok(self)
     }
 
     /// Use a caller-supplied transport. See [`Connector`].
     pub fn connector(mut self, connector: Arc<dyn Connector>) -> Self {
         self.connector = connector;
-        self.http_proxy = None;
+        self.proxy = None;
         self
     }
+
+    crate::tls::proxy_tls_builder_methods!();
 
     /// Connect-phase timeout (default 30 s). `None` disables it.
     pub fn connect_timeout(mut self, d: Option<Duration>) -> Self {
@@ -347,6 +360,8 @@ impl Client {
     fn effective_connector(&self, host: &str) -> Arc<dyn Connector> {
         if self.host_bypassed(host) {
             Arc::new(DirectConnector)
+        } else if let Some(p) = &self.proxy {
+            p.connector(&self.proxy_tls)
         } else {
             self.connector.clone()
         }
@@ -372,12 +387,14 @@ impl Client {
             .with_tls_settings(&self.tls)
             .idn(self.idn)
             .decompress(self.decompress);
-        r = match &self.http_proxy {
-            // An HTTP proxy travels as the request's own proxy + no-proxy list,
-            // so the bypass is decided per hop: a redirect from a no-proxy host
-            // to an external one still goes through the proxy (and vice versa).
+        r.proxy_tls = self.proxy_tls.clone();
+        r = match &self.proxy {
+            // The proxy travels as the request's own proxy + no-proxy list, so
+            // the bypass is decided per hop (for http, https and socks proxies
+            // alike): a redirect from a no-proxy host to an external one still
+            // goes through the proxy, and vice versa.
             Some(p) => {
-                r.proxy = Some(p.clone());
+                r.set_proxy_spec(p.clone());
                 r.no_proxy(self.no_proxy.clone())
             }
             None => {
@@ -563,6 +580,44 @@ mod tests {
         // A custom connector replaces the HTTP proxy entirely.
         let c = c.connector(std::sync::Arc::new(crate::net::DirectConnector));
         assert!(c.request("GET", "http://x/").unwrap().proxy.is_none());
+    }
+
+    /// SOCKS and `https://` proxies are also re-decided per hop: the request
+    /// keeps the proxy spec and picks a direct dial only for no-proxy hosts.
+    /// The proxy's TLS settings travel separately from the origin's.
+    #[test]
+    fn socks_and_https_proxy_bypass_is_decided_per_hop() {
+        for spec in ["socks5h://proxy.example:1080", "https://proxy.example:443"] {
+            let c = Client::new()
+                .proxy(spec)
+                .unwrap()
+                .no_proxy(["internal.example"])
+                .verify_tls(false)
+                .proxy_ca_bundle("/proxy-ca.pem");
+            let mut r = c.request("GET", "http://internal.example/").unwrap();
+            assert!(r.proxy.is_none(), "{spec}");
+            assert!(r.proxy_spec.is_some(), "{spec}");
+            assert!(
+                !r.verify_tls && r.proxy_tls.verify,
+                "{spec}: -k is origin-only"
+            );
+            assert_eq!(r.proxy_tls.ca_bundle.as_deref(), Some("/proxy-ca.pem"));
+            r.select_hop_connector();
+            assert!(
+                r.connector.is_direct(),
+                "{spec}: no-proxy host dials direct"
+            );
+            r.url = crate::url::Url::parse("http://external.example/").unwrap();
+            r.select_hop_connector();
+            assert!(!r.connector.is_direct(), "{spec}: external host is proxied");
+        }
+        // Non-HTTP protocols pick the connector per host too.
+        let c = Client::new()
+            .proxy("socks5://p:1080")
+            .unwrap()
+            .no_proxy(["internal.example"]);
+        assert!(c.net_config_for("internal.example").connector.is_direct());
+        assert!(!c.net_config_for("external.example").connector.is_direct());
     }
 
     /// Serve one `gophers://` request with the rustls test cert (a `localhost`

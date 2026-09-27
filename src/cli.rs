@@ -69,6 +69,76 @@ enum OutputSpec {
     Remote,
 }
 
+/// `--proxy-insecure`, `--proxy-cacert`, ... (see [`Args::proxy_tls`]).
+#[derive(Default, Clone)]
+struct ProxyTlsArgs {
+    insecure: bool,
+    cacert: Option<String>,
+    capath: Option<String>,
+    crlfile: Option<String>,
+    /// `--proxy-cert <file[:password]>`.
+    cert: Option<String>,
+    key: Option<String>,
+    pass: Option<String>,
+    cert_type_der: bool,
+    key_type_der: bool,
+    pinned_pubkey: Option<String>,
+    ciphers: Option<String>,
+    tls13_ciphers: Option<String>,
+    tls_min: Option<rsurl::tls::ProtocolVersion>,
+    tls_max: Option<rsurl::tls::ProtocolVersion>,
+}
+
+/// Apply [`ProxyTlsArgs`] to a builder with the `proxy_*` TLS methods
+/// (`rsurl::Request` and `rsurl::Client` share the same names).
+macro_rules! apply_proxy_tls {
+    ($b:expr, $p:expr) => {{
+        let p: &ProxyTlsArgs = $p;
+        let mut b = $b;
+        if p.insecure {
+            b = b.proxy_verify_tls(false);
+        }
+        if let Some(v) = &p.cacert {
+            b = b.proxy_ca_bundle(v);
+        }
+        if let Some(v) = &p.capath {
+            b = b.proxy_ca_path(v);
+        }
+        if let Some(v) = &p.crlfile {
+            b = b.proxy_crl_file(v);
+        }
+        if let Some(cert) = &p.cert {
+            let (cert_path, inline_pass) = split_cert_pass(cert);
+            b = b
+                .proxy_client_cert(cert_path)
+                .proxy_cert_type_der(p.cert_type_der)
+                .proxy_key_type_der(p.key_type_der);
+            if let Some(k) = &p.key {
+                b = b.proxy_client_key(k);
+            }
+            if let Some(pass) = p.pass.as_deref().or(inline_pass) {
+                b = b.proxy_client_key_pass(pass);
+            }
+        }
+        if let Some(v) = &p.pinned_pubkey {
+            b = b.proxy_pinned_pubkey(v);
+        }
+        if let Some(v) = &p.ciphers {
+            b = b.proxy_ciphers(v);
+        }
+        if let Some(v) = &p.tls13_ciphers {
+            b = b.proxy_tls13_ciphers(v);
+        }
+        if let Some(v) = p.tls_min {
+            b = b.proxy_tls_min_version(v);
+        }
+        if let Some(v) = p.tls_max {
+            b = b.proxy_tls_max_version(v);
+        }
+        b
+    }};
+}
+
 #[derive(Default, Clone)]
 struct Args {
     urls: Vec<String>,
@@ -245,6 +315,10 @@ struct Args {
     /// restrict the offered cipher suites (honored on purecrypto-tls).
     ciphers: Option<String>,
     tls13_ciphers: Option<String>,
+    /// curl's `--proxy-*` TLS family: settings for the TLS session to an
+    /// `https://` proxy, independent of the origin's (`-k` does not relax the
+    /// proxy check and `--proxy-insecure` does not relax the origin's).
+    proxy_tls: ProxyTlsArgs,
     /// Recognized-but-not-yet-enforced flags, kept so curl scripts/config files
     /// don't hard-fail. `--limit-rate`/`-y`/`-Y` need streaming downloads
     /// (enforced on the file-download path). We warn when they are no-ops.
@@ -2320,6 +2394,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             return code;
         }
     }
+    if let Some(code) = check_proxy_tls_files(args) {
+        return code;
+    }
 
     // Proxy: explicit `-x` wins over env vars; `-x ""` disables both.
     let proxy_spec = resolve_proxy_spec(&parsed_url, args);
@@ -2348,6 +2425,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     if let Some(list) = resolve_noproxy(args) {
         req = req.no_proxy(list.split(',').map(str::trim).filter(|s| !s.is_empty()));
     }
+    req = apply_proxy_tls!(req, &args.proxy_tls);
 
     // If `-b "k=v"` was given, apply those cookies to the jar against the
     // current URL before issuing the request. This must happen before the
@@ -2662,6 +2740,46 @@ fn check_tls_files(args: &Args) -> Option<u8> {
     None
 }
 
+/// [`check_tls_files`] for the `--proxy-*` TLS files. Same exit codes.
+fn check_proxy_tls_files(args: &Args) -> Option<u8> {
+    let p = &args.proxy_tls;
+    let unreadable = |p: &str| File::open(p).is_err();
+    let fail = |what: &str, path: &str, code: u8| {
+        if show_errors(args) {
+            eprintln!("rsurl: error setting proxy {what} {path:?}: cannot read it");
+        }
+        Some(code)
+    };
+    if let Some(f) = p.cacert.as_deref().filter(|f| unreadable(f)) {
+        return fail("certificate file", f, 77);
+    }
+    if let Some(d) = p.capath.as_deref().filter(|d| !Path::new(d).is_dir()) {
+        return fail("certificate directory", d, 77);
+    }
+    if let Some(cert) = &p.cert {
+        let (path, _) = split_cert_pass(cert);
+        if unreadable(path) {
+            return fail("client certificate", path, 58);
+        }
+        if let Some(k) = p.key.as_deref().filter(|f| unreadable(f)) {
+            return fail("private key file", k, 58);
+        }
+    }
+    if let Some(f) = p.crlfile.as_deref().filter(|f| unreadable(f)) {
+        return fail("CRL file", f, 82);
+    }
+    None
+}
+
+/// Parse a `--tls-max` / `--proxy-tls-max` version argument.
+fn parse_tls_max(v: &str, flag: &str) -> Result<rsurl::tls::ProtocolVersion, String> {
+    Ok(match v {
+        "1.3" => rsurl::tls::ProtocolVersion::TLSv1_3,
+        "1.0" | "1.1" | "1.2" => rsurl::tls::ProtocolVersion::TLSv1_2,
+        other => return Err(format!("{flag}: unsupported version {other:?}")),
+    })
+}
+
 fn parse_args(raw: &[String]) -> Result<Args, String> {
     let mut a = Args::default();
     let mut it = raw.iter();
@@ -2875,13 +2993,30 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
                         .map_err(|_| "--share-ratio requires a number".to_string())?,
                 )
             }
-            "--tls-max" => {
-                let v = next_val(&mut it, arg)?;
-                a.tls_max = Some(match v.as_str() {
-                    "1.3" => rsurl::tls::ProtocolVersion::TLSv1_3,
-                    "1.0" | "1.1" | "1.2" => rsurl::tls::ProtocolVersion::TLSv1_2,
-                    other => return Err(format!("--tls-max: unsupported version {other:?}")),
-                });
+            "--tls-max" => a.tls_max = Some(parse_tls_max(&next_val(&mut it, arg)?, arg)?),
+            // The `--proxy-*` TLS family: the session to an `https://` proxy.
+            "--proxy-insecure" => a.proxy_tls.insecure = true,
+            "--proxy-cacert" => a.proxy_tls.cacert = Some(next_val(&mut it, arg)?),
+            "--proxy-capath" => a.proxy_tls.capath = Some(next_val(&mut it, arg)?),
+            "--proxy-crlfile" => a.proxy_tls.crlfile = Some(next_val(&mut it, arg)?),
+            "--proxy-cert" => a.proxy_tls.cert = Some(next_val(&mut it, arg)?),
+            "--proxy-key" => a.proxy_tls.key = Some(next_val(&mut it, arg)?),
+            "--proxy-pass" => a.proxy_tls.pass = Some(next_val(&mut it, arg)?),
+            "--proxy-cert-type" => {
+                a.proxy_tls.cert_type_der = parse_cert_type(&next_val(&mut it, arg)?, arg)?
+            }
+            "--proxy-key-type" => {
+                a.proxy_tls.key_type_der = parse_cert_type(&next_val(&mut it, arg)?, arg)?
+            }
+            "--proxy-pinnedpubkey" => a.proxy_tls.pinned_pubkey = Some(next_val(&mut it, arg)?),
+            "--proxy-ciphers" => a.proxy_tls.ciphers = Some(next_val(&mut it, arg)?),
+            "--proxy-tls13-ciphers" => a.proxy_tls.tls13_ciphers = Some(next_val(&mut it, arg)?),
+            "--proxy-tlsv1" | "--proxy-tlsv1.0" | "--proxy-tlsv1.1" | "--proxy-tlsv1.2" => {
+                a.proxy_tls.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_2)
+            }
+            "--proxy-tlsv1.3" => a.proxy_tls.tls_min = Some(rsurl::tls::ProtocolVersion::TLSv1_3),
+            "--proxy-tls-max" => {
+                a.proxy_tls.tls_max = Some(parse_tls_max(&next_val(&mut it, arg)?, arg)?)
             }
             "--no-idn" => a.no_idn = true,
             "--cacert" => a.cacert = Some(next_val(&mut it, arg)?),
@@ -3898,6 +4033,7 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
     if let Some(spec) = resolve_proxy_spec(url, args) {
         c = c.proxy(&spec)?;
     }
+    c = apply_proxy_tls!(c, &args.proxy_tls);
     if let Some(list) = resolve_noproxy(args) {
         c = c.no_proxy(
             list.split(',')
@@ -6259,7 +6395,20 @@ Options:
                            shorthands for -x socks4://… etc.
   -U, --proxy-user <u:p>   credentials for the proxy (Basic / SOCKS5 auth)
       --noproxy <hosts>    comma-separated host suffixes that bypass the
-                           proxy; \"*\" bypasses everything
+                           proxy; \"*\" bypasses everything (re-checked on
+                           every redirect hop, for every proxy kind)
+      --proxy-insecure     don't verify an https:// proxy's certificate
+                           (-k applies to the origin only, and vice versa)
+      --proxy-cacert <f>   / --proxy-capath <dir> / --proxy-crlfile <f>
+                           trust settings for an https:// proxy
+      --proxy-cert <c[:p]> / --proxy-key <f> / --proxy-pass <p>
+                           client certificate for an https:// proxy
+      --proxy-cert-type <t> / --proxy-key-type <t>   PEM (default) or DER
+      --proxy-pinnedpubkey <h>  pin an https:// proxy's public key
+      --proxy-ciphers <l> / --proxy-tls13-ciphers <l>
+                           restrict cipher suites offered to the proxy
+      --proxy-tlsv1.2/1.3 / --proxy-tls-max <ver>
+                           TLS version floor / ceiling for the proxy
   -f, --fail               on HTTP >= 400, emit no body and exit 22
   -S, --show-error         show errors even with -s
   -G, --get                put -d data in the URL query and use GET

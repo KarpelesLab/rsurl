@@ -68,6 +68,138 @@ impl Default for TlsSettings {
     }
 }
 
+impl std::fmt::Debug for TlsSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The key passphrase is redacted so a `{:?}` of a request can't leak it.
+        f.debug_struct("TlsSettings")
+            .field("verify", &self.verify)
+            .field("ca_bundle", &self.ca_bundle)
+            .field("ca_path", &self.ca_path)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &self.client_key)
+            .field(
+                "client_key_pass",
+                &self.client_key_pass.as_ref().map(|_| "<redacted>"),
+            )
+            .field("cert_is_der", &self.cert_is_der)
+            .field("key_is_der", &self.key_is_der)
+            .field("pinned_pubkey", &self.pinned_pubkey)
+            .field("crl_file", &self.crl_file)
+            .field("ciphers", &self.ciphers)
+            .field("tls13_ciphers", &self.tls13_ciphers)
+            .field("min_version", &self.min_version)
+            .field("max_version", &self.max_version)
+            .field("verify_callback", &self.verify_callback)
+            .finish()
+    }
+}
+
+/// Builder methods for the TLS session *to an `https://` proxy* (curl's
+/// `--proxy-*` TLS family), shared by `Client` and `Request`; both keep these
+/// settings in a `proxy_tls` field, independent of the origin's TLS settings.
+macro_rules! proxy_tls_builder_methods {
+    () => {
+        /// Verify the certificate of an `https://` proxy (default `true`).
+        /// `false` is curl's `--proxy-insecure`. Independent of
+        /// [`verify_tls`](Self::verify_tls): `-k` does not relax proxy
+        /// verification, and this does not relax origin verification.
+        pub fn proxy_verify_tls(mut self, on: bool) -> Self {
+            self.proxy_tls.verify = on;
+            self
+        }
+
+        /// Trust the CA bundle (PEM) at `path` instead of the system roots
+        /// when verifying an `https://` proxy (curl `--proxy-cacert`).
+        pub fn proxy_ca_bundle(mut self, path: &str) -> Self {
+            self.proxy_tls.ca_bundle = Some(path.to_string());
+            self
+        }
+
+        /// Additionally trust every CA certificate in `dir` when verifying an
+        /// `https://` proxy (curl `--proxy-capath`).
+        pub fn proxy_ca_path(mut self, dir: &str) -> Self {
+            self.proxy_tls.ca_path = Some(dir.to_string());
+            self
+        }
+
+        /// Check the `https://` proxy's chain against the CRL in `path` (curl
+        /// `--proxy-crlfile`).
+        pub fn proxy_crl_file(mut self, path: &str) -> Self {
+            self.proxy_tls.crl_file = Some(path.to_string());
+            self
+        }
+
+        /// Present the client certificate at `path` to an `https://` proxy
+        /// (curl `--proxy-cert`).
+        pub fn proxy_client_cert(mut self, path: &str) -> Self {
+            self.proxy_tls.client_cert = Some(path.to_string());
+            self
+        }
+
+        /// Client private key at `path` for the proxy client certificate
+        /// (curl `--proxy-key`).
+        pub fn proxy_client_key(mut self, path: &str) -> Self {
+            self.proxy_tls.client_key = Some(path.to_string());
+            self
+        }
+
+        /// Passphrase for an encrypted proxy client key (curl `--proxy-pass`).
+        pub fn proxy_client_key_pass(mut self, pass: &str) -> Self {
+            self.proxy_tls.client_key_pass = Some(pass.to_string());
+            self
+        }
+
+        /// Treat the proxy client certificate as DER (curl
+        /// `--proxy-cert-type DER`).
+        pub fn proxy_cert_type_der(mut self, der: bool) -> Self {
+            self.proxy_tls.cert_is_der = der;
+            self
+        }
+
+        /// Treat the proxy client key as DER (curl `--proxy-key-type DER`).
+        pub fn proxy_key_type_der(mut self, der: bool) -> Self {
+            self.proxy_tls.key_is_der = der;
+            self
+        }
+
+        /// Pin the `https://` proxy's public key (curl `--proxy-pinnedpubkey`,
+        /// `sha256//BASE64[;...]`); a mismatch fails the proxy handshake.
+        pub fn proxy_pinned_pubkey(mut self, spec: &str) -> Self {
+            self.proxy_tls.pinned_pubkey = Some(spec.to_string());
+            self
+        }
+
+        /// Restrict the TLS ≤ 1.2 cipher suites offered to the proxy (curl
+        /// `--proxy-ciphers`).
+        pub fn proxy_ciphers(mut self, list: &str) -> Self {
+            self.proxy_tls.ciphers = Some(list.to_string());
+            self
+        }
+
+        /// Restrict the TLS 1.3 cipher suites offered to the proxy (curl
+        /// `--proxy-tls13-ciphers`).
+        pub fn proxy_tls13_ciphers(mut self, list: &str) -> Self {
+            self.proxy_tls.tls13_ciphers = Some(list.to_string());
+            self
+        }
+
+        /// Minimum TLS version for the proxy connection (curl
+        /// `--proxy-tlsv1.x`).
+        pub fn proxy_tls_min_version(mut self, v: crate::tls::ProtocolVersion) -> Self {
+            self.proxy_tls.min_version = Some(v);
+            self
+        }
+
+        /// Maximum TLS version for the proxy connection (curl
+        /// `--proxy-tls-max`).
+        pub fn proxy_tls_max_version(mut self, v: crate::tls::ProtocolVersion) -> Self {
+            self.proxy_tls.max_version = Some(v);
+            self
+        }
+    };
+}
+pub(crate) use proxy_tls_builder_methods;
+
 impl TlsSettings {
     /// Build backend [`TlsOpts`] offering `alpn`. Files are read here, so a
     /// missing or unreadable one surfaces as an [`Error`] before any
