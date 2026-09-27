@@ -66,7 +66,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     tcp.set_read_timeout(Some(PING_INTERVAL))?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     if url.is_tls() {
-        let mut stream = crate::tls::connect_over(tcp, &url.host)?;
+        let mut stream = cfg.tls_connect(tcp, &url.host)?;
         run_session(&mut stream, &topic, user.as_deref(), pass.as_deref())
     } else {
         let mut stream = tcp;
@@ -131,10 +131,10 @@ pub(crate) fn publish_with(
     let (user, pass) = (user.as_deref(), pass.as_deref());
 
     let tcp = cfg.connect(&url.host, url.port)?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_read_timeout(cfg.io_timeout())?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     if url.is_tls() {
-        let mut stream = crate::tls::connect_over(tcp, &url.host)?;
+        let mut stream = cfg.tls_connect(tcp, &url.host)?;
         run_publish(&mut stream, &topic, payload, qos, user, pass)
     } else {
         let mut stream = tcp;

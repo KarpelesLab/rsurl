@@ -113,7 +113,7 @@ impl Session {
         reject_control_bytes(&url.path, "path")?;
 
         let stream = cfg.connect(&url.host, url.port)?;
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_read_timeout(cfg.io_timeout())?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
         Ok(Session {

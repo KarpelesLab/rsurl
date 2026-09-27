@@ -36,6 +36,13 @@ pub(crate) mod pc_roots;
 pub(crate) mod client_auth;
 pub(crate) use client_auth::{cipher_names_to_ids, parse_pinned_pubkey};
 
+// curl-flag TLS settings (paths, pin specs) → backend `TlsOpts`, shared by
+// HTTP and the non-HTTP protocols.
+#[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
+mod settings;
+#[cfg(any(feature = "purecrypto-tls", feature = "rustls-tls"))]
+pub(crate) use settings::TlsSettings;
+
 #[cfg(feature = "rustls-tls")]
 mod rustls;
 #[cfg(feature = "rustls-tls")]

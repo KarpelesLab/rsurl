@@ -522,29 +522,43 @@ pub fn build_request(h: &EasyHandle) -> Result<Request, CURLcode> {
             req.basic_auth(u, &p)
         };
     }
+    // libcurl: a CURLOPT_HTTPHEADER entry naming a header libcurl would
+    // generate itself (in any of its "Name: v" / "Name:" / "Name;" forms)
+    // replaces the generated one — it is never sent twice.
+    let custom = slist_lines(h.http_header);
+    let custom_has = |name: &str| {
+        custom.iter().any(|l| {
+            l.split_once([':', ';'])
+                .is_some_and(|(n, _)| n.trim().eq_ignore_ascii_case(name))
+        })
+    };
     if let Some(tok) = &h.bearer {
-        req = req.header("Authorization", &format!("Bearer {tok}"));
+        if !custom_has("Authorization") {
+            req = req.header("Authorization", &format!("Bearer {tok}"));
+        }
     }
 
     // Simple header-valued options.
     if let Some(v) = &h.useragent {
-        req = req.header("User-Agent", v);
+        if !custom_has("User-Agent") {
+            req = req.header("User-Agent", v);
+        }
     }
     if let Some(v) = &h.referer {
-        req = req.header("Referer", v);
+        if !custom_has("Referer") {
+            req = req.header("Referer", v);
+        }
     }
     if let Some(v) = &h.cookie {
-        req = req.header("Cookie", v);
+        if !custom_has("Cookie") {
+            req = req.header("Cookie", v);
+        }
     }
     if let Some(v) = &h.range {
         // CURLOPT_RANGE takes the bare "X-Y" range set; HTTP needs the unit.
         req = req.header("Range", &format!("bytes={v}"));
     }
-    let custom = slist_lines(h.http_header);
-    let custom_ae = custom.iter().any(|l| {
-        l.split_once([':', ';'])
-            .is_some_and(|(n, _)| n.trim().eq_ignore_ascii_case("accept-encoding"))
-    });
+    let custom_ae = custom_has("Accept-Encoding");
     match &h.accept_encoding {
         Some(v) => {
             let val = if v.is_empty() {

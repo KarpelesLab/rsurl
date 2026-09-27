@@ -16,8 +16,13 @@ use crate::url::Url;
 pub(crate) struct NetConfig {
     pub(crate) connector: Arc<dyn Connector>,
     pub(crate) connect_timeout: Option<Duration>,
-    /// Verify TLS certificates (consumed by the HTTP arm of `transfer_url`).
-    pub(crate) verify: bool,
+    /// TLS settings (`-k`, `--cacert`, `-E`, `--pinnedpubkey`, ...) for every
+    /// TLS leg: ftps/imaps/smtps/... and STARTTLS upgrades, plus the HTTP arm
+    /// of `transfer_url`. Use [`NetConfig::tls_connect`].
+    pub(crate) tls: crate::tls::TlsSettings,
+    /// Per-read inactivity timeout for the protocol sockets. `None` blocks
+    /// indefinitely; see [`NetConfig::io_timeout`].
+    pub(crate) read_timeout: Option<Duration>,
     /// Try `EPSV` before `PASV` for FTP passive data connections. Cleared by
     /// curl's `--disable-epsv`; the FTP backend then goes straight to `PASV`.
     pub(crate) ftp_use_epsv: bool,
@@ -40,7 +45,8 @@ impl Default for NetConfig {
         NetConfig {
             connector: Arc::new(DirectConnector),
             connect_timeout: Some(Duration::from_secs(30)),
-            verify: true,
+            tls: crate::tls::TlsSettings::default(),
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
             ftp_use_epsv: true,
             ftp_create_dirs: false,
             ftp_active: false,
@@ -49,10 +55,29 @@ impl Default for NetConfig {
     }
 }
 
+/// Default per-read inactivity timeout (curl has none, but a stalled peer
+/// must not hang a library caller forever).
+pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl NetConfig {
     /// Dial `host:port` through the configured connector.
     pub(crate) fn connect(&self, host: &str, port: u16) -> Result<Box<dyn NetStream>> {
         self.connector.connect(host, port, self.connect_timeout)
+    }
+
+    /// TLS-handshake `transport` for `host` with this config's TLS settings
+    /// (verification, CA, client cert, pins, CRL, versions, ciphers).
+    pub(crate) fn tls_connect<S: std::io::Read + std::io::Write>(
+        &self,
+        transport: S,
+        host: &str,
+    ) -> Result<crate::tls::TlsStream<S>> {
+        self.tls.connect(transport, host)
+    }
+
+    /// The per-read socket timeout to apply to protocol connections.
+    pub(crate) fn io_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 }
 
@@ -100,7 +125,7 @@ pub struct Client {
     http_proxy: Option<crate::http::ProxyConfig>,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
-    verify: bool,
+    tls: crate::tls::TlsSettings,
     idn: bool,
     no_proxy: Vec<String>,
     ftp_use_epsv: bool,
@@ -116,8 +141,8 @@ impl Default for Client {
             connector: Arc::new(DirectConnector),
             http_proxy: None,
             connect_timeout: Some(Duration::from_secs(30)),
-            read_timeout: Some(Duration::from_secs(60)),
-            verify: true,
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
+            tls: crate::tls::TlsSettings::default(),
             idn: true,
             no_proxy: Vec::new(),
             ftp_use_epsv: true,
@@ -167,7 +192,87 @@ impl Client {
 
     /// Verify TLS certificates (default `true`; `false` is curl's `-k`).
     pub fn verify_tls(mut self, on: bool) -> Self {
-        self.verify = on;
+        self.tls.verify = on;
+        self
+    }
+
+    /// Trust the CA bundle (PEM) at `path` instead of the system roots (curl
+    /// `--cacert`). Applies to every TLS protocol this client drives.
+    pub fn ca_bundle(mut self, path: &str) -> Self {
+        self.tls.ca_bundle = Some(path.to_string());
+        self
+    }
+
+    /// Additionally trust every CA certificate in `dir` (curl `--capath`).
+    pub fn ca_path(mut self, dir: &str) -> Self {
+        self.tls.ca_path = Some(dir.to_string());
+        self
+    }
+
+    /// Check server chains against the CRL in `path` (curl `--crlfile`).
+    pub fn crl_file(mut self, path: &str) -> Self {
+        self.tls.crl_file = Some(path.to_string());
+        self
+    }
+
+    /// Present the client certificate at `path` (curl `-E`/`--cert`).
+    pub fn client_cert(mut self, path: &str) -> Self {
+        self.tls.client_cert = Some(path.to_string());
+        self
+    }
+
+    /// Client private key at `path` (curl `--key`).
+    pub fn client_key(mut self, path: &str) -> Self {
+        self.tls.client_key = Some(path.to_string());
+        self
+    }
+
+    /// Passphrase for an encrypted client key (curl `--pass`).
+    pub fn client_key_pass(mut self, pass: &str) -> Self {
+        self.tls.client_key_pass = Some(pass.to_string());
+        self
+    }
+
+    /// Treat the client certificate file as DER (curl `--cert-type DER`).
+    pub fn cert_type_der(mut self, der: bool) -> Self {
+        self.tls.cert_is_der = der;
+        self
+    }
+
+    /// Treat the client key file as DER (curl `--key-type DER`).
+    pub fn key_type_der(mut self, der: bool) -> Self {
+        self.tls.key_is_der = der;
+        self
+    }
+
+    /// Pin the server public key (curl `--pinnedpubkey`,
+    /// `sha256//BASE64[;...]`); a mismatch fails the handshake.
+    pub fn pinned_pubkey(mut self, spec: &str) -> Self {
+        self.tls.pinned_pubkey = Some(spec.to_string());
+        self
+    }
+
+    /// Restrict TLS ≤ 1.2 cipher suites (curl `--ciphers`).
+    pub fn ciphers(mut self, list: &str) -> Self {
+        self.tls.ciphers = Some(list.to_string());
+        self
+    }
+
+    /// Restrict TLS 1.3 cipher suites (curl `--tls13-ciphers`).
+    pub fn tls13_ciphers(mut self, list: &str) -> Self {
+        self.tls.tls13_ciphers = Some(list.to_string());
+        self
+    }
+
+    /// Minimum acceptable TLS version (curl `--tlsv1.x`).
+    pub fn tls_min_version(mut self, v: crate::tls::ProtocolVersion) -> Self {
+        self.tls.min_version = Some(v);
+        self
+    }
+
+    /// Maximum acceptable TLS version (curl `--tls-max`).
+    pub fn tls_max_version(mut self, v: crate::tls::ProtocolVersion) -> Self {
+        self.tls.max_version = Some(v);
         self
     }
 
@@ -251,7 +356,8 @@ impl Client {
         NetConfig {
             connector: self.effective_connector(host),
             connect_timeout: self.connect_timeout,
-            verify: self.verify,
+            tls: self.tls.clone(),
+            read_timeout: self.read_timeout,
             ftp_use_epsv: self.ftp_use_epsv,
             ftp_create_dirs: self.ftp_create_dirs,
             ftp_active: self.ftp_active,
@@ -263,7 +369,7 @@ impl Client {
     /// transport and defaults.
     pub fn request(&self, method: &str, url: &str) -> Result<crate::Request> {
         let mut r = crate::Request::new(method, url)?
-            .verify_tls(self.verify)
+            .with_tls_settings(&self.tls)
             .idn(self.idn)
             .decompress(self.decompress);
         r = match &self.http_proxy {
@@ -357,6 +463,13 @@ impl Client {
         crate::ftp::append_with(url, body, &self.net_config_for(&url.host))
     }
 
+    /// Upload `body` to a `tftp://` URL (RFC 1350 WRQ) through this client's
+    /// transport: a SOCKS5 proxy is honoured and the socket family follows the
+    /// server's address (IPv6 works).
+    pub fn tftp_store(&self, url: &Url, body: &[u8]) -> Result<()> {
+        crate::tftp::store_with(url, body, &self.net_config_for(&url.host))
+    }
+
     /// Send a message over SMTP/SMTPS (curl `--mail-from`/`--mail-rcpt` + body).
     pub fn smtp_send(
         &self,
@@ -390,7 +503,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::Client;
+    use super::{Client, NetConfig, DEFAULT_READ_TIMEOUT};
+    use std::time::Duration;
 
     /// `Client` must stay `Send + Sync` so it can be wrapped in an `Arc` and
     /// shared across threads (documented contract). A compile-time check.
@@ -449,5 +563,101 @@ mod tests {
         // A custom connector replaces the HTTP proxy entirely.
         let c = c.connector(std::sync::Arc::new(crate::net::DirectConnector));
         assert!(c.request("GET", "http://x/").unwrap().proxy.is_none());
+    }
+
+    /// Serve one `gophers://` request with the rustls test cert (a `localhost`
+    /// leaf under the test CA), answering `hello` and closing cleanly.
+    #[cfg(feature = "rustls-tls")]
+    fn serve_gophers_once() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let cfg = crate::proto::tls::rustls_tests::server_config();
+            let mut server = rustls::ServerConnection::new(cfg).unwrap();
+            {
+                let mut tls = rustls::Stream::new(&mut server, &mut sock);
+                let mut byte = [0u8; 1];
+                let mut line = Vec::new();
+                while tls.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                    line.push(byte[0]);
+                    if line.ends_with(b"\r\n") {
+                        break;
+                    }
+                }
+                let _ = tls.write_all(b"hello");
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+            crate::test_support::graceful_close(&mut sock);
+        });
+        port
+    }
+
+    /// The non-HTTP protocols honour the client's TLS settings: an unknown CA
+    /// fails by default, `-k` or `--cacert` makes it work, and a wrong
+    /// `--pinnedpubkey` fails even with `-k` (previously every non-HTTP TLS leg
+    /// hard-coded default verification and ignored all of these).
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn non_http_tls_honours_client_tls_settings() {
+        let url = |port: u16| format!("gophers://localhost:{port}/");
+
+        let port = serve_gophers_once();
+        assert!(
+            Client::new().transfer(&url(port)).is_err(),
+            "untrusted test CA must be rejected by default"
+        );
+
+        let port = serve_gophers_once();
+        let body = Client::new()
+            .verify_tls(false)
+            .transfer(&url(port))
+            .unwrap();
+        assert_eq!(body, b"hello");
+
+        let dir = std::env::temp_dir().join(format!("rsurl-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, crate::proto::tls::rustls_tests::CA_CERT_PEM).unwrap();
+        let port = serve_gophers_once();
+        let body = Client::new()
+            .ca_bundle(ca.to_str().unwrap())
+            .transfer(&url(port))
+            .unwrap();
+        assert_eq!(body, b"hello");
+
+        let port = serve_gophers_once();
+        let wrong_pin = "sha256//AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert!(
+            Client::new()
+                .verify_tls(false)
+                .pinned_pubkey(wrong_pin)
+                .transfer(&url(port))
+                .is_err(),
+            "a pin mismatch must fail even with -k"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn net_config_carries_tls_settings_and_read_timeout() {
+        let c = Client::new()
+            .verify_tls(false)
+            .ca_bundle("/ca.pem")
+            .pinned_pubkey("sha256//x")
+            .read_timeout(Some(Duration::from_secs(7)));
+        let cfg = c.net_config_for("example.com");
+        assert!(!cfg.tls.verify);
+        assert_eq!(cfg.tls.ca_bundle.as_deref(), Some("/ca.pem"));
+        assert_eq!(cfg.tls.pinned_pubkey.as_deref(), Some("sha256//x"));
+        assert_eq!(cfg.io_timeout(), Some(Duration::from_secs(7)));
+        assert_eq!(
+            NetConfig::default().io_timeout(),
+            Some(DEFAULT_READ_TIMEOUT)
+        );
     }
 }

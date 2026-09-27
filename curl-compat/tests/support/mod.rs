@@ -32,15 +32,17 @@ fn shared_lib_name() -> &'static str {
     }
 }
 
-/// Directory holding the built shared library: the profile dir the test
-/// binary itself lives under (`<target>/<profile>/deps/<test>`).
+/// Directory holding the built shared library. `cargo test` builds the cdylib
+/// into `<target>/<profile>/deps/` next to the test binary — prefer that copy:
+/// the uplifted `<target>/<profile>/libcurl.*` is only refreshed by `cargo
+/// build` and can be a stale older build that the loader would pick instead.
 pub fn libdir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let profile_dir = exe.parent()?.parent()?.to_path_buf();
-    profile_dir
-        .join(shared_lib_name())
-        .exists()
-        .then_some(profile_dir)
+    let deps_dir = exe.parent()?.to_path_buf();
+    let profile_dir = deps_dir.parent()?.to_path_buf();
+    [deps_dir, profile_dir]
+        .into_iter()
+        .find(|d| d.join(shared_lib_name()).exists())
 }
 
 /// Compile `src` (relative to the crate root) against the drop-in. Returns the

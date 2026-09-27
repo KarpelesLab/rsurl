@@ -119,7 +119,11 @@ impl MaybeTlsStream {
     /// STARTTLS), verifying `host` as the SNI / certificate name — exactly as an
     /// implicit-TLS scheme does. Errors, leaving the transport unchanged, if it
     /// is not currently plaintext.
-    pub(crate) fn upgrade(&mut self, host: &str) -> crate::error::Result<()> {
+    pub(crate) fn upgrade(
+        &mut self,
+        host: &str,
+        tls: &crate::tls::TlsSettings,
+    ) -> crate::error::Result<()> {
         let plain = match std::mem::replace(self, Self::Upgrading) {
             Self::Plain(s) => s,
             other => {
@@ -129,7 +133,7 @@ impl MaybeTlsStream {
                 ));
             }
         };
-        let tls = crate::tls::connect_over(plain, host)?;
+        let tls = tls.connect(plain, host)?;
         *self = Self::Tls(Box::new(tls));
         Ok(())
     }

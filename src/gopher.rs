@@ -41,7 +41,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     let selector = selector_from_path(&url.path)?;
 
     let tcp = cfg.connect(&url.host, url.port)?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_read_timeout(cfg.io_timeout())?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let mut request = Vec::with_capacity(selector.len() + 2);
@@ -49,7 +49,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     request.extend_from_slice(b"\r\n");
 
     if url.is_tls() {
-        let mut tls = crate::tls::connect_over(tcp, &url.host)?;
+        let mut tls = cfg.tls_connect(tcp, &url.host)?;
         tls.write_all(&request)?;
         tls.flush()?;
         read_capped(&mut tls)

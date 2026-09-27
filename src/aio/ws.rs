@@ -99,7 +99,16 @@ struct Partial {
 /// so only the [`connect`](WebSocket::connect) call — which takes a `Runtime`,
 /// since there is no implicit event loop natively — differs between targets.
 ///
-/// See the [module docs](self) for cancellation behaviour.
+/// # Cancellation
+///
+/// [`recv`](WebSocket::recv) is cancel-safe provided the connection's own
+/// `read` is (as Tokio's is): a partly reassembled message lives on the
+/// `WebSocket`, not in the future, so dropping a `recv` (a `select!` branch
+/// losing, a timeout) loses nothing and the next `recv` carries on. Writes are
+/// not resumable, so a send (or the automatic pong/close echo inside `recv`)
+/// that is dropped mid-write, or that fails, leaves the connection unusable:
+/// every later operation returns an error rather than risk putting a half
+/// frame on the wire.
 ///
 /// Dropping the socket drops the underlying connection without a close
 /// handshake; call [`close`](Self::close) for a polite shutdown.
@@ -213,7 +222,7 @@ impl<C: AsyncConn> WebSocket<C> {
     /// Receive the next message, or `None` once the connection has closed
     /// cleanly. A protocol/IO error is returned as `Some(Err(..))`.
     ///
-    /// Cancel-safe (see the [module docs](self)).
+    /// Cancel-safe (see [`WebSocket`]'s *Cancellation* notes).
     pub async fn recv(&mut self) -> Option<Result<WsMessage>> {
         match self.recv_inner().await {
             Ok(Some(m)) => Some(Ok(m)),

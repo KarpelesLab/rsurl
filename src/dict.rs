@@ -258,7 +258,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     let request = parse_path(&url.path)?;
 
     let stream = cfg.connect(&url.host, url.port)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_read_timeout(cfg.io_timeout())?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let mut writer = stream.try_clone_box()?;

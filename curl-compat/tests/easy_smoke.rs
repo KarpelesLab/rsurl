@@ -70,7 +70,21 @@ fn start_echo() -> u16 {
                     req.extend_from_slice(&buf[..n]);
                 }
                 let method = head.split(' ').next().unwrap_or("").to_string();
-                let body = format!("M={method} R={} L={clen}", header("range"));
+                let path = head.split(' ').nth(1).unwrap_or("");
+                let body = if path.ends_with("ua") {
+                    // Every User-Agent / Referer line, to catch duplicates.
+                    let all = |name: &str| {
+                        head.lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .filter(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+                            .map(|(_, v)| v.trim())
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    };
+                    format!("U={} F={}", all("user-agent"), all("referer"))
+                } else {
+                    format!("M={method} R={} L={clen}", header("range"))
+                };
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -173,6 +187,8 @@ fn easy_option_semantics() {
         "post=M=POST R=- L=5",
         "header_size_ok=1",
         "unknown_opt=48",
+        // An explicit HTTPHEADER User-Agent/Referer replaces USERAGENT/REFERER.
+        "ua=U=hdr-ua F=hdr-ref",
     ] {
         assert!(stdout.contains(want), "missing {want:?} in {stdout:?}");
     }

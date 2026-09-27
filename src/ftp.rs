@@ -176,7 +176,7 @@ fn cwd_path<R: Read + Write>(ctrl: &mut BufReader<R>, dirs: &[String], create: b
 /// `AUTH SSL`, as curl does) and upgrade the control channel in place. Any
 /// refusal is an error — the caller only asks when TLS is *required*, so
 /// falling back to cleartext would leak the credentials.
-fn auth_tls(ctrl: &mut BufReader<Stream>, host: &str) -> Result<()> {
+fn auth_tls(ctrl: &mut BufReader<Stream>, host: &str, tls: &crate::tls::TlsSettings) -> Result<()> {
     for mech in ["TLS", "SSL"] {
         send(ctrl, &format!("AUTH {mech}"))?;
         let (c, _) = read_reply(ctrl)?;
@@ -189,7 +189,7 @@ fn auth_tls(ctrl: &mut BufReader<Stream>, host: &str) -> Result<()> {
                     "ftp: server sent data after AUTH TLS reply".into(),
                 ));
             }
-            ctrl.get_mut().upgrade(host)?;
+            ctrl.get_mut().upgrade(host, tls)?;
             return Ok(());
         }
     }
@@ -210,7 +210,7 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
     // 1) Control channel, dialed through the configured transport, bounded by
     //    an idle timeout so a silent server can't hang the transfer.
     let tcp = cfg.connect(&url.host, url.port)?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_read_timeout(cfg.io_timeout())?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     // Remember the control connection's peer address. For a *direct* dial PASV
     // replies carry a server-chosen data IP which we deliberately ignore (a
@@ -231,7 +231,7 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
         .map(|a| a.ip())
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     let control = if url.scheme == "ftps" {
-        Stream::Tls(Box::new(crate::tls::connect_over(tcp, &url.host)?))
+        Stream::Tls(Box::new(cfg.tls_connect(tcp, &url.host)?))
     } else {
         Stream::Plain(tcp)
     };
@@ -246,7 +246,7 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
     // 2b) Explicit FTPS: `--ssl-reqd` on a plain `ftp://` URL must upgrade
     //     before USER/PASS go out, or fail.
     if url.scheme == "ftp" && cfg.require_tls {
-        auth_tls(&mut ctrl, &url.host)?;
+        auth_tls(&mut ctrl, &url.host, &cfg.tls)?;
     }
     let tls = !ctrl.get_ref().is_plain();
 
@@ -354,9 +354,11 @@ enum DataConn {
         listener: std::net::TcpListener,
         /// The control peer; the inbound data connection must come from it.
         peer_ip: std::net::IpAddr,
-        /// `Some(host)` wraps the accepted socket in TLS (ftps), using `host`
-        /// as the SNI; `None` for plain ftp.
-        tls_host: Option<String>,
+        /// `Some((host, settings))` wraps the accepted socket in TLS (ftps),
+        /// using `host` as the SNI / verified name; `None` for plain ftp.
+        tls: Option<Box<(String, crate::tls::TlsSettings)>>,
+        /// Per-read timeout for the accepted data socket.
+        read_timeout: Option<std::time::Duration>,
     },
 }
 
@@ -370,10 +372,11 @@ impl DataConn {
             DataConn::Active {
                 listener,
                 peer_ip,
-                tls_host,
+                tls,
+                read_timeout,
             } => {
                 let (sock, addr) = accept_with_timeout(&listener)?;
-                sock.set_read_timeout(Some(IO_TIMEOUT))?;
+                sock.set_read_timeout(read_timeout)?;
                 sock.set_write_timeout(Some(IO_TIMEOUT))?;
                 // Only the control server may open the data connection; reject
                 // any other source (a port-scanner or off-path attacker).
@@ -384,8 +387,11 @@ impl DataConn {
                     )));
                 }
                 let boxed: Box<dyn NetStream> = Box::new(sock);
-                Ok(match tls_host {
-                    Some(host) => Stream::Tls(Box::new(crate::tls::connect_over(boxed, &host)?)),
+                Ok(match tls {
+                    Some(t) => {
+                        let (host, settings) = *t;
+                        Stream::Tls(Box::new(settings.connect(boxed, &host)?))
+                    }
                     None => Stream::Plain(boxed),
                 })
             }
@@ -416,11 +422,11 @@ fn open_data<R: Read + Write>(
         let listener = std::net::TcpListener::bind((ctrl_local_ip, 0))?;
         let port = listener.local_addr()?.port();
         announce_active(ctrl, ctrl_local_ip, port)?;
-        let tls_host = tls.then(|| url.host.clone());
         return Ok(DataConn::Active {
             listener,
             peer_ip: ctrl_peer_ip,
-            tls_host,
+            tls: tls.then(|| Box::new((url.host.clone(), cfg.tls.clone()))),
+            read_timeout: cfg.io_timeout(),
         });
     }
     let (data_host, data_port) = open_passive(
@@ -431,7 +437,7 @@ fn open_data<R: Read + Write>(
         cfg.ftp_use_epsv,
     )?;
     let data_tcp = cfg.connect(&data_host, data_port)?;
-    data_tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    data_tcp.set_read_timeout(cfg.io_timeout())?;
     data_tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     // Note: the data-channel TLS session is a fresh handshake; the TLS layer
     // exposes no session-resumption hook, so servers enforcing
@@ -439,7 +445,7 @@ fn open_data<R: Read + Write>(
     Ok(DataConn::Ready(if tls {
         // Per RFC 4217 §10.2: SNI must be the original hostname, not the
         // address we got from PASV/EPSV (which is often an IP literal).
-        Stream::Tls(Box::new(crate::tls::connect_over(data_tcp, &url.host)?))
+        Stream::Tls(Box::new(cfg.tls_connect(data_tcp, &url.host)?))
     } else {
         Stream::Plain(data_tcp)
     }))

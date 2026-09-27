@@ -3643,24 +3643,14 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
 /// rather than key on them (mirrors `http::tls_pool_eligible`, plus the
 /// routing inputs the h1 pool keys on).
 fn pool_eligible(req: &Request) -> bool {
-    let tls_default = req.verify_tls
-        && req.ca_bundle.is_none()
-        && req.ca_path.is_none()
-        && req.crl_file.is_none()
-        && req.pinned_pubkey.is_none()
-        && req.client_cert.is_none()
-        && req.client_key.is_none()
-        && req.ciphers.is_none()
-        && req.tls13_ciphers.is_none()
-        && req.tls_min.is_none()
-        && req.tls_max.is_none()
-        && req.tls_verify_callback.is_none();
-    let direct_route = req.connector.is_direct()
+    // The shared TLS-posture + direct-connection gate (one definition for the
+    // h1 and h2 pools, so a new TLS knob can't be forgotten in one of them) ...
+    crate::http::tls_pool_eligible(req)
+        // ... plus the routing inputs `PoolKey` doesn't carry: a per-request
+        // proxy resolver and `--connect-to`/`--resolve` dial overrides.
         && req.proxy_resolver.is_none()
-        && (req.proxy.is_none() || crate::http::proxy_bypassed(req))
         && req.connect_to.is_empty()
-        && req.resolve.is_empty();
-    tls_default && direct_route
+        && req.resolve.is_empty()
 }
 
 /// Send a single request/response over an HTTP/2 connection, reusing a

@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use crate::error::{Error, Result};
 use crate::net::MaybeTlsStream as Stream;
 use crate::net::NetConfig;
-use crate::tls::{connect_over, reject_pipelined_plaintext};
+use crate::tls::reject_pipelined_plaintext;
 use crate::url::Url;
 use crate::websocket::base64_encode;
 
@@ -48,10 +48,10 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
 
     let tcp = cfg.connect(&url.host, url.port)?;
     // Idle bound so a stalled server fails the send instead of hanging it.
-    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_read_timeout(cfg.io_timeout())?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     let stream = if url.scheme == "smtps" {
-        Stream::Tls(Box::new(connect_over(tcp, &url.host)?))
+        Stream::Tls(Box::new(cfg.tls_connect(tcp, &url.host)?))
     } else {
         Stream::Plain(tcp)
     };
@@ -84,7 +84,7 @@ pub(crate) fn send(url: &Url, body: &[u8], opts: &SmtpOptions, cfg: &NetConfig) 
                 ))
             }
         };
-        let tls = connect_over(plain, &url.host)?;
+        let tls = cfg.tls_connect(plain, &url.host)?;
         io = BufReader::new(Stream::Tls(Box::new(tls)));
         caps = ehlo(&mut io, &url.host)?;
     }

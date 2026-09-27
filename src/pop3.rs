@@ -10,7 +10,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 
 use crate::error::{Error, Result};
-use crate::tls::{connect_over, reject_pipelined_plaintext};
+use crate::tls::reject_pipelined_plaintext;
 use crate::url::Url;
 
 /// Upper bound on a multi-line POP3 response body (LIST output or a RETR'd
@@ -70,12 +70,12 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
         .ok_or_else(|| Error::InvalidUrl(format!("pop3 path: {}", url.path)))?;
 
     let tcp = cfg.connect(&url.host, url.port)?;
-    tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+    tcp.set_read_timeout(cfg.io_timeout())?;
     tcp.set_write_timeout(Some(IO_TIMEOUT))?;
     if url.is_tls() {
         // Implicit TLS (pop3s://): handshake before the greeting. This already
         // satisfies `require_tls`.
-        let tls = connect_over(tcp, &url.host)?;
+        let tls = cfg.tls_connect(tcp, &url.host)?;
         let mut session = Session::new(BufReader::new(IoAdapter::Tls(Box::new(tls))));
         session.read_status()?; // greeting
         run(&mut session, user, pass, action)
@@ -86,7 +86,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
         // upgraded) transport is settled — this avoids a poisoned-stream state.
         let mut io = BufReader::new(IoAdapter::Plain(tcp));
         read_status_buf(&mut io)?; // greeting
-        let upgraded = try_stls(&mut io, &url.host)?;
+        let upgraded = try_stls(&mut io, &url.host, &cfg.tls)?;
         if cfg.require_tls && !upgraded {
             return Err(Error::BadResponse(
                 "pop3: TLS required (--ssl-reqd) but server did not offer STLS".into(),
@@ -124,14 +124,18 @@ fn read_status_buf<R: Read + Write>(io: &mut BufReader<R>) -> Result<String> {
 /// same plaintext flight. Those bytes were received before the handshake;
 /// reading them post-TLS would treat attacker-staged data as trusted. We abort
 /// if any remain rather than discard them, exactly like smtp/imap.
-fn try_stls(io: &mut BufReader<IoAdapter>, host: &str) -> Result<bool> {
+fn try_stls(
+    io: &mut BufReader<IoAdapter>,
+    host: &str,
+    tls: &crate::tls::TlsSettings,
+) -> Result<bool> {
     // Negotiate STLS (send command, read reply, run the injection guard). A
     // `false` means the server doesn't support STLS — leave it plaintext.
     if !stls_negotiate(io)? {
         return Ok(false);
     }
     // Upgrade the BufReader's inner transport to TLS in place.
-    io.get_mut().upgrade(host)?;
+    io.get_mut().upgrade(host, tls)?;
     Ok(true)
 }
 

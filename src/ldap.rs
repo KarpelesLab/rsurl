@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::net::NetConfig;
-use crate::tls::connect_over;
 use crate::url::Url;
 
 // =============================================================================
@@ -1185,10 +1184,10 @@ pub(crate) fn fetch_with(url: &Url, cfg: &NetConfig) -> Result<Vec<u8>> {
 
     // Connect through the configured transport.
     let sock = cfg.connect(&url.host, url.port)?;
-    sock.set_read_timeout(Some(IO_TIMEOUT)).ok();
+    sock.set_read_timeout(cfg.io_timeout()).ok();
     sock.set_write_timeout(Some(IO_TIMEOUT)).ok();
     let mut transport = if url.is_tls() {
-        let tls = connect_over(sock, &url.host)?;
+        let tls = cfg.tls_connect(sock, &url.host)?;
         Transport::Tls(Box::new(tls))
     } else {
         Transport::Plain(sock)

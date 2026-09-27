@@ -267,7 +267,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
         }
         "wss" => {
             let tcp = tcp_connect(url, cfg)?;
-            let mut tls = crate::tls::connect_over(tcp, &url.host)?;
+            let mut tls = cfg.tls_connect(tcp, &url.host)?;
             let (mut pmd, _proto) = handshake(&mut tls, url, &[])?;
             read_data_and_close(&mut tls, pmd.as_mut())
         }
@@ -277,7 +277,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
 
 fn tcp_connect(url: &Url, cfg: &crate::net::NetConfig) -> Result<Box<dyn crate::net::NetStream>> {
     let stream = cfg.connect(&url.host, url.port)?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_read_timeout(cfg.io_timeout())?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     Ok(stream)
 }
@@ -943,9 +943,7 @@ impl WebSocket {
                     // owns the socket.
                     let read_clone = data.try_clone_box().ok();
                     let shutdown = data.try_clone_box().ok();
-                    let mut opts = crate::tls::TlsOpts::verifying();
-                    opts.verify = cfg.verify;
-                    let tls = crate::tls::connect_over_tls(data, &url.host, opts)?;
+                    let tls = cfg.tls_connect(data, &url.host)?;
                     match read_clone {
                         Some(read) => {
                             read.set_read_timeout(Some(SEND_TIMEOUT))

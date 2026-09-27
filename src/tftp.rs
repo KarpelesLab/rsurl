@@ -189,7 +189,7 @@ pub fn fetch(url: &Url) -> Result<Vec<u8>> {
 pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let filename = filename_of(url)?;
 
-    let server = resolve(&url.host, url.port)?;
+    let server = resolve(url.host_unbracketed(), url.port)?;
     let socket = open_udp_transport(cfg.connector.udp_proxy(), server)?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
 
@@ -348,7 +348,7 @@ pub(crate) fn store_with(url: &Url, data: &[u8], cfg: &crate::net::NetConfig) ->
         )));
     }
 
-    let server = resolve(&url.host, url.port)?;
+    let server = resolve(url.host_unbracketed(), url.port)?;
     let socket = open_udp_transport(cfg.connector.udp_proxy(), server)?;
     socket.set_read_timeout(Some(READ_TIMEOUT))?;
 

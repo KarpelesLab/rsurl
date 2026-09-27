@@ -1959,6 +1959,10 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // Non-HTTP schemes go through the generic transfer dispatcher; HTTP-only
     // options (-X, -H, -d, ...) are ignored for them in this milestone.
     if !matches!(parsed_url.scheme.as_str(), "http" | "https") {
+        // `-u user:pass` applies to the login-based protocols too (curl), and
+        // overrides any URL userinfo. Their backends read (and percent-decode)
+        // the URL userinfo, so re-encode the credentials into it.
+        apply_cli_credentials(&mut parsed_url, args);
         // WebSocket: persistent, interactive-ish client (curl never built its
         // CLI side). Send `-d`/piped-stdin messages, print received ones.
         if matches!(parsed_url.scheme.as_str(), "ws" | "wss") {
@@ -3506,7 +3510,17 @@ fn run_tftp_upload(url: &Url, path: &str, args: &Args) -> u8 {
         }
     };
 
-    match rsurl::tftp::store(url, &bytes) {
+    // Through a client so `-x` (SOCKS5) and IPv6 servers work for uploads too.
+    let client = match transfer_client(url, args) {
+        Ok(c) => c,
+        Err(e) => {
+            if show_errors(args) {
+                eprintln!("rsurl: {e}");
+            }
+            return 5;
+        }
+    };
+    match client.tftp_store(url, &bytes) {
         Ok(()) => 0,
         Err(e) => {
             if show_errors(args) {
@@ -3758,6 +3772,71 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
     }
 }
 
+/// Schemes whose backend authenticates with the URL userinfo, and so take
+/// `-u user:pass` (curl applies `-u` to all of them).
+const USERINFO_SCHEMES: &[&str] = &[
+    "ftp", "ftps", "imap", "imaps", "pop3", "pop3s", "smtp", "smtps", "ldap", "ldaps", "mqtt",
+    "mqtts",
+];
+
+/// Put `-u user:pass` into `url`'s userinfo (percent-encoded, as the backends
+/// decode it) for the login-based non-HTTP schemes, replacing any userinfo
+/// the URL carried — curl's precedence.
+fn apply_cli_credentials(url: &mut Url, args: &Args) {
+    let Some((user, pass)) = &args.basic_auth else {
+        return;
+    };
+    if !USERINFO_SCHEMES.contains(&url.scheme.as_str()) {
+        return;
+    }
+    let mut ui = pct_encode_userinfo(user);
+    if !pass.is_empty() {
+        ui.push(':');
+        ui.push_str(&pct_encode_userinfo(pass));
+    }
+    url.userinfo = Some(ui);
+}
+
+/// Percent-encode everything but RFC 3986 unreserved characters, so `:`,
+/// `@`, `%` and control bytes in a credential survive the userinfo round-trip.
+fn pct_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Split URL userinfo into percent-decoded `(user, password)`.
+fn decoded_userinfo(ui: &str) -> (String, Option<String>) {
+    let decode = |s: &str| {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                let hex = |c: u8| (c as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    match ui.split_once(':') {
+        Some((u, p)) => (decode(u), Some(decode(p))),
+        None => (decode(ui), None),
+    }
+}
+
 /// Build a [`rsurl::Client`] for the non-HTTP transfer path from the CLI args:
 /// proxy (`-x`, incl. socks/https), no-proxy, `-k`, `--no-idn`, connect timeout.
 fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
@@ -3770,6 +3849,51 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
         .require_tls(args.ssl_reqd);
     if let Some(d) = args.connect_timeout {
         c = c.connect_timeout(Some(d));
+    }
+    // `-m`/--max-time bounds every blocking read of the transfer, so an idle
+    // stall can't outlive it. (The non-HTTP backends have no whole-transfer
+    // clock; a peer trickling bytes can still exceed `-m` in total.)
+    if let Some(d) = args.max_time {
+        c = c.read_timeout(Some(d));
+    }
+    // The same TLS flags the HTTP path applies (`--cacert`, `-E`, pins, ...)
+    // reach ftps/imaps/smtps/pop3s/ldaps/mqtts/gophers and STARTTLS upgrades.
+    if let Some(v) = args.tls_min {
+        c = c.tls_min_version(v);
+    }
+    if let Some(v) = args.tls_max {
+        c = c.tls_max_version(v);
+    }
+    if let Some(path) = &args.cacert {
+        c = c.ca_bundle(path);
+    }
+    if let Some(dir) = &args.capath {
+        c = c.ca_path(dir);
+    }
+    if let Some(spec) = &args.pinned_pubkey {
+        c = c.pinned_pubkey(spec);
+    }
+    if let Some(path) = &args.crl_file {
+        c = c.crl_file(path);
+    }
+    if let Some(list) = &args.ciphers {
+        c = c.ciphers(list);
+    }
+    if let Some(list) = &args.tls13_ciphers {
+        c = c.tls13_ciphers(list);
+    }
+    if let Some(cert) = &args.cert {
+        let (cert_path, inline_pass) = split_cert_pass(cert);
+        c = c
+            .client_cert(cert_path)
+            .cert_type_der(args.cert_type_der)
+            .key_type_der(args.key_type_der);
+        if let Some(key) = &args.key_file {
+            c = c.client_key(key);
+        }
+        if let Some(pass) = args.key_pass.as_deref().or(inline_pass) {
+            c = c.client_key_pass(pass);
+        }
     }
     if let Some(spec) = resolve_proxy_spec(url, args) {
         c = c.proxy(&spec)?;
@@ -4034,11 +4158,13 @@ fn run_smtp(url: &Url, args: &Args) -> u8 {
         }
         return 2;
     };
+    // URL userinfo is percent-encoded (`-u` was folded into it, encoded, by
+    // `apply_cli_credentials`); `smtp_send` takes the raw credentials.
     let (user, pass) = match url.userinfo.as_deref() {
-        Some(ui) => match ui.split_once(':') {
-            Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
-            None => (Some(ui.to_string()), None),
-        },
+        Some(ui) => {
+            let (u, p) = decoded_userinfo(ui);
+            (Some(u), p)
+        }
         None => (None, None),
     };
     let client = match transfer_client(url, args) {
@@ -4814,12 +4940,18 @@ fn metadata_json(meta: &rsurl::bittorrent::Metainfo) -> String {
     o.push_str("],\n");
     o.push_str("  \"files\": [\n");
     let mut off = 0u64;
-    // TODO(merge): skip BEP 47 padding entries (`f.padding`) in this listing,
-    // while still advancing `off` past them, once `FileEntry::padding` exists.
-    for (i, f) in meta.files.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for f in &meta.files {
+        // BEP 47 padding files are alignment filler, never real content: omit
+        // them from the listing but keep counting their bytes in `offset`.
+        if f.padding {
+            off += f.length;
+            continue;
+        }
+        if !first {
             o.push_str(",\n");
         }
+        first = false;
         o.push_str(&format!(
             "    {{\"path\": \"{}\", \"length\": {}, \"offset\": {}}}",
             // Canonical forward-slash path regardless of OS separator.
@@ -4896,14 +5028,18 @@ fn bt_resolve_file(
     meta: &rsurl::bittorrent::Metainfo,
     sel: &str,
 ) -> std::result::Result<(usize, u64, u64), String> {
-    // TODO(merge): once `FileEntry::padding` exists, number and match only the
-    // non-padding files (BEP 47) so `--bt-file N` agrees with `--bt-info`,
-    // while the offset sum below still counts padding bytes.
+    // Number and match only real files: BEP 47 padding entries are hidden
+    // (as in `--bt-info`), so `--bt-file N` means the Nth listed file. The
+    // offset below still sums every entry, padding included.
+    let real: Vec<usize> = (0..meta.files.len())
+        .filter(|&i| !meta.files[i].padding)
+        .collect();
     let idx = match sel.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= meta.files.len() => Some(n - 1),
+        Ok(n) if n >= 1 && n <= real.len() => Some(real[n - 1]),
         _ => {
             let sel = sel.replace('\\', "/"); // canonical, cross-platform
-            meta.files.iter().position(|f| {
+            real.iter().copied().find(|&i| {
+                let f = &meta.files[i];
                 let p = f.path.to_string_lossy().replace('\\', "/");
                 p == sel
                     || f.path.file_name().and_then(|n| n.to_str()) == Some(sel.as_str())
@@ -4918,7 +5054,7 @@ fn bt_resolve_file(
         }
         None => Err(format!(
             "--bt-file: no file matching {sel:?} (torrent has {} file(s); use --bt-info to list them)",
-            meta.files.len()
+            real.len()
         )),
     }
 }
@@ -6850,5 +6986,55 @@ mod tests {
         ];
         let got = assemble_form_body(&parts).unwrap().unwrap();
         assert_eq!(got, b"n=1&rawbytes&k=hello+world");
+    }
+
+    #[test]
+    fn userinfo_encoding_round_trips_special_characters() {
+        let enc = pct_encode_userinfo("p@ss:w%rd /é");
+        assert!(!enc.contains(['@', ':', ' ']), "{enc}");
+        let (u, p) = decoded_userinfo(&format!("{}:{enc}", pct_encode_userinfo("a:b")));
+        assert_eq!(u, "a:b");
+        assert_eq!(p.as_deref(), Some("p@ss:w%rd /é"));
+        assert_eq!(decoded_userinfo("solo"), ("solo".to_string(), None));
+    }
+
+    /// BEP 47 padding entries are hidden from `--bt-info` and `--bt-file`
+    /// numbering, but their bytes still count toward later files' offsets.
+    #[cfg(feature = "bittorrent")]
+    #[test]
+    fn bt_listing_and_selection_skip_padding_files() {
+        use rsurl::bittorrent::{FileEntry, Metainfo};
+        let fe = |p: &str, length: u64, padding: bool| FileEntry {
+            path: p.into(),
+            length,
+            padding,
+        };
+        let meta = Metainfo {
+            info_hash: [0; 20],
+            name: "t".into(),
+            piece_length: 16,
+            pieces: vec![[0; 20]; 3],
+            files: vec![
+                fe("a.bin", 10, false),
+                fe(".pad/6", 6, true),
+                fe("b.bin", 20, false),
+            ],
+            total_length: 36,
+            trackers: Vec::new(),
+            private: false,
+        };
+        let json = metadata_json(&meta);
+        assert!(!json.contains(".pad"), "{json}");
+        assert!(
+            json.contains(r#""path": "b.bin", "length": 20, "offset": 16"#),
+            "{json}"
+        );
+        assert_eq!(bt_resolve_file(&meta, "2"), Ok((2, 16, 20)));
+        assert_eq!(bt_resolve_file(&meta, "b.bin"), Ok((2, 16, 20)));
+        assert!(bt_resolve_file(&meta, "3").is_err());
+        assert!(
+            bt_resolve_file(&meta, "6").is_err(),
+            "padding is not selectable"
+        );
     }
 }

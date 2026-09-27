@@ -632,7 +632,7 @@ pub(crate) mod rustls_tests {
     // A test CA (trusted by the client) and a `localhost` leaf signed by it
     // (presented by the server). Using the CA cert itself as an end-entity is
     // rejected by webpki (`CaUsedAsEndEntity`), so a real chain is required.
-    pub(super) const CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+    pub(crate) const CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
 MIIBhzCCAS2gAwIBAgIUEJAJGguFhUu6Wi64F9FYb6oJ9bkwCgYIKoZIzj0EAwIw
 GDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTAgFw0yNjA2MjEyMzI2MjFaGA8yMTI2
 MDUyODIzMjYyMVowGDEWMBQGA1UEAwwNcnN1cmwtdGVzdC1jYTBZMBMGByqGSM49

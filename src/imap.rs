@@ -35,7 +35,7 @@
 use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
-use crate::tls::{connect_over, reject_pipelined_plaintext};
+use crate::tls::reject_pipelined_plaintext;
 use crate::url::Url;
 use crate::websocket::base64_encode;
 
@@ -66,16 +66,16 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     // Idle bound so a stalled server fails the transfer instead of hanging it.
     let dial = || -> Result<Box<dyn crate::net::NetStream>> {
         let sock = cfg.connect(&url.host, url.port)?;
-        sock.set_read_timeout(Some(IO_TIMEOUT))?;
+        sock.set_read_timeout(cfg.io_timeout())?;
         sock.set_write_timeout(Some(IO_TIMEOUT))?;
         Ok(sock)
     };
     match url.scheme.as_str() {
-        "imap" => run(Stream::Plain(dial()?), url, cfg.require_tls),
+        "imap" => run(Stream::Plain(dial()?), url, cfg),
         "imaps" => {
             let sock = dial()?;
-            let tls = connect_over(sock, &url.host)?;
-            run(Stream::Tls(Box::new(tls)), url, cfg.require_tls)
+            let tls = cfg.tls_connect(sock, &url.host)?;
+            run(Stream::Tls(Box::new(tls)), url, cfg)
         }
         other => Err(Error::UnsupportedScheme(other.to_string())),
     }
@@ -86,7 +86,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
 /// [`crate::net::MaybeTlsStream`]).
 use crate::net::MaybeTlsStream as Stream;
 
-fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
+fn run(mut sock: Stream, url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u8>> {
     let mut buf = LineReader::new();
 
     // Read the unsolicited greeting. Must start with `* OK` (or `* PREAUTH`,
@@ -125,7 +125,7 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
         // trust them post-TLS. (Shared guard; `is_clear()` is the buffer state.)
         reject_pipelined_plaintext("imap", buf.is_clear())?;
         // Tagged OK means the server is ready; everything after is TLS.
-        sock.upgrade(&url.host)?;
+        sock.upgrade(&url.host, &cfg.tls)?;
         // RFC 2595: discard the pre-TLS capability list and re-probe, since
         // capabilities (e.g. LOGINDISABLED, AUTH=*) commonly change post-TLS.
         caps = request_capability(&mut sock, &mut buf, &mut tagger)?;
@@ -134,7 +134,7 @@ fn run(mut sock: Stream, url: &Url, require_tls: bool) -> Result<Vec<u8>> {
     // require-TLS (curl --ssl-reqd): if the connection is still plaintext after
     // the STARTTLS step (not imaps, and STARTTLS wasn't negotiated), refuse to
     // continue before LOGIN/AUTHENTICATE so credentials never travel in clear.
-    require_tls_ok(require_tls, sock.is_plain())?;
+    require_tls_ok(cfg.require_tls, sock.is_plain())?;
 
     // Authenticate, if we have credentials and aren't already PREAUTH.
     if !preauth {

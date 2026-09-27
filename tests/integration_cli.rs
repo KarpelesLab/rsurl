@@ -379,3 +379,133 @@ fn unreadable_tls_files_exit_with_curl_codes() {
     ]);
     assert_eq!(out.status.code(), Some(58), "{out:?}");
 }
+
+/// A one-connection POP3 server that answers `+OK` to everything, serves
+/// message 1 on `RETR`, and records every command line it received.
+fn pop3_mock() -> (u16, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = std::thread::spawn(move || {
+        let (sock, _) = listener.accept().unwrap();
+        let mut w = sock.try_clone().unwrap();
+        let mut r = BufReader::new(sock);
+        let mut seen = Vec::new();
+        w.write_all(b"+OK ready\r\n").unwrap();
+        let mut line = String::new();
+        while r.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+            let cmd = line.trim_end().to_string();
+            line.clear();
+            let reply: &[u8] = if cmd.starts_with("STLS") || cmd.starts_with("CAPA") {
+                b"-ERR no\r\n"
+            } else if cmd.starts_with("RETR") {
+                b"+OK\r\nSubject: hi\r\n\r\nbody\r\n.\r\n"
+            } else {
+                b"+OK\r\n"
+            };
+            let quit = cmd == "QUIT";
+            seen.push(cmd);
+            let _ = w.write_all(reply);
+            if quit {
+                break;
+            }
+        }
+        seen
+    });
+    (port, h)
+}
+
+/// curl applies `-u user:pass` to the login-based non-HTTP protocols, overriding
+/// URL userinfo; special characters in the password survive intact.
+#[test]
+fn user_flag_applies_to_pop3_and_overrides_url_userinfo() {
+    let (port, h) = pop3_mock();
+    let out = run(&[
+        "-s",
+        "-u",
+        "alice:p@ss:w%rd",
+        &format!("pop3://bob:wrong@127.0.0.1:{port}/1"),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("body"));
+    let seen = h.join().unwrap();
+    assert!(seen.contains(&"USER alice".to_string()), "{seen:?}");
+    assert!(seen.contains(&"PASS p@ss:w%rd".to_string()), "{seen:?}");
+}
+
+/// Percent-encoded URL userinfo is decoded before login (`%40` → `@`).
+#[test]
+fn pop3_url_userinfo_is_percent_decoded() {
+    let (port, h) = pop3_mock();
+    let out = run(&[
+        "-s",
+        &format!("pop3://bob%40example.com:s%3Acret@127.0.0.1:{port}/1"),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen = h.join().unwrap();
+    assert!(
+        seen.contains(&"USER bob@example.com".to_string()),
+        "{seen:?}"
+    );
+    assert!(seen.contains(&"PASS s:cret".to_string()), "{seen:?}");
+}
+
+/// `-T file tftp://[::1]:port/name` uploads over IPv6. The CLI used to call a
+/// store path that always bound an IPv4 socket, so IPv6 servers (and `-x`
+/// SOCKS5) were unreachable for uploads.
+#[test]
+fn tftp_upload_reaches_ipv6_server() {
+    let Ok(server) = std::net::UdpSocket::bind("[::1]:0") else {
+        eprintln!("skipping: no IPv6 loopback");
+        return;
+    };
+    let port = server.local_addr().unwrap().port();
+    server
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let h = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let (n, peer) = server.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..2], &[0, 2], "expected WRQ");
+        let name_end = buf[2..n].iter().position(|&b| b == 0).unwrap() + 2;
+        let name = String::from_utf8_lossy(&buf[2..name_end]).into_owned();
+        server.send_to(&[0, 4, 0, 0], peer).unwrap();
+        let mut data = Vec::new();
+        loop {
+            let (n, _) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..2], &[0, 3], "expected DATA");
+            data.extend_from_slice(&buf[4..n]);
+            server.send_to(&[0, 4, buf[2], buf[3]], peer).unwrap();
+            if n - 4 < 512 {
+                break;
+            }
+        }
+        (name, data)
+    });
+    let dir = temp_dir("tftp6");
+    let src = dir.join("up.txt");
+    std::fs::write(&src, b"over ipv6").unwrap();
+    let out = run(&[
+        "-s",
+        "-T",
+        src.to_str().unwrap(),
+        &format!("tftp://[::1]:{port}/remote.txt"),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (name, data) = h.join().unwrap();
+    assert_eq!(name, "remote.txt");
+    assert_eq!(data, b"over ipv6");
+    let _ = std::fs::remove_dir_all(&dir);
+}

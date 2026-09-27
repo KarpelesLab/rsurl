@@ -2968,55 +2968,56 @@ pub(crate) fn effective_basic_auth(req: &Request) -> Option<String> {
     Some(crate::websocket::base64_encode(combined.as_bytes()))
 }
 
+impl Request {
+    /// This request's TLS flags as backend-neutral [`crate::tls::TlsSettings`].
+    pub(crate) fn tls_settings(&self) -> crate::tls::TlsSettings {
+        crate::tls::TlsSettings {
+            verify: self.verify_tls,
+            ca_bundle: self.ca_bundle.clone(),
+            ca_path: self.ca_path.clone(),
+            client_cert: self.client_cert.clone(),
+            client_key: self.client_key.clone(),
+            client_key_pass: self.client_key_pass.clone(),
+            cert_is_der: self.cert_is_der,
+            key_is_der: self.key_is_der,
+            pinned_pubkey: self.pinned_pubkey.clone(),
+            crl_file: self.crl_file.clone(),
+            ciphers: self.ciphers.clone(),
+            tls13_ciphers: self.tls13_ciphers.clone(),
+            min_version: self.tls_min,
+            max_version: self.tls_max,
+            verify_callback: self.tls_verify_callback.clone(),
+        }
+    }
+
+    /// Apply non-HTTP [`crate::tls::TlsSettings`] (from a `Client`) to this
+    /// request, so HTTP legs of a `Client` transfer honour the same TLS flags.
+    pub(crate) fn with_tls_settings(mut self, t: &crate::tls::TlsSettings) -> Self {
+        self.verify_tls = t.verify;
+        self.ca_bundle = t.ca_bundle.clone();
+        self.ca_path = t.ca_path.clone();
+        self.client_cert = t.client_cert.clone();
+        self.client_key = t.client_key.clone();
+        self.client_key_pass = t.client_key_pass.clone();
+        self.cert_is_der = t.cert_is_der;
+        self.key_is_der = t.key_is_der;
+        self.pinned_pubkey = t.pinned_pubkey.clone();
+        self.crl_file = t.crl_file.clone();
+        self.ciphers = t.ciphers.clone();
+        self.tls13_ciphers = t.tls13_ciphers.clone();
+        self.tls_min = t.min_version;
+        self.tls_max = t.max_version;
+        if t.verify_callback.is_some() {
+            self.tls_verify_callback = t.verify_callback.clone();
+        }
+        self
+    }
+}
+
 /// Build a [`crate::tls::TlsOpts`] from a [`Request`]'s flags, loading the
 /// CA bundle from disk if `--cacert` was set.
 pub(crate) fn tls_opts_from(req: &Request, alpn: &[&[u8]]) -> Result<crate::tls::TlsOpts> {
-    let mut opts = crate::tls::TlsOpts::verifying();
-    opts.alpn = alpn.iter().map(|p| p.to_vec()).collect();
-    opts.verify = req.verify_tls;
-    opts.min_version = req.tls_min;
-    opts.max_version = req.tls_max;
-    // Base trust store: `--cacert` replaces the system roots; otherwise leave
-    // `None` so the backend loads the system bundle. `--capath` *adds* a
-    // directory of CAs on top of whichever base is in effect (curl semantics).
-    if let Some(path) = &req.ca_bundle {
-        opts.roots = Some(crate::tls::load_roots_from_file(path)?);
-    }
-    if let Some(dir) = &req.ca_path {
-        opts.roots = Some(crate::tls::load_roots_from_dir(opts.roots.take(), dir)?);
-    }
-    // Client certificate / key for mTLS. Files are read here so a missing /
-    // unreadable file surfaces as an `Error` before the connection is dialed.
-    if let Some(cert_path) = &req.client_cert {
-        opts.client_cert = Some(std::fs::read(cert_path).map_err(Error::Io)?);
-        opts.cert_is_der = req.cert_is_der;
-        opts.key_is_der = req.key_is_der;
-        opts.client_key_pass = req.client_key_pass.clone();
-        if let Some(key_path) = &req.client_key {
-            opts.client_key = Some(std::fs::read(key_path).map_err(Error::Io)?);
-        }
-    }
-    // Public-key pinning.
-    if let Some(spec) = &req.pinned_pubkey {
-        opts.pinned_spki_sha256 = crate::tls::parse_pinned_pubkey(spec)?;
-    }
-    // CRL file (read here so a missing file errors before dialing).
-    if let Some(path) = &req.crl_file {
-        opts.crl_pem = Some(std::fs::read(path).map_err(Error::Io)?);
-    }
-    // Cipher-suite restriction: combine --ciphers (TLS≤1.2) and --tls13-ciphers
-    // into one IANA-ID list; the backend intersects it per TLS version.
-    if let Some(spec) = &req.ciphers {
-        opts.cipher_suites
-            .extend(crate::tls::cipher_names_to_ids(spec)?);
-    }
-    if let Some(spec) = &req.tls13_ciphers {
-        opts.cipher_suites
-            .extend(crate::tls::cipher_names_to_ids(spec)?);
-    }
-    // Caller-owned certificate validation hook (browser trust model).
-    opts.verify_callback = req.tls_verify_callback.clone();
-    Ok(opts)
+    req.tls_settings().to_opts(alpn)
 }
 
 /// Decide whether an error from the HTTP/3 (QUIC) path should trigger a
@@ -3245,16 +3246,14 @@ fn send_https(req: Request, trace: &mut dyn Write) -> Result<Response> {
 }
 
 /// Why HTTP/3 can't carry `req` as configured, or `None` when it can. The QUIC
-/// path dials the origin itself over UDP: it can't traverse an HTTP proxy, and
-/// it doesn't apply `--resolve`/`--connect-to` overrides — using it would
-/// silently bypass the proxy or the pinned backend. `--http3` then falls back
-/// to TCP; `--http3-only` fails.
+/// path dials the origin itself over UDP, so it can't traverse an HTTP proxy —
+/// using it would silently bypass the proxy. `--http3` then falls back to TCP;
+/// `--http3-only` fails. (`--resolve`/`--connect-to` are fine: the QUIC dial
+/// applies them, see `http3::dial_addr`. A custom/SOCKS connector never gets
+/// here — [`send_https`] routes it to the connector path first.)
 fn h3_route_blocker(req: &Request) -> Option<&'static str> {
     if req.proxy.is_some() && !proxy_bypassed(req) {
         return Some("through an HTTP proxy");
-    }
-    if effective_dial_target(&req.connect_to, &req.resolve, &req.url.host, req.url.port).is_some() {
-        return Some("with --resolve/--connect-to overrides");
     }
     None
 }
@@ -4118,7 +4117,11 @@ pub(crate) fn parse_content_length(headers: &[(String, String)]) -> Result<Optio
 /// Whether a response's body is framed by the connection close (RFC 9112 §6.3
 /// rule 8): it may carry a body, yet has neither `Transfer-Encoding` nor
 /// `Content-Length`.
-fn body_is_close_delimited(method: &str, status: u16, headers: &[(String, String)]) -> bool {
+pub(crate) fn body_is_close_delimited(
+    method: &str,
+    status: u16,
+    headers: &[(String, String)],
+) -> bool {
     let bodyless = method.eq_ignore_ascii_case("HEAD")
         || (100..200).contains(&status)
         || status == 204
@@ -6325,24 +6328,19 @@ mod tests {
     }
 
     #[test]
-    fn http3_is_not_used_through_a_proxy_or_dial_overrides() {
+    fn http3_is_not_used_through_a_proxy_but_allows_dial_overrides() {
         let base = || Request::get("https://example.com/").unwrap();
         assert!(h3_route_blocker(&base()).is_none());
         assert!(h3_route_blocker(&base().proxy("http://127.0.0.1:1").unwrap()).is_some());
+        // The QUIC dial applies --resolve / --connect-to itself
+        // (`http3::dial_addr`), so they no longer force a TCP fallback.
         assert!(h3_route_blocker(&base().resolve_addr(
             "example.com",
             443,
             std::net::IpAddr::from([127, 0, 0, 1])
         ))
-        .is_some());
-        assert!(h3_route_blocker(&base().connect_to("example.com", 443, "other", 8443)).is_some());
-        // A --resolve for a different authority doesn't affect this request.
-        assert!(h3_route_blocker(&base().resolve_addr(
-            "unrelated.test",
-            443,
-            std::net::IpAddr::from([127, 0, 0, 1])
-        ))
         .is_none());
+        assert!(h3_route_blocker(&base().connect_to("example.com", 443, "other", 8443)).is_none());
         // --http3-only through a proxy fails up front instead of bypassing it.
         let err = base()
             .proxy("http://127.0.0.1:1")

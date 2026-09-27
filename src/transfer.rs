@@ -49,7 +49,8 @@ pub(crate) fn transfer_url_with(url: &Url, cfg: &crate::net::NetConfig) -> Resul
             url.path
         ))?
         .connector(cfg.connector.clone())
-        .verify_tls(cfg.verify)
+        .with_tls_settings(&cfg.tls)
+        .read_timeout(cfg.read_timeout)
         .send()
         .map(|r| r.body),
         "ftp" | "ftps" => crate::ftp::fetch_with(url, cfg),

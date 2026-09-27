@@ -96,6 +96,23 @@ int main(int argc, char **argv) {
     return 1;
   curl_easy_cleanup(h);
 
+  /* 4. HTTPHEADER naming User-Agent/Referer replaces USERAGENT/REFERER
+   *    (never both on the wire). The echo server lists every value. */
+  char uaurl[512];
+  snprintf(uaurl, sizeof(uaurl), "%sua", url);
+  h = curl_easy_init();
+  curl_easy_setopt(h, CURLOPT_URL, uaurl);
+  curl_easy_setopt(h, CURLOPT_USERAGENT, "opt-ua");
+  curl_easy_setopt(h, CURLOPT_REFERER, "opt-ref");
+  struct curl_slist *hdrs = NULL;
+  hdrs = curl_slist_append(hdrs, "user-agent: hdr-ua");
+  hdrs = curl_slist_append(hdrs, "Referer: hdr-ref");
+  curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+  if (fetch(h, "ua"))
+    return 1;
+  curl_slist_free_all(hdrs);
+  curl_easy_cleanup(h);
+
   curl_global_cleanup();
   return 0;
 }

@@ -122,7 +122,12 @@ where
 /// with an unreachable AAAA record work, and matches what `TcpStream::connect`
 /// does for the blocking path.
 pub(super) async fn connect<R: Runtime>(rt: &R, host: &str, port: u16) -> Result<R::Conn> {
-    let addrs = rt.resolve(host, port).await.map_err(Error::Io)?;
+    // A URL IPv6 literal keeps its brackets (`[::1]`); the resolver wants the
+    // bare address.
+    let addrs = rt
+        .resolve(crate::url::unbracket(host), port)
+        .await
+        .map_err(Error::Io)?;
     let mut last: Option<io::Error> = None;
     for addr in addrs {
         match rt.connect(addr).await {
@@ -167,7 +172,18 @@ async fn send_once<R: Runtime>(
             let mut opts = crate::tls::TlsOpts::verifying();
             let engine = crate::tls::build_client_engine(&u.host, &mut opts)?;
             let mut tls = TlsClient::new(engine, exchange);
-            asyncio::drive(&mut tls, &mut conn).await?
+            let events = asyncio::drive(&mut tls, &mut conn).await?;
+            // A body framed by the connection close is only complete if the
+            // close was authenticated with `close_notify`; a bare TCP FIN may
+            // be an attacker truncating it (same rule as the blocking path).
+            if let Some(Event::Response { head, .. }) = events.first() {
+                if crate::http::body_is_close_delimited(method, head.status, &head.headers)
+                    && !tls.received_close_notify()
+                {
+                    return Err(Error::UnexpectedEof);
+                }
+            }
+            events
         }
         other => return Err(Error::UnsupportedScheme(other.to_string())),
     };
@@ -209,7 +225,10 @@ fn finish_response(mut resp: Response, decompress: bool) -> Result<Response> {
     };
     let decoded = crate::compress::decode_body(resp.body, &encoding)?;
     if decoded.decoded {
-        resp.headers = crate::compress::strip_after_decode(resp.headers);
+        // Keep advertising any layers that were not peeled (`foo, gzip` →
+        // `Content-Encoding: foo`) so the caller can tell the body is still
+        // encoded.
+        resp.headers = crate::compress::headers_after_decode(resp.headers, &decoded);
     }
     resp.body = decoded.body;
     Ok(resp)
@@ -253,6 +272,44 @@ fn host_header(u: &Url) -> String {
         u.host.clone()
     } else {
         format!("{}:{}", u.host, u.port)
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    fn resp(ce: &str, body: Vec<u8>) -> Response {
+        Response {
+            status: 200,
+            reason: "OK".into(),
+            headers: vec![
+                ("Content-Encoding".into(), ce.into()),
+                ("Content-Length".into(), body.len().to_string()),
+            ],
+            body,
+        }
+    }
+
+    /// A partial peel (`x-unknown, gzip`: gzip removed, `x-unknown` left) must
+    /// keep advertising the remaining layer, like the blocking path.
+    #[test]
+    fn partial_peel_keeps_remaining_content_encoding() {
+        use compcol::{gzip::Gzip, vec::compress_to_vec};
+        let gz = compress_to_vec::<Gzip>(b"inner").unwrap();
+        let out = finish_response(resp("x-unknown, gzip", gz), true).unwrap();
+        assert_eq!(out.body, b"inner");
+        assert_eq!(out.header("content-encoding"), Some("x-unknown"));
+        assert_eq!(out.header("content-length"), None);
+    }
+
+    #[test]
+    fn full_peel_drops_content_encoding() {
+        use compcol::{gzip::Gzip, vec::compress_to_vec};
+        let gz = compress_to_vec::<Gzip>(b"plain").unwrap();
+        let out = finish_response(resp("gzip", gz), true).unwrap();
+        assert_eq!(out.body, b"plain");
+        assert_eq!(out.header("content-encoding"), None);
     }
 }
 
@@ -300,6 +357,34 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"hello aio");
+    }
+
+    /// A bracketed IPv6 literal URL resolves (the resolver gets `::1`, not
+    /// `[::1]`).
+    #[tokio::test]
+    async fn async_get_ipv6_literal() {
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            return; // no IPv6 loopback here
+        };
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while sock.read(&mut byte).map(|n| n == 1).unwrap_or(false) {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nv6");
+        });
+        let resp = get(&TokioRuntime, &format!("http://[::1]:{port}/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.body, b"v6");
     }
 
     #[tokio::test]

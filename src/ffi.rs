@@ -445,16 +445,20 @@ pub unsafe extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
         for (k, v) in &h.headers {
             req = req.header(k, v);
         }
-        if let Some(ua) = &h.user_agent {
+        // As in libcurl, an explicit header of the same name (from
+        // RSURL_OPT_HTTPHEADER) replaces the one an option would generate
+        // instead of being sent alongside it.
+        let explicit = |name: &str| h.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+        if let Some(ua) = h.user_agent.as_ref().filter(|_| !explicit("User-Agent")) {
             req = req.header("User-Agent", ua);
         }
-        if let Some(referer) = &h.referer {
+        if let Some(referer) = h.referer.as_ref().filter(|_| !explicit("Referer")) {
             req = req.header("Referer", referer);
         }
-        if let Some(cookie) = &h.cookie {
+        if let Some(cookie) = h.cookie.as_ref().filter(|_| !explicit("Cookie")) {
             req = req.header("Cookie", cookie);
         }
-        if let Some(token) = &h.bearer {
+        if let Some(token) = h.bearer.as_ref().filter(|_| !explicit("Authorization")) {
             req = req.header("Authorization", &format!("Bearer {token}"));
         }
         if let Some(range) = &h.range {
@@ -652,4 +656,77 @@ pub extern "C" fn rsurl_version() -> *const c_char {
     ffi_guard(ptr::null(), || {
         concat!("rsurl/", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::io::{Read, Write};
+
+    /// One-shot HTTP server that answers with every `User-Agent` / `Referer`
+    /// line it received, joined by `|`, so duplicates are visible.
+    fn echo_ua_referer() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut b = [0u8; 1];
+            while s.read(&mut b).map(|n| n == 1).unwrap_or(false) {
+                head.push(b[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let all = |name: &str| {
+                head.lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .filter(|(k, _)| k.trim().eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.trim().to_string())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            };
+            let body = format!("U={} F={}", all("user-agent"), all("referer"));
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        port
+    }
+
+    /// An explicit `User-Agent`/`Referer` header line replaces the value from
+    /// `RSURL_OPT_USERAGENT`/`RSURL_OPT_REFERER` (libcurl semantics) instead of
+    /// both going out on the wire.
+    #[test]
+    fn explicit_header_overrides_useragent_and_referer_options() {
+        let port = echo_ua_referer();
+        let set = |h: *mut RSURL, opt: RsurlOpt, v: &str| {
+            let c = CString::new(v).unwrap();
+            // SAFETY: `h` is a live handle from `rsurl_easy_init`.
+            let rc = unsafe { rsurl_easy_setopt_str(h, opt as c_int, c.as_ptr()) };
+            assert!(matches!(rc, RsurlCode::Ok));
+        };
+        let h = rsurl_easy_init();
+        set(h, RsurlOpt::Url, &format!("http://127.0.0.1:{port}/"));
+        set(h, RsurlOpt::UserAgent, "opt-ua");
+        set(h, RsurlOpt::Referer, "opt-ref");
+        set(h, RsurlOpt::Header, "user-agent: hdr-ua");
+        set(h, RsurlOpt::Header, "Referer: hdr-ref");
+        // SAFETY: `h` is live; the out-pointers are valid locals.
+        unsafe {
+            assert!(matches!(rsurl_easy_perform(h), RsurlCode::Ok));
+            let (mut p, mut n) = (std::ptr::null(), 0usize);
+            assert!(matches!(
+                rsurl_easy_response_body(h, &mut p, &mut n),
+                RsurlCode::Ok
+            ));
+            let body = std::slice::from_raw_parts(p, n);
+            assert_eq!(body, b"U=hdr-ua F=hdr-ref");
+            rsurl_easy_cleanup(h);
+        }
+    }
 }
