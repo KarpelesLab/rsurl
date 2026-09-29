@@ -1061,20 +1061,24 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
     // so no pin handling is wired here.
     let tls = builder.build();
 
-    let transport_params = TransportParameters {
-        max_idle_timeout_ms: Some(30_000),
-        max_udp_payload_size: Some(1452),
+    // `TransportParameters` became `#[non_exhaustive]` in purecrypto 0.9.7
+    // (the RFC 9000 §22.3 registry keeps growing), so it takes the same
+    // `default()`-plus-field-assignment idiom as `QuicConfig` below.
+    let transport_params = {
+        let mut tp = TransportParameters::default();
+        tp.max_idle_timeout_ms = Some(30_000);
+        tp.max_udp_payload_size = Some(1452);
         // Generous credit so the server can put the whole response on one
         // bidi stream without our blocking it.
-        initial_max_data: Some(10 * 1024 * 1024),
-        initial_max_stream_data_bidi_local: Some(2 * 1024 * 1024),
-        initial_max_stream_data_bidi_remote: Some(2 * 1024 * 1024),
-        initial_max_stream_data_uni: Some(2 * 1024 * 1024),
-        initial_max_streams_bidi: Some(100),
+        tp.initial_max_data = Some(10 * 1024 * 1024);
+        tp.initial_max_stream_data_bidi_local = Some(2 * 1024 * 1024);
+        tp.initial_max_stream_data_bidi_remote = Some(2 * 1024 * 1024);
+        tp.initial_max_stream_data_uni = Some(2 * 1024 * 1024);
+        tp.initial_max_streams_bidi = Some(100);
         // QPACK encoder + decoder + server-control all live on uni streams.
-        initial_max_streams_uni: Some(100),
-        active_connection_id_limit: Some(2),
-        ..Default::default()
+        tp.initial_max_streams_uni = Some(100);
+        tp.active_connection_id_limit = Some(2);
+        tp
     };
     // `QuicConfig` is `#[non_exhaustive]` (purecrypto 0.6), so it can't be
     // built with a struct literal; the documented idiom is `default()` plus
