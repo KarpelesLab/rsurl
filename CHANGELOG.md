@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/rsurl/compare/v0.1.15...v0.2.0) - 2026-09-29
+
+### Added
+
+- *(ftp)* resume the control TLS session on FTPS data channels
+- *(aio)* TLS options for async https and wss
+- *(proxy)* --proxy-* TLS options; re-decide NO_PROXY per hop for all proxy kinds
+
+### Fixed
+
+- *(http3)* build QUIC transport parameters for non-exhaustive purecrypto 0.9.7
+- *(net)* enforce -m/--max-time as a whole-transfer deadline for non-HTTP protocols
+- *(ssh)* [**breaking**] reject unknown host keys by default like curl
+- *(ci)* unused mut on Windows in ssh temp dir; build C smoke tests -m32 on i686
+- plumb TLS, auth and timeout options into non-HTTP protocols
+- *(cli,ffi,curl-compat)* curl-compatible option parsing and a working libcurl ABI
+- *(http)* 1xx handling, pool isolation, no POST replay, curl redirect semantics
+- *(ftp,smtp,imap,...)* curl-compatible, fail-closed non-HTTP protocols
+- *(http2,http3)* pool isolation, trailers, no silent replays, RFC 9113/9114 validation
+- *(bittorrent)* swarm liveness, spoof-resistant trackers, exact output files
+- *(url,net,tls)* IPv6 literals, RFC 3986 resolution, proxy and NO_PROXY handling
+- *(websocket,aio)* enforce RFC 6455/7692 rules and make async recv cancel-safe
+- *(cookie,download)* RFC 6265 cookie dates/Secure rules and safe resumable downloads
+- *(io)* surface caller read timeouts in the blocking driver
+
+### Other
+
+- isolate CLI integration tests from proxy env vars
+
 ## [0.1.15](https://github.com/KarpelesLab/rsurl/compare/v0.1.14...v0.1.15) - 2026-09-17
 
 ### Other
