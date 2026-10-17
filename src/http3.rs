@@ -109,19 +109,17 @@ pub(crate) mod varint {
         if value < 1 << 6 {
             out.push(value as u8);
         } else if value < 1 << 14 {
-            let bytes = (value as u16).to_be_bytes();
-            out.push(bytes[0] | 0x40);
-            out.push(bytes[1]);
+            let mut bytes = (value as u16).to_be_bytes();
+            bytes[0] |= 0x40;
+            out.extend_from_slice(&bytes);
         } else if value < 1 << 30 {
-            let bytes = (value as u32).to_be_bytes();
-            out.push(bytes[0] | 0x80);
-            out.push(bytes[1]);
-            out.push(bytes[2]);
-            out.push(bytes[3]);
+            let mut bytes = (value as u32).to_be_bytes();
+            bytes[0] |= 0x80;
+            out.extend_from_slice(&bytes);
         } else {
-            let bytes = value.to_be_bytes();
-            out.push(bytes[0] | 0xC0);
-            out.extend_from_slice(&bytes[1..]);
+            let mut bytes = value.to_be_bytes();
+            bytes[0] |= 0xC0;
+            out.extend_from_slice(&bytes);
         }
     }
 
@@ -623,7 +621,7 @@ fn send_inner(
     if !req.body.is_empty() {
         let _ = writeln!(trace, "* uploading {} body bytes", req.body.len());
     }
-    pump(&mut conn, &*sock, peer, req.read_timeout, dial_start)?;
+    pump(&mut conn, &*sock, peer, dial_start)?;
 
     let mut resp = read_response(
         &mut conn,
@@ -659,7 +657,7 @@ fn drain_uni_streams(conn: &mut QuicConnection, state: &mut Http3State) -> Resul
         .readable_streams()
         .filter(|s| s.is_uni() && s.is_server_initiated())
         .collect();
-    let mut tmp = vec![0u8; 16 * 1024];
+    let mut tmp = [0u8; 16 * 1024];
     for sid in ids {
         // A read error on a uni stream is not fatal for a one-shot request;
         // `while let Ok` simply stops draining it. `n == 0` (no more buffered
@@ -763,7 +761,6 @@ fn process_uni_stream(state: &mut Http3State, sid: u64) -> Result<()> {
                     .decoder
                     .feed_encoder_stream(&entry.buf[..consumed])
                     .map_err(|e| Error::BadResponse(format!("qpack: encoder stream: {e}")))?;
-                let entry = state.uni.get_mut(&sid).expect("entry present");
                 entry.buf.drain(..consumed);
             }
             Ok(())
@@ -829,8 +826,7 @@ fn process_control_stream(state: &mut Http3State, sid: u64) -> Result<()> {
                 if entry.buf.len() < total {
                     return Ok(()); // wait for the whole frame
                 }
-                let payload: Vec<u8> = entry.buf[hdr_len..total].to_vec();
-                entry.buf.drain(..total);
+                let payload = &entry.buf[hdr_len..total];
                 match frame.ty {
                     frame_type::SETTINGS => {
                         if state.settings_seen {
@@ -838,14 +834,14 @@ fn process_control_stream(state: &mut Http3State, sid: u64) -> Result<()> {
                                 "http3: second SETTINGS frame (H3_FRAME_UNEXPECTED)".into(),
                             ));
                         }
-                        validate_settings(&payload)?;
+                        validate_settings(payload)?;
                         state.settings_seen = true;
                     }
                     frame_type::GOAWAY => {
                         let malformed = || {
                             Error::BadResponse("http3: malformed GOAWAY (H3_FRAME_ERROR)".into())
                         };
-                        let (id, used) = varint::decode(&payload).map_err(|_| malformed())?;
+                        let (id, used) = varint::decode(payload).map_err(|_| malformed())?;
                         if used != payload.len() {
                             return Err(malformed());
                         }
@@ -866,6 +862,7 @@ fn process_control_stream(state: &mut Http3State, sid: u64) -> Result<()> {
                     // CANCEL_PUSH: we never accept pushes; nothing to cancel.
                     _ => {}
                 }
+                entry.buf.drain(..total);
             }
             _ => {
                 // Unknown / grease (§9): skip its payload as it streams in.
@@ -939,10 +936,9 @@ fn verify_peer_certificates(conn: &QuicConnection, req: &Request, pins: &[[u8; 3
     // SAN check below is skipped: it is the engine's job, which the callback now
     // owns.
     if let Some(cb) = &req.tls_verify_callback {
-        let chain = conn.peer_certificates().to_vec();
         let verdict = cb.call(&crate::tls::CertVerify {
             server_name: tls_host(&req.url.host),
-            chain_der: &chain,
+            chain_der: conn.peer_certificates(),
         });
         if verdict == crate::tls::CertVerdict::Reject {
             return Err(Error::BadResponse(
@@ -989,9 +985,7 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
     //
     // Base trust store: `--cacert <file>` replaces the defaults; otherwise use
     // the embedded CA bundle. `--capath <dir>` then *adds* a directory of CAs
-    // on top of whichever base is in effect (curl semantics). Going through
-    // `pc_roots` directly sidesteps the active `crate::tls::*` backend (which
-    // may be rustls), because QUIC always needs a purecrypto root store.
+    // on top of whichever base is in effect (curl semantics).
     let mut roots = match &req.ca_bundle {
         Some(path) => crate::tls::pc_roots::load_from_file(path)?,
         None => crate::tls::pc_roots::embedded_roots(),
@@ -1000,10 +994,11 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         crate::tls::pc_roots::add_from_dir(&mut roots, dir)?;
     }
 
+    let server_name = quic_server_name(req);
     let mut builder = purecrypto::tls::Config::builder()
         .tls_only()
         .roots(roots)
-        .server_name(quic_server_name(req))
+        .server_name(server_name.clone())
         // A verify callback is the sole trust authority (browser model): when
         // one is set, disable the engine's own chain verification and defer to
         // the callback post-handshake (see `verify_peer_certificates`). This
@@ -1056,9 +1051,9 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         builder = builder.cipher_suites(&cipher_ids);
     }
 
-    // NOTE: `--pinnedpubkey` is rejected up front in `send_inner` (it needs a
-    // peer-certificate accessor that `QuicConnection` lacks — purecrypto#31),
-    // so no pin handling is wired here.
+    // `--pinnedpubkey` is parsed up front in `send_inner` and checked against
+    // the peer chain after the handshake (`verify_peer_certificates`), so no
+    // pin handling is wired here.
     let tls = builder.build();
 
     // `TransportParameters` became `#[non_exhaustive]` in purecrypto 0.9.7
@@ -1092,7 +1087,7 @@ fn build_client(req: &Request) -> Result<QuicConnection> {
         cfg
     };
 
-    QuicConnection::client(cfg, &quic_server_name(req))
+    QuicConnection::client(cfg, &server_name)
         .map_err(|e| Error::BadResponse(format!("http3: build client: {e:?}")))
 }
 
@@ -1182,20 +1177,15 @@ fn pump_once(
     can_block: bool,
     start: Instant,
 ) -> Result<bool> {
+    // One buffer serves both directions: datagrams are sealed straight into
+    // it on the way out and received into it on the way in.
+    let mut buf = [0u8; MAX_DATAGRAM];
+
     // Egress: keep draining until pop returns empty.
-    let mut sent_anything = false;
-    loop {
-        let dg = conn.pop_datagram();
-        if dg.is_empty() {
-            break;
-        }
-        sock.send_to(&dg, peer)?;
-        sent_anything = true;
-    }
+    let mut sent_anything = flush_egress(conn, sock, peer, &mut buf)?;
 
     // Ingress: try one recv (timed). `can_block` controls whether we wait
     // up to the socket's read-timeout for traffic to arrive.
-    let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut got_anything = false;
     if can_block {
         // Wake no later than the next QUIC timer (the PTO) so a loss is
@@ -1232,16 +1222,29 @@ fn pump_once(
     conn.on_timeout(start.elapsed());
 
     // Drain any retransmissions the timer / feed triggered.
-    loop {
-        let dg = conn.pop_datagram();
-        if dg.is_empty() {
-            break;
-        }
-        sock.send_to(&dg, peer)?;
-        sent_anything = true;
-    }
+    sent_anything |= flush_egress(conn, sock, peer, &mut buf)?;
 
     Ok(sent_anything || got_anything)
+}
+
+/// Send every datagram the connection has queued, sealing each into `buf`
+/// rather than allocating one. Returns whether anything went out.
+fn flush_egress(
+    conn: &mut QuicConnection,
+    sock: &dyn UdpTransport,
+    peer: std::net::SocketAddr,
+    buf: &mut [u8],
+) -> Result<bool> {
+    let mut sent_anything = false;
+    loop {
+        let n = conn.pop_datagram_into(buf);
+        if n == 0 {
+            break;
+        }
+        sock.send_to(&buf[..n], peer)?;
+        sent_anything = true;
+    }
+    Ok(sent_anything)
 }
 
 /// Run the QUIC handshake until `is_handshake_complete()`.
@@ -1424,8 +1427,9 @@ fn write_request(
     } else {
         format!("{}:{}", req.url.host, req.url.port)
     };
+    let method = crate::http::effective_method(req);
     let mut fields: Vec<(String, String)> = Vec::with_capacity(req.headers.len() + 5);
-    fields.push((":method".into(), crate::http::effective_method(req)));
+    fields.push((":method".into(), method.clone()));
     fields.push((":scheme".into(), "https".into()));
     fields.push((":authority".into(), host_port));
     fields.push((":path".into(), req.url.path.clone()));
@@ -1477,11 +1481,7 @@ fn write_request(
             .find(|(k, _)| k == ":path")
             .map(|(_, v)| v.as_str())
             .unwrap_or("/");
-        let _ = writeln!(
-            trace,
-            "> {} {path} HTTP/3",
-            crate::http::effective_method(req)
-        );
+        let _ = writeln!(trace, "> {method} {path} HTTP/3");
         if let Some((_, authority)) = fields.iter().find(|(k, _)| k == ":authority") {
             let _ = writeln!(trace, "> Host: {authority}");
         }
@@ -1517,7 +1517,6 @@ fn pump(
     conn: &mut QuicConnection,
     sock: &dyn UdpTransport,
     peer: std::net::SocketAddr,
-    _read_timeout: Option<Duration>,
     start: Instant,
 ) -> Result<()> {
     // A couple of non-blocking ticks just to flush our pending datagrams.
@@ -1549,6 +1548,7 @@ fn read_response(
     let start = Instant::now();
 
     let mut stream_buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 16 * 1024];
     let mut rs = ReqStream {
         head_request: crate::http::effective_method(req).eq_ignore_ascii_case("HEAD"),
         ..ReqStream::default()
@@ -1582,7 +1582,6 @@ fn read_response(
         }
 
         // Pull whatever has arrived on the request stream.
-        let mut tmp = vec![0u8; 16 * 1024];
         let (n, fin) = match conn.read(sid, &mut tmp) {
             Ok(x) => x,
             Err(e) => return Err(Error::BadResponse(format!("http3: stream read: {e:?}"))),
@@ -1777,7 +1776,7 @@ fn try_consume_frame(
     sink: Option<&mut dyn Write>,
 ) -> FrameOutcome {
     match consume_frame(buf, rs, decoder, sink) {
-        Ok(Some(x)) => FrameOutcome::Consumed(x.0, x.1),
+        Ok(Some((n, ack))) => FrameOutcome::Consumed(n, ack),
         Ok(None) => FrameOutcome::NeedMore,
         Err(e) => FrameOutcome::Err(e),
     }
@@ -2014,21 +2013,15 @@ fn finalize_response(
     let (hdrs, body) = crate::http::maybe_decode_body(hdrs, body, decompress, trace)?;
     // Streaming path: the un-encoded body already went to the sink; only the
     // buffered (content-encoded) fallback still has bytes here to flush.
-    if let Some(w) = sink {
-        if !body.is_empty() {
-            w.write_all(&body)?;
+    let body = match sink {
+        Some(w) => {
+            if !body.is_empty() {
+                w.write_all(&body)?;
+            }
+            Vec::new()
         }
-        return Ok(Response {
-            status,
-            reason: String::new(),
-            version: "HTTP/3".to_string(),
-            headers: hdrs,
-            body: Vec::new(),
-            timing: crate::http::Timing::default(),
-            final_url: String::new(),
-            tls: None,
-        });
-    }
+        None => body,
+    };
     Ok(Response {
         status,
         // HTTP/3 has no reason phrase on the wire.
