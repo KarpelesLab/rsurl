@@ -146,17 +146,12 @@ rustls-pemfile = { version = "2", optional = true }
 # are pure-Rust FFI *binding* crates (extern decls against the libc that std
 # already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
-# Keep this crate's purecrypto major in step with ours. A mismatch is not a
-# build error — it silently compiles purecrypto twice and leaves the SSH stack
-# on the older crypto. puressh 0.1.8 (and 0.1.9, the latest) still tracks
-# purecrypto 0.9 while we are on 0.10, so for now both are built — bump puressh
-# as soon as a release on purecrypto 0.10 lands.
 # 0.1.7 is a security-hardening release (client-side: bounded inbound
 # buffering, sanitised remote scp stderr, known_hosts failing closed on
 # `@revoked`); it also marks the caller-built structs `#[non_exhaustive]`, so
 # `src/ssh.rs` builds `Config` / `KnownHostsPolicy` / `ScpRecvOptions` through
 # their constructors instead of struct literals.
-puressh = { version = "0.1.8", optional = true, default-features = false, features = ["client", "compress"] }
+puressh = { version = "0.1.10", optional = true, default-features = false, features = ["client", "compress"] }
 # Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
 # `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
 # heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =
@@ -244,7 +239,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # In-process SSH/SFTP server for the SSH host-key end-to-end tests
 # (tests/integration_ssh.rs). Dev-only (the `server` feature never reaches the
 # library build, which stays client-only); no `pam`, so still no C toolchain.
-puressh = { version = "0.1.8", default-features = false, features = ["client", "compress", "server"] }
+puressh = { version = "0.1.10", default-features = false, features = ["client", "compress", "server"] }
 
 [profile.release]
 lto = "thin"
