@@ -187,17 +187,10 @@ fn ssh_dir() -> Option<PathBuf> {
 
 /// Best-effort home directory: `$HOME` on unix, `$USERPROFILE` on Windows.
 fn home_dir() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var("HOME") {
-        if !h.is_empty() {
-            return Some(PathBuf::from(h));
-        }
-    }
-    if let Ok(h) = std::env::var("USERPROFILE") {
-        if !h.is_empty() {
-            return Some(PathBuf::from(h));
-        }
-    }
-    None
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|h| !h.is_empty()))
+        .map(PathBuf::from)
 }
 
 /// Split `user[:pass]` userinfo into `(Option<user>, Option<pass>)`. An empty
@@ -222,11 +215,10 @@ pub fn userinfo_password(url: &Url) -> (Option<String>, Option<String>) {
     split_userinfo(url.userinfo.as_deref())
 }
 
-/// Resolve the SSH username for `url` given the parsed `opts`. URL userinfo
-/// wins, then `opts.password`-bearing `-u` user (threaded by the CLI into
-/// `opts` is the password only, so the user must come from the URL or the
-/// `user` arg), then `$USER`/`$USERNAME` like OpenSSH. Returns an error only
-/// if nothing yields a name.
+/// Resolve the SSH username for `url`. URL userinfo wins, then the `-u` user
+/// (`cli_user`; the CLI threads only the password half into [`SshOptions`]),
+/// then `$USER`/`$USERNAME`/`$LOGNAME` like OpenSSH. Returns an error only if
+/// nothing yields a name.
 pub fn resolve_user(url: &Url, cli_user: Option<&str>) -> Result<String> {
     let (url_user, _) = split_userinfo(url.userinfo.as_deref());
     if let Some(u) = url_user {
@@ -317,7 +309,9 @@ fn check_pins(
     use purecrypto::hash::{Digest, Sha256};
     if let Some(want) = sha256 {
         let got = crate::websocket::base64_encode(Sha256::digest(blob).as_ref());
-        let unpad = |s: &str| s.split('=').next().unwrap_or("").to_string();
+        fn unpad(s: &str) -> &str {
+            s.split('=').next().unwrap_or("")
+        }
         if unpad(&got) != unpad(want) {
             return Err(format!(
                 "mismatch sha256 fingerprint. Remote {got} is not equal to {want}"
@@ -705,7 +699,7 @@ impl TempFile {
         for _ in 0..8 {
             let mut rnd = [0u8; 16];
             OsRng.fill_bytes(&mut rnd);
-            let name: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+            let name = crate::digest::hex(&rnd);
             let dir = std::env::temp_dir().join(format!("rsurl-scp-{name}"));
             match create_private_dir(&dir) {
                 Ok(()) => {
@@ -753,9 +747,7 @@ fn scp_download(client: &mut Client, path: &str) -> Result<Vec<u8>> {
     client
         .scp_recv_from(path, &tmp.path, opts)
         .map_err(|e| Error::Ssh(format!("scp recv {path:?}: {e}")))?;
-    let bytes = std::fs::read(&tmp.path)
-        .map_err(|e| Error::Ssh(format!("scp recv: reading temp file: {e}")))?;
-    Ok(bytes)
+    std::fs::read(&tmp.path).map_err(|e| Error::Ssh(format!("scp recv: reading temp file: {e}")))
 }
 
 /// SCP upload: write `body` to a temp file, then `scp -t` it to the remote

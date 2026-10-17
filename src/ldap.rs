@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::net::NetConfig;
-use crate::url::Url;
+use crate::url::{percent_decode, Url};
+use crate::websocket::base64_encode;
 
 // =============================================================================
 // BER tag bytes used by LDAP
@@ -81,9 +82,7 @@ fn encode_length(len: usize, out: &mut Vec<u8>) {
         n += 1;
     }
     out.push(0x80 | n as u8);
-    for i in (0..n).rev() {
-        out.push(tmp[i]);
-    }
+    out.extend(tmp[..n].iter().rev());
 }
 
 /// Write a TLV with the given tag byte and pre-built value.
@@ -115,35 +114,31 @@ fn write_constructed(out: &mut Vec<u8>, tag: u8, f: impl FnOnce(&mut Vec<u8>)) {
     }
 }
 
-fn write_integer(out: &mut Vec<u8>, v: i64) {
-    // Two's-complement, minimal-length encoding per X.690 §8.3.
-    let mut bytes = v.to_be_bytes().to_vec();
-    while bytes.len() > 1 {
-        let first = bytes[0];
-        let next = bytes[1];
+/// Write `v` under `tag` in two's-complement, minimal-length encoding per
+/// X.690 §8.3 (shared by INTEGER and ENUMERATED).
+fn write_int_tlv(out: &mut Vec<u8>, tag: u8, v: i64) {
+    let bytes = v.to_be_bytes();
+    let mut skip = 0;
+    while skip + 1 < bytes.len() {
+        let first = bytes[skip];
+        let next = bytes[skip + 1];
         // Drop a redundant leading byte: 0x00 if next high bit is 0,
         // or 0xff if next high bit is 1.
         if (first == 0x00 && next & 0x80 == 0) || (first == 0xff && next & 0x80 != 0) {
-            bytes.remove(0);
+            skip += 1;
         } else {
             break;
         }
     }
-    write_tlv(out, tag::INTEGER, &bytes);
+    write_tlv(out, tag, &bytes[skip..]);
+}
+
+fn write_integer(out: &mut Vec<u8>, v: i64) {
+    write_int_tlv(out, tag::INTEGER, v);
 }
 
 fn write_enumerated(out: &mut Vec<u8>, v: i64) {
-    let mut bytes = v.to_be_bytes().to_vec();
-    while bytes.len() > 1 {
-        let first = bytes[0];
-        let next = bytes[1];
-        if (first == 0x00 && next & 0x80 == 0) || (first == 0xff && next & 0x80 != 0) {
-            bytes.remove(0);
-        } else {
-            break;
-        }
-    }
-    write_tlv(out, tag::ENUMERATED, &bytes);
+    write_int_tlv(out, tag::ENUMERATED, v);
 }
 
 fn write_octet_string(out: &mut Vec<u8>, s: &[u8]) {
@@ -199,8 +194,8 @@ impl<'a> BerReader<'a> {
             return Err(Error::BadResponse("ber: truncated length bytes".into()));
         }
         let mut len = 0usize;
-        for i in 0..n {
-            len = (len << 8) | self.data[i] as usize;
+        for &b in &self.data[..n] {
+            len = (len << 8) | b as usize;
         }
         self.data = &self.data[n..];
         Ok(len)
@@ -286,28 +281,6 @@ struct ParsedUrlQuery {
     attrs: Vec<String>,
     scope: Scope,
     filter: String,
-}
-
-/// Percent-decode a URL component. Invalid escapes are passed through as-is.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'%' && i + 2 < bytes.len() {
-            let h1 = hex_val(bytes[i + 1]);
-            let h2 = hex_val(bytes[i + 2]);
-            if let (Some(h1), Some(h2)) = (h1, h2) {
-                out.push((h1 << 4) | h2);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Reject a percent-decoded URL component that contains NUL, CR, LF, or any
@@ -560,8 +533,7 @@ impl<'a> FilterParser<'a> {
             self.bump();
         }
         let desc = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| Error::BadResponse("filter: non-utf8 attr".into()))?
-            .to_string();
+            .map_err(|_| Error::BadResponse("filter: non-utf8 attr".into()))?;
         if let Some(op) = ordering {
             self.bump();
             self.expect(b'=')?;
@@ -569,12 +541,13 @@ impl<'a> FilterParser<'a> {
                 return Err(Error::BadResponse("filter: bad attribute".into()));
             }
             let raw = self.read_value()?;
-            reject_ctl(&raw, "filter value")?;
-            let value = unescape_value(&raw)?;
+            reject_ctl(raw, "filter value")?;
+            let value = unescape_value(raw)?;
+            let attr = desc.to_string();
             return Ok(match op {
-                b'>' => Filter::GreaterOrEqual { attr: desc, value },
-                b'<' => Filter::LessOrEqual { attr: desc, value },
-                _ => Filter::ApproxMatch { attr: desc, value },
+                b'>' => Filter::GreaterOrEqual { attr, value },
+                b'<' => Filter::LessOrEqual { attr, value },
+                _ => Filter::ApproxMatch { attr, value },
             });
         }
         self.expect(b'=')?;
@@ -583,9 +556,9 @@ impl<'a> FilterParser<'a> {
         //   attr:=value  attr:dn:=value  attr:rule:=value  attr:dn:rule:=value
         //   :rule:=value  :dn:rule:=value
         if desc.contains(':') {
-            return self.parse_extensible(&desc);
+            return self.parse_extensible(desc);
         }
-        let attr = desc;
+        let attr = desc.to_string();
         let value_raw = self.read_value()?;
         // A bare `*` is the presence filter, NOT a substring match.
         if value_raw == "*" {
@@ -599,12 +572,11 @@ impl<'a> FilterParser<'a> {
             // nothing. Splitting happens on the *escaped* text, so a literal
             // asterisk written as `\2a` is not a wildcard; each segment is then
             // RFC 4515-unescaped.
-            let segments: Vec<&str> = value_raw.split('*').collect();
-            let last = segments.len() - 1;
+            let last = value_raw.matches('*').count();
             let mut initial = None;
             let mut any = Vec::new();
             let mut final_ = None;
-            for (i, seg) in segments.iter().enumerate() {
+            for (i, seg) in value_raw.split('*').enumerate() {
                 if seg.is_empty() {
                     continue;
                 }
@@ -627,15 +599,15 @@ impl<'a> FilterParser<'a> {
                 final_,
             });
         }
-        reject_ctl(&value_raw, "filter value")?;
+        reject_ctl(value_raw, "filter value")?;
         Ok(Filter::EqualityMatch {
             attr,
-            value: unescape_value(&value_raw)?,
+            value: unescape_value(value_raw)?,
         })
     }
 
     /// Read an assertion value up to the closing `)`.
-    fn read_value(&mut self) -> Result<String> {
+    fn read_value(&mut self) -> Result<&'a str> {
         let vstart = self.pos;
         while let Some(c) = self.peek() {
             if c == b')' {
@@ -645,7 +617,6 @@ impl<'a> FilterParser<'a> {
         }
         std::str::from_utf8(&self.bytes[vstart..self.pos])
             .map_err(|_| Error::BadResponse("filter: non-utf8 value".into()))
-            .map(|s| s.to_string())
     }
 
     /// Parse the extensible-match form (RFC 4515 §3). `desc` is the text before
@@ -663,36 +634,18 @@ impl<'a> FilterParser<'a> {
     /// token is the empty string left of the `:=`. Interior tokens are the
     /// optional `dn` marker and/or the matchingRule, in either supported order.
     fn parse_extensible(&mut self, desc: &str) -> Result<Filter> {
-        let mut tokens: Vec<&str> = desc.split(':').collect();
         // The last token is the empty string immediately before `:=`.
-        match tokens.last() {
-            Some(&"") => {
-                tokens.pop();
-            }
-            _ => {
-                // `desc` came from text ending at the `=`; the operator is `:=`
-                // so the final segment must be empty. Anything else (e.g. a `:`
-                // in the middle of an attribute, which RFC 4515 disallows) is a
-                // malformed filter.
-                return Err(Error::BadResponse(
-                    "filter: malformed extensible match (expected ':=')".into(),
-                ));
-            }
-        }
-        if tokens.is_empty() {
+        // `desc` came from text ending at the `=`; the operator is `:=` so the
+        // final segment must be empty. Anything else (e.g. a `:` in the middle
+        // of an attribute, which RFC 4515 disallows) is a malformed filter.
+        let Some(desc) = desc.strip_suffix(':') else {
             return Err(Error::BadResponse(
-                "filter: empty extensible match description".into(),
+                "filter: malformed extensible match (expected ':=')".into(),
             ));
-        }
-        // First token is the attribute type (may be empty => no type).
-        let attr_type = {
-            let a = tokens.remove(0);
-            if a.is_empty() {
-                None
-            } else {
-                Some(a.to_string())
-            }
         };
+        let mut tokens = desc.split(':');
+        // First token is the attribute type (may be empty => no type).
+        let attr_type = tokens.next().filter(|a| !a.is_empty()).map(str::to_string);
         // Remaining tokens: an optional `dn` marker and an optional matchingRule.
         let mut dn_attributes = false;
         let mut matching_rule: Option<String> = None;
@@ -727,8 +680,8 @@ impl<'a> FilterParser<'a> {
         // Every field is BER-encoded into the request; reject embedded control
         // bytes the same as every other filter field, then decode RFC 4515
         // escapes in the value.
-        reject_ctl(&match_value, "filter extensible match value")?;
-        let match_value = unescape_value(&match_value)?;
+        reject_ctl(match_value, "filter extensible match value")?;
+        let match_value = unescape_value(match_value)?;
         if let Some(t) = &attr_type {
             reject_ctl(t, "filter extensible match attribute")?;
         }
@@ -1045,7 +998,7 @@ fn parse_search_entry(body: &[u8]) -> Result<SearchEntry> {
 }
 
 /// Append an LDIF representation of a single entry to `out`.
-fn write_ldif_entry(out: &mut Vec<u8>, dn: &str, attrs: &[(String, Vec<Vec<u8>>)]) {
+fn write_ldif_entry(out: &mut Vec<u8>, dn: &str, attrs: &[LdapAttr]) {
     // The `dn` line's *value* is the DN string; `write_ldif_line` already
     // base64-encodes any value with CR/LF/control/high bytes, so a malicious DN
     // can't forge extra LDIF lines. (`dn` itself is a fixed, safe name.)
@@ -1084,17 +1037,15 @@ fn ldif_name_is_safe(name: &str) -> bool {
 /// `name` is a safe LDIF attribute description (see [`ldif_name_is_safe`]) —
 /// the value, by contrast, is always made safe here.
 fn write_ldif_line(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    out.extend_from_slice(name.as_bytes());
     if ldif_is_safe(value) {
-        out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value);
-        out.push(b'\n');
     } else {
-        out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b":: ");
         out.extend_from_slice(base64_encode(value).as_bytes());
-        out.push(b'\n');
     }
+    out.push(b'\n');
 }
 
 fn ldif_is_safe(value: &[u8]) -> bool {
@@ -1108,45 +1059,9 @@ fn ldif_is_safe(value: &[u8]) -> bool {
     if first == b' ' || first == b':' || first == b'<' {
         return false;
     }
-    for &b in value {
-        if b == 0 || b == b'\r' || b == b'\n' || b >= 0x80 {
-            return false;
-        }
-    }
-    true
-}
-
-/// Tiny RFC 4648 base64 encoder. We don't pull in another dep.
-fn base64_encode(input: &[u8]) -> String {
-    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut i = 0;
-    while i + 3 <= input.len() {
-        let b0 = input[i];
-        let b1 = input[i + 1];
-        let b2 = input[i + 2];
-        out.push(ALPHA[(b0 >> 2) as usize] as char);
-        out.push(ALPHA[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(ALPHA[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        out.push(ALPHA[(b2 & 0x3f) as usize] as char);
-        i += 3;
-    }
-    let rem = input.len() - i;
-    if rem == 1 {
-        let b0 = input[i];
-        out.push(ALPHA[(b0 >> 2) as usize] as char);
-        out.push(ALPHA[((b0 & 0x03) << 4) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let b0 = input[i];
-        let b1 = input[i + 1];
-        out.push(ALPHA[(b0 >> 2) as usize] as char);
-        out.push(ALPHA[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(ALPHA[((b1 & 0x0f) << 2) as usize] as char);
-        out.push('=');
-    }
-    out
+    !value
+        .iter()
+        .any(|&b| b == 0 || b == b'\r' || b == b'\n' || b >= 0x80)
 }
 
 // =============================================================================

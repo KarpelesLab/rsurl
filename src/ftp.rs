@@ -269,7 +269,7 @@ fn connect_login(url: &Url, cfg: &NetConfig, typecode: TypeCode) -> Result<Contr
     // 3) Login. Anonymous by default; honor `user[:pass]@` from the URL
     //    (percent-decoded, like curl).
     let (user, pass) = split_userinfo(url.userinfo.as_deref());
-    let (user, pass) = (percent_decode(&user), percent_decode(&pass));
+    let (user, pass) = (percent_decode(user), percent_decode(pass));
     // Reject control characters in URL-derived credentials so a CR/LF can't
     // smuggle extra FTP commands onto the control channel (`send` also guards
     // the assembled line, but validating the inputs gives a clearer error).
@@ -867,15 +867,14 @@ fn read_reply<R: BufRead>(r: &mut R) -> Result<(u16, String)> {
         let line = read_line(r)?;
         // A continuation line may or may not start with the code. The
         // terminator is specifically `NNN ` (code + space).
-        if let Ok((c, s, rest)) = split_code(&line) {
-            text.push('\n');
-            text.push_str(rest);
-            if c == code && s == ' ' {
-                return Ok((code, text));
-            }
-        } else {
-            text.push('\n');
-            text.push_str(line.trim_end_matches(['\r', '\n']));
+        let (done, rest) = match split_code(&line) {
+            Ok((c, s, rest)) => (c == code && s == ' ', rest),
+            Err(_) => (false, line.trim_end_matches(['\r', '\n'])),
+        };
+        text.push('\n');
+        text.push_str(rest);
+        if done {
+            return Ok((code, text));
         }
     }
 }
@@ -896,7 +895,8 @@ fn read_line<R: BufRead>(r: &mut R) -> Result<String> {
     if buf.len() > MAX_LINE {
         return Err(Error::BadResponse("ftp reply line too long".into()));
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// Parse the leading 3-digit code from an FTP reply line. Returns
@@ -933,19 +933,19 @@ fn parse_pasv(text: &str) -> Option<(String, u16)> {
     let open = text.find('(')?;
     let close = text[open..].find(')')? + open;
     let inner = &text[open + 1..close];
-    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
-    if parts.len() != 6 {
-        return None;
-    }
-    let nums: Vec<u16> = parts.iter().filter_map(|p| p.parse::<u16>().ok()).collect();
     // All six fields are octets (0..=255): the four IP bytes *and* the two
-    // port bytes. Range-checking the port bytes too avoids a silent truncation
-    // when computing the 16-bit port below.
-    if nums.len() != 6 || nums.iter().any(|&n| n > 255) {
+    // port bytes. Parsing the port bytes as `u8` too avoids a silent
+    // truncation when computing the 16-bit port below.
+    let mut fields = inner.split(',').map(str::trim);
+    let mut nums = [0u8; 6];
+    for n in &mut nums {
+        *n = fields.next()?.parse().ok()?;
+    }
+    if fields.next().is_some() {
         return None;
     }
     let host = format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]);
-    let port = ((nums[4] as u8 as u16) << 8) | nums[5] as u8 as u16;
+    let port = u16::from_be_bytes([nums[4], nums[5]]);
     // Port 0 is not a dialable data port; treat it as a malformed reply
     // rather than attempting an odd connect.
     if port == 0 {
@@ -963,28 +963,12 @@ fn parse_epsv(text: &str) -> Option<u16> {
     let inner = text.get(open + 1..close)?;
     // First byte is the delimiter (must be the same char repeated 3 times,
     // then the port, then the same delimiter again).
-    let mut chars = inner.chars();
-    let delim = chars.next()?;
-    // Find the 3rd delim from the start; everything between it and the 4th
-    // is the port.
-    let bytes: Vec<char> = inner.chars().collect();
-    let mut count = 0usize;
-    let mut start = None;
-    let mut end = None;
-    for (i, ch) in bytes.iter().enumerate() {
-        if *ch == delim {
-            count += 1;
-            if count == 3 {
-                start = Some(i + 1);
-            } else if count == 4 {
-                end = Some(i);
-                break;
-            }
-        }
-    }
-    let s = start?;
-    let e = end?;
-    let port_str: String = bytes[s..e].iter().collect();
+    let delim = inner.chars().next()?;
+    // The port is the field between the 3rd and 4th delimiters; the 4th must
+    // be present.
+    let mut fields = inner.split(delim);
+    let port_str = fields.nth(3)?;
+    fields.next()?;
     let port: u16 = port_str.parse().ok()?;
     // Port 0 is not a dialable data port; treat it as a malformed reply.
     if port == 0 {
@@ -995,13 +979,10 @@ fn parse_epsv(text: &str) -> Option<u16> {
 
 /// Split `user[:pass]` into `(user, pass)`, defaulting to anonymous /
 /// `rsurl@` (matching real curl's anonymous-FTP defaults).
-fn split_userinfo(ui: Option<&str>) -> (String, String) {
+fn split_userinfo(ui: Option<&str>) -> (&str, &str) {
     match ui {
-        None => ("anonymous".to_string(), "rsurl@".to_string()),
-        Some(s) => match s.split_once(':') {
-            Some((u, p)) => (u.to_string(), p.to_string()),
-            None => (s.to_string(), "rsurl@".to_string()),
-        },
+        None => ("anonymous", "rsurl@"),
+        Some(s) => s.split_once(':').unwrap_or((s, "rsurl@")),
     }
 }
 

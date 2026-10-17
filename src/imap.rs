@@ -36,7 +36,7 @@ use std::io::{Read, Write};
 
 use crate::error::{Error, Result};
 use crate::tls::reject_pipelined_plaintext;
-use crate::url::Url;
+use crate::url::{percent_decode, Url};
 use crate::websocket::base64_encode;
 
 /// Upper bound on a single server-declared IMAP literal (`{N}`). The size is
@@ -166,8 +166,10 @@ fn run(mut sock: Stream, url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     let section = target.section.as_deref().unwrap_or("");
 
     let body = match (target.mailbox.as_deref(), target.uid, target.mailindex) {
-        // Plain `/` (or empty) and no message: list mailboxes.
-        (None, None, None) => {
+        // Plain `/` (or empty) and no message: list mailboxes. A path of the
+        // form `/;UID=N` (no mailbox) isn't really allowed by RFC 5092 — it
+        // falls through to the same listing as a safe default.
+        (None, _, _) => {
             let tag = tagger.next();
             let cmd = format!("{tag} LIST \"\" \"*\"\r\n");
             sock.write_all(cmd.as_bytes())?;
@@ -218,18 +220,6 @@ fn run(mut sock: Stream, url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
             // message's literal verbatim, or empty bytes if the server gave
             // us nothing back (UID didn't exist).
             literals.into_iter().next().unwrap_or_default()
-        }
-
-        // Path of the form `/;UID=N` (no mailbox). RFC 5092 doesn't really
-        // allow this — fall through to "list mailboxes" as a safe default.
-        (None, _, _) => {
-            let tag = tagger.next();
-            let cmd = format!("{tag} LIST \"\" \"*\"\r\n");
-            sock.write_all(cmd.as_bytes())?;
-            sock.flush()?;
-            let resp = buf.read_response(&mut sock, &tag)?;
-            require_ok(&resp, &tag, "LIST")?;
-            collect_untagged(&resp, "LIST").into_bytes()
         }
     };
 
@@ -431,8 +421,19 @@ fn sasl_plain_initial(user: &str, pass: &str) -> String {
 /// True if `resp`'s final line is the tagged completion for `tag` (i.e. not a
 /// `+ ...` continuation request).
 fn is_tagged_done(resp: &str, tag: &str) -> bool {
-    let last = resp.lines().rev().find(|l| !l.is_empty()).unwrap_or("");
-    last.starts_with(&format!("{tag} ")) || last == tag
+    is_tagged_line(last_line(resp), tag)
+}
+
+/// The last non-empty line of `resp` (where the tagged status lives).
+fn last_line(resp: &str) -> &str {
+    resp.lines().rev().find(|l| !l.is_empty()).unwrap_or("")
+}
+
+/// True if `line` is the tagged response for `tag`: it starts with the tag
+/// followed by a space, or is exactly the tag.
+fn is_tagged_line(line: &str, tag: &str) -> bool {
+    line.strip_prefix(tag)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
 }
 
 /// Parsed, normalized IMAP capability set. Stored uppercased so lookups are
@@ -457,8 +458,7 @@ impl Caps {
     }
 
     fn has(&self, cap: &str) -> bool {
-        let needle = cap.to_ascii_uppercase();
-        self.set.contains(&needle)
+        self.set.iter().any(|c| c.eq_ignore_ascii_case(cap))
     }
 
     fn is_empty(&self) -> bool {
@@ -468,7 +468,7 @@ impl Caps {
 
 /// Pull capability tokens out of a `[CAPABILITY ...]` response code embedded in
 /// a line (e.g. the greeting `* OK [CAPABILITY IMAP4rev2 STARTTLS] ready`).
-fn parse_capability_code(line: &str) -> Option<Vec<String>> {
+fn parse_capability_code(line: &str) -> Option<Vec<&str>> {
     let start = line.find('[')?;
     let end = line[start..].find(']')? + start;
     let inside = &line[start + 1..end];
@@ -476,7 +476,7 @@ fn parse_capability_code(line: &str) -> Option<Vec<String>> {
     if !toks.next()?.eq_ignore_ascii_case("CAPABILITY") {
         return None;
     }
-    let caps: Vec<String> = toks.map(|s| s.to_string()).collect();
+    let caps: Vec<&str> = toks.collect();
     if caps.is_empty() {
         None
     } else {
@@ -486,13 +486,13 @@ fn parse_capability_code(line: &str) -> Option<Vec<String>> {
 
 /// Pull capability tokens out of an untagged `* CAPABILITY ...` line anywhere in
 /// `resp`.
-fn parse_capability_line(resp: &str) -> Option<Vec<String>> {
+fn parse_capability_line(resp: &str) -> Option<Vec<&str>> {
     for line in resp.lines() {
         if let Some(rest) = line.strip_prefix("* ") {
             let mut toks = rest.split_whitespace();
             if let Some(first) = toks.next() {
                 if first.eq_ignore_ascii_case("CAPABILITY") {
-                    let caps: Vec<String> = toks.map(|s| s.to_string()).collect();
+                    let caps: Vec<&str> = toks.collect();
                     if !caps.is_empty() {
                         return Some(caps);
                     }
@@ -532,7 +532,7 @@ fn select_mailbox(
 
 fn require_ok(resp: &str, tag: &str, what: &str) -> Result<()> {
     // The tagged response is the last non-empty line. Status word follows the tag.
-    let last = resp.lines().rev().find(|l| !l.is_empty()).unwrap_or("");
+    let last = last_line(resp);
     let rest = last.strip_prefix(tag).unwrap_or("").trim_start();
     let status = rest.split_whitespace().next().unwrap_or("");
     if status.eq_ignore_ascii_case("OK") {
@@ -624,10 +624,7 @@ fn parse_path(path: &str) -> Result<ImapPath> {
         None => (path, None),
     };
     let trimmed = path.strip_prefix('/').unwrap_or(path);
-    let (mbox_part, params) = match trimmed.find(';') {
-        Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
-        None => (trimmed, ""),
-    };
+    let (mbox_part, params) = trimmed.split_once(';').unwrap_or((trimmed, ""));
     let mbox_part = mbox_part.strip_suffix('/').unwrap_or(mbox_part);
     let mut p = ImapPath {
         mailbox: (!mbox_part.is_empty()).then(|| percent_decode(mbox_part)),
@@ -662,38 +659,6 @@ fn parse_uidvalidity(resp: &str) -> Option<u32> {
     let rest = &resp[i + "[UIDVALIDITY ".len()..];
     let end = rest.find(']')?;
     rest[..end].trim().parse().ok()
-}
-
-/// Minimal percent-decoder for mailbox names in URL paths. Invalid escapes
-/// pass through unchanged — IMAP URL escaping is the producer's job.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|e| {
-        // Fall back to lossy UTF-8 if the decoded bytes aren't valid UTF-8.
-        String::from_utf8_lossy(&e.into_bytes()).into_owned()
-    })
-}
-
-fn hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(10 + b - b'a'),
-        b'A'..=b'F' => Some(10 + b - b'A'),
-        _ => None,
-    }
 }
 
 /// If `line` ends in an IMAP literal length specifier (`{<n>}` right before
@@ -762,9 +727,9 @@ impl LineReader {
         loop {
             if let Some(rel) = find_crlf(&self.buf[scanned..]) {
                 let pos = scanned + rel;
-                let line_bytes: Vec<u8> = self.buf.drain(..pos + 2).collect();
-                let without_crlf = &line_bytes[..line_bytes.len() - 2];
-                return Ok(String::from_utf8_lossy(without_crlf).into_owned());
+                let line = String::from_utf8_lossy(&self.buf[..pos]).into_owned();
+                self.buf.drain(..pos + 2);
+                return Ok(line);
             }
             scanned = self.buf.len().saturating_sub(1);
             // Per-line bound: the aggregate `MAX_RESPONSE_BYTES` guard in
@@ -880,7 +845,7 @@ impl LineReader {
             }
             // Tagged response? Only a line that starts with our tag plus a
             // space (or is exactly the tag) ends the response.
-            if trimmed.starts_with(&format!("{tag} ")) || trimmed == tag {
+            if is_tagged_line(trimmed, tag) {
                 return Ok((text, literals));
             }
         }

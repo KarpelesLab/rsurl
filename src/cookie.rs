@@ -76,6 +76,22 @@ pub struct Cookie {
     pub partition_key: Option<String>,
 }
 
+impl Cookie {
+    /// The `(name, domain, path)` identity RFC 6265 §5.3 step 11 dedupes on.
+    fn key(&self) -> CookieKey<'_> {
+        (&self.name, &self.domain, &self.path)
+    }
+}
+
+/// `(name, domain, path)` borrowed from a cookie or an explicit entry.
+type CookieKey<'a> = (&'a str, &'a str, &'a str);
+
+/// Whether two cookie keys name the same cookie: exact name and path,
+/// case-insensitive domain.
+fn same_key(a: CookieKey<'_>, b: CookieKey<'_>) -> bool {
+    a.0 == b.0 && a.1.eq_ignore_ascii_case(b.1) && a.2 == b.2
+}
+
 /// Bag of cookies. Cheap to clone in tests; threaded by `&mut` through the
 /// redirect chain in [`crate::Request::send_with_jar`].
 #[derive(Debug, Clone, Default)]
@@ -132,11 +148,9 @@ impl CookieJar {
         }
 
         // A zero or past expiry means delete (RFC 6265 §5.3 step 11).
-        if let Some(exp) = parsed.expires {
-            if exp <= now {
-                self.remove_matching(&parsed);
-                return;
-            }
+        if parsed.expires.is_some_and(|exp| exp <= now) {
+            self.remove_matching(&parsed);
+            return;
         }
 
         // Replace any existing cookie with same (name, domain, path) trio
@@ -146,12 +160,9 @@ impl CookieJar {
     }
 
     fn remove_matching(&mut self, c: &Cookie) {
-        self.cookies.retain(|x| {
-            !(x.name == c.name && x.domain.eq_ignore_ascii_case(&c.domain) && x.path == c.path)
-        });
-        self.explicit.retain(|(n, d, p)| {
-            !(*n == c.name && d.eq_ignore_ascii_case(&c.domain) && *p == c.path)
-        });
+        self.cookies.retain(|x| !same_key(x.key(), c.key()));
+        self.explicit
+            .retain(|(n, d, p)| !same_key((n, d, p), c.key()));
     }
 
     /// Whether a stored Secure cookie would be overwritten (or deleted) by
@@ -171,10 +182,8 @@ impl CookieJar {
     /// Called before send-side matching and before serialising.
     pub fn purge_expired(&mut self) {
         let now = unix_now();
-        self.cookies.retain(|c| match c.expires {
-            Some(exp) => exp > now,
-            None => true,
-        });
+        self.cookies
+            .retain(|c| c.expires.is_none_or(|exp| exp > now));
     }
 
     /// Build the value of the `Cookie:` request header for an outgoing
@@ -199,11 +208,16 @@ impl CookieJar {
         // earlier creation order. We don't track creation order, so the
         // tiebreaker is jar insertion order — stable enough for this use.
         matches.sort_by_key(|c| std::cmp::Reverse(c.path.len()));
-        let parts: Vec<String> = matches
-            .iter()
-            .map(|c| format!("{}={}", c.name, c.value))
-            .collect();
-        Some(parts.join("; "))
+        let mut header = String::new();
+        for (i, c) in matches.iter().enumerate() {
+            if i > 0 {
+                header.push_str("; ");
+            }
+            header.push_str(&c.name);
+            header.push('=');
+            header.push_str(&c.value);
+        }
+        Some(header)
     }
 
     /// Read a Netscape `cookies.txt` file into a fresh jar. Missing file
@@ -251,6 +265,7 @@ impl CookieJar {
         // Unix. We render the whole jar into a buffer first, then commit it
         // atomically via a sibling temp file created 0600 and renamed into
         // place — readers never observe a partial or wrong-mode jar.
+        use std::fmt::Write as _;
         let mut body = String::new();
         body.push_str(
             "# Netscape HTTP Cookie File\n\
@@ -281,7 +296,6 @@ impl CookieJar {
             // set with an explicit Domain= attribute), FALSE if host-only.
             let dflag = if c.host_only { "FALSE" } else { "TRUE" };
             let sflag = if c.secure { "TRUE" } else { "FALSE" };
-            use std::fmt::Write as _;
             let _ = writeln!(
                 body,
                 "{prefix}{}\t{dflag}\t{}\t{sflag}\t{exp}\t{}\t{}",
@@ -322,7 +336,7 @@ impl CookieJar {
     fn is_explicit(&self, c: &Cookie) -> bool {
         self.explicit
             .iter()
-            .any(|(n, d, p)| *n == c.name && d.eq_ignore_ascii_case(&c.domain) && *p == c.path)
+            .any(|(n, d, p)| same_key((n, d, p), c.key()))
     }
 
     /// Iterate over the stored cookies (browser/embedder introspection).
@@ -347,11 +361,9 @@ impl CookieJar {
     /// one was removed. Case-insensitive on domain, like RFC 6265 matching.
     pub fn remove(&mut self, name: &str, domain: &str, path: &str) -> bool {
         let before = self.cookies.len();
-        self.cookies.retain(|c| {
-            !(c.name == name && c.domain.eq_ignore_ascii_case(domain) && c.path == path)
-        });
-        self.explicit
-            .retain(|(n, d, p)| !(n == name && d.eq_ignore_ascii_case(domain) && p == path));
+        let key = (name, domain, path);
+        self.cookies.retain(|c| !same_key(c.key(), key));
+        self.explicit.retain(|(n, d, p)| !same_key((n, d, p), key));
         self.cookies.len() != before
     }
 
@@ -364,10 +376,8 @@ impl CookieJar {
 
 /// Whether a stored cookie should be attached to a request for `url`.
 fn matches_request(c: &Cookie, url: &crate::Url, now: u64) -> bool {
-    if let Some(exp) = c.expires {
-        if exp <= now {
-            return false;
-        }
+    if c.expires.is_some_and(|exp| exp <= now) {
+        return false;
     }
     // A Secure cookie may only travel over a transport-secured scheme. Gate
     // on the URL's actual TLS property rather than the literal "https" string
@@ -379,10 +389,19 @@ fn matches_request(c: &Cookie, url: &crate::Url, now: u64) -> bool {
     if !domain_match(&url.host, &c.domain, c.host_only) {
         return false;
     }
-    if !path_match(request_path(&url.path), &c.path) {
-        return false;
-    }
-    true
+    path_match(request_path(&url.path), &c.path)
+}
+
+/// ASCII-case-insensitive `s.ends_with(suffix)`.
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    let (s, suffix) = (s.as_bytes(), suffix.as_bytes());
+    s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// ASCII-case-insensitive `s.starts_with(prefix)`.
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    let (s, prefix) = (s.as_bytes(), prefix.as_bytes());
+    s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 /// RFC 6265 §5.1.3. `request_host` matches `cookie_domain` if:
@@ -390,13 +409,11 @@ fn matches_request(c: &Cookie, url: &crate::Url, now: u64) -> bool {
 /// * `!host_only` and `request_host == cookie_domain` or
 ///   `request_host` ends with `.cookie_domain`.
 fn domain_match(request_host: &str, cookie_domain: &str, host_only: bool) -> bool {
-    let rh = request_host.to_ascii_lowercase();
-    let cd = cookie_domain.to_ascii_lowercase();
-    if host_only {
-        return rh == cd;
-    }
-    if rh == cd {
+    if request_host.eq_ignore_ascii_case(cookie_domain) {
         return true;
+    }
+    if host_only {
+        return false;
     }
     // RFC 6265 §5.1.3: the suffix ("ends with .cookie_domain") rule is for
     // domain names only. If the request host is an IP literal it must match the
@@ -406,10 +423,13 @@ fn domain_match(request_host: &str, cookie_domain: &str, host_only: bool) -> boo
     // This mirrors the Set-Cookie ingest guard, which forces host-only for IP
     // request hosts, and closes the same leak for cookies arriving via any
     // path (including a hostile `cookies.txt`).
-    if is_ip_literal(&rh) {
+    if is_ip_literal(request_host) {
         return false;
     }
-    rh.ends_with(&format!(".{cd}"))
+    let (rh, cd) = (request_host.as_bytes(), cookie_domain.as_bytes());
+    rh.len() > cd.len()
+        && rh[rh.len() - cd.len() - 1] == b'.'
+        && ends_with_ignore_ascii_case(request_host, cookie_domain)
 }
 
 /// The path component of a request target, without any `?query` or
@@ -429,13 +449,9 @@ fn is_secure_context(url: &crate::Url) -> bool {
     if url.is_tls() {
         return true;
     }
-    let host = url
-        .host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
-    host == "localhost"
-        || host.ends_with(".localhost")
+    let host = url.host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || ends_with_ignore_ascii_case(host, ".localhost")
         || host == "::1"
         || host
             .parse::<std::net::Ipv4Addr>()
@@ -480,9 +496,10 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
         return None;
     }
 
-    // Inferred defaults; attributes below may override.
+    // Inferred defaults; attributes below may override. `domain` stays `None`
+    // (meaning the request host) unless a `Domain=` attribute is honoured.
     let request_host = request_url.host.to_ascii_lowercase();
-    let mut domain = request_host.clone();
+    let mut domain: Option<String> = None;
     let mut host_only = true;
     let mut path = default_path(request_path(&request_url.path));
     let mut has_domain_attr = false;
@@ -534,7 +551,7 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
                 // the request host itself yields a host-only cookie.
                 if !is_scopable_cookie_domain(&v) {
                     if v == request_host {
-                        domain = v;
+                        domain = Some(v);
                         host_only = true;
                         continue;
                     }
@@ -545,7 +562,7 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
                 if !domain_match(&request_host, &v, false) {
                     return None;
                 }
-                domain = v;
+                domain = Some(v);
                 host_only = false;
             }
         } else if k.eq_ignore_ascii_case("path") {
@@ -599,11 +616,11 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
     // Cookie name prefixes (RFC 6265bis §4.1.3), matched case-insensitively:
     // `__Secure-` requires the Secure attribute; `__Host-` additionally
     // requires host-only scope (no Domain=) and `Path=/`.
-    let lname = name.to_ascii_lowercase();
-    if lname.starts_with("__secure-") && !secure {
+    if starts_with_ignore_ascii_case(name, "__secure-") && !secure {
         return None;
     }
-    if lname.starts_with("__host-") && (!secure || has_domain_attr || path != "/") {
+    if starts_with_ignore_ascii_case(name, "__host-") && (!secure || has_domain_attr || path != "/")
+    {
         return None;
     }
 
@@ -619,7 +636,7 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
     Some(Cookie {
         name: name.to_string(),
         value: value.to_string(),
-        domain,
+        domain: domain.unwrap_or(request_host),
         path,
         expires,
         secure,
@@ -635,17 +652,14 @@ fn parse_set_cookie(line: &str, request_url: &crate::Url, now: u64) -> Option<Co
 /// Effectively: strip query/fragment (callers already do this), take the
 /// directory part of the URI's path. Yields `/` for `/` or `/foo`.
 fn default_path(uri_path: &str) -> String {
-    if uri_path.is_empty() || !uri_path.starts_with('/') {
+    if !uri_path.starts_with('/') {
         return "/".into();
     }
     // Last slash position (other than the first one).
-    if let Some(idx) = uri_path.rfind('/') {
-        if idx == 0 {
-            return "/".into();
-        }
-        return uri_path[..idx].to_string();
+    match uri_path.rfind('/') {
+        Some(idx) if idx > 0 => uri_path[..idx].to_string(),
+        _ => "/".into(),
     }
-    "/".into()
 }
 
 /// Cookie-date parser implementing the lenient algorithm of RFC 6265 §5.1.1,
@@ -741,24 +755,16 @@ fn parse_month(s: &str) -> Option<u32> {
     // `&s.to_ascii_lowercase()[..3]` panics when the token is shorter than 3
     // bytes or when byte index 3 isn't a UTF-8 char boundary (multibyte
     // input) — a remote DoS. `get(..3)` returns None instead of panicking;
-    // month names are pure ASCII so an ASCII-lowercase of the 3-byte prefix
-    // is sufficient.
-    let prefix = s.get(..3)?.to_ascii_lowercase();
-    Some(match prefix.as_str() {
-        "jan" => 1,
-        "feb" => 2,
-        "mar" => 3,
-        "apr" => 4,
-        "may" => 5,
-        "jun" => 6,
-        "jul" => 7,
-        "aug" => 8,
-        "sep" => 9,
-        "oct" => 10,
-        "nov" => 11,
-        "dec" => 12,
-        _ => return None,
-    })
+    // month names are pure ASCII so an ASCII-case-insensitive compare of the
+    // 3-byte prefix is sufficient.
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let prefix = s.get(..3)?;
+    MONTHS
+        .iter()
+        .position(|m| m.eq_ignore_ascii_case(prefix))
+        .map(|i| i as u32 + 1)
 }
 
 /// Compute the Unix epoch second for a UTC Y/M/D h:m:s. Pure arithmetic
@@ -873,10 +879,7 @@ fn is_scopable_cookie_domain(domain: &str) -> bool {
         return false;
     }
     let lowered = d.to_ascii_lowercase();
-    match psl2::lookup(&lowered) {
-        Some(dom) => !dom.is_public_suffix(),
-        None => false,
-    }
+    psl2::lookup(&lowered).is_some_and(|dom| !dom.is_public_suffix())
 }
 
 /// `true` if `host` is an IP-address literal rather than a DNS name. Per
@@ -939,7 +942,7 @@ fn parse_netscape_line(line: &str) -> LineOutcome {
     if fields.len() != 7 && fields.len() != 6 {
         return LineOutcome::Malformed;
     }
-    let domain = fields[0].to_string();
+    let domain = fields[0];
     if domain.is_empty() {
         return LineOutcome::Malformed;
     }
