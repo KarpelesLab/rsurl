@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.17](https://github.com/KarpelesLab/rsurl/compare/v0.1.16...v0.1.17) - 2026-10-17
+
+### Fixed
+
+- *(http)* satisfy clippy 1.89 nonminimal_bool in 303 redirect check
+- *(bittorrent)* avoid deprecated AtomicUsize::fetch_update
+
+### Other
+
+- *(fullrust)* skip doctests, the image ships no rustdoc
+- *(deps)* bump puressh to 0.1.10
+- raise MSRV to 1.95
+- pin the i686 job to 1.95 for curl-compat's rust-version
+- pin test & lint and i686 jobs to the 1.89 MSRV
+- *(deps)* bump purecrypto to 0.10
+
 ## [0.1.16](https://github.com/KarpelesLab/rsurl/compare/v0.1.15...v0.1.16) - 2026-09-29
 
 ### Added
