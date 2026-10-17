@@ -186,7 +186,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 purecrypto = "0.10"
 zeroize = "1"
-compcol = { version = "0.6.11", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
+compcol = { version = "0.7.2", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
 psl2 = { version = "0.1", default-features = false }
 
 # ── Browser (wasm32) backend ────────────────────────────────────────────────
