@@ -2265,9 +2265,9 @@ fn redirect_request(
     let to_get = match status {
         301 | 302 => is_post && !keep_post,
         303 => {
-            !prev_method.eq_ignore_ascii_case("GET")
-                && !prev_method.eq_ignore_ascii_case("HEAD")
-                && !(is_post && keep_post)
+            !(prev_method.eq_ignore_ascii_case("GET")
+                || prev_method.eq_ignore_ascii_case("HEAD")
+                || (is_post && keep_post))
         }
         _ => false,
     };
