@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.19](https://github.com/KarpelesLab/rsurl/compare/v0.1.18...v0.1.19) - 2026-10-17
+
+### Fixed
+
+- *(http)* ignore an empty Location header like curl does
+- *(download)* cap the segment_size chunk plan and saturate the last chunk end
+- *(telnet)* apply the default read timeout to the session
+
+### Other
+
+- *(http)* one redirect-hop helper and one response-head type
+- *(net)* preallocate the SOCKS5 UDP receive scratch buffer
+
 ## [0.1.18](https://github.com/KarpelesLab/rsurl/compare/v0.1.17...v0.1.18) - 2026-10-17
 
 ### Other
