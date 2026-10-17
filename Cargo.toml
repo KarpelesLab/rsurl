@@ -2,7 +2,7 @@
 name = "rsurl"
 version = "0.1.16"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.95"
 authors = ["Karpelès Lab Inc."]
 description = "A pure-Rust implementation of curl. Library, C FFI, and CLI for HTTP/HTTPS/FTP/FTPS."
 license = "MIT"
@@ -90,7 +90,7 @@ serde_json = { version = "1", optional = true }
 # excluded name-constraint subtrees, commonName ignored whenever a SAN is
 # present, bounded CRL work) plus QUIC hardening behind HTTP/3; its only
 # breaking change for a consumer is the MSRV, which is why `rust-version`
-# above reads 1.89 and cargo refuses to build this crate on 1.88. 0.8.2/0.8.3
+# was raised to 1.89 (cargo refuses to build this crate on 1.88). 0.8.2/0.8.3
 # are pure fixes on paths rsurl rides: TLS truncation surfaced as
 # `UnexpectedEof` on the blocking Stream adapter, read-path alerts delivered on
 # the tokio/mio surfaces, and QUIC PTO / anti-amplification corrections under

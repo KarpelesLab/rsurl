@@ -38,7 +38,7 @@ impl Drop for ConnSlot {
 /// Claim one of `max` connection slots, or `None` when all are taken.
 fn claim_slot(active: &Arc<AtomicUsize>, max: usize) -> Option<ConnSlot> {
     active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < max).then_some(n + 1)
         })
         .ok()
