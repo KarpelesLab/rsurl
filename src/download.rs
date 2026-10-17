@@ -390,14 +390,14 @@ fn write_atomically(path: &Path, fill: impl FnOnce(&mut File) -> Result<u64>) ->
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let name = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+        .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let tmp = path.with_file_name(format!(
         ".{name}.rsurltmp.{}.{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut file = std::fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .read(true)
         .create_new(true)
@@ -818,7 +818,7 @@ impl Downloader {
         loop {
             match self.attempt_single(have, &mut validators, &mut known_total) {
                 Attempt::Done { written, total } => {
-                    self.verify_and_finalize(written, total)?;
+                    self.verify_and_finalize(written)?;
                     return Ok(DownloadOutcome {
                         bytes_written: written,
                         total,
@@ -1085,11 +1085,11 @@ impl Downloader {
         // the chunks still in flight) and enforces the transfer-wide rate
         // limit. Hand the callback back on the way out so a single-stream
         // fallback keeps reporting.
-        let meter = Arc::new(ByteMeter::new(
+        let meter = ByteMeter::new(
             self.opts.progress.take(),
             self.opts.limit_rate,
             self.opts.low_speed,
-        ));
+        );
         let out = self.run_segmented_metered(&meter);
         meter.report(true);
         self.opts.progress = meter.take_cb();
@@ -1098,7 +1098,7 @@ impl Downloader {
 
     fn run_segmented_metered(
         &mut self,
-        meter: &Arc<ByteMeter>,
+        meter: &ByteMeter,
     ) -> std::result::Result<DownloadOutcome, SegErr> {
         // There is NO HEAD probe. Everything we need — total size, range
         // support, validators — is learned either from the on-disk `.rsurlpart`
@@ -1117,8 +1117,7 @@ impl Downloader {
                     Bootstrap::Full(written) => {
                         // No range support (or a resource that fits in one open
                         // stream): the whole body is already on disk.
-                        self.verify_and_finalize(written, Some(written))
-                            .map_err(SegErr::Fatal)?;
+                        self.verify_and_finalize(written).map_err(SegErr::Fatal)?;
                         return Ok(DownloadOutcome {
                             bytes_written: written,
                             total: Some(written),
@@ -1138,8 +1137,7 @@ impl Downloader {
             };
 
         self.run_chunks(&plan, total, chunk_key, &validators, bitmap, meter)?;
-        self.verify_and_finalize(total, Some(total))
-            .map_err(SegErr::Fatal)?;
+        self.verify_and_finalize(total).map_err(SegErr::Fatal)?;
         Ok(DownloadOutcome {
             bytes_written: total,
             total: Some(total),
@@ -1402,7 +1400,7 @@ impl Downloader {
         chunk_key: u32,
         validators: &Validators,
         bitmap: Vec<u8>,
-        meter: &Arc<ByteMeter>,
+        meter: &ByteMeter,
     ) -> std::result::Result<(), SegErr> {
         let num_chunks = plan.len();
         let workers = self
@@ -1411,84 +1409,65 @@ impl Downloader {
             .clamp(1, num_chunks.max(1))
             .min(MAX_SEGMENT_WORKERS);
 
-        let plan: Arc<Vec<(u64, u64)>> = Arc::new(plan.to_vec());
-        let bitmap = Arc::new(Mutex::new(bitmap));
-        let next = Arc::new(AtomicUsize::new(0));
-        let failed: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
-        let fallback = Arc::new(AtomicBool::new(false));
-        let validators = Arc::new(validators.clone());
+        let bitmap = Mutex::new(bitmap);
+        let next = AtomicUsize::new(0);
+        let failed: Mutex<Option<Error>> = Mutex::new(None);
+        let fallback = AtomicBool::new(false);
         // `If-Range` guards every chunk request: if the resource changed since
         // we learned its size/validators, the server answers `200` instead of
         // `206` and we restart rather than splice mismatched bytes. Falls back
         // to `Last-Modified` when there is no strong `ETag`.
-        let if_range = Arc::new(validators.if_range().unwrap_or("").to_string());
+        let if_range = validators.if_range().unwrap_or("");
         let retry = self.retry();
+        let store = self.store.as_ref();
+        let base = &self.base;
 
-        let mut handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let plan = Arc::clone(&plan);
-            let bitmap = Arc::clone(&bitmap);
-            let next = Arc::clone(&next);
-            let failed = Arc::clone(&failed);
-            let fallback = Arc::clone(&fallback);
-            let meter = Arc::clone(meter);
-            let store = Arc::clone(&self.store);
-            let validators = Arc::clone(&validators);
-            let if_range = Arc::clone(&if_range);
-            let base = self.base.clone();
-            handles.push(std::thread::spawn(move || loop {
-                if failed.lock().unwrap().is_some() || fallback.load(Ordering::Relaxed) {
-                    break;
-                }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= num_chunks {
-                    break;
-                }
-                if bit_get(&bitmap.lock().unwrap(), i) {
-                    continue;
-                }
-                let (start, end) = plan[i];
-                match fetch_chunk_streaming(
-                    &base,
-                    store.as_ref(),
-                    start,
-                    end,
-                    total,
-                    &if_range,
-                    retry,
-                    &meter,
-                ) {
-                    ChunkResult::Ok => {
-                        let mut bm = bitmap.lock().unwrap();
-                        bit_set(&mut bm, i);
-                        let meta = ranged_meta(chunk_key as u64, total, &validators, &bm);
-                        store.save_state(total, Kind::HttpRanged, &meta);
-                        drop(bm);
-                        meter.report(true);
-                    }
-                    ChunkResult::Fallback => fallback.store(true, Ordering::Relaxed),
-                    ChunkResult::Fatal(e) => *failed.lock().unwrap() = Some(e),
-                }
-            }));
-        }
         // A worker that panicked (e.g. a progress callback panicking) left its
         // claimed chunk unfinished; the file has a hole and must not be
         // finalized.
-        let mut panicked = false;
-        for h in handles {
-            panicked |= h.join().is_err();
-        }
+        let panicked = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    s.spawn(|| loop {
+                        if failed.lock().unwrap().is_some() || fallback.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= num_chunks {
+                            break;
+                        }
+                        if bit_get(&bitmap.lock().unwrap(), i) {
+                            continue;
+                        }
+                        let (start, end) = plan[i];
+                        match fetch_chunk_streaming(
+                            base, store, start, end, total, if_range, retry, meter,
+                        ) {
+                            ChunkResult::Ok => {
+                                let mut bm = bitmap.lock().unwrap();
+                                bit_set(&mut bm, i);
+                                let meta = ranged_meta(chunk_key, total, validators, &bm);
+                                store.save_state(total, Kind::HttpRanged, &meta);
+                                drop(bm);
+                                meter.report(true);
+                            }
+                            ChunkResult::Fallback => fallback.store(true, Ordering::Relaxed),
+                            ChunkResult::Fatal(e) => *failed.lock().unwrap() = Some(e),
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .fold(false, |panicked, h| panicked | h.join().is_err())
+        });
         if panicked {
             return Err(SegErr::Fatal(Error::BadResponse(
                 "segment worker panicked; download incomplete".into(),
             )));
         }
 
-        if let Some(e) = Arc::try_unwrap(failed)
-            .ok()
-            .and_then(|m| m.into_inner().ok())
-            .flatten()
-        {
+        if let Some(e) = failed.into_inner().ok().flatten() {
             return Err(SegErr::Fatal(e));
         }
         if fallback.load(Ordering::Relaxed) {
@@ -1498,7 +1477,7 @@ impl Downloader {
     }
 
     fn persist_ranged(&self, chunk: u32, total: u64, validators: &Validators, bitmap: &[u8]) {
-        let meta = ranged_meta(chunk as u64, total, validators, bitmap);
+        let meta = ranged_meta(chunk, total, validators, bitmap);
         self.store.save_state(total, Kind::HttpRanged, &meta);
     }
 
@@ -1515,7 +1494,7 @@ impl Downloader {
     /// Verify size + optional SHA-256, then publish the result (an atomic
     /// rename into place for a file target). On a mismatch the partial is
     /// discarded so the next run starts clean.
-    fn verify_and_finalize(&self, real_size: u64, _total: Option<u64>) -> Result<DownloadOutcome> {
+    fn verify_and_finalize(&self, real_size: u64) -> Result<()> {
         if let Some(want) = self.opts.expected_sha256 {
             match self.store.hash_prefix(real_size) {
                 Ok(got) if got == want => {}
@@ -1528,12 +1507,7 @@ impl Downloader {
                 Err(e) => return Err(Error::Io(e)),
             }
         }
-        self.store.finalize(real_size).map_err(Error::Io)?;
-        Ok(DownloadOutcome {
-            bytes_written: real_size,
-            total: Some(real_size),
-            resumed_from: 0,
-        })
+        self.store.finalize(real_size).map_err(Error::Io)
     }
 
     /// The chunk-fetch retry budget + backoff derived from the options.
@@ -1547,15 +1521,7 @@ impl Downloader {
 
     /// Sleep with bounded exponential backoff before retry number `attempt_no`.
     fn backoff(&self, attempt_no: u32) {
-        let shift = attempt_no.saturating_sub(1).min(20);
-        let delay = self
-            .opts
-            .initial_backoff
-            .saturating_mul(1u32 << shift)
-            .min(self.opts.max_backoff);
-        if !delay.is_zero() {
-            std::thread::sleep(delay);
-        }
+        sleep_backoff(attempt_no, self.opts.initial_backoff, self.opts.max_backoff);
     }
 }
 
@@ -1689,11 +1655,6 @@ enum ChunkResult {
     Fatal(Error),
 }
 
-/// Fetch `[start, end]` into `store`, **streaming straight through** (never
-/// buffering the chunk in memory, so a chunk may be any size). On a transient
-/// break it retries, resuming from wherever the stream stopped — byte-level
-/// resume *within* the chunk. `Ok` only once every byte is written, so a
-/// partial chunk never marks its bitmap bit done.
 /// Retry budget + backoff for a chunk fetch.
 #[derive(Clone, Copy)]
 struct Retry {
@@ -1702,6 +1663,11 @@ struct Retry {
     cap: Duration,
 }
 
+/// Fetch `[start, end]` into `store`, **streaming straight through** (never
+/// buffering the chunk in memory, so a chunk may be any size). On a transient
+/// break it retries, resuming from wherever the stream stopped — byte-level
+/// resume *within* the chunk. `Ok` only once every byte is written, so a
+/// partial chunk never marks its bitmap bit done.
 #[allow(clippy::too_many_arguments)]
 fn fetch_chunk_streaming(
     base: &Request,
@@ -2098,7 +2064,7 @@ fn hash_blob_prefix(blob: &TempBlob, len: u64) -> io::Result<[u8; 32]> {
 
 /// Stream the first `len` bytes of `path` through SHA-256.
 fn hash_prefix(path: &Path, len: u64) -> io::Result<[u8; 32]> {
-    let mut f = std::fs::File::open(path)?;
+    let mut f = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut remaining = len;
     let mut buf = [0u8; 64 * 1024];
@@ -2125,7 +2091,7 @@ fn hash_prefix(path: &Path, len: u64) -> io::Result<[u8; 32]> {
 //   HttpRanged meta:  [chunk:u32][total:u64][vlen:u32][validators][bitmap]
 
 fn encode_validators(v: &Validators) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(6 + v.url.len() + v.etag.len() + v.last_modified.len());
     for s in [&v.url, &v.etag, &v.last_modified] {
         let b = s.as_bytes();
         out.extend_from_slice(&(b.len() as u16).to_le_bytes());
@@ -2153,10 +2119,11 @@ fn decode_validators(p: &[u8]) -> Option<Validators> {
 }
 
 fn stream_meta(total: u64, done: u64, validators: &Validators) -> Vec<u8> {
-    let mut m = Vec::with_capacity(16);
+    let v = encode_validators(validators);
+    let mut m = Vec::with_capacity(16 + v.len());
     m.extend_from_slice(&total.to_le_bytes());
     m.extend_from_slice(&done.to_le_bytes());
-    m.extend_from_slice(&encode_validators(validators));
+    m.extend_from_slice(&v);
     m
 }
 
@@ -2169,10 +2136,10 @@ fn parse_stream_meta(meta: &[u8]) -> Option<(u64, Validators)> {
     Some((done, v))
 }
 
-fn ranged_meta(chunk: u64, total: u64, validators: &Validators, bitmap: &[u8]) -> Vec<u8> {
+fn ranged_meta(chunk: u32, total: u64, validators: &Validators, bitmap: &[u8]) -> Vec<u8> {
     let v = encode_validators(validators);
     let mut m = Vec::with_capacity(16 + v.len() + bitmap.len());
-    m.extend_from_slice(&(chunk as u32).to_le_bytes());
+    m.extend_from_slice(&chunk.to_le_bytes());
     m.extend_from_slice(&total.to_le_bytes());
     m.extend_from_slice(&(v.len() as u32).to_le_bytes());
     m.extend_from_slice(&v);
@@ -2923,7 +2890,7 @@ mod tests {
                     (2000, 2999),
                     (3000, 3999),
                     (4000, 4999),
-                ]) as u64,
+                ]),
                 5_000,
                 &validators,
                 &bitmap,
