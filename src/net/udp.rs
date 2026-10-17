@@ -10,6 +10,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -18,6 +19,8 @@ use crate::net::socks;
 /// Largest SOCKS5 UDP request header: RSV(2) + FRAG(1) + ATYP(1) + IPv6(16) +
 /// PORT(2).
 const MAX_UDP_HEADER: usize = 22;
+/// Largest UDP payload a single datagram can carry (16-bit length field).
+const MAX_UDP_DATAGRAM: usize = 65_535;
 
 /// A datagram transport: send/recv to/from arbitrary peers, with the per-recv
 /// peer always reported as the true source (decapsulated for SOCKS5).
@@ -121,6 +124,11 @@ pub(crate) struct Socks5UdpTransport {
     /// Connected (NET-2) to the proxy's UDP relay endpoint, so the kernel only
     /// delivers datagrams sourced from the proxy.
     relay: UdpSocket,
+    /// Receive scratch for the encapsulated datagram, sized for the largest
+    /// possible UDP payload plus the SOCKS5 header so no receive is truncated.
+    /// Allocated once: `recv_from` sits under the HTTP/3 and TFTP receive
+    /// loops, which must not allocate per datagram.
+    scratch: Mutex<Vec<u8>>,
 }
 
 impl Socks5UdpTransport {
@@ -155,6 +163,7 @@ impl Socks5UdpTransport {
         Ok(Socks5UdpTransport {
             _control: control,
             relay,
+            scratch: Mutex::new(vec![0u8; MAX_UDP_DATAGRAM + MAX_UDP_HEADER]),
         })
     }
 }
@@ -169,7 +178,7 @@ impl UdpTransport for Socks5UdpTransport {
         Ok(buf.len())
     }
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        let mut scratch = vec![0u8; buf.len().saturating_add(MAX_UDP_HEADER)];
+        let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         // Connected socket: the kernel only delivers datagrams from the proxy
         // relay endpoint, so the decapsulated source below is trustworthy.
         let n = self.relay.recv(&mut scratch)?;
