@@ -69,7 +69,7 @@ async fn exchange<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
                     )));
                 }
                 hops += 1;
-                url = crate::url::resolve(&url, &location)?;
+                url = crate::url::resolve(&url, location)?;
                 // 301/302/303 turn a non-idempotent request into a bodyless GET;
                 // 307/308 preserve method and body (RFC 9110 §15.4).
                 if (301..=303).contains(&resp.status) && method != "GET" && method != "HEAD" {
@@ -158,12 +158,12 @@ async fn send_once<R: Runtime>(
     let mut conn = connect(rt, &u.host, u.port).await?;
 
     let target = if u.path.is_empty() {
-        "/".to_string()
+        "/"
     } else {
-        u.path.clone()
+        u.path.as_str()
     };
     let headers = build_headers(u, caller_headers, body.len());
-    let bytes = ClientExchange::encode_request(method, &target, &headers, body);
+    let bytes = ClientExchange::encode_request(method, target, &headers, body);
 
     let events: Vec<Event> = match u.scheme.as_str() {
         "http" => {
@@ -209,11 +209,11 @@ fn is_redirect(status: u16) -> bool {
 }
 
 /// First value for header `name` (case-insensitive), if present.
-fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
+        .map(|(_, v)| v.as_str())
 }
 
 /// Apply response decompression when requested: decode the body per its
@@ -227,7 +227,7 @@ fn finish_response(mut resp: Response, decompress: bool) -> Result<Response> {
     let Some(encoding) = header_value(&resp.headers, "content-encoding") else {
         return Ok(resp);
     };
-    let decoded = crate::compress::decode_body(resp.body, &encoding)?;
+    let decoded = crate::compress::decode_body(resp.body, encoding)?;
     if decoded.decoded {
         // Keep advertising any layers that were not peeled (`foo, gzip` →
         // `Content-Encoding: foo`) so the caller can tell the body is still

@@ -36,8 +36,9 @@ use crate::url::Url;
 use crate::websocket::{
     accumulate, bad_close_error, base64_encode, build_client_frame, check_handshake_response,
     close_echo_payload, close_payload, parse_close_payload, random_16, subprotocol_header,
-    try_parse_frame, validate_control_frame, Frame, CLOSE_INVALID_DATA, HANDSHAKE_DEADLINE,
-    OPCODE_BINARY, OPCODE_CLOSE, OPCODE_CONT, OPCODE_PING, OPCODE_PONG, OPCODE_TEXT,
+    try_parse_frame, upgrade_request, validate_control_frame, Frame, CLOSE_INVALID_DATA,
+    HANDSHAKE_DEADLINE, OPCODE_BINARY, OPCODE_CLOSE, OPCODE_CONT, OPCODE_PING, OPCODE_PONG,
+    OPCODE_TEXT,
 };
 
 use super::{TlsOptions, WsMessage};
@@ -186,9 +187,8 @@ impl<C: AsyncConn> WebSocket<C> {
         R: Runtime<Conn = C>,
     {
         let u = Url::parse(url)?;
-        let subs: Vec<String> = subprotocols.iter().map(|s| s.to_string()).collect();
         // Validate before touching the network.
-        let proto_header = subprotocol_header(&subs)?;
+        let proto_header = subprotocol_header(subprotocols)?;
 
         super::native::with_timeout(rt, Some(HANDSHAKE_DEADLINE), async {
             let conn = super::native::connect(rt, &u.host, u.port).await?;
@@ -213,7 +213,7 @@ impl<C: AsyncConn> WebSocket<C> {
             };
 
             let mut ws = WebSocket::new(transport);
-            ws.handshake(&u, &subs, &proto_header).await?;
+            ws.handshake(&u, subprotocols, &proto_header).await?;
             Ok(ws)
         })
         .await
@@ -450,34 +450,13 @@ impl<C: AsyncConn> WebSocket<C> {
     async fn handshake(
         &mut self,
         u: &Url,
-        subprotocols: &[String],
+        subprotocols: &[&str],
         proto_header: &str,
     ) -> Result<()> {
         let key_b64 = base64_encode(&random_16()?);
 
-        let host_header =
-            if (u.scheme == "ws" && u.port == 80) || (u.scheme == "wss" && u.port == 443) {
-                u.host.clone()
-            } else {
-                format!("{}:{}", u.host, u.port)
-            };
-        let path = if u.path.is_empty() {
-            "/"
-        } else {
-            u.path.as_str()
-        };
-
         // No `Sec-WebSocket-Extensions`: we do not offer permessage-deflate.
-        let req = format!(
-            "GET {path} HTTP/1.1\r\n\
-             Host: {host_header}\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Key: {key_b64}\r\n\
-             Sec-WebSocket-Version: 13\r\n\
-             {proto_header}\
-             \r\n"
-        );
+        let req = upgrade_request(u, &key_b64, None, proto_header);
         self.write_frame(req.as_bytes()).await?;
 
         let head = self.read_handshake_head().await?;
@@ -858,11 +837,10 @@ mod tests {
     }
 
     fn run_handshake(conn: MockConn, offered: &[&str]) -> Result<Option<String>> {
-        let offered: Vec<String> = offered.iter().map(|s| s.to_string()).collect();
-        let header = subprotocol_header(&offered)?;
+        let header = subprotocol_header(offered)?;
         let url = Url::parse("ws://example.com/").unwrap();
         let mut ws = ws_over(conn);
-        block_on(ws.handshake(&url, &offered, &header))?;
+        block_on(ws.handshake(&url, offered, &header))?;
         Ok(ws.subprotocol)
     }
 

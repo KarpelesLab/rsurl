@@ -218,7 +218,7 @@ impl Response {
         if self.status >= 400 {
             Err(Error::Status {
                 code: self.status,
-                reason: self.reason.clone(),
+                reason: self.reason,
             })
         } else {
             Ok(self)

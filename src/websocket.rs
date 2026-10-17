@@ -67,7 +67,6 @@ use compcol::{Algorithm, Decoder, Status};
 use purecrypto::hash::{Digest, Sha1};
 
 use crate::error::{Error, Result};
-use crate::tls::TlsStream;
 use crate::url::Url;
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -107,6 +106,9 @@ pub(crate) const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(60);
 /// smaller window would fail on back-references beyond it (RFC 7692 §7.1.2.2).
 const PMD_OFFER: &str =
     "permessage-deflate; client_no_context_takeover; server_no_context_takeover";
+
+/// An empty subprotocol offer, typed so the generic handshake can infer it.
+const NO_SUBPROTOCOLS: &[&str] = &[];
 
 /// Negotiated permessage-deflate (RFC 7692) state for a connection.
 ///
@@ -262,13 +264,13 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
     match url.scheme.as_str() {
         "ws" => {
             let mut sock = tcp_connect(url, cfg)?;
-            let (mut pmd, _proto) = handshake(&mut sock, url, &[])?;
+            let (mut pmd, _proto) = handshake(&mut sock, url, NO_SUBPROTOCOLS)?;
             read_data_and_close(&mut sock, pmd.as_mut())
         }
         "wss" => {
             let tcp = tcp_connect(url, cfg)?;
             let mut tls = cfg.tls_connect(tcp, &url.host)?;
-            let (mut pmd, _proto) = handshake(&mut tls, url, &[])?;
+            let (mut pmd, _proto) = handshake(&mut tls, url, NO_SUBPROTOCOLS)?;
             read_data_and_close(&mut tls, pmd.as_mut())
         }
         other => Err(Error::UnsupportedScheme(other.to_string())),
@@ -543,7 +545,10 @@ impl WsTransport {
     /// Read with a bounded OS-level poll tick, re-checking the shutdown flag
     /// each tick and enforcing the caller's inactivity deadline in software.
     fn read_polled(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let deadline = (*self.read_timeout.lock().unwrap()).map(|d| Instant::now() + d);
+        // `checked_add`: an absurdly large timeout means "no deadline" rather
+        // than an `Instant` overflow panic.
+        let deadline =
+            (*self.read_timeout.lock().unwrap()).and_then(|d| Instant::now().checked_add(d));
         let mut programmed: Option<Duration> = None;
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
@@ -854,13 +859,10 @@ fn spawn_keepalive(
             }
             if transport.idle() >= interval {
                 // A failed ping means the socket is gone — stop quietly.
-                match build_client_frame(OPCODE_PING, &[]) {
-                    Ok(frame) => {
-                        if transport.write_unless_closed(&send_closed, &frame).is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
+                let sent = build_client_frame(OPCODE_PING, &[])
+                    .and_then(|frame| transport.write_unless_closed(&send_closed, &frame));
+                if sent.is_err() {
+                    return;
                 }
             }
         }
@@ -1424,11 +1426,7 @@ impl WsWriter {
     /// close), no further fragment is sent and this returns an error: nothing
     /// may follow a close frame on the wire.
     pub fn send_stream<R: Read>(&mut self, opcode: WsOpcode, reader: &mut R) -> Result<()> {
-        let transport = Arc::clone(&self.transport);
-        let send_closed = Arc::clone(&self.send_closed);
-        send_stream_inner(opcode.to_u8(), reader, |frame| {
-            transport.write_unless_closed(&send_closed, frame)
-        })
+        send_stream_inner(opcode.to_u8(), reader, |frame| self.write_frame(frame))
     }
 
     /// Start sending a PING whenever the connection is idle (no outbound write)
@@ -1472,12 +1470,7 @@ impl WsWriter {
                     "websocket: control frames cannot be fragmented (fin must be true)".into(),
                 ));
             }
-            if payload.len() > MAX_CONTROL_PAYLOAD {
-                return Err(Error::BadResponse(format!(
-                    "websocket: control frame payload too large: {} bytes (max {MAX_CONTROL_PAYLOAD})",
-                    payload.len()
-                )));
-            }
+            check_control_payload(payload)?;
         }
         let frame = build_client_frame_inner(fin, opcode.to_u8(), payload, false)?;
         if opcode == WsOpcode::Close {
@@ -1487,12 +1480,7 @@ impl WsWriter {
     }
 
     fn send_control(&mut self, opcode: u8, payload: &[u8]) -> Result<()> {
-        if payload.len() > MAX_CONTROL_PAYLOAD {
-            return Err(Error::BadResponse(format!(
-                "websocket: control frame payload too large: {} bytes (max {MAX_CONTROL_PAYLOAD})",
-                payload.len()
-            )));
-        }
+        check_control_payload(payload)?;
         let frame = build_client_frame(opcode, payload)?;
         self.write_frame(&frame)
     }
@@ -1520,47 +1508,34 @@ impl WsWriter {
     }
 }
 
+/// Reject an outgoing control-frame payload over 125 bytes (RFC 6455 §5.5).
+fn check_control_payload(payload: &[u8]) -> Result<()> {
+    if payload.len() > MAX_CONTROL_PAYLOAD {
+        return Err(Error::BadResponse(format!(
+            "websocket: control frame payload too large: {} bytes (max {MAX_CONTROL_PAYLOAD})",
+            payload.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Drive the HTTP/1.1 upgrade handshake on `stream`. After this returns, the
 /// stream sits at the first byte of the first WS frame.
 ///
 /// Returns `Some(Pmd)` if the server agreed to permessage-deflate (RFC 7692),
 /// `None` otherwise (in which case the connection operates uncompressed,
 /// exactly as before).
-fn handshake<S: Read + Write>(
+fn handshake<S: Read + Write, P: AsRef<str>>(
     stream: &mut S,
     url: &Url,
-    subprotocols: &[String],
+    subprotocols: &[P],
 ) -> Result<(Option<Pmd>, Option<String>)> {
-    let key_bytes: [u8; 16] = random_16()?;
-    let key_b64 = base64_encode(&key_bytes);
-
-    let host_header =
-        if (url.scheme == "ws" && url.port == 80) || (url.scheme == "wss" && url.port == 443) {
-            url.host.clone()
-        } else {
-            format!("{}:{}", url.host, url.port)
-        };
-
-    let path = if url.path.is_empty() {
-        "/"
-    } else {
-        url.path.as_str()
-    };
+    let key_b64 = base64_encode(&random_16()?);
 
     // Sec-WebSocket-Protocol: comma-separated subprotocols in preference order.
     let proto_header = subprotocol_header(subprotocols)?;
 
-    let req = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host_header}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key_b64}\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         Sec-WebSocket-Extensions: {PMD_OFFER}\r\n\
-         {proto_header}\
-         \r\n"
-    );
+    let req = upgrade_request(url, &key_b64, Some(PMD_OFFER), &proto_header);
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
 
@@ -1581,26 +1556,72 @@ fn handshake<S: Read + Write>(
     Ok((pmd, resp.subprotocol))
 }
 
+/// The HTTP/1.1 Upgrade request for `url` (RFC 6455 §4.1), through the blank
+/// line: `key_b64` is the `Sec-WebSocket-Key`, `extensions` the
+/// `Sec-WebSocket-Extensions` offer (if any), and `proto_header` the
+/// `Sec-WebSocket-Protocol` line from [`subprotocol_header`]. Shared with the
+/// async WebSocket in `crate::aio`.
+pub(crate) fn upgrade_request(
+    url: &Url,
+    key_b64: &str,
+    extensions: Option<&str>,
+    proto_header: &str,
+) -> String {
+    use std::fmt::Write as _;
+
+    let path = if url.path.is_empty() {
+        "/"
+    } else {
+        url.path.as_str()
+    };
+    let default_port =
+        (url.scheme == "ws" && url.port == 80) || (url.scheme == "wss" && url.port == 443);
+
+    let mut req = String::with_capacity(256 + path.len() + url.host.len() + proto_header.len());
+    let _ = write!(req, "GET {path} HTTP/1.1\r\nHost: {}", url.host);
+    if !default_port {
+        let _ = write!(req, ":{}", url.port);
+    }
+    let _ = write!(
+        req,
+        "\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key_b64}\r\n\
+         Sec-WebSocket-Version: 13\r\n"
+    );
+    if let Some(ext) = extensions {
+        let _ = write!(req, "Sec-WebSocket-Extensions: {ext}\r\n");
+    }
+    req.push_str(proto_header);
+    req.push_str("\r\n");
+    req
+}
+
 /// The `Sec-WebSocket-Protocol` request header line (with trailing CRLF) for
 /// `subprotocols`, or an empty string when none are offered. Each value must
 /// be a non-empty RFC 7230 token (RFC 6455 §4.1), which also rules out CR/LF
 /// header injection and a `,` that would split one value into two. Shared with
 /// the async WebSocket in `crate::aio`.
-pub(crate) fn subprotocol_header(subprotocols: &[String]) -> Result<String> {
+pub(crate) fn subprotocol_header<P: AsRef<str>>(subprotocols: &[P]) -> Result<String> {
     if subprotocols.is_empty() {
         return Ok(String::new());
     }
-    for p in subprotocols {
+    let mut header = String::from("Sec-WebSocket-Protocol: ");
+    for (i, p) in subprotocols.iter().enumerate() {
+        let p = p.as_ref();
         if !is_http_token(p) {
             return Err(Error::InvalidUrl(format!(
                 "websocket: invalid subprotocol {p:?} (must be an HTTP token)"
             )));
         }
+        if i > 0 {
+            header.push_str(", ");
+        }
+        header.push_str(p);
     }
-    Ok(format!(
-        "Sec-WebSocket-Protocol: {}\r\n",
-        subprotocols.join(", ")
-    ))
+    header.push_str("\r\n");
+    Ok(header)
 }
 
 /// Whether `s` is a non-empty RFC 7230 §3.2.6 `token`.
@@ -1642,10 +1663,10 @@ pub(crate) struct HandshakeResponse {
 /// upgrade`, the matching `Sec-WebSocket-Accept`, and — if present — a
 /// `Sec-WebSocket-Protocol` naming exactly one of the offered values. Shared by
 /// the blocking and async clients so the two cannot diverge.
-pub(crate) fn check_handshake_response(
+pub(crate) fn check_handshake_response<P: AsRef<str>>(
     buf: &[u8],
     key_b64: &str,
-    offered: &[String],
+    offered: &[P],
 ) -> Result<HandshakeResponse> {
     let head = std::str::from_utf8(buf)
         .map_err(|_| Error::BadResponse("non-utf8 handshake response".into()))?;
@@ -1664,7 +1685,7 @@ pub(crate) fn check_handshake_response(
 
     let mut upgrade_ok = false;
     let mut connection_ok = false;
-    let mut accept_value: Option<String> = None;
+    let mut accept_value: Option<&str> = None;
     let mut extensions_value: Option<String> = None;
     let mut subprotocol_value: Option<String> = None;
     for line in lines {
@@ -1687,7 +1708,7 @@ pub(crate) fn check_handshake_response(
                 connection_ok = true;
             }
         } else if k.eq_ignore_ascii_case("sec-websocket-accept") {
-            accept_value = Some(v.to_string());
+            accept_value = Some(v);
         } else if k.eq_ignore_ascii_case("sec-websocket-protocol") {
             if subprotocol_value.replace(v.to_string()).is_some() {
                 return Err(Error::BadResponse(
@@ -1728,7 +1749,7 @@ pub(crate) fn check_handshake_response(
     // RFC 6455 §4.1: a subprotocol the client did not offer (or any, when it
     // offered none) fails the connection. Values are compared exactly.
     if let Some(sel) = &subprotocol_value {
-        if !offered.iter().any(|p| p == sel) {
+        if !offered.iter().any(|p| p.as_ref() == sel) {
             return Err(Error::BadResponse(format!(
                 "websocket: server selected subprotocol {sel:?}, which was not offered"
             )));
@@ -1763,7 +1784,7 @@ fn read_handshake_head<S: Read>(stream: &mut S, deadline: Duration) -> Result<Ve
             return Err(Error::UnexpectedEof);
         }
         buf.push(b[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+        if buf.ends_with(b"\r\n\r\n") {
             break;
         }
         if buf.len() > 64 * 1024 {
@@ -1850,9 +1871,8 @@ fn parse_pmd_response(value: &str) -> Result<Option<Pmd>> {
                 }
             } else if key.eq_ignore_ascii_case("server_max_window_bits") {
                 flag(&mut server_max_window_bits)?;
-                match val.and_then(parse_window_bits) {
-                    Some(_) => {}
-                    None => return Err(bad("server_max_window_bits must be 8..=15")),
+                if val.and_then(parse_window_bits).is_none() {
+                    return Err(bad("server_max_window_bits must be 8..=15"));
                 }
             } else if key.eq_ignore_ascii_case("client_max_window_bits") {
                 flag(&mut client_max_window_bits)?;
@@ -2185,11 +2205,12 @@ fn send_message<S: Write>(
 /// How much of a streamed body to pull from the source per WebSocket frame.
 const STREAM_CHUNK: usize = 64 * 1024;
 
-/// Read up to `cap` bytes into a fresh buffer, looping over short reads until
-/// the buffer is full or the source hits EOF. Returns a shorter (possibly
-/// empty) buffer only at EOF.
-fn read_chunk<R: Read>(reader: &mut R, cap: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; cap];
+/// Read up to `cap` bytes into `buf` (replacing its contents, reusing its
+/// allocation), looping over short reads until the buffer is full or the
+/// source hits EOF. Leaves a shorter (possibly empty) buffer only at EOF.
+fn read_chunk<R: Read>(reader: &mut R, buf: &mut Vec<u8>, cap: usize) -> io::Result<()> {
+    buf.clear();
+    buf.resize(cap, 0);
     let mut filled = 0;
     while filled < cap {
         match reader.read(&mut buf[filled..]) {
@@ -2200,7 +2221,7 @@ fn read_chunk<R: Read>(reader: &mut R, cap: usize) -> io::Result<Vec<u8>> {
         }
     }
     buf.truncate(filled);
-    Ok(buf)
+    Ok(())
 }
 
 /// Stream a data message from `reader`, fragmenting it into a leading data
@@ -2221,11 +2242,13 @@ fn send_stream_inner<R: Read>(
             "send_stream expects a data opcode (text/binary), got 0x{opcode:x}"
         )));
     }
-    let mut cur = read_chunk(reader, STREAM_CHUNK).map_err(Error::Io)?;
+    let mut cur = Vec::new();
+    let mut next = Vec::new();
+    read_chunk(reader, &mut cur, STREAM_CHUNK).map_err(Error::Io)?;
     let mut first = true;
     loop {
         // Peek the next chunk so we know whether `cur` is the final fragment.
-        let next = read_chunk(reader, STREAM_CHUNK).map_err(Error::Io)?;
+        read_chunk(reader, &mut next, STREAM_CHUNK).map_err(Error::Io)?;
         let fin = next.is_empty();
         let op = if first { opcode } else { OPCODE_CONT };
         let frame = build_client_frame_inner(fin, op, &cur, false)?;
@@ -2234,7 +2257,9 @@ fn send_stream_inner<R: Read>(
         if fin {
             break;
         }
-        cur = next;
+        // The two buffers rotate: the consumed `cur` is refilled as the next
+        // look-ahead, so no chunk-sized allocation happens per frame.
+        std::mem::swap(&mut cur, &mut next);
     }
     Ok(())
 }
@@ -2532,12 +2557,6 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
     }
     out
 }
-
-// Silence unused-import warning in builds that take only the `ws://` path
-// — `TlsStream` is referenced in docs but not directly in this module
-// (we call `crate::tls::connect_over` instead).
-#[allow(dead_code)]
-fn _tlsstream_in_scope_for_docs<S: Read + Write>(_: TlsStream<S>) {}
 
 #[cfg(test)]
 mod tests {
@@ -3227,7 +3246,7 @@ mod tests {
             response: Cursor::new(resp),
         };
         let url = Url::parse("ws://example.com/chat").expect("url");
-        let _ = handshake(&mut rec, &url, &[]); // Accept mismatch is fine here.
+        let _ = handshake(&mut rec, &url, NO_SUBPROTOCOLS); // Accept mismatch is fine here.
         let req = String::from_utf8(rec.request).expect("utf8 request");
         assert!(
             req.contains("Sec-WebSocket-Extensions: permessage-deflate"),
@@ -3300,6 +3319,27 @@ mod tests {
     #[test]
     fn handshake_no_longer_offers_client_max_window_bits() {
         assert!(!PMD_OFFER.contains("client_max_window_bits"));
+    }
+
+    #[test]
+    fn upgrade_request_bytes() {
+        // Default port: bare host; empty path becomes "/".
+        let url = Url::parse("wss://example.com").expect("url");
+        assert_eq!(
+            upgrade_request(&url, "KEY", None, ""),
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: KEY\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        // Non-default port, extension offer and subprotocol line.
+        let url = Url::parse("ws://example.com:8080/chat?x=1").expect("url");
+        assert_eq!(
+            upgrade_request(&url, "KEY", Some("ext"), "Sec-WebSocket-Protocol: a, b\r\n"),
+            "GET /chat?x=1 HTTP/1.1\r\nHost: example.com:8080\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: KEY\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: ext\r\n\
+             Sec-WebSocket-Protocol: a, b\r\n\r\n"
+        );
     }
 
     #[test]
@@ -3833,8 +3873,7 @@ mod tests {
     }
 
     fn check(resp: &str, key: &str, offered: &[&str]) -> Result<HandshakeResponse> {
-        let offered: Vec<String> = offered.iter().map(|s| s.to_string()).collect();
-        check_handshake_response(resp.as_bytes(), key, &offered)
+        check_handshake_response(resp.as_bytes(), key, offered)
     }
 
     fn resp_101(status: &str, key: &str, extra: &str) -> String {
@@ -3889,9 +3928,12 @@ mod tests {
 
     #[test]
     fn subprotocol_values_must_be_tokens() {
-        assert!(subprotocol_header(&["chat".into(), "v2.proto".into()]).is_ok());
+        assert_eq!(
+            subprotocol_header(&["chat", "v2.proto"]).unwrap(),
+            "Sec-WebSocket-Protocol: chat, v2.proto\r\n"
+        );
         for bad in ["", "a b", "a,b", "chat\r\nX-Evil: 1", "caf\u{e9}"] {
-            assert!(subprotocol_header(&[bad.to_string()]).is_err(), "{bad:?}");
+            assert!(subprotocol_header(&[bad]).is_err(), "{bad:?}");
         }
     }
 
