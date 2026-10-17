@@ -37,12 +37,16 @@ impl Drop for ConnSlot {
 
 /// Claim one of `max` connection slots, or `None` when all are taken.
 fn claim_slot(active: &Arc<AtomicUsize>, max: usize) -> Option<ConnSlot> {
-    active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-            (n < max).then_some(n + 1)
-        })
-        .ok()
-        .map(|_| ConnSlot(Arc::clone(active)))
+    // Hand-rolled CAS loop: `fetch_update` is deprecated on current stable in
+    // favour of `try_update`, which is newer than our MSRV.
+    let mut n = active.load(Ordering::Acquire);
+    while n < max {
+        match active.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(ConnSlot(Arc::clone(active))),
+            Err(cur) => n = cur,
+        }
+    }
+    None
 }
 
 fn serr(msg: impl Into<String>) -> Error {
