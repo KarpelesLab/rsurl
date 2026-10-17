@@ -348,12 +348,11 @@ cargo build --release --features ffi
 # C header:     include/rsurl.h
 ```
 
-Minimum supported Rust version (MSRV): **1.89**, for every feature
-combination (it is pinned as `rust-version` in `Cargo.toml`, and the
-`fullrust` CI job builds and tests the whole crate on exactly that release).
-The floor tracks `purecrypto`, which raised it to 1.89 in 0.8.0; cargo
-enforces this, so the build fails outright on 1.88 rather than drifting.
-Dropping the `ssh` feature does not lower it.
+Minimum supported Rust version (MSRV): **1.95**, for every feature
+combination (it is pinned as `rust-version` in `Cargo.toml`, and CI lints,
+tests, and builds the `fullrust` target on exactly that release). Cargo
+enforces this, so the build fails outright on older toolchains rather than
+drifting. Dropping the `ssh` feature does not lower it.
 
 ### TLS backend
 
@@ -408,7 +407,7 @@ libc. The result is a fully static `x86_64-unknown-linux-fullrust` ELF with no
 it needs to run is the Linux kernel.
 
 ```sh
-docker run --rm -v "$PWD":/src ghcr.io/karpeleslab/fullrust:1.89 build --release --bin rsurl
+docker run --rm -v "$PWD":/src ghcr.io/karpeleslab/fullrust:1.95 build --release --bin rsurl
 readelf -d target/x86_64-unknown-linux-fullrust/release/rsurl   # no dynamic section
 ```
 

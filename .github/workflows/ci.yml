@@ -41,7 +41,7 @@ jobs:
         # Pinned to the MSRV (`rust-version` in Cargo.toml): a floating stable
         # breaks `clippy -D warnings` whenever std deprecates something whose
         # replacement is newer than our MSRV.
-        uses: dtolnay/rust-toolchain@1.89
+        uses: dtolnay/rust-toolchain@1.95
         with:
           components: rustfmt, clippy
 
@@ -132,11 +132,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust (with i686 target)
-        # Pinned rather than floating stable, which breaks `clippy -D warnings`
-        # whenever std deprecates something whose replacement is newer than our
-        # MSRV. 1.95 rather than rsurl's 1.89 because the curl-compat step below
-        # needs curl-compat's `rust-version` (1.95); the test & lint matrix
-        # covers rsurl's MSRV.
+        # Pinned to the MSRV, like the test & lint matrix above.
         uses: dtolnay/rust-toolchain@1.95
         with:
           targets: i686-unknown-linux-gnu
@@ -232,23 +228,21 @@ jobs:
     # that actually run there, and no other job in this matrix compiles them
     # against a real network stack. Build and test here so they can't rot.
     #
-    # The image is pinned to Rust 1.89, this crate's `rust-version` (the
-    # action would otherwise default to 1.88, which purecrypto 0.8 no longer
-    # builds on). Keep the two in step: fullrust publishes one image per Rust
-    # minor, 1.88 through 1.95.
+    # The image is pinned to Rust 1.95, this crate's `rust-version`. Keep the
+    # two in step: fullrust publishes one image per Rust minor.
     steps:
       - uses: actions/checkout@v6
 
       - name: Build the CLI for the fullrust target
         uses: KarpelesLab/fullrust@master
         with:
-          image: ghcr.io/karpeleslab/fullrust:1.89
+          image: ghcr.io/karpeleslab/fullrust:1.95
           args: --release --bin rsurl
 
       - name: Test (release)
         uses: KarpelesLab/fullrust@master
         with:
-          image: ghcr.io/karpeleslab/fullrust:1.89
+          image: ghcr.io/karpeleslab/fullrust:1.95
           command: test
           args: --release
 
