@@ -354,11 +354,7 @@ pub unsafe extern "C" fn rsurl_easy_setopt_long(
             RsurlOpt::HttpContentDecoding => h.decompress = value != 0,
             RsurlOpt::FollowLocation => h.follow_location = value != 0,
             RsurlOpt::MaxRedirs => {
-                h.max_redirs = if value < 0 {
-                    Some(0)
-                } else {
-                    Some(value as u32)
-                }
+                h.max_redirs = Some(u32::try_from(value.max(0)).unwrap_or(u32::MAX))
             }
             RsurlOpt::SslVerifyPeer => h.verify_peer = value != 0,
             _ => return RsurlCode::InvalidArg,
@@ -410,15 +406,12 @@ pub unsafe extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
         let Some(url) = h.url.as_deref() else {
             return RsurlCode::InvalidArg;
         };
-        let method = h.method.clone().unwrap_or_else(|| {
-            if h.body.is_some() {
-                "POST".to_string()
-            } else {
-                "GET".to_string()
-            }
-        });
+        let method = h
+            .method
+            .as_deref()
+            .unwrap_or(if h.body.is_some() { "POST" } else { "GET" });
 
-        let mut req = match Request::new(&method, url) {
+        let mut req = match Request::new(method, url) {
             Ok(r) => r,
             Err(crate::Error::UnsupportedScheme(_)) => return RsurlCode::Unsupported,
             Err(_) => return RsurlCode::InvalidArg,
@@ -462,12 +455,11 @@ pub unsafe extern "C" fn rsurl_easy_perform(handle: *mut RSURL) -> RsurlCode {
             req = req.header("Authorization", &format!("Bearer {token}"));
         }
         if let Some(range) = &h.range {
-            let v = if range.contains('=') {
-                range.clone()
+            req = if range.contains('=') {
+                req.header("Range", range)
             } else {
-                format!("bytes={range}")
+                req.header("Range", &format!("bytes={range}"))
             };
-            req = req.header("Range", &v);
         }
         if let Some(enc) = &h.accept_encoding {
             // curl: an empty string means "every codec I can decode".
@@ -576,7 +568,7 @@ pub unsafe extern "C" fn rsurl_easy_response_status(handle: *const RSURL) -> c_l
         // SAFETY: `handle` validity is this function's documented contract.
         unsafe { handle_ref(handle) }
             .and_then(|h| h.last_response.as_ref())
-            .map(|r| r.status as c_long)
+            .map(|r| c_long::from(r.status))
             .unwrap_or(0)
     })
 }

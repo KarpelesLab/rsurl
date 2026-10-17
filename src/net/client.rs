@@ -439,8 +439,8 @@ impl Client {
                 r.no_proxy(self.no_proxy.clone())
             }
             None => {
-                let host = r.url().host.clone();
-                r.connector(self.effective_connector(&host))
+                let connector = self.effective_connector(&r.url().host);
+                r.connector(connector)
             }
         };
         r = r.read_timeout(self.read_timeout);

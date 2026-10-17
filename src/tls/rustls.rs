@@ -422,18 +422,15 @@ pub fn connect_over_tls<S: Read + Write>(
     // x509 parser, always linked) — then defer to a caller-owned verify callback
     // if one is set (authoritative; the browser model). The HTTP/3 path enforces
     // pins in the same order.
-    let chain = s.peer_certificates().to_vec();
+    let chain = s.peer_certificates();
     let leaf = chain.first().map(Vec::as_slice);
-    if client_auth::enforce_pins_then_callback(
+    client_auth::enforce_pins_then_callback(
         leaf,
         &opts.pinned_spki_sha256,
         sni,
-        &chain,
+        chain,
         opts.verify_callback.as_ref(),
-    )? == client_auth::PostHandshakeDecision::CallbackAccepted
-    {
-        return Ok(s);
-    }
+    )?;
     // TLS-4: no SAN-less-leaf check is needed here. webpki (used by the rustls
     // verifier) already rejects a leaf that has no Subject Alternative Name —
     // it does not fall back to Common Name matching — so a SAN-less server cert

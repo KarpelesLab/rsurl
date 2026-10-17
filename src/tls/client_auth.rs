@@ -253,7 +253,7 @@ pub fn cipher_names_to_ids(spec: &str) -> Result<Vec<u16>> {
 pub fn load_cert_chain(pem: &str) -> Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     for block in crate::tls::pc_roots::pem_blocks(pem) {
-        let cert = purecrypto::x509::Certificate::from_pem(&block)
+        let cert = purecrypto::x509::Certificate::from_pem(block)
             .map_err(|e| Error::BadResponse(format!("client cert: cannot parse PEM: {e:?}")))?;
         out.push(cert.to_der().to_vec());
     }

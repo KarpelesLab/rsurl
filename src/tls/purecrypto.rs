@@ -362,19 +362,19 @@ fn build_client_conn_resuming(
     }
     // CRL-based revocation (curl `--crlfile`): the chain is rejected at
     // handshake time if the leaf/intermediates appear on a supplied CRL.
-    if let Some(crl_bytes) = &opts.crl_pem {
+    if let Some(crl_bytes) = opts.crl_pem.take() {
         let mut store = CrlStore::new();
         // curl's --crlfile accepts a *concatenation* of PEM CRLs. Split out
         // every `X509 CRL` block and add each one — `add_pem` only consumes the
         // first block, so feeding it the whole file would silently drop the
         // revocations in the 2nd+ CRL. A block that fails to parse is surfaced
         // as an error rather than dropped.
-        let blocks = std::str::from_utf8(crl_bytes)
+        let blocks = std::str::from_utf8(&crl_bytes)
             .ok()
             .map(crl_pem_blocks)
             .unwrap_or_default();
         if !blocks.is_empty() {
-            for block in &blocks {
+            for block in blocks {
                 store
                     .add_pem(block)
                     .map_err(|_| Error::BadResponse("--crlfile: invalid PEM CRL block".into()))?;
@@ -382,7 +382,7 @@ fn build_client_conn_resuming(
         } else {
             // No PEM CRL blocks found — treat the file as raw DER (single CRL).
             store
-                .add_der(crl_bytes.clone())
+                .add_der(crl_bytes)
                 .map_err(|_| Error::BadResponse("--crlfile: not a valid PEM or DER CRL".into()))?;
         }
         builder = builder.crls(store);
@@ -408,7 +408,7 @@ pub fn connect_over_tls<S: Read + Write>(
         plaintext: Vec::new(),
         pending_wire: Vec::new(),
         seen_eof: false,
-        session: opts.session_cache.clone().map(|cache| SessionSink {
+        session: opts.session_cache.take().map(|cache| SessionSink {
             cache,
             server_name: super::server_name(sni).to_string(),
             verified: effective_verify,
@@ -431,13 +431,13 @@ pub fn connect_over_tls<S: Read + Write>(
     // even when a verify callback is present — then defer to a caller-owned
     // verify callback if one is set (authoritative; the browser model). The
     // HTTP/3 path enforces pins in the same order.
-    let chain = s.peer_certificates().to_vec();
+    let chain = s.peer_certificates();
     let leaf = chain.first().map(Vec::as_slice);
     if client_auth::enforce_pins_then_callback(
         leaf,
         &opts.pinned_spki_sha256,
         sni,
-        &chain,
+        chain,
         opts.verify_callback.as_ref(),
     )? == client_auth::PostHandshakeDecision::CallbackAccepted
     {
@@ -448,16 +448,12 @@ pub fn connect_over_tls<S: Read + Write>(
     // matching is deprecated and rejected by webpki/browsers and the rustls
     // backend, so align the default backend with modern standards. Only meaningful
     // when we actually verified the chain (`-k` skips hostname verification too).
-    if effective_verify {
-        if let Some(der) = s.peer_certificates().first() {
-            if !client_auth::leaf_has_san(der) {
-                return Err(Error::BadResponse(
-                    "server certificate has no Subject Alternative Name \
-                     (CN fallback is not accepted)"
-                        .into(),
-                ));
-            }
-        }
+    if effective_verify && leaf.is_some_and(|der| !client_auth::leaf_has_san(der)) {
+        return Err(Error::BadResponse(
+            "server certificate has no Subject Alternative Name \
+             (CN fallback is not accepted)"
+                .into(),
+        ));
     }
     Ok(s)
 }
@@ -465,7 +461,7 @@ pub fn connect_over_tls<S: Read + Write>(
 /// Split a `--crlfile` PEM body into its individual `X509 CRL` blocks. Mirrors
 /// the certificate splitter in [`super::pc_roots`] so a concatenation of CRLs
 /// (which curl accepts) is fully honoured instead of only the first block.
-fn crl_pem_blocks(pem: &str) -> Vec<String> {
+fn crl_pem_blocks(pem: &str) -> Vec<&str> {
     pc_roots::pem_blocks_labelled(pem, "X509 CRL")
 }
 

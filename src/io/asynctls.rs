@@ -43,15 +43,15 @@ pub(crate) async fn handshake<C: AsyncConn>(
     // Files (CA bundle, client cert/key, CRL) are read and pins parsed here,
     // so a bad setting fails before the handshake starts.
     let mut opts = tls.to_opts(&[])?;
-    let pins = opts.pinned_spki_sha256.clone();
     let mut engine = crate::tls::build_client_engine(host, &mut opts)?;
     let mut inbuf = vec![0u8; 16 * 1024];
+    let mut out = Vec::new();
 
     // Standard sans-IO handshake pump: flush whatever the engine wants to
     // send, stop once it is no longer handshaking, otherwise feed it the
     // next inbound flight.
     loop {
-        let mut out = Vec::new();
+        out.clear();
         engine.drain_outgoing(&mut out);
         if !out.is_empty() {
             conn.write_all(&out).await?;
@@ -67,7 +67,11 @@ pub(crate) async fn handshake<C: AsyncConn>(
         engine.feed_incoming(&inbuf[..n])?;
     }
 
-    tls.verify_peer(&engine.tls_params().peer_certificates, host, &pins)?;
+    tls.verify_peer(
+        &engine.tls_params().peer_certificates,
+        host,
+        &opts.pinned_spki_sha256,
+    )?;
     Ok(engine)
 }
 
@@ -84,6 +88,8 @@ pub(crate) struct AsyncTlsStream<C> {
     engine: ClientEngine,
     /// Scratch for inbound ciphertext reads.
     inbuf: Vec<u8>,
+    /// Scratch for outbound records drained from the engine.
+    outbuf: Vec<u8>,
     /// Set while ciphertext is being written, and left set if that write fails
     /// or its future is dropped.
     poisoned: bool,
@@ -103,6 +109,7 @@ impl<C: AsyncConn> AsyncTlsStream<C> {
             conn,
             engine,
             inbuf: vec![0u8; 16 * 1024],
+            outbuf: Vec::new(),
             poisoned: false,
         })
     }
@@ -120,14 +127,14 @@ impl<C: AsyncConn> AsyncTlsStream<C> {
     /// Write out every record the engine has queued (and flush when asked),
     /// poisoning the stream for the duration — see the type docs.
     async fn send_queued(&mut self, flush: bool) -> io::Result<()> {
-        let mut out = Vec::new();
-        self.engine.drain_outgoing(&mut out);
-        if out.is_empty() && !flush {
+        self.outbuf.clear();
+        self.engine.drain_outgoing(&mut self.outbuf);
+        if self.outbuf.is_empty() && !flush {
             return Ok(());
         }
         self.poisoned = true;
-        if !out.is_empty() {
-            self.conn.write_all(&out).await?;
+        if !self.outbuf.is_empty() {
+            self.conn.write_all(&self.outbuf).await?;
         }
         if flush {
             self.conn.flush().await?;
@@ -151,8 +158,7 @@ impl<C: AsyncConn> AsyncConn for AsyncTlsStream<C> {
             if m == 0 {
                 return Ok(0); // peer closed the underlying connection
             }
-            let chunk = self.inbuf[..m].to_vec();
-            self.engine.feed_incoming(&chunk).map_err(to_io)?;
+            self.engine.feed_incoming(&self.inbuf[..m]).map_err(to_io)?;
             // Feeding may have produced records to send (e.g. a TLS 1.3
             // post-handshake message or key update) — flush them.
             self.send_queued(true).await?;

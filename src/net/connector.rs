@@ -123,9 +123,8 @@ impl Connector for Socks4Connector {
         port: u16,
         timeout: Option<Duration>,
     ) -> Result<Box<dyn NetStream>> {
-        let stream = open_tcp(&self.host, self.port, timeout)?;
-        apply_handshake_timeout(&stream, timeout)?;
-        let mut s = stream;
+        let mut s = open_tcp(&self.host, self.port, timeout)?;
+        apply_handshake_timeout(&s, timeout)?;
         socks::socks4_connect(&mut s, host, port, &self.user, self.remote_dns)?;
         clear_handshake_timeout(&s)?;
         Ok(Box::new(s))
@@ -360,14 +359,15 @@ fn http_connect<S: Read + Write>(
     const MAX_HEADER_BYTES: usize = 64 * 1024;
     let host_port = crate::url::authority(host, port);
     let mut buf = Vec::with_capacity(128);
-    write!(&mut buf, "CONNECT {host_port} HTTP/1.1\r\n")?;
-    write!(&mut buf, "Host: {host_port}\r\n")?;
-    write!(&mut buf, "Proxy-Connection: Keep-Alive\r\n")?;
+    write!(
+        &mut buf,
+        "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\nProxy-Connection: Keep-Alive\r\n"
+    )?;
     if let Some((user, pass)) = auth {
         let creds = crate::websocket::base64_encode(format!("{user}:{pass}").as_bytes());
         write!(&mut buf, "Proxy-Authorization: Basic {creds}\r\n")?;
     }
-    write!(&mut buf, "\r\n")?;
+    buf.extend_from_slice(b"\r\n");
     stream.write_all(&buf)?;
     stream.flush()?;
 
@@ -388,10 +388,9 @@ fn http_connect<S: Read + Write>(
         }
         total += 1;
         if byte[0] == b'\n' {
-            let trimmed =
-                String::from_utf8_lossy(line.strip_suffix(b"\r").unwrap_or(&line)).into_owned();
+            let trimmed = line.strip_suffix(b"\r").unwrap_or(&line);
             if status.is_none() {
-                status = Some(trimmed.clone());
+                status = Some(String::from_utf8_lossy(trimmed).into_owned());
             }
             if trimmed.is_empty() {
                 break;
@@ -403,15 +402,14 @@ fn http_connect<S: Read + Write>(
     }
 
     let status = status.ok_or_else(|| Error::BadResponse("CONNECT: no status line".into()))?;
-    let parts: Vec<&str> = status.splitn(3, ' ').collect();
-    if parts.len() < 2 {
+    let Some(code_str) = status.split(' ').nth(1) else {
         return Err(Error::BadResponse(format!(
             "CONNECT: malformed status line {status:?}"
         )));
-    }
-    let code: u16 = parts[1]
+    };
+    let code: u16 = code_str
         .parse()
-        .map_err(|_| Error::BadResponse(format!("CONNECT: bad status {:?}", parts[1])))?;
+        .map_err(|_| Error::BadResponse(format!("CONNECT: bad status {code_str:?}")))?;
     if !(200..300).contains(&code) {
         return Err(Error::BadResponse(format!(
             "CONNECT to {host_port} failed: {status}"
@@ -520,32 +518,36 @@ impl ProxySpec {
     /// Build the connector for this proxy. `tls` configures the TLS session
     /// *to the proxy* (only used by `https://` proxies).
     pub(crate) fn connector(&self, tls: &crate::tls::TlsSettings) -> Arc<dyn Connector> {
-        let p = self.clone();
-        let socks_user = || p.auth.as_ref().map(|(u, _)| u.clone()).unwrap_or_default();
-        match p.scheme.as_str() {
+        let host = self.host.clone();
+        let port = self.port;
+        match self.scheme.as_str() {
             "https" => Arc::new(HttpsProxyTlsConnector {
-                host: p.host,
-                port: p.port,
-                auth: p.auth,
+                host,
+                port,
+                auth: self.auth.clone(),
                 tls: tls.clone(),
             }),
             "socks4" | "socks4a" => Arc::new(Socks4Connector {
-                user: socks_user(),
-                remote_dns: p.scheme == "socks4a",
-                host: p.host,
-                port: p.port,
+                user: self
+                    .auth
+                    .as_ref()
+                    .map(|(u, _)| u.clone())
+                    .unwrap_or_default(),
+                remote_dns: self.scheme == "socks4a",
+                host,
+                port,
             }),
             "socks5" | "socks5h" => Arc::new(Socks5Connector {
-                remote_dns: p.scheme == "socks5h",
-                host: p.host,
-                port: p.port,
-                auth: p.auth,
+                remote_dns: self.scheme == "socks5h",
+                host,
+                port,
+                auth: self.auth.clone(),
             }),
             // `parse` admits only the schemes above plus `http`.
             _ => Arc::new(HttpProxyConnector {
-                host: p.host,
-                port: p.port,
-                auth: p.auth,
+                host,
+                port,
+                auth: self.auth.clone(),
             }),
         }
     }

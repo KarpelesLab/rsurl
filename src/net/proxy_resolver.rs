@@ -53,10 +53,11 @@ fn env_any<S: AsRef<str>>(names: &[S]) -> Option<String> {
 
 /// The `<scheme>_proxy` variable names to consult for `scheme`, in order.
 fn scheme_proxy_vars(scheme: &str) -> Vec<String> {
-    let scheme = match scheme.to_ascii_lowercase().as_str() {
-        "ws" => "http".to_string(),
-        "wss" => "https".to_string(),
-        other => other.to_string(),
+    let scheme = scheme.to_ascii_lowercase();
+    let scheme = match scheme.as_str() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
     };
     let lower = format!("{scheme}_proxy");
     if scheme == "http" {
@@ -105,9 +106,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let host_ip = crate::url::ip_literal_addr(host, 0).map(|a| a.ip());
-    let host = crate::url::unbracket(host)
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let host = crate::url::unbracket(host).trim_end_matches('.');
     entries.into_iter().any(|entry| {
         let entry = entry.trim();
         if entry == "*" {
@@ -123,15 +122,13 @@ where
                 None => entry.parse::<std::net::IpAddr>().is_ok_and(|e| e == ip),
             },
             None => {
-                let e = entry
-                    .trim_start_matches('.')
-                    .trim_end_matches('.')
-                    .to_ascii_lowercase();
+                let e = entry.trim_start_matches('.').trim_end_matches('.');
+                let (h, e) = (host.as_bytes(), e.as_bytes());
                 !e.is_empty()
-                    && (host == e
-                        || (host.len() > e.len()
-                            && host.ends_with(&e)
-                            && host.as_bytes()[host.len() - e.len() - 1] == b'.'))
+                    && (h.eq_ignore_ascii_case(e)
+                        || (h.len() > e.len()
+                            && h[h.len() - e.len()..].eq_ignore_ascii_case(e)
+                            && h[h.len() - e.len() - 1] == b'.'))
             }
         }
     })

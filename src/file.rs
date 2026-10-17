@@ -62,7 +62,7 @@ fn local_path(url_path: &str) -> Result<PathBuf> {
         Some(i) => &url_path[..i],
         None => url_path,
     };
-    let bytes = percent_decode(raw);
+    let bytes = crate::url::percent_decode_bytes(raw);
     if bytes.contains(&0) {
         return Err(Error::InvalidUrl(format!(
             "file:// path contains NUL: {raw}"
@@ -92,29 +92,6 @@ fn local_path(url_path: &str) -> Result<PathBuf> {
         };
         Ok(PathBuf::from(path))
     }
-}
-
-/// `%XX` → byte; a `%` not followed by two hex digits is kept literally.
-fn percent_decode(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
-fn hex(c: u8) -> Option<u8> {
-    (c as char).to_digit(16).map(|d| d as u8)
 }
 
 #[cfg(test)]

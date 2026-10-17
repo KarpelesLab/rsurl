@@ -312,10 +312,11 @@ fn encode_loose(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.bytes().any(|b| b == b' ' || b >= 0x80) {
         return std::borrow::Cow::Borrowed(s);
     }
+    use std::fmt::Write;
     let mut out = String::with_capacity(s.len() + 8);
     for &b in s.as_bytes() {
         if b == b' ' || b >= 0x80 {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         } else {
             out.push(b as char);
         }
@@ -413,6 +414,12 @@ pub(crate) fn ip_literal_addr(host: &str, port: u16) -> Option<std::net::SocketA
 /// Percent-decode `s` (RFC 3986 §2.1) to a string; `%XX` with invalid hex is
 /// kept verbatim and invalid UTF-8 is replaced lossily. `+` is not special.
 pub(crate) fn percent_decode(s: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(s)).into_owned()
+}
+
+/// Percent-decode `s` to raw bytes: `%XX` → byte, a `%` not followed by two
+/// hex digits is kept literally, `+` is not special.
+pub(crate) fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -428,7 +435,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 /// Format `host:port` for a request authority or `CONNECT` line, bracketing a

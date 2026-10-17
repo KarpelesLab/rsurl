@@ -65,7 +65,7 @@ pub(crate) fn add_from_dir(roots: &mut RootCertStore, dir: &str) -> Result<()> {
             continue; // binary/unreadable file in the dir — skip like curl/OpenSSL
         };
         for block in pem_blocks(&pem) {
-            if roots.add_pem(&block).is_ok() {
+            if roots.add_pem(block).is_ok() {
                 loaded += 1;
             }
         }
@@ -82,7 +82,7 @@ fn parse_into_store(pem: &str, path: &str) -> Result<RootCertStore> {
     let mut roots = RootCertStore::new();
     let mut loaded = 0usize;
     for block in pem_blocks(pem) {
-        if roots.add_pem(&block).is_ok() {
+        if roots.add_pem(block).is_ok() {
             loaded += 1;
         }
     }
@@ -95,15 +95,16 @@ fn parse_into_store(pem: &str, path: &str) -> Result<RootCertStore> {
 }
 
 /// Yield each `-----BEGIN CERTIFICATE-----...-----END CERTIFICATE-----`
-/// block from a PEM string as its own string.
-pub(crate) fn pem_blocks(pem: &str) -> Vec<String> {
+/// block from a PEM string as its own slice of `pem`.
+pub(crate) fn pem_blocks(pem: &str) -> Vec<&str> {
     pem_blocks_labelled(pem, "CERTIFICATE")
 }
 
 /// Like [`pem_blocks`] but for an arbitrary RFC 7468 `label` (e.g. `X509 CRL`).
 /// Yields each `-----BEGIN <label>-----...-----END <label>-----` block as its
-/// own string, tolerating junk between blocks and unterminated/stray headers.
-pub(crate) fn pem_blocks_labelled(pem: &str, label: &str) -> Vec<String> {
+/// own slice of `pem`, tolerating junk between blocks and unterminated/stray
+/// headers.
+pub(crate) fn pem_blocks_labelled<'a>(pem: &'a str, label: &str) -> Vec<&'a str> {
     let begin = format!("-----BEGIN {label}-----");
     let end = format!("-----END {label}-----");
     let (begin, end): (&str, &str) = (&begin, &end);
@@ -132,7 +133,7 @@ pub(crate) fn pem_blocks_labelled(pem: &str, label: &str) -> Vec<String> {
         // `add_pem` remains the authority on what's actually trusted; we only
         // slice candidate blocks here.
         let end_abs = start + begin.len() + end_rel + end.len();
-        out.push(rest[start..end_abs].to_string());
+        out.push(&rest[start..end_abs]);
         rest = &rest[end_abs..];
     }
     out

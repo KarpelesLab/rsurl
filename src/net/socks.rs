@@ -24,6 +24,20 @@ fn resolve_ipv4(host: &str, port: u16) -> Result<[u8; 4]> {
     )))
 }
 
+/// Append a SOCKS5 `ATYP` byte (1 = IPv4, 4 = IPv6) and the address octets.
+pub(crate) fn push_ip(out: &mut Vec<u8>, ip: IpAddr) {
+    match ip {
+        IpAddr::V4(v4) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            out.push(0x04);
+            out.extend_from_slice(&v6.octets());
+        }
+    }
+}
+
 /// SOCKS4 / SOCKS4a `CONNECT`. With `remote_dns` (4a) the proxy resolves
 /// `host`; otherwise it is resolved locally to an IPv4 literal.
 pub(crate) fn socks4_connect<S: Read + Write>(
@@ -162,19 +176,10 @@ pub(crate) fn socks5_request<S: Read + Write>(
     port: u16,
     remote_dns: bool,
 ) -> Result<SocketAddr> {
-    let mut req = vec![0x05u8, cmd, 0x00];
-    let literal = crate::url::ip_literal_addr(host, port);
-    if let Some(addr) = literal {
-        match addr.ip() {
-            IpAddr::V4(v4) => {
-                req.push(0x01);
-                req.extend_from_slice(&v4.octets());
-            }
-            IpAddr::V6(v6) => {
-                req.push(0x04);
-                req.extend_from_slice(&v6.octets());
-            }
-        }
+    let mut req = Vec::with_capacity(6 + host.len().max(16));
+    req.extend_from_slice(&[0x05, cmd, 0x00]);
+    if let Some(addr) = crate::url::ip_literal_addr(host, port) {
+        push_ip(&mut req, addr.ip());
     } else if remote_dns {
         if host.len() > 255 {
             return Err(Error::BadResponse(
@@ -189,16 +194,7 @@ pub(crate) fn socks5_request<S: Read + Write>(
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| Error::InvalidUrl(host.to_string()))?;
-        match addr.ip() {
-            IpAddr::V4(v4) => {
-                req.push(0x01);
-                req.extend_from_slice(&v4.octets());
-            }
-            IpAddr::V6(v6) => {
-                req.push(0x04);
-                req.extend_from_slice(&v6.octets());
-            }
-        }
+        push_ip(&mut req, addr.ip());
     }
     req.extend_from_slice(&port.to_be_bytes());
     stream.write_all(&req)?;

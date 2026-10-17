@@ -311,44 +311,21 @@ pub(crate) fn verify_peer_chain(
     callback: Option<&VerifyCallback>,
     pins: &[[u8; 32]],
 ) -> Result<()> {
+    use super::client_auth::{enforce_pins_then_callback, leaf_has_san, PostHandshakeDecision};
     let leaf = chain.first().map(Vec::as_slice);
 
-    if !pins.is_empty() {
-        match leaf {
-            Some(der) if super::client_auth::spki_pin_matches(der, pins) => {}
-            _ => {
-                return Err(Error::BadResponse(
-                    "pinned public key does not match server certificate".into(),
-                ))
-            }
-        }
-    }
-
-    if let Some(cb) = callback {
-        let verdict = cb.call(&super::CertVerify {
-            server_name,
-            chain_der: chain,
-        });
-        if verdict == super::CertVerdict::Reject {
-            return Err(Error::BadResponse(
-                "server certificate rejected by verify callback".into(),
-            ));
-        }
+    if enforce_pins_then_callback(leaf, pins, server_name, chain, callback)?
+        == PostHandshakeDecision::CallbackAccepted
+    {
         return Ok(());
     }
 
-    if verify {
-        match leaf {
-            Some(der) if super::client_auth::leaf_has_san(der) => {}
-            Some(_) => {
-                return Err(Error::BadResponse(
-                    "server certificate has no Subject Alternative Name \
-                     (CN fallback is not accepted)"
-                        .into(),
-                ))
-            }
-            None => {}
-        }
+    if verify && leaf.is_some_and(|der| !leaf_has_san(der)) {
+        return Err(Error::BadResponse(
+            "server certificate has no Subject Alternative Name \
+             (CN fallback is not accepted)"
+                .into(),
+        ));
     }
     Ok(())
 }

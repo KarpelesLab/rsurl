@@ -195,16 +195,7 @@ impl UdpTransport for Socks5UdpTransport {
 fn encode_udp_header(dst: SocketAddr, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(MAX_UDP_HEADER + data.len());
     out.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV RSV FRAG
-    match dst.ip() {
-        IpAddr::V4(v4) => {
-            out.push(0x01);
-            out.extend_from_slice(&v4.octets());
-        }
-        IpAddr::V6(v6) => {
-            out.push(0x04);
-            out.extend_from_slice(&v6.octets());
-        }
-    }
+    socks::push_ip(&mut out, dst.ip());
     out.extend_from_slice(&dst.port().to_be_bytes());
     out.extend_from_slice(data);
     out
