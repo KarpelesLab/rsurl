@@ -113,6 +113,10 @@ pub(crate) fn run(url: &Url, input: &[u8], cfg: &NetConfig) -> Result<Vec<u8>> {
         return Err(Error::UnsupportedScheme(url.scheme.clone()));
     }
     let mut sock = cfg.connect(&url.host, url.port)?;
+    // Bound every read like the other protocols do: a server that keeps the
+    // session open (the usual case — a login prompt) must not hang the
+    // transfer forever. `-m` still caps the whole operation on top of this.
+    sock.set_read_timeout(cfg.io_timeout())?;
     if !input.is_empty() {
         sock.write_all(&escape_iac(input))?;
         sock.flush()?;
