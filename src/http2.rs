@@ -456,13 +456,11 @@ impl StreamRecvWindow {
 /// Build a 4-byte-payload WINDOW_UPDATE frame (RFC 9113 §6.9). Caller is
 /// responsible for ensuring `increment` is non-zero and within `2^31 - 1`.
 fn window_update_frame(stream_id: u32, increment: u32) -> Frame {
-    let mut payload = Vec::with_capacity(4);
-    payload.extend_from_slice(&(increment & 0x7fff_ffff).to_be_bytes());
     Frame {
         typ: F_WINDOW_UPDATE,
         flags: 0,
         stream_id,
-        payload,
+        payload: (increment & 0x7fff_ffff).to_be_bytes().to_vec(),
     }
 }
 
@@ -496,26 +494,14 @@ const MAX_FRAME_PAYLOAD: usize = 1 << 20; // 1 MiB hard cap, plenty for our use.
 /// 2^14; anything larger is a FRAME_SIZE_ERROR (RFC 9113 §4.2).
 const OUR_MAX_FRAME_SIZE: usize = MAX_FRAME_SIZE_MIN as usize;
 
-fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<()> {
-    r.read_exact(buf)
-}
-
 fn read_frame<R: Read>(r: &mut R) -> io::Result<Frame> {
-    read_frame_limited(r, OUR_MAX_FRAME_SIZE)
-}
-
-fn read_frame_limited<R: Read>(r: &mut R, max_payload: usize) -> io::Result<Frame> {
-    let max_payload = max_payload.min(MAX_FRAME_PAYLOAD);
     let mut hdr = [0u8; 9];
-    read_exact(r, &mut hdr)?;
-    let length = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | (hdr[2] as usize);
+    r.read_exact(&mut hdr)?;
+    let length = u32::from_be_bytes([0, hdr[0], hdr[1], hdr[2]]) as usize;
     let typ = hdr[3];
     let flags = hdr[4];
-    let stream_id = (((hdr[5] & 0x7f) as u32) << 24)
-        | ((hdr[6] as u32) << 16)
-        | ((hdr[7] as u32) << 8)
-        | (hdr[8] as u32);
-    if length > max_payload {
+    let stream_id = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) & 0x7fff_ffff;
+    if length > OUR_MAX_FRAME_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("frame payload too large: {length} (FRAME_SIZE_ERROR)"),
@@ -523,7 +509,7 @@ fn read_frame_limited<R: Read>(r: &mut R, max_payload: usize) -> io::Result<Fram
     }
     let mut payload = vec![0u8; length];
     if length > 0 {
-        read_exact(r, &mut payload)?;
+        r.read_exact(&mut payload)?;
     }
     Ok(Frame {
         typ,
@@ -534,27 +520,33 @@ fn read_frame_limited<R: Read>(r: &mut R, max_payload: usize) -> io::Result<Fram
 }
 
 fn write_frame<W: Write>(w: &mut W, f: &Frame) -> io::Result<()> {
-    if f.payload.len() > MAX_FRAME_PAYLOAD {
+    write_frame_parts(w, f.typ, f.flags, f.stream_id, &f.payload)
+}
+
+/// Serialise one frame from its parts, so a DATA chunk borrowed from a request
+/// body (or a fixed-size control payload) goes on the wire without first being
+/// copied into a `Frame`.
+fn write_frame_parts<W: Write>(
+    w: &mut W,
+    typ: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "frame payload too large",
         ));
     }
-    let len = f.payload.len();
+    let len = (payload.len() as u32).to_be_bytes();
+    let sid = (stream_id & 0x7fff_ffff).to_be_bytes(); // R bit clear.
     let hdr = [
-        ((len >> 16) & 0xff) as u8,
-        ((len >> 8) & 0xff) as u8,
-        (len & 0xff) as u8,
-        f.typ,
-        f.flags,
-        ((f.stream_id >> 24) & 0x7f) as u8, // R bit clear.
-        ((f.stream_id >> 16) & 0xff) as u8,
-        ((f.stream_id >> 8) & 0xff) as u8,
-        (f.stream_id & 0xff) as u8,
+        len[1], len[2], len[3], typ, flags, sid[0], sid[1], sid[2], sid[3],
     ];
     w.write_all(&hdr)?;
-    if !f.payload.is_empty() {
-        w.write_all(&f.payload)?;
+    if !payload.is_empty() {
+        w.write_all(payload)?;
     }
     Ok(())
 }
@@ -574,23 +566,29 @@ fn priority_weight_byte(priority: crate::http::Priority) -> Option<u8> {
 // HPACK integer codec (RFC 7541 §5.1).
 // ---------------------------------------------------------------------------
 
-/// Encode an integer with `prefix_bits` of the first byte available.
-/// The non-integer high bits of the first byte are left as zero; the caller
-/// OR's its flag bits in afterwards.
-fn encode_int(value: u64, prefix_bits: u8) -> Vec<u8> {
+/// Encode an integer with `prefix_bits` of the first byte available,
+/// appending to `out`. `flags` holds the representation's marker bits (the
+/// non-integer high bits of the first byte), OR'ed into that byte.
+fn encode_int_into(out: &mut Vec<u8>, value: u64, prefix_bits: u8, flags: u8) {
     let max_prefix: u64 = (1u64 << prefix_bits) - 1;
-    let mut out = Vec::new();
     if value < max_prefix {
-        out.push(value as u8);
-        return out;
+        out.push(value as u8 | flags);
+        return;
     }
-    out.push(max_prefix as u8);
+    out.push(max_prefix as u8 | flags);
     let mut rem = value - max_prefix;
     while rem >= 128 {
         out.push(((rem & 0x7f) as u8) | 0x80);
         rem >>= 7;
     }
     out.push(rem as u8);
+}
+
+/// [`encode_int_into`] on a fresh buffer with no flag bits.
+#[cfg(test)]
+fn encode_int(value: u64, prefix_bits: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_int_into(&mut out, value, prefix_bits, 0);
     out
 }
 
@@ -1046,7 +1044,6 @@ fn huffman_decode(input: &[u8]) -> Result<Vec<u8>> {
             let max_len = acc_len.min(30);
             for try_len in 5..=max_len {
                 let code = (acc >> (acc_len - try_len)) & ((1u64 << try_len) - 1);
-                // Linear scan: small table, predictable performance.
                 if let Some(sym) = lookup_huffman(code as u32, try_len) {
                     if sym == 256 {
                         // EOS in a literal is a decoder error per RFC 7541 §5.2.
@@ -1107,7 +1104,7 @@ const DYN_TABLE_CAP: usize = 4096;
 /// HPACK decoder state. The dynamic table is FIFO: newest entries pushed at
 /// the front (index 62 in the combined table), oldest evicted from the back.
 struct Decoder {
-    dyn_table: Vec<(String, String)>,
+    dyn_table: VecDeque<(String, String)>,
     dyn_table_size: usize,
     dyn_table_cap: usize,
 }
@@ -1115,7 +1112,7 @@ struct Decoder {
 impl Decoder {
     fn new() -> Self {
         Decoder {
-            dyn_table: Vec::new(),
+            dyn_table: VecDeque::new(),
             dyn_table_size: 0,
             dyn_table_cap: DYN_TABLE_CAP,
         }
@@ -1127,7 +1124,7 @@ impl Decoder {
 
     fn evict_to_fit(&mut self, incoming: usize) {
         while self.dyn_table_size + incoming > self.dyn_table_cap && !self.dyn_table.is_empty() {
-            let (n, v) = self.dyn_table.pop().unwrap();
+            let (n, v) = self.dyn_table.pop_back().unwrap();
             self.dyn_table_size = self.dyn_table_size.saturating_sub(Self::entry_size(&n, &v));
         }
     }
@@ -1141,31 +1138,34 @@ impl Decoder {
             return;
         }
         self.evict_to_fit(sz);
-        self.dyn_table.insert(0, (name, value));
+        self.dyn_table.push_front((name, value));
         self.dyn_table_size += sz;
     }
 
-    fn lookup(&self, index: u64) -> Result<(String, String)> {
+    /// Borrow the `(name, value)` at 1-based combined index `index`.
+    fn lookup_ref(&self, index: u64) -> Result<(&str, &str)> {
         if index == 0 {
             return Err(Error::BadResponse("hpack: index 0".into()));
         }
-        let idx = index as usize;
+        let idx = usize::try_from(index).unwrap_or(usize::MAX);
         if idx <= STATIC_TABLE.len() {
-            let (n, v) = STATIC_TABLE[idx - 1];
-            return Ok((n.to_string(), v.to_string()));
+            return Ok(STATIC_TABLE[idx - 1]);
         }
-        let dyn_idx = idx - STATIC_TABLE.len() - 1;
-        if dyn_idx >= self.dyn_table.len() {
-            return Err(Error::BadResponse(format!(
-                "hpack: index {idx} out of range"
-            )));
+        match self.dyn_table.get(idx - STATIC_TABLE.len() - 1) {
+            Some((n, v)) => Ok((n, v)),
+            None => Err(Error::BadResponse(format!(
+                "hpack: index {index} out of range"
+            ))),
         }
-        let (n, v) = &self.dyn_table[dyn_idx];
-        Ok((n.clone(), v.clone()))
+    }
+
+    fn lookup(&self, index: u64) -> Result<(String, String)> {
+        let (n, v) = self.lookup_ref(index)?;
+        Ok((n.to_string(), v.to_string()))
     }
 
     fn lookup_name(&self, index: u64) -> Result<String> {
-        Ok(self.lookup(index)?.0)
+        Ok(self.lookup_ref(index)?.0.to_string())
     }
 
     /// Decode a length-prefixed string literal: 1 bit Huffman flag, 7-bit
@@ -1289,7 +1289,7 @@ impl Decoder {
 /// with the high bits of the EOS code (all-ones).
 fn huffman_encode(input: &[u8]) -> Vec<u8> {
     // Total bit length first so we can size the output exactly.
-    let total_bits: usize = input.iter().map(|b| HUFFMAN[*b as usize].1 as usize).sum();
+    let total_bits = huffman_bit_len(input);
     let out_len = total_bits.div_ceil(8);
     let mut out = vec![0u8; out_len];
 
@@ -1335,22 +1335,23 @@ fn huffman_encode(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Total number of Huffman code bits `input` encodes to (before padding).
+fn huffman_bit_len(input: &[u8]) -> usize {
+    input.iter().map(|b| HUFFMAN[*b as usize].1 as usize).sum()
+}
+
 /// Encode one length-prefixed string literal (RFC 7541 §5.2). The high bit
 /// of the length-prefix byte is the Huffman flag: 1 = Huffman, 0 = raw.
 /// We pick whichever encoding is shorter on the wire (ties go to raw,
 /// which slightly favours decoder speed and avoids a needless Huffman pass).
 fn encode_literal_string(out: &mut Vec<u8>, s: &str) {
     let raw = s.as_bytes();
-    let huff = huffman_encode(raw);
-    if huff.len() < raw.len() {
-        let mut len_bytes = encode_int(huff.len() as u64, 7);
-        len_bytes[0] |= 0x80; // Huffman bit set.
-        out.extend_from_slice(&len_bytes);
-        out.extend_from_slice(&huff);
+    let huff_len = huffman_bit_len(raw).div_ceil(8);
+    if huff_len < raw.len() {
+        encode_int_into(out, huff_len as u64, 7, 0x80); // Huffman bit set.
+        out.extend_from_slice(&huffman_encode(raw));
     } else {
-        let mut len_bytes = encode_int(raw.len() as u64, 7);
-        len_bytes[0] &= 0x7f; // Huffman bit cleared.
-        out.extend_from_slice(&len_bytes);
+        encode_int_into(out, raw.len() as u64, 7, 0); // Huffman bit cleared.
         out.extend_from_slice(raw);
     }
 }
@@ -1496,28 +1497,20 @@ impl Encoder {
             // A shrink-then-grow since the last block must first signal the
             // minimum (RFC 7541 §4.2), then the final size.
             if let Some(min) = self.pending_min_table_size.take().filter(|m| *m < n) {
-                let mut bytes = encode_int(min as u64, 5);
-                bytes[0] |= 0x20;
-                out.extend_from_slice(&bytes);
+                encode_int_into(out, min as u64, 5, 0x20);
             }
-            let mut bytes = encode_int(n as u64, 5);
-            bytes[0] |= 0x20;
-            out.extend_from_slice(&bytes);
+            encode_int_into(out, n as u64, 5, 0x20);
         }
 
         // (2) Indexed field representation.
         if let Some(idx) = self.combined_full_index(name, value) {
-            let mut bytes = encode_int(idx as u64, 7);
-            bytes[0] |= 0x80;
-            out.extend_from_slice(&bytes);
+            encode_int_into(out, idx as u64, 7, 0x80);
             return;
         }
 
         // (3) Literal with incremental indexing, indexed name.
         if let Some(idx) = self.combined_name_index(name) {
-            let mut bytes = encode_int(idx as u64, 6);
-            bytes[0] |= 0x40;
-            out.extend_from_slice(&bytes);
+            encode_int_into(out, idx as u64, 6, 0x40);
             encode_literal_string(out, value);
             self.insert(name, value);
             return;
@@ -1730,6 +1723,16 @@ impl Stream {
     /// chunk on this stream.
     fn send_budget(&self, conn_window: &ConnSendWindow) -> i64 {
         self.send_window.available.min(conn_window.available)
+    }
+
+    /// The final response head and the peer's END_STREAM have both arrived:
+    /// the stream is terminal and ready to be turned into a `Response`.
+    fn response_complete(&self) -> bool {
+        matches!(
+            self.state,
+            StreamState::Closed | StreamState::HalfClosedRemote
+        ) && self.end_stream_recv
+            && self.response_headers.is_some()
     }
 
     /// Append a header-block fragment (HEADERS / CONTINUATION) to the
@@ -1999,13 +2002,8 @@ impl<S: Read + Write> Connection<S> {
     /// from growing unbounded across pooled reuses (task requirement #6) and
     /// is a no-op for the common single-stream-per-request case.
     fn prune_completed_streams(&mut self) {
-        self.streams.retain(|_, s| {
-            let terminal = matches!(s.state, StreamState::Closed)
-                || (matches!(s.state, StreamState::HalfClosedRemote)
-                    && s.response_headers.is_some()
-                    && s.end_stream_recv);
-            !terminal
-        });
+        self.streams
+            .retain(|_, s| s.state != StreamState::Closed && !s.response_complete());
     }
 
     /// Allocate the next client-initiated stream id and register an empty
@@ -2077,11 +2075,10 @@ impl<S: Read + Write> Connection<S> {
         Ok(())
     }
 
-    /// Build and write the HEADERS + CONTINUATION + DATA frames for `req` on
-    /// `stream_id`. Blocks on flow control by reading inbound frames in-place
-    /// when the send window is depleted. The stream's `state` is advanced
-    /// for each outbound transition.
-    fn send_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
+    /// Write the PRIORITY hint and HEADERS (+ CONTINUATION) frames for `req`
+    /// on `stream_id`, advancing the stream state. Returns whether `req` has a
+    /// body still to be sent (END_STREAM was set on HEADERS otherwise).
+    fn write_request_headers(&mut self, stream_id: u32, req: &Request) -> Result<bool> {
         self.send_priority_hint(stream_id, req.priority)?;
         let header_block = build_header_block(&mut self.encoder, req);
         let has_body = !req.body.is_empty();
@@ -2095,14 +2092,21 @@ impl<S: Read + Write> Connection<S> {
         for f in &header_frames {
             write_frame(&mut self.tls, f)?;
         }
-        {
-            let s = self
-                .streams
-                .get_mut(&stream_id)
-                .ok_or_else(|| Error::BadResponse(format!("stream {stream_id} not found")))?;
-            s.state = s.state.send_data(!has_body)?;
-            s.head_request = crate::http::effective_method(req).eq_ignore_ascii_case("HEAD");
-        }
+        let s = self
+            .streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| Error::BadResponse(format!("stream {stream_id} not found")))?;
+        s.state = s.state.send_data(!has_body)?;
+        s.head_request = crate::http::effective_method(req).eq_ignore_ascii_case("HEAD");
+        Ok(has_body)
+    }
+
+    /// Build and write the HEADERS + CONTINUATION + DATA frames for `req` on
+    /// `stream_id`. Blocks on flow control by reading inbound frames in-place
+    /// when the send window is depleted. The stream's `state` is advanced
+    /// for each outbound transition.
+    fn send_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
+        let has_body = self.write_request_headers(stream_id, req)?;
 
         if has_body {
             let mut remaining: &[u8] = req.body.as_slice();
@@ -2128,13 +2132,13 @@ impl<S: Read + Write> Connection<S> {
                             // the rest of our send side with
                             // RST_STREAM(NO_ERROR) — which keeps the connection
                             // itself healthy for reuse.
-                            let rst = Frame {
-                                typ: F_RST_STREAM,
-                                flags: 0,
+                            write_frame_parts(
+                                &mut self.tls,
+                                F_RST_STREAM,
+                                0,
                                 stream_id,
-                                payload: ERR_NO_ERROR.to_be_bytes().to_vec(),
-                            };
-                            write_frame(&mut self.tls, &rst)?;
+                                &ERR_NO_ERROR.to_be_bytes(),
+                            )?;
                             self.tls.flush()?;
                             if let Some(s) = self.streams.get_mut(&stream_id) {
                                 s.state = StreamState::Closed;
@@ -2159,13 +2163,8 @@ impl<S: Read + Write> Connection<S> {
                 let chunk = &remaining[..n];
                 remaining = &remaining[n..];
                 let is_last = remaining.is_empty();
-                let data_frame = Frame {
-                    typ: F_DATA,
-                    flags: if is_last { FLAG_END_STREAM } else { 0 },
-                    stream_id,
-                    payload: chunk.to_vec(),
-                };
-                write_frame(&mut self.tls, &data_frame)?;
+                let flags = if is_last { FLAG_END_STREAM } else { 0 };
+                write_frame_parts(&mut self.tls, F_DATA, flags, stream_id, chunk)?;
                 self.conn_send_window.consume(n);
                 let s = self.streams.get_mut(&stream_id).unwrap();
                 s.send_window.consume(n);
@@ -2194,20 +2193,16 @@ impl<S: Read + Write> Connection<S> {
     ) -> Result<Stream> {
         loop {
             // Has the stream already completed in an earlier dispatch?
-            if let Some(s) = self.streams.get(&stream_id) {
-                if matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
-                    && s.response_headers.is_some()
-                    && s.end_stream_recv
-                {
-                    self.fire_head(stream_id, &mut on_head);
-                    return Ok(self.streams.remove(&stream_id).unwrap());
-                }
-                self.check_not_abandoned(stream_id)?;
-            } else {
+            let Some(s) = self.streams.get(&stream_id) else {
                 return Err(Error::BadResponse(format!(
                     "stream {stream_id} not registered"
                 )));
+            };
+            if s.response_complete() {
+                self.fire_head(stream_id, &mut on_head);
+                return Ok(self.streams.remove(&stream_id).unwrap());
             }
+            self.check_not_abandoned(stream_id)?;
 
             let reborrow: Option<&mut dyn Write> = match &mut sink {
                 Some(w) => Some(&mut **w),
@@ -2244,19 +2239,20 @@ impl<S: Read + Write> Connection<S> {
         let Some(headers) = s.response_headers.as_ref() else {
             return;
         };
-        let mut status: Option<u16> = None;
-        let mut clean: Vec<(String, String)> = Vec::with_capacity(headers.len());
-        for (k, v) in headers {
-            if k == ":status" {
-                status = v.parse::<u16>().ok();
-            } else if !k.starts_with(':') {
-                clean.push((k.clone(), v.clone()));
-            }
-        }
         // Interim 1xx responses (e.g. 100/103) are not the final head; wait.
+        let status = headers
+            .iter()
+            .rev()
+            .find(|(k, _)| k == ":status")
+            .and_then(|(_, v)| v.parse::<u16>().ok());
         let Some(status) = status.filter(|s| *s >= 200) else {
             return;
         };
+        let clean: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(k, _)| !k.starts_with(':'))
+            .cloned()
+            .collect();
         if let Some(obs) = on_head.take() {
             obs(&crate::http::ResponseHead {
                 status,
@@ -2289,26 +2285,13 @@ impl<S: Read + Write> Connection<S> {
     /// `send_request_on` is the verb name; this is `stage_request_on` because
     /// it only commits the request headers, deferring the body.
     fn stage_request_on(&mut self, stream_id: u32, req: &Request) -> Result<()> {
-        self.send_priority_hint(stream_id, req.priority)?;
-        let header_block = build_header_block(&mut self.encoder, req);
-        let has_body = !req.body.is_empty();
-        let max_frame_size = self.send_frame_limit();
-        let header_frames =
-            fragment_header_block(stream_id, &header_block, max_frame_size, !has_body);
-        for f in &header_frames {
-            write_frame(&mut self.tls, f)?;
-        }
-        let s = self
-            .streams
-            .get_mut(&stream_id)
-            .ok_or_else(|| Error::BadResponse(format!("stream {stream_id} not found")))?;
-        s.state = s.state.send_data(!has_body)?;
-        s.head_request = crate::http::effective_method(req).eq_ignore_ascii_case("HEAD");
-        if has_body {
-            s.pending_body = Some(PendingBody {
-                bytes: req.body.clone(),
-                sent: 0,
-            });
+        if self.write_request_headers(stream_id, req)? {
+            if let Some(s) = self.streams.get_mut(&stream_id) {
+                s.pending_body = Some(PendingBody {
+                    bytes: req.body.clone(),
+                    sent: 0,
+                });
+            }
         }
         Ok(())
     }
@@ -2351,52 +2334,35 @@ impl<S: Read + Write> Connection<S> {
                 // ones within this same pass.
                 let s = self.streams.get(&id).unwrap();
                 let budget = s.send_budget(&self.conn_send_window);
-                let (remaining_len, sent) = match s.pending_body.as_ref() {
-                    Some(pb) => (pb.bytes.len() - pb.sent, pb.sent),
-                    None => break, // body fully sent
+                let Some(pb) = s.pending_body.as_ref() else {
+                    break; // body fully sent
                 };
-                if remaining_len == 0 {
+                let remaining = &pb.bytes[pb.sent..];
+                if remaining.is_empty() {
                     // Defensive: an empty pending body is cleared below; this
                     // shouldn't happen because we never stage an empty body.
                     self.streams.get_mut(&id).unwrap().pending_body = None;
                     break;
                 }
-                let n = next_data_chunk_size(max_frame_size, budget, remaining_len);
+                let n = next_data_chunk_size(max_frame_size, budget, remaining.len());
                 if n == 0 {
                     // Window exhausted for this stream right now — move on to
                     // the next one rather than blocking (no head-of-line stall).
                     break;
                 }
-                let is_last = n == remaining_len;
-                let chunk: Vec<u8> = {
-                    let pb = self
-                        .streams
-                        .get(&id)
-                        .unwrap()
-                        .pending_body
-                        .as_ref()
-                        .unwrap();
-                    pb.bytes[sent..sent + n].to_vec()
-                };
-                let data_frame = Frame {
-                    typ: F_DATA,
-                    flags: if is_last { FLAG_END_STREAM } else { 0 },
-                    stream_id: id,
-                    payload: chunk,
-                };
-                write_frame(&mut self.tls, &data_frame)?;
+                let is_last = n == remaining.len();
+                let flags = if is_last { FLAG_END_STREAM } else { 0 };
+                write_frame_parts(&mut self.tls, F_DATA, flags, id, &remaining[..n])?;
                 self.conn_send_window.consume(n);
                 let s = self.streams.get_mut(&id).unwrap();
                 s.send_window.consume(n);
                 s.state = s.state.send_data(is_last)?;
                 let pb = s.pending_body.as_mut().unwrap();
                 pb.sent += n;
+                wrote = true;
                 if is_last {
                     s.pending_body = None;
                     let _ = writeln!(trace, "* [stream {id}] request body sent");
-                }
-                wrote = true;
-                if is_last {
                     break;
                 }
             }
@@ -2441,25 +2407,12 @@ impl<S: Read + Write> Connection<S> {
         // Indices not yet started, in order. We start them as slots free up.
         let mut queue: VecDeque<usize> = (0..n).collect();
 
-        // Helper closure-free start: open a stream for request `idx` and write
-        // its HEADERS. On failure to open (e.g. GOAWAY boundary,
-        // MAX_CONCURRENT, id exhaustion) record the error for that request.
-        // We inline this rather than use a closure so it can borrow `self`.
-
         // Prime: start as many as the concurrency limit allows.
         self.start_queued(&mut queue, &mut id_to_idx, &mut results, reqs, trace);
         // Flush the HEADERS we just wrote, plus any body bytes we can send.
-        match self.pump_pending_sends(trace) {
-            Ok(_) => {}
-            Err(e) => {
-                // A write failure here is connection-fatal: fail everything
-                // still outstanding and bail.
-                self.fail_all_outstanding(&id_to_idx, &mut results, &queue, &e);
-                return collect_results(results);
-            }
-        }
-        if let Err(e) = self.tls.flush() {
-            let e = Error::Io(e);
+        if let Err(e) = self.flush_pending(trace) {
+            // A write failure here is connection-fatal: fail everything
+            // still outstanding and bail.
             self.fail_all_outstanding(&id_to_idx, &mut results, &queue, &e);
             return collect_results(results);
         }
@@ -2532,13 +2485,13 @@ impl<S: Read + Write> Connection<S> {
                         // Complete response before our body was fully sent
                         // (§8.1): stop sending the rest with
                         // RST_STREAM(NO_ERROR); the response stands.
-                        let rst = Frame {
-                            typ: F_RST_STREAM,
-                            flags: 0,
-                            stream_id: done_id,
-                            payload: ERR_NO_ERROR.to_be_bytes().to_vec(),
-                        };
-                        let _ = write_frame(&mut self.tls, &rst);
+                        let _ = write_frame_parts(
+                            &mut self.tls,
+                            F_RST_STREAM,
+                            0,
+                            done_id,
+                            &ERR_NO_ERROR.to_be_bytes(),
+                        );
                     }
                     let mut built = build_response_from_stream_labelled(
                         stream,
@@ -2587,12 +2540,11 @@ impl<S: Read + Write> Connection<S> {
         reqs: &[Request],
         trace: &mut dyn Write,
     ) {
-        while !queue.is_empty() {
+        while let Some(&idx) = queue.front() {
             // Respect the peer's concurrency cap based on currently-open streams.
             if (self.streams.len() as u64) >= self.peer.max_concurrent_streams as u64 {
                 break;
             }
-            let idx = *queue.front().unwrap();
             let id = match self.open_stream() {
                 Ok(id) => id,
                 Err(e) => {
@@ -2629,10 +2581,7 @@ impl<S: Read + Write> Connection<S> {
             if !id_to_idx.contains_key(&id) {
                 continue;
             }
-            let complete = matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
-                && s.end_stream_recv
-                && s.response_headers.is_some();
-            if matches!(s.state, StreamState::Closed) && !complete {
+            if s.state == StreamState::Closed && !s.response_complete() {
                 if culprit.is_some() {
                     // More than one candidate — ambiguous, treat as fatal.
                     return None;
@@ -2655,20 +2604,19 @@ impl<S: Read + Write> Connection<S> {
         id_to_idx: &mut HashMap<u32, usize>,
         results: &mut [Option<Result<Response>>],
     ) {
-        let last = match self.goaway_received {
-            Some(l) => l,
-            None => return,
+        let Some(last) = self.goaway_received else {
+            return;
         };
         let doomed: Vec<u32> = id_to_idx
             .keys()
             .copied()
-            .filter(|id| *id > last)
             .filter(|id| {
                 // Don't clobber a stream that actually completed.
-                match self.streams.get(id) {
-                    Some(s) => !(s.end_stream_recv && s.response_headers.is_some()),
-                    None => true,
-                }
+                *id > last
+                    && !self
+                        .streams
+                        .get(id)
+                        .is_some_and(|s| s.end_stream_recv && s.response_headers.is_some())
             })
             .collect();
         for id in doomed {
@@ -2690,12 +2638,7 @@ impl<S: Read + Write> Connection<S> {
         queue: &VecDeque<usize>,
         err: &Error,
     ) {
-        for &idx in id_to_idx.values() {
-            if results[idx].is_none() {
-                results[idx] = Some(Err(clone_error(err)));
-            }
-        }
-        for &idx in queue.iter() {
+        for &idx in id_to_idx.values().chain(queue) {
             if results[idx].is_none() {
                 results[idx] = Some(Err(clone_error(err)));
             }
@@ -2740,14 +2683,11 @@ impl<S: Read + Write> Connection<S> {
 
         // Flood / no-progress accounting. Both the single-stream and
         // multiplexed loops reach the wire through this method, so accounting
-        // here covers both paths. We snapshot `typ`/`flags` up front so the
-        // budget can be billed without cloning the payload.
-        let frame_typ = frame.typ;
-        let frame_flags = frame.flags;
+        // here covers both paths.
         // Cheap-control-frame floods are billed BEFORE dispatch: a successful
         // RST_STREAM dispatch returns a per-stream `Err`, so billing it here
         // (rather than after) is what makes the Rapid-Reset budget bite.
-        self.budget.record_control_frame(frame_typ, frame_flags)?;
+        self.budget.record_control_frame(frame.typ, frame.flags)?;
         // Handlers signal real forward progress by setting `self.made_progress`
         // (cleared here before each dispatch); a terminal `Done` outcome also
         // counts. The no-progress streak is judged only on a successful
@@ -2833,7 +2773,7 @@ impl<S: Read + Write> Connection<S> {
                     typ: F_PING,
                     flags: FLAG_ACK,
                     stream_id: 0,
-                    payload: frame.payload.clone(),
+                    payload: frame.payload,
                 };
                 write_frame(&mut self.tls, &pong)?;
                 self.tls.flush()?;
@@ -2866,16 +2806,8 @@ impl<S: Read + Write> Connection<S> {
                 // process them; mark them closed and let the caller see that.
                 // (For now we just transition state; the body/headers stay
                 // empty so the caller surfaces a BadResponse.)
-                let doomed: Vec<u32> = self
-                    .streams
-                    .iter()
-                    .filter(|(id, _)| **id > last)
-                    .map(|(id, _)| *id)
-                    .collect();
-                for id in doomed {
-                    if let Some(s) = self.streams.get_mut(&id) {
-                        s.state = StreamState::Closed;
-                    }
+                for (_, s) in self.streams.iter_mut().filter(|(id, _)| **id > last) {
+                    s.state = StreamState::Closed;
                 }
             }
             _ => {
@@ -2973,16 +2905,15 @@ impl<S: Read + Write> Connection<S> {
         let stream_id = frame.stream_id;
         // Server push: a HEADERS on a stream we never opened with an even id
         // (or a higher odd id from the peer) violates ENABLE_PUSH=0.
-        let known = self.streams.contains_key(&stream_id);
-        if !known {
+        let Some(s) = self.streams.get(&stream_id) else {
             return Err(Error::BadResponse(format!(
                 "HEADERS on unknown stream {stream_id} (server push disabled)"
             )));
-        }
+        };
 
         // State check: HEADERS on a Closed stream is ignored (trailers after
         // close, RFC 9113 §5.1). Any other illegal state is an error.
-        let state = self.streams.get(&stream_id).unwrap().state;
+        let state = s.state;
         if state == StreamState::Closed {
             // Drain the fragment but do not decode; this keeps the decoder's
             // dynamic table consistent with the peer's view (HPACK requires
@@ -3044,11 +2975,10 @@ impl<S: Read + Write> Connection<S> {
     /// `Done(stream_id)` once the stream has its final response head and the
     /// peer's END_STREAM; `Continue` otherwise.
     fn outcome_for(&self, stream_id: u32) -> DispatchOutcome {
-        let done = self.streams.get(&stream_id).is_some_and(|s| {
-            matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
-                && s.end_stream_recv
-                && s.response_headers.is_some()
-        });
+        let done = self
+            .streams
+            .get(&stream_id)
+            .is_some_and(Stream::response_complete);
         if done {
             DispatchOutcome::Done(stream_id)
         } else {
@@ -3065,14 +2995,16 @@ impl<S: Read + Write> Connection<S> {
             s.state = StreamState::Closed;
             s.response_headers = None;
         }
-        let rst = Frame {
-            typ: F_RST_STREAM,
-            flags: 0,
-            stream_id,
-            payload: ERR_PROTOCOL.to_be_bytes().to_vec(),
-        };
         // Best-effort: the error is reported regardless of the write.
-        if write_frame(&mut self.tls, &rst).is_ok() {
+        if write_frame_parts(
+            &mut self.tls,
+            F_RST_STREAM,
+            0,
+            stream_id,
+            &ERR_PROTOCOL.to_be_bytes(),
+        )
+        .is_ok()
+        {
             let _ = self.tls.flush();
         }
         Error::BadResponse(format!("http2: stream {stream_id}: {msg}"))
@@ -3219,8 +3151,7 @@ impl<S: Read + Write> Connection<S> {
                 "http2: flow-control window exceeded by peer".into(),
             ));
         }
-        let known = self.streams.contains_key(&stream_id);
-        if !known {
+        let Some(s) = self.streams.get(&stream_id) else {
             // DATA for an unknown / already-evicted stream: drop silently per
             // RFC 9113 §5.1 ("frames for closed streams MAY be ignored").
             // We still need to replenish the conn window so the peer can keep
@@ -3230,8 +3161,8 @@ impl<S: Read + Write> Connection<S> {
                 self.tls.flush()?;
             }
             return Ok(DispatchOutcome::Continue);
-        }
-        let state = self.streams.get(&stream_id).unwrap().state;
+        };
+        let state = s.state;
         if state == StreamState::Closed {
             // Per §5.1, DATA on a closed stream is a STREAM_CLOSED error;
             // we surface it as such.
@@ -3332,15 +3263,7 @@ impl<S: Read + Write> Connection<S> {
         }
         self.tls.flush()?;
 
-        let s = self.streams.get(&stream_id).unwrap();
-        let done = matches!(s.state, StreamState::Closed | StreamState::HalfClosedRemote)
-            && s.end_stream_recv
-            && s.response_headers.is_some();
-        Ok(if done {
-            DispatchOutcome::Done(stream_id)
-        } else {
-            DispatchOutcome::Continue
-        })
+        Ok(self.outcome_for(stream_id))
     }
 
     fn process_rst(&mut self, frame: Frame) -> Result<DispatchOutcome> {
@@ -3610,8 +3533,7 @@ fn dial_h2(req: &Request, trace: &mut dyn Write) -> Result<DialedH2> {
     let tls = crate::tls::connect_over_tls(tcp, &req.url.host, opts)?;
     let appconnect = start.elapsed();
     crate::http::write_tls_info(&tls, trace);
-    let negotiated_h2 = tls.alpn_selected().map(|p| p == b"h2").unwrap_or(false);
-    if !negotiated_h2 {
+    if tls.alpn_selected().is_none_or(|p| p != b"h2") {
         // Bail before emitting any request `>` lines — the caller (Auto mode)
         // will fall back to HTTP/1.1 on a fresh connection.
         return Err(Error::H2NotNegotiated);
@@ -3708,7 +3630,7 @@ pub fn send(req: Request, trace: &mut dyn Write) -> Result<Response> {
                         drop(conn_guard);
                         if still_usable {
                             let mut guard = global_pool().lock().unwrap_or_else(|e| e.into_inner());
-                            guard.release(key.clone(), arc);
+                            guard.release(key, arc);
                             let _ = writeln!(trace, "* Connection kept alive (pooled)");
                         } else {
                             let _ = writeln!(trace, "* Connection closed");
@@ -3790,11 +3712,10 @@ fn pooled_failure_retryable<S: Read + Write>(
     }
     let transport_failure = matches!(err, Error::Io(_) | Error::UnexpectedEof);
     let nothing_received = stream.is_none_or(|s| !s.rx_any);
-    let method = crate::http::effective_method(req).to_ascii_uppercase();
-    let idempotent = matches!(
-        method.as_str(),
-        "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE"
-    );
+    let method = crate::http::effective_method(req);
+    let idempotent = ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"]
+        .iter()
+        .any(|m| method.eq_ignore_ascii_case(m));
     transport_failure && nothing_received && idempotent
 }
 
@@ -3846,38 +3767,13 @@ fn build_response_from_stream_labelled(
     decompress: bool,
     trace: &mut dyn Write,
 ) -> Result<Response> {
-    let headers = stream
-        .response_headers
-        .ok_or_else(|| Error::BadResponse("response ended before any HEADERS frame".into()))?;
+    let (status, clean_headers) = split_response_head(stream.response_headers)?;
 
-    let mut status: Option<u16> = None;
-    let mut clean_headers: Vec<(String, String)> = Vec::with_capacity(headers.len());
-    for (k, v) in headers {
-        if k == ":status" {
-            status = Some(
-                v.parse::<u16>()
-                    .map_err(|_| Error::BadResponse(format!("bad :status {v:?}")))?,
-            );
-        } else if k.starts_with(':') {
-            // Other pseudo-headers (none defined for responses) — drop.
-        } else {
-            clean_headers.push((k, v));
-        }
-    }
-    let status = status.ok_or_else(|| Error::BadResponse("response missing :status".into()))?;
-
-    // Response `<` trace, mirroring the HTTP/1.1 reader: a status line carrying
-    // the HTTP/2 version + numeric status, then each header field in received
-    // order (lowercase, as h2 delivers them), then a closing blank `< `.
     let tag = match label_id {
         Some(id) => format!("[stream {id}] "),
         None => String::new(),
     };
-    let _ = writeln!(trace, "< {tag}HTTP/2 {status}");
-    for (k, v) in &clean_headers {
-        let _ = writeln!(trace, "< {tag}{k}: {v}");
-    }
-    let _ = writeln!(trace, "< {tag}");
+    trace_response_head(trace, &tag, status, &clean_headers);
 
     let wire_len = stream.body.len();
     let _ = writeln!(trace, "* {tag}Received {wire_len} body bytes");
@@ -3901,22 +3797,14 @@ fn build_response_from_stream_labelled(
     })
 }
 
-/// Like [`build_response_from_stream`] but for the streaming path: the body has
-/// already been written to `sink` by [`Connection::process_data`] (so
-/// `stream.body` is empty), unless it was a content-encoded response, which the
-/// streaming path deliberately buffers — in that case decode it now and write
-/// the plaintext to `sink`. The returned `Response` always carries an empty
-/// `body` (the bytes are in the sink).
-fn build_response_from_stream_streaming(
-    stream: Stream,
-    sink: &mut dyn Write,
-    decompress: bool,
-    trace: &mut dyn Write,
-) -> Result<Response> {
-    let headers = stream
-        .response_headers
+/// Split a received response head into its `:status` and the regular header
+/// fields. Any other pseudo-header (none are defined for responses, but be
+/// conservative) is dropped.
+fn split_response_head(
+    headers: Option<Vec<(String, String)>>,
+) -> Result<(u16, Vec<(String, String)>)> {
+    let headers = headers
         .ok_or_else(|| Error::BadResponse("response ended before any HEADERS frame".into()))?;
-
     let mut status: Option<u16> = None;
     let mut clean_headers: Vec<(String, String)> = Vec::with_capacity(headers.len());
     for (k, v) in headers {
@@ -3930,12 +3818,40 @@ fn build_response_from_stream_streaming(
         }
     }
     let status = status.ok_or_else(|| Error::BadResponse("response missing :status".into()))?;
+    Ok((status, clean_headers))
+}
 
-    let _ = writeln!(trace, "< HTTP/2 {status}");
-    for (k, v) in &clean_headers {
-        let _ = writeln!(trace, "< {k}: {v}");
+/// Response `<` trace, mirroring the HTTP/1.1 reader: a status line carrying
+/// the HTTP/2 version + numeric status, then each header field in received
+/// order (lowercase, as h2 delivers them), then a closing blank `< `. `tag`
+/// is the `[stream N] ` label (empty on the single-stream path).
+fn trace_response_head(
+    trace: &mut dyn Write,
+    tag: &str,
+    status: u16,
+    headers: &[(String, String)],
+) {
+    let _ = writeln!(trace, "< {tag}HTTP/2 {status}");
+    for (k, v) in headers {
+        let _ = writeln!(trace, "< {tag}{k}: {v}");
     }
-    let _ = writeln!(trace, "< ");
+    let _ = writeln!(trace, "< {tag}");
+}
+
+/// Like [`build_response_from_stream`] but for the streaming path: the body has
+/// already been written to `sink` by [`Connection::process_data`] (so
+/// `stream.body` is empty), unless it was a content-encoded response, which the
+/// streaming path deliberately buffers — in that case decode it now and write
+/// the plaintext to `sink`. The returned `Response` always carries an empty
+/// `body` (the bytes are in the sink).
+fn build_response_from_stream_streaming(
+    stream: Stream,
+    sink: &mut dyn Write,
+    decompress: bool,
+    trace: &mut dyn Write,
+) -> Result<Response> {
+    let (status, clean_headers) = split_response_head(stream.response_headers)?;
+    trace_response_head(trace, "", status, &clean_headers);
     let total = stream.body.len() as u64 + stream.streamed_len;
     let _ = writeln!(trace, "* Received {total} body bytes (streamed)");
 
@@ -4045,17 +3961,12 @@ fn request_header_fields(req: &Request) -> (RequestPseudo, Vec<(String, String)>
             continue;
         }
         let lk = k.to_ascii_lowercase();
-        if lk == "user-agent" {
-            have_ua = true;
-        }
-        if lk == "accept" {
-            have_accept = true;
-        }
-        if lk == "accept-encoding" {
-            have_accept_enc = true;
-        }
-        if lk == "authorization" {
-            have_auth = true;
+        match lk.as_str() {
+            "user-agent" => have_ua = true,
+            "accept" => have_accept = true,
+            "accept-encoding" => have_accept_enc = true,
+            "authorization" => have_auth = true,
+            _ => {}
         }
         fields.push((lk, v.clone()));
     }
@@ -4132,10 +4043,18 @@ fn trace_request(req: &Request, trace: &mut dyn Write) {
 
 fn is_connection_specific_header(name: &str) -> bool {
     // RFC 9113 §8.2.2: connection-specific header fields MUST NOT be sent.
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" // unless value is exactly "trailers"; we conservatively drop.
-    )
+    // `te` is included unless its value is exactly "trailers"; we
+    // conservatively drop it.
+    [
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "upgrade",
+        "te",
+    ]
+    .iter()
+    .any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// What a validated response header section carries.
@@ -4185,17 +4104,19 @@ pub(crate) fn validate_response_fields(
             continue;
         }
         seen_regular = true;
-        let lname = name.to_ascii_lowercase();
-        if lname == "te" {
+        if name.eq_ignore_ascii_case("te") {
             if !value.trim().eq_ignore_ascii_case("trailers") {
                 return Err(format!("te: {value:?} not allowed"));
             }
             continue;
         }
-        if is_connection_specific_header(&lname) {
-            return Err(format!("connection-specific field {lname:?}"));
+        if is_connection_specific_header(name) {
+            return Err(format!(
+                "connection-specific field {:?}",
+                name.to_ascii_lowercase()
+            ));
         }
-        if lname == "content-length" && !trailers {
+        if name.eq_ignore_ascii_case("content-length") && !trailers {
             for part in value.split(',') {
                 let part = part.trim();
                 if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
