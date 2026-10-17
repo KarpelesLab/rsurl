@@ -1119,7 +1119,7 @@ impl Request {
             // Follow a 3xx with a Location when redirects are enabled, draining
             // the (small) intermediate body first so the socket can be dropped.
             if req.follow_redirects && is_redirect_status(head.status) {
-                if let Some(loc) = head.header("location") {
+                if let Some(loc) = redirect_location(&head.headers) {
                     let _ = read_body(
                         &mut bufrd,
                         &head.headers,
@@ -1369,7 +1369,7 @@ impl Request {
             // Follow a redirect (mirrors `send_to`'s logic, operating on the
             // head; the small redirect body is drained first).
             if req.follow_redirects && is_redirect_status(head.status) {
-                if let Some(loc) = head.header("location") {
+                if let Some(loc) = redirect_location(&head.headers) {
                     let _ = read_body(
                         &mut bufrd,
                         &head.headers,
@@ -1592,7 +1592,7 @@ impl Request {
                 resp.final_url = url_to_string(&req.url);
                 return Ok(resp);
             }
-            let Some(location) = resp.header("location") else {
+            let Some(location) = redirect_location(&resp.headers) else {
                 // 3xx without Location — give it back as the final response.
                 resp.final_url = url_to_string(&req.url);
                 return Ok(resp);
@@ -1605,6 +1605,16 @@ impl Request {
 
 fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// The `Location` a 3xx asks us to follow, if any. An empty value is treated
+/// as absent, as curl does: the response is then final, not a redirect.
+pub(crate) fn redirect_location(headers: &[(String, String)]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("location"))
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
 }
 
 /// Spend one hop of the redirect budget and rewrite `req` for `location` (see
@@ -5840,6 +5850,16 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn redirect_location_ignores_empty_values() {
+        let hdrs = |v: &str| vec![("Location".to_string(), v.to_string())];
+        assert_eq!(redirect_location(&hdrs("/next")), Some("/next"));
+        assert_eq!(redirect_location(&hdrs(" /next ")), Some("/next"));
+        assert_eq!(redirect_location(&hdrs("")), None);
+        assert_eq!(redirect_location(&hdrs("   ")), None);
+        assert_eq!(redirect_location(&[]), None);
     }
 
     #[test]

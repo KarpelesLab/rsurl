@@ -62,7 +62,7 @@ async fn exchange<R: Runtime>(rt: &R, req: &Request) -> Result<Response> {
 
         // Follow a redirect, or fall through to return this response.
         if req.follow_redirects && is_redirect(resp.status) {
-            if let Some(location) = header_value(&resp.headers, "location") {
+            if let Some(location) = crate::http::redirect_location(&resp.headers) {
                 if hops >= MAX_REDIRECTS {
                     return Err(Error::BadResponse(format!(
                         "aio: maximum ({MAX_REDIRECTS}) redirects followed"
