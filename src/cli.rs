@@ -57,10 +57,12 @@
 //!     -h, --help               print help
 //!     -V, --version            print version
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rsurl::{CookieJar, HttpVersionPref, Request, Response, Url};
@@ -614,8 +616,10 @@ pub fn main() -> ExitCode {
     }
 
     // Final jar save, to the first operation that asked for one.
-    if let (Some(j), Some(op)) = (jar.as_ref(), ops.iter().find(|a| a.cookie_jar.is_some())) {
-        let path = op.cookie_jar.as_deref().unwrap();
+    let jar_target = ops
+        .iter()
+        .find_map(|a| a.cookie_jar.as_deref().map(|path| (a, path)));
+    if let (Some(j), Some((op, path))) = (jar.as_ref(), jar_target) {
         if let Err(e) = j.save_netscape(path) {
             if show_errors(op) {
                 eprintln!("rsurl: writing cookie jar {path}: {e}");
@@ -628,9 +632,6 @@ pub fn main() -> ExitCode {
     ExitCode::from(last_failure)
 }
 
-/// Warn (once) about recognized flags that aren't yet enforced, so users
-/// aren't misled into thinking a limit/cert is active. Silenced by `-s`
-/// (without `-S`), like other diagnostics.
 /// True when the HTTP body will be streamed straight to a file: a file output
 /// (not a TTY, so no escape-guard needed), no header-inclusion, and no
 /// status-gated body suppression. This is the path that enforces
@@ -646,6 +647,9 @@ fn streams_to_file(args: &Args) -> bool {
         && args.dump_header.is_none()
 }
 
+/// Warn (once) about recognized flags that aren't yet enforced, so users
+/// aren't misled into thinking a limit/cert is active. Silenced by `-s`
+/// (without `-S`), like other diagnostics.
 fn warn_unsupported(ops: &[Args]) {
     if !ops.iter().any(show_errors) {
         return;
@@ -747,18 +751,18 @@ fn expand_short_bundles(tokens: &[String]) -> Vec<String> {
             out.push(t.clone());
             continue;
         }
-        let chars: Vec<char> = t[1..].chars().collect();
+        let body = &t[1..];
         let mut needs_value = false;
-        for (i, c) in chars.iter().enumerate() {
+        for (i, c) in body.char_indices() {
             let opt = format!("-{c}");
             let takes = option_takes_value(&opt);
             out.push(opt);
             if takes {
-                let rest: String = chars[i + 1..].iter().collect();
+                let rest = &body[i + c.len_utf8()..];
                 if rest.is_empty() {
                     needs_value = true; // value is the next argv token
                 } else {
-                    out.push(rest); // attached value
+                    out.push(rest.to_string()); // attached value
                 }
                 break;
             }
@@ -837,9 +841,11 @@ impl Iterator for GlobIter {
         let mut url = String::new();
         let mut caps = Vec::new();
         for (seg, &i) in self.segs.iter().zip(&self.idx) {
-            let v = seg.item(i);
-            url.push_str(&v);
-            if !matches!(seg, GlobSeg::Lit(_)) {
+            if let GlobSeg::Lit(s) = seg {
+                url.push_str(s);
+            } else {
+                let v = seg.item(i);
+                url.push_str(&v);
                 caps.push(v);
             }
         }
@@ -1074,7 +1080,7 @@ fn run_parallel(ops: &[Args]) -> u8 {
 /// could not be expanded (already reported).
 enum Job {
     Run {
-        op: Box<Args>,
+        op: Arc<Args>,
         url: String,
         caps: Vec<String>,
     },
@@ -1087,7 +1093,7 @@ enum Job {
 fn jobs(ops: &[Args]) -> Box<dyn Iterator<Item = Job> + Send + '_> {
     Box::new(ops.iter().flat_map(|op| {
         op.urls.iter().enumerate().flat_map(move |(i, url)| {
-            let op = Box::new(op.for_url(i));
+            let op = Arc::new(op.for_url(i));
             let it: Box<dyn Iterator<Item = Job> + Send> = if glob_disabled(&op, url) {
                 Box::new(std::iter::once(Job::Run {
                     op,
@@ -1183,11 +1189,8 @@ fn parse_config_text(text: &str) -> Vec<String> {
         }
         let (opt, val) = match line.find(|c: char| c.is_whitespace() || c == '=' || c == ':') {
             Some(i) => {
-                let rest = line[i..]
-                    .trim_start()
-                    .strip_prefix(['=', ':'])
-                    .unwrap_or_else(|| line[i..].trim_start())
-                    .trim_start();
+                let rest = line[i..].trim_start();
+                let rest = rest.strip_prefix(['=', ':']).unwrap_or(rest).trim_start();
                 (&line[..i], Some(rest))
             }
             None => (line, None),
@@ -1221,23 +1224,19 @@ fn parse_config_text(text: &str) -> Vec<String> {
 /// * `-c <file>` alone → empty jar; cookies received during the run are
 ///   saved at the end.
 fn build_initial_jar(args: &Args) -> Result<Option<CookieJar>, String> {
-    if args.cookie_in.is_none() && args.cookie_jar.is_none() {
-        return Ok(None);
-    }
-    let mut jar = match args.cookie_in.as_deref() {
-        Some(s) if !s.contains('=') => CookieJar::load_netscape_or_empty(s)
-            .map_err(|e| format!("reading cookie file {s}: {e}"))?,
-        _ => CookieJar::new(),
+    let load = |path: &str| {
+        CookieJar::load_netscape_or_empty(path)
+            .map_err(|e| format!("reading cookie file {path}: {e}"))
     };
-    // If only `-c` was given (no `-b`), and the destination already exists,
-    // curl pre-populates the jar from it so cookies aren't dropped. We
-    // mirror that by reading the file when it's there — missing is fine.
-    if args.cookie_in.is_none() {
-        if let Some(path) = args.cookie_jar.as_deref() {
-            jar = CookieJar::load_netscape_or_empty(path)
-                .map_err(|e| format!("reading cookie file {path}: {e}"))?;
-        }
-    }
+    let mut jar = match (args.cookie_in.as_deref(), args.cookie_jar.as_deref()) {
+        (None, None) => return Ok(None),
+        (Some(s), _) if !s.contains('=') => load(s)?,
+        (Some(_), _) => CookieJar::new(),
+        // If only `-c` was given (no `-b`), and the destination already exists,
+        // curl pre-populates the jar from it so cookies aren't dropped. We
+        // mirror that by reading the file when it's there — missing is fine.
+        (None, Some(path)) => load(path)?,
+    };
     if args.junk_session_cookies {
         drop_session_cookies(&mut jar);
     }
@@ -1277,26 +1276,19 @@ fn resolve_proxy_spec(url: &Url, args: &Args) -> Option<String> {
     }
     // Helper that reads an env var, trying the uppercase form, then the
     // lowercase form. Empty values count as unset.
-    let read = |upper: &str, lower: &str| -> Option<String> {
-        for k in [upper, lower] {
-            if let Ok(v) = std::env::var(k) {
-                if !v.is_empty() {
-                    return Some(v);
-                }
-            }
-        }
-        None
-    };
+    let read = |upper: &str, lower: &str| env_nonempty(upper).or_else(|| env_nonempty(lower));
     let scheme_proxy = match url.scheme.as_str() {
         "https" => read("HTTPS_PROXY", "https_proxy"),
         // Avoid uppercase HTTP_PROXY (curl historical caveat — see doc above)
-        "http" => match std::env::var("http_proxy") {
-            Ok(v) if !v.is_empty() => Some(v),
-            _ => None,
-        },
+        "http" => env_nonempty("http_proxy"),
         _ => None,
     };
     scheme_proxy.or_else(|| read("ALL_PROXY", "all_proxy"))
+}
+
+/// An environment variable's value, treating an empty one as unset.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 /// Resolve the no-proxy list: explicit `--noproxy` wins; otherwise we
@@ -1305,14 +1297,7 @@ fn resolve_noproxy(args: &Args) -> Option<String> {
     if let Some(v) = &args.noproxy {
         return Some(v.clone());
     }
-    for k in ["NO_PROXY", "no_proxy"] {
-        if let Ok(v) = std::env::var(k) {
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
+    env_nonempty("NO_PROXY").or_else(|| env_nonempty("no_proxy"))
 }
 
 /// Apply explicit `-b "k=v; k2=v2"` cookies to the jar for `request_url`'s
@@ -1361,10 +1346,9 @@ fn read_at_file(path: &str) -> Result<Vec<u8>, String> {
 /// Matches curl's `-d @file` newline-stripping behaviour, which exists so
 /// that copying a multi-line config value into a form field doesn't
 /// accidentally embed line breaks.
-fn strip_newlines(data: Vec<u8>) -> Vec<u8> {
-    data.into_iter()
-        .filter(|&b| b != b'\r' && b != b'\n' && b != 0)
-        .collect()
+fn strip_newlines(mut data: Vec<u8>) -> Vec<u8> {
+    data.retain(|&b| b != b'\r' && b != b'\n' && b != 0);
+    data
 }
 
 /// Percent-encode `bytes` per `application/x-www-form-urlencoded`: unreserved
@@ -1445,14 +1429,13 @@ mod form_parser {
             return Err(format!("-F: empty field name: {spec:?}"));
         }
         let rest = &spec[eq + 1..];
-        let mut tokens = split_semi(rest);
+        let mut tokens = split_semi(rest).into_iter();
         // First token is always the value; remaining tokens are modifiers.
-        let raw_value = tokens.remove(0);
+        let raw_value = tokens.next().unwrap_or_default();
         let body = classify_body(&raw_value);
-        let mut extras = Vec::new();
-        for tok in tokens {
-            extras.push(classify_extra(&tok)?);
-        }
+        let extras = tokens
+            .map(|tok| classify_extra(&tok))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(FormPart { name, body, extras })
     }
 
@@ -1607,6 +1590,7 @@ mod form_parser {
 /// `----rsurl-boundary-` so verbose traces are easy to grep.
 mod multipart {
     use super::{FormBody, FormExtra, FormPart};
+    use std::borrow::Cow;
 
     /// Build the body and return `(boundary, bytes)`. The boundary string
     /// is what goes into `Content-Type: multipart/form-data; boundary=<…>`.
@@ -1631,37 +1615,36 @@ mod multipart {
         // what bytes form the body. `<file` parts get no filename even
         // though they read from a file — that's how curl distinguishes a
         // form *field* from a form *upload*.
-        let (bytes, default_filename, is_upload): (Vec<u8>, Option<String>, bool) = match &part.body
-        {
-            FormBody::Literal(s) | FormBody::LiteralStrict(s) => {
-                (s.as_bytes().to_vec(), None, false)
-            }
-            FormBody::File(path) => {
-                let bytes =
-                    super::read_local(path).map_err(|e| format!("-F: can't read {path:?}: {e}"))?;
-                let name = std::path::Path::new(path)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.clone());
-                (bytes, Some(name), true)
-            }
-            FormBody::FileAsField(path) => {
-                let bytes =
-                    super::read_local(path).map_err(|e| format!("-F: can't read {path:?}: {e}"))?;
-                (bytes, None, false)
-            }
-        };
+        let (bytes, default_filename, is_upload): (Cow<'_, [u8]>, Option<Cow<'_, str>>, bool) =
+            match &part.body {
+                FormBody::Literal(s) | FormBody::LiteralStrict(s) => {
+                    (Cow::Borrowed(s.as_bytes()), None, false)
+                }
+                FormBody::File(path) => {
+                    let bytes = super::read_local(path)
+                        .map_err(|e| format!("-F: can't read {path:?}: {e}"))?;
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map_or(Cow::Borrowed(path.as_str()), |s| s.to_string_lossy());
+                    (Cow::Owned(bytes), Some(name), true)
+                }
+                FormBody::FileAsField(path) => {
+                    let bytes = super::read_local(path)
+                        .map_err(|e| format!("-F: can't read {path:?}: {e}"))?;
+                    (Cow::Owned(bytes), None, false)
+                }
+            };
 
         // Modifier overrides.
         let mut ctype: Option<&str> = None;
-        let mut filename: Option<String> = default_filename;
+        let mut filename = default_filename;
         let mut extra_headers: Vec<u8> = Vec::new();
         let mut promote_to_upload = is_upload;
         for ex in &part.extras {
             match ex {
                 FormExtra::Type(t) => ctype = Some(t),
                 FormExtra::Filename(f) => {
-                    filename = Some(f.clone());
+                    filename = Some(Cow::Borrowed(f.as_str()));
                     // Setting filename on a literal-bodied part is how curl
                     // promotes "this is text" to "this is a named upload".
                     promote_to_upload = true;
@@ -1672,10 +1655,7 @@ mod multipart {
                     // Trim outer whitespace per line, ignore blank lines,
                     // keep curl's permissive behaviour (no header parsing).
                     for line in raw.split(|b| *b == b'\n') {
-                        let mut l = line;
-                        if l.last() == Some(&b'\r') {
-                            l = &l[..l.len() - 1];
-                        }
+                        let l = line.strip_suffix(b"\r").unwrap_or(line);
                         if l.is_empty() {
                             continue;
                         }
@@ -1690,12 +1670,10 @@ mod multipart {
         out.extend_from_slice(b"Content-Disposition: form-data; name=\"");
         out.extend_from_slice(encode_attr(&part.name, escape).as_bytes());
         out.extend_from_slice(b"\"");
-        if promote_to_upload || filename.is_some() {
-            if let Some(fname) = filename.as_deref() {
-                out.extend_from_slice(b"; filename=\"");
-                out.extend_from_slice(encode_attr(fname, escape).as_bytes());
-                out.extend_from_slice(b"\"");
-            }
+        if let Some(fname) = filename.as_deref() {
+            out.extend_from_slice(b"; filename=\"");
+            out.extend_from_slice(encode_attr(fname, escape).as_bytes());
+            out.extend_from_slice(b"\"");
         }
         out.extend_from_slice(b"\r\n");
 
@@ -2150,33 +2128,30 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
 
     // `-G`/`--get`: fold urlencoded `-d` data into the URL query and send a
     // bodyless GET (curl semantics; multipart/`-F` is left untouched).
-    let mut url_owned = url.to_string();
+    let mut url_owned = Cow::Borrowed(url);
     if args.get {
         if let Some((bytes, ctype, _)) = &assembled {
             if ctype.starts_with("application/x-www-form-urlencoded") {
                 let q = String::from_utf8_lossy(bytes);
                 if !q.is_empty() {
-                    url_owned.push(if url_owned.contains('?') { '&' } else { '?' });
-                    url_owned.push_str(&q);
+                    let u = url_owned.to_mut();
+                    u.push(if u.contains('?') { '&' } else { '?' });
+                    u.push_str(&q);
                 }
                 assembled = None;
             }
         }
     }
 
-    let method = args.method.clone().unwrap_or_else(|| {
-        if args.head {
-            "HEAD".to_string()
-        } else if args.get {
-            "GET".to_string()
-        } else if let Some((_, _, m)) = &assembled {
-            (*m).to_string()
-        } else {
-            "GET".to_string()
-        }
+    let method = args.method.as_deref().unwrap_or(if args.head {
+        "HEAD"
+    } else if args.get {
+        "GET"
+    } else {
+        assembled.as_ref().map_or("GET", |(_, _, m)| *m)
     });
 
-    let mut req = match Request::new(&method, &url_owned) {
+    let mut req = match Request::new(method, &url_owned) {
         Ok(r) => r,
         Err(e) => {
             if show_errors(args) {
@@ -2232,10 +2207,10 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     }
     // `-r`/`--range`: a bare range becomes `bytes=<range>`.
     if let Some(r) = &args.range {
-        let v = if r.contains('=') {
-            r.clone()
+        let v: Cow<'_, str> = if r.contains('=') {
+            Cow::Borrowed(r)
         } else {
-            format!("bytes={r}")
+            format!("bytes={r}").into()
         };
         req = add_header(req, args, &mut added, "Range", &v);
     }
@@ -2465,9 +2440,9 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
     // --limit-rate, -# progress, and an early --max-filesize abort.
     if streams_to_file(args) {
         // Resolve the concrete output file the library download engine needs.
-        let name = if args.remote_name {
+        let name: Cow<'_, str> = if args.remote_name {
             match remote_name_from_url(&parsed_url) {
-                Ok(n) => n,
+                Ok(n) => n.into(),
                 Err(e) => {
                     if show_errors(args) {
                         eprintln!("rsurl: {e}");
@@ -2476,7 +2451,7 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
                 }
             }
         } else {
-            args.output.clone().unwrap_or_default()
+            Cow::Borrowed(args.output.as_deref().unwrap_or_default())
         };
         let concrete = !name.is_empty() && name != "-";
         let workers = args.parallel_segments.unwrap_or(1).min(MAX_SEGMENTS);
@@ -2493,11 +2468,11 @@ fn process_url(url: &str, args: &Args, mut jar: Option<&mut CookieJar>) -> u8 {
             } else {
                 SegmentPlan::Single
             };
-            return run_library_download(&req, &parsed_url, args, &name, jar, plan);
+            return run_library_download(req, &parsed_url, args, &name, jar, plan);
         }
         if concrete && parallel_segments_eligible(args) {
             return run_library_download(
-                &req,
+                req,
                 &parsed_url,
                 args,
                 &name,
@@ -2727,61 +2702,66 @@ fn append_url_queries(url: &str, parts: &[String]) -> Result<String, String> {
 /// `--crlfile` (82). Otherwise the transfer would fail later with a generic
 /// I/O error.
 fn check_tls_files(args: &Args) -> Option<u8> {
-    let unreadable = |p: &str| File::open(p).is_err();
-    let fail = |what: &str, path: &str, code: u8| {
-        if show_errors(args) {
-            eprintln!("rsurl: error setting {what} {path:?}: cannot read it");
-        }
-        Some(code)
-    };
-    if let Some(p) = args.cacert.as_deref().filter(|p| unreadable(p)) {
-        return fail("certificate file", p, 77);
-    }
-    if let Some(p) = args.capath.as_deref().filter(|p| !Path::new(p).is_dir()) {
-        return fail("certificate directory", p, 77);
-    }
-    if let Some(cert) = &args.cert {
-        let (path, _) = split_cert_pass(cert);
-        if unreadable(path) {
-            return fail("client certificate", path, 58);
-        }
-        if let Some(k) = args.key_file.as_deref().filter(|p| unreadable(p)) {
-            return fail("private key file", k, 58);
-        }
-    }
-    if let Some(p) = args.crl_file.as_deref().filter(|p| unreadable(p)) {
-        return fail("CRL file", p, 82);
-    }
-    None
+    check_tls_inputs(
+        args,
+        "",
+        args.cacert.as_deref(),
+        args.capath.as_deref(),
+        args.cert.as_deref(),
+        args.key_file.as_deref(),
+        args.crl_file.as_deref(),
+    )
 }
 
 /// [`check_tls_files`] for the `--proxy-*` TLS files. Same exit codes.
 fn check_proxy_tls_files(args: &Args) -> Option<u8> {
     let p = &args.proxy_tls;
+    check_tls_inputs(
+        args,
+        "proxy ",
+        p.cacert.as_deref(),
+        p.capath.as_deref(),
+        p.cert.as_deref(),
+        p.key.as_deref(),
+        p.crlfile.as_deref(),
+    )
+}
+
+/// Shared body of [`check_tls_files`] and [`check_proxy_tls_files`]; `label`
+/// is `""` for the origin's files and `"proxy "` for the proxy's.
+fn check_tls_inputs(
+    args: &Args,
+    label: &str,
+    cacert: Option<&str>,
+    capath: Option<&str>,
+    cert: Option<&str>,
+    key: Option<&str>,
+    crl: Option<&str>,
+) -> Option<u8> {
     let unreadable = |p: &str| File::open(p).is_err();
     let fail = |what: &str, path: &str, code: u8| {
         if show_errors(args) {
-            eprintln!("rsurl: error setting proxy {what} {path:?}: cannot read it");
+            eprintln!("rsurl: error setting {label}{what} {path:?}: cannot read it");
         }
         Some(code)
     };
-    if let Some(f) = p.cacert.as_deref().filter(|f| unreadable(f)) {
-        return fail("certificate file", f, 77);
+    if let Some(p) = cacert.filter(|p| unreadable(p)) {
+        return fail("certificate file", p, 77);
     }
-    if let Some(d) = p.capath.as_deref().filter(|d| !Path::new(d).is_dir()) {
-        return fail("certificate directory", d, 77);
+    if let Some(p) = capath.filter(|p| !Path::new(p).is_dir()) {
+        return fail("certificate directory", p, 77);
     }
-    if let Some(cert) = &p.cert {
+    if let Some(cert) = cert {
         let (path, _) = split_cert_pass(cert);
         if unreadable(path) {
             return fail("client certificate", path, 58);
         }
-        if let Some(k) = p.key.as_deref().filter(|f| unreadable(f)) {
+        if let Some(k) = key.filter(|p| unreadable(p)) {
             return fail("private key file", k, 58);
         }
     }
-    if let Some(f) = p.crlfile.as_deref().filter(|f| unreadable(f)) {
-        return fail("CRL file", f, 82);
+    if let Some(p) = crl.filter(|p| unreadable(p)) {
+        return fail("CRL file", p, 82);
     }
     None
 }
@@ -2986,7 +2966,7 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--parallel-segments" => {
                 // Optional count; defaults to 4. Only consume the next token if
                 // it parses as a number (otherwise it's the URL / next flag).
-                let n = match it.clone().next().and_then(|s| s.parse::<usize>().ok()) {
+                let n = match it.as_slice().first().and_then(|s| s.parse::<usize>().ok()) {
                     Some(v) => {
                         it.next();
                         v
@@ -3195,15 +3175,12 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             | "--no-progress-meter"
             | "--styled-output"
             | "--no-styled-output" => {}
-            // TLS knobs neither backend can honour. Fail loudly rather than
-            // silently ignore, so a user is never misled into thinking a
-            // cipher restriction / revocation check is in effect.
-            //   --ciphers / --tls13-ciphers : no per-cipher selection API in
-            //     purecrypto or rustls (both pick a safe suite set internally).
-            //   --cert-status (OCSP must-staple) : rsurl does not request or
-            //     require an OCSP staple.
             "--ciphers" => a.ciphers = Some(next_val(&mut it, arg)?),
             "--tls13-ciphers" => a.tls13_ciphers = Some(next_val(&mut it, arg)?),
+            // A TLS knob neither backend can honour. Fail loudly rather than
+            // silently ignore, so a user is never misled into thinking a
+            // revocation check is in effect: rsurl does not request or require
+            // an OCSP staple.
             "--cert-status" => {
                 return Err(
                     "--cert-status: OCSP-staple validation is not implemented (rsurl does not \
@@ -3271,11 +3248,10 @@ fn transfer_exit_code(e: &rsurl::Error) -> u8 {
                 7
             }
         }
-        rsurl::Error::BadResponse(m) if tls_exit_code(m).is_some() => tls_exit_code(m).unwrap(),
-        rsurl::Error::Io(io) if tls_exit_code(&io.to_string()).is_some() => {
-            tls_exit_code(&io.to_string()).unwrap()
-        }
         rsurl::Error::BadResponse(m) => {
+            if let Some(code) = tls_exit_code(m) {
+                return code;
+            }
             let m = m.to_ascii_lowercase();
             if m.contains("timed out") {
                 28 // CURLE_OPERATION_TIMEDOUT
@@ -3285,17 +3261,23 @@ fn transfer_exit_code(e: &rsurl::Error) -> u8 {
                 8 // CURLE_WEIRD_SERVER_REPLY
             }
         }
-        rsurl::Error::Io(io) => match io.kind() {
-            // A unix socket read timeout surfaces as EAGAIN (`WouldBlock`).
-            ErrorKind::TimedOut | ErrorKind::WouldBlock => 28,
-            ErrorKind::ConnectionRefused
-            | ErrorKind::ConnectionReset
-            | ErrorKind::ConnectionAborted => 7,
-            // std has no stable "name resolution failed" kind; the OS resolver
-            // surfaces it in the message ("failed to lookup address ...").
-            _ if io.to_string().contains("failed to lookup") => 6, // CURLE_COULDNT_RESOLVE_HOST
-            _ => 7,                                                // CURLE_COULDNT_CONNECT
-        },
+        rsurl::Error::Io(io) => {
+            let msg = io.to_string();
+            if let Some(code) = tls_exit_code(&msg) {
+                return code;
+            }
+            match io.kind() {
+                // A unix socket read timeout surfaces as EAGAIN (`WouldBlock`).
+                ErrorKind::TimedOut | ErrorKind::WouldBlock => 28,
+                ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted => 7,
+                // std has no stable "name resolution failed" kind; the OS resolver
+                // surfaces it in the message ("failed to lookup address ...").
+                _ if msg.contains("failed to lookup") => 6, // CURLE_COULDNT_RESOLVE_HOST
+                _ => 7,                                     // CURLE_COULDNT_CONNECT
+            }
+        }
         // The CLI never attaches a cancel token, so this is unreachable in
         // practice; map to curl's "aborted by callback" for completeness.
         rsurl::Error::Cancelled => 42, // CURLE_ABORTED_BY_CALLBACK
@@ -3454,12 +3436,8 @@ fn content_disposition_params(cd: &str) -> Vec<(String, String)> {
         }
     }
     loop {
-        let key: String = chars
-            .by_ref()
-            .take_while(|&c| c != '=')
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let raw_key: String = chars.by_ref().take_while(|&c| c != '=').collect();
+        let key = raw_key.trim();
         if key.is_empty() {
             break;
         }
@@ -3485,9 +3463,10 @@ fn content_disposition_params(cd: &str) -> Vec<(String, String)> {
                 }
                 value.push(c);
             }
-            value = value.trim().to_string();
+            // Leading whitespace was consumed above; only the tail needs trimming.
+            value.truncate(value.trim_end().len());
         }
-        params.push((key, value));
+        params.push((key.to_string(), value));
     }
     params
 }
@@ -3772,17 +3751,9 @@ fn run_ssh(url: &Url, args: &Args) -> u8 {
                     }
                 }
             } else {
-                match &args.output {
-                    Some(path) if path != "-" => match create_output_file(path, args) {
-                        Ok(f) => Box::new(f),
-                        Err(e) => {
-                            if show_errors(args) {
-                                eprintln!("rsurl: open {path}: {e}");
-                            }
-                            return 23;
-                        }
-                    },
-                    _ => Box::new(io::stdout().lock()),
+                match open_output(args) {
+                    Ok(o) => o,
+                    Err(code) => return code,
                 }
             };
             if let Err(e) = out.write_all(&bytes) {
@@ -3942,17 +3913,9 @@ fn run_rtsp(url: &Url, args: &Args) -> u8 {
     };
     match client.rtsp(url, method) {
         Ok(bytes) => {
-            let mut out: Box<dyn Write> = match &args.output {
-                Some(path) if path != "-" => match create_output_file(path, args) {
-                    Ok(f) => Box::new(f),
-                    Err(e) => {
-                        if show_errors(args) {
-                            eprintln!("rsurl: open {path}: {e}");
-                        }
-                        return 23;
-                    }
-                },
-                _ => Box::new(io::stdout().lock()),
+            let mut out = match open_output(args) {
+                Ok(o) => o,
+                Err(code) => return code,
             };
             if let Err(e) = out.write_all(&bytes) {
                 if show_errors(args) {
@@ -3999,12 +3962,13 @@ fn apply_cli_credentials(url: &mut Url, args: &Args) {
 /// Percent-encode everything but RFC 3986 unreserved characters, so `:`,
 /// `@`, `%` and control bytes in a credential survive the userinfo round-trip.
 fn pct_encode_userinfo(s: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            write!(out, "%{b:02X}").expect("write to String");
         }
     }
     out
@@ -4099,13 +4063,7 @@ fn transfer_client(url: &Url, args: &Args) -> rsurl::Result<rsurl::Client> {
     }
     c = apply_proxy_tls!(c, &args.proxy_tls);
     if let Some(list) = resolve_noproxy(args) {
-        c = c.no_proxy(
-            list.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect::<Vec<_>>(),
-        );
+        c = c.no_proxy(list.split(',').map(str::trim).filter(|s| !s.is_empty()));
     }
     if let Some(path) = &args.unix_socket {
         #[cfg(unix)]
@@ -4249,17 +4207,9 @@ fn run_websocket(url: &Url, args: &Args) -> u8 {
         None => {}
     }
 
-    let mut out: Box<dyn Write> = match &args.output {
-        Some(path) if path != "-" => match create_output_file(path, args) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                if show_errors(args) {
-                    eprintln!("rsurl: open {path}: {e}");
-                }
-                return 23;
-            }
-        },
-        _ => Box::new(io::stdout().lock()),
+    let mut out = match open_output(args) {
+        Ok(o) => o,
+        Err(code) => return code,
     };
 
     let mut code = 0u8;
@@ -4418,17 +4368,9 @@ fn run_telnet(url: &Url, args: &Args) -> u8 {
     };
     match client.telnet(url, &input) {
         Ok(bytes) => {
-            let mut out: Box<dyn Write> = match &args.output {
-                Some(path) if path != "-" => match create_output_file(path, args) {
-                    Ok(f) => Box::new(f),
-                    Err(e) => {
-                        if show_errors(args) {
-                            eprintln!("rsurl: open {path}: {e}");
-                        }
-                        return 23;
-                    }
-                },
-                _ => Box::new(io::stdout().lock()),
+            let mut out = match open_output(args) {
+                Ok(o) => o,
+                Err(code) => return code,
             };
             if out.write_all(&bytes).is_err() {
                 return 23;
@@ -4460,17 +4402,9 @@ fn run_transfer(url: &Url, args: &Args) -> u8 {
     };
     match client.transfer_url(url) {
         Ok(bytes) => {
-            let mut out: Box<dyn Write> = match &args.output {
-                Some(path) if path != "-" => match create_output_file(path, args) {
-                    Ok(f) => Box::new(f),
-                    Err(e) => {
-                        if show_errors(args) {
-                            eprintln!("rsurl: open {path}: {e}");
-                        }
-                        return 23;
-                    }
-                },
-                _ => Box::new(io::stdout().lock()),
+            let mut out = match open_output(args) {
+                Ok(o) => o,
+                Err(code) => return code,
             };
             if let Err(e) = out.write_all(&bytes) {
                 if show_errors(args) {
@@ -4504,9 +4438,9 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
             return 5;
         }
     };
-    let name = if args.remote_name {
+    let name: Cow<'_, str> = if args.remote_name {
         match remote_name_from_url(url) {
-            Ok(n) => n,
+            Ok(n) => n.into(),
             Err(e) => {
                 if show_errors(args) {
                     eprintln!("rsurl: {e}");
@@ -4515,7 +4449,7 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
             }
         }
     } else {
-        args.output.clone().unwrap_or_default()
+        Cow::Borrowed(args.output.as_deref().unwrap_or_default())
     };
     let (file, out_path) = match create_output_file_tracked(&name, args) {
         Ok(pair) => pair,
@@ -4528,18 +4462,7 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
     };
     let (speed_limit, speed_time) = low_speed_params(args);
     let now = std::time::Instant::now();
-    let mut sink = DownloadSink {
-        inner: Box::new(file),
-        written: 0,
-        max: args.max_filesize,
-        rate: args.limit_rate.as_deref().and_then(parse_rate),
-        speed_limit,
-        speed_time,
-        started: now,
-        progress: args.progress_bar,
-        silent: args.silent,
-        last_tick: now,
-    };
+    let mut sink = DownloadSink::new(Box::new(file), args, speed_limit, speed_time, now);
     let result = client.transfer_url_to(url, &mut sink);
     let time_total = now.elapsed();
     let written = sink.written;
@@ -4572,26 +4495,7 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
                 drop(sink);
                 let _ = std::fs::remove_file(&out_path);
             }
-            if e.to_string().contains(MAX_FILESIZE_SENTINEL) {
-                if show_errors(args) {
-                    eprintln!("rsurl: Maximum file size exceeded");
-                }
-                return 63;
-            }
-            if e.to_string().contains(LOW_SPEED_SENTINEL) {
-                if show_errors(args) {
-                    eprintln!(
-                        "rsurl: Operation too slow. Less than {} bytes/sec transferred \
-                         the last {speed_time} seconds",
-                        speed_limit.unwrap_or(1)
-                    );
-                }
-                return 28;
-            }
-            if show_errors(args) {
-                eprintln!("rsurl: {e}");
-            }
-            transfer_exit_code(&e)
+            download_error_code(&e, args, speed_limit, speed_time)
         }
     }
 }
@@ -4611,28 +4515,12 @@ fn run_stream_download(url: &Url, args: &Args) -> u8 {
 /// ASCII and ordinary (multi-byte) UTF-8 text pass through unchanged.
 fn sanitize_for_tty(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        match std::str::from_utf8(rest) {
-            Ok(s) => {
-                push_sanitized_str(s, &mut out);
-                break;
-            }
-            Err(e) => {
-                // Valid prefix up to the error: sanitize as UTF-8 text.
-                let valid_up_to = e.valid_up_to();
-                if valid_up_to > 0 {
-                    // SAFETY: bytes[..valid_up_to] is valid UTF-8 per the error.
-                    let s = unsafe { std::str::from_utf8_unchecked(&rest[..valid_up_to]) };
-                    push_sanitized_str(s, &mut out);
-                }
-                // Escape every byte of the invalid sequence as raw \xHH.
-                let bad = e.error_len().unwrap_or(1);
-                for &b in &rest[valid_up_to..valid_up_to + bad] {
-                    out.extend_from_slice(format!("\\x{b:02x}").as_bytes());
-                }
-                rest = &rest[valid_up_to + bad..];
-            }
+    for chunk in bytes.utf8_chunks() {
+        // Valid UTF-8 text: sanitize per codepoint.
+        push_sanitized_str(chunk.valid(), &mut out);
+        // Escape every byte of an invalid sequence as raw \xHH.
+        for &b in chunk.invalid() {
+            write!(out, "\\x{b:02x}").expect("write to Vec");
         }
     }
     out
@@ -4644,7 +4532,7 @@ fn push_sanitized_str(s: &str, out: &mut Vec<u8>) {
         let cp = ch as u32;
         let dangerous = (cp < 0x20 && ch != '\t') || (0x7f..=0x9f).contains(&cp);
         if dangerous {
-            out.extend_from_slice(format!("\\x{cp:02x}").as_bytes());
+            write!(out, "\\x{cp:02x}").expect("write to Vec");
         } else {
             let mut buf = [0u8; 4];
             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
@@ -4660,16 +4548,16 @@ fn body_looks_binary(body: &[u8]) -> bool {
     body.contains(&0)
 }
 
-/// `-w`/`--write-out`: render `args.write_out` to stdout after a transfer,
-/// expanding `%{var}` variables and `\n`/`\t`/`\r`/`\\` escapes. `time_total`
-/// is measured around the request. Variables we don't (yet) compute expand to
-/// an empty string, matching curl's treatment of unknown names.
 /// Format a phase duration as curl's fixed `%.6f` seconds; an unmeasured phase
 /// (`None`) renders as `0.000000`, matching curl.
 fn fmt_secs(d: Option<std::time::Duration>) -> String {
     format!("{:.6}", d.map_or(0.0, |d| d.as_secs_f64()))
 }
 
+/// `-w`/`--write-out`: render `args.write_out` to stdout after a transfer,
+/// expanding `%{var}` variables and `\n`/`\t`/`\r`/`\\` escapes. `time_total`
+/// is measured around the request. Variables we don't (yet) compute expand to
+/// an empty string, matching curl's treatment of unknown names.
 fn run_write_out(
     resp: &Response,
     url: &Url,
@@ -4772,7 +4660,7 @@ fn run_write_out_code(
                     out.push('%');
                 }
                 // %header{Name}: emit a named response header (curl 7.84+).
-                _ if chars.clone().take(7).collect::<String>() == "header{" => {
+                _ if chars.clone().take(7).eq("header{".chars()) => {
                     for _ in 0..7 {
                         chars.next();
                     }
@@ -4821,11 +4709,8 @@ fn url_to_display(url: &Url) -> String {
 /// Parse an HTTP-date (RFC 1123, `Sun, 06 Nov 1994 08:49:37 GMT`) to a Unix
 /// epoch. Returns `None` for anything it can't parse. GMT is assumed.
 fn httpdate_to_epoch(s: &str) -> Option<u64> {
-    let rest = s
-        .trim()
-        .split_once(", ")
-        .map(|(_, r)| r)
-        .unwrap_or(s.trim());
+    let s = s.trim();
+    let rest = s.split_once(", ").map_or(s, |(_, r)| r);
     let mut it = rest.split_whitespace();
     let day: i64 = it.next()?.parse().ok()?;
     let mon: i64 = match it.next()? {
@@ -4928,7 +4813,8 @@ fn proto_allowed(scheme: &str, spec: &str) -> bool {
         "smtps", "mqtt", "mqtts", "rtsp", "tftp", "ldap", "ldaps", "gopher", "gophers", "dict",
         "file", "ws", "wss", "telnet",
     ];
-    let mut set: std::collections::HashSet<String> = ALL.iter().map(|s| s.to_string()).collect();
+    let spec = spec.to_ascii_lowercase();
+    let mut set: std::collections::HashSet<&str> = ALL.iter().copied().collect();
     for tok in spec.split(',') {
         let tok = tok.trim();
         if tok.is_empty() {
@@ -4940,10 +4826,10 @@ fn proto_allowed(scheme: &str, spec: &str) -> bool {
             b'-' => ('-', &tok[1..]),
             _ => ('+', tok),
         };
-        let names: Vec<String> = if name == "all" {
-            ALL.iter().map(|s| s.to_string()).collect()
+        let names: &[&str] = if name == "all" {
+            ALL
         } else {
-            vec![name.to_ascii_lowercase()]
+            std::slice::from_ref(&name)
         };
         match op {
             '=' => {
@@ -4953,13 +4839,13 @@ fn proto_allowed(scheme: &str, spec: &str) -> bool {
             '+' => set.extend(names),
             '-' => {
                 for n in names {
-                    set.remove(&n);
+                    set.remove(n);
                 }
             }
             _ => {}
         }
     }
-    set.contains(&scheme.to_ascii_lowercase())
+    set.contains(scheme.to_ascii_lowercase().as_str())
 }
 
 /// Parse a curl `--limit-rate` value (`1000`, `2k`, `3M`, `1G`) to bytes/sec.
@@ -5003,6 +4889,31 @@ struct DownloadSink<'a> {
     last_tick: std::time::Instant,
 }
 
+impl<'a> DownloadSink<'a> {
+    /// A sink over `inner` configured from the CLI flags, with its clock
+    /// (rate limiting, low-speed window, progress ticks) started at `now`.
+    fn new(
+        inner: Box<dyn Write + 'a>,
+        args: &Args,
+        speed_limit: Option<u64>,
+        speed_time: u64,
+        now: std::time::Instant,
+    ) -> Self {
+        DownloadSink {
+            inner,
+            written: 0,
+            max: args.max_filesize,
+            rate: args.limit_rate.as_deref().and_then(parse_rate),
+            speed_limit,
+            speed_time,
+            started: now,
+            progress: args.progress_bar,
+            silent: args.silent,
+            last_tick: now,
+        }
+    }
+}
+
 impl Write for DownloadSink<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if let Some(max) = self.max {
@@ -5042,8 +4953,6 @@ impl Write for DownloadSink<'_> {
     }
 }
 
-/// Streaming HTTP download to a file: enforces `--limit-rate`/`-#`/
-/// `--max-filesize` and avoids buffering the whole body in memory.
 /// CLI-level gate for segmented parallel download (before any network probe).
 /// `--parallel-segments n>1` and none of the features that constrain the byte
 /// range or the write path (resume, user range, rate limits, upload).
@@ -5091,9 +5000,10 @@ const RESUME_CHUNK: u64 = 4 * 1024 * 1024;
 /// Lower-hex encoding of bytes.
 #[cfg(feature = "bittorrent")]
 fn bytes_hex(b: &[u8]) -> String {
+    use std::fmt::Write;
     let mut s = String::with_capacity(b.len() * 2);
     for x in b {
-        s.push_str(&format!("{x:02x}"));
+        write!(s, "{x:02x}").expect("write to String");
     }
     s
 }
@@ -5101,6 +5011,7 @@ fn bytes_hex(b: &[u8]) -> String {
 /// Escape a string for embedding in a JSON double-quoted value.
 #[cfg(feature = "bittorrent")]
 fn json_escape(s: &str) -> String {
+    use std::fmt::Write;
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -5109,7 +5020,7 @@ fn json_escape(s: &str) -> String {
             '\n' => o.push_str("\\n"),
             '\r' => o.push_str("\\r"),
             '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => write!(o, "\\u{:04x}", c as u32).expect("write to String"),
             c => o.push(c),
         }
     }
@@ -5119,23 +5030,21 @@ fn json_escape(s: &str) -> String {
 /// Render torrent metadata as JSON, including each file's computed byte offset.
 #[cfg(feature = "bittorrent")]
 fn metadata_json(meta: &rsurl::bittorrent::Metainfo) -> String {
+    use std::fmt::Write;
     let mut o = String::new();
     o.push_str("{\n");
-    o.push_str(&format!("  \"name\": \"{}\",\n", json_escape(&meta.name)));
-    o.push_str(&format!(
-        "  \"info_hash\": \"{}\",\n",
-        bytes_hex(&meta.info_hash)
-    ));
-    o.push_str(&format!("  \"piece_length\": {},\n", meta.piece_length));
-    o.push_str(&format!("  \"num_pieces\": {},\n", meta.num_pieces()));
-    o.push_str(&format!("  \"total_length\": {},\n", meta.total_length));
-    o.push_str(&format!("  \"private\": {},\n", meta.private));
+    writeln!(o, "  \"name\": \"{}\",", json_escape(&meta.name)).expect("write to String");
+    writeln!(o, "  \"info_hash\": \"{}\",", bytes_hex(&meta.info_hash)).expect("write to String");
+    writeln!(o, "  \"piece_length\": {},", meta.piece_length).expect("write to String");
+    writeln!(o, "  \"num_pieces\": {},", meta.num_pieces()).expect("write to String");
+    writeln!(o, "  \"total_length\": {},", meta.total_length).expect("write to String");
+    writeln!(o, "  \"private\": {},", meta.private).expect("write to String");
     o.push_str("  \"trackers\": [");
     for (i, t) in meta.trackers.iter().enumerate() {
         if i > 0 {
             o.push_str(", ");
         }
-        o.push_str(&format!("\"{}\"", json_escape(t)));
+        write!(o, "\"{}\"", json_escape(t)).expect("write to String");
     }
     o.push_str("],\n");
     o.push_str("  \"files\": [\n");
@@ -5152,13 +5061,15 @@ fn metadata_json(meta: &rsurl::bittorrent::Metainfo) -> String {
             o.push_str(",\n");
         }
         first = false;
-        o.push_str(&format!(
+        write!(
+            o,
             "    {{\"path\": \"{}\", \"length\": {}, \"offset\": {}}}",
             // Canonical forward-slash path regardless of OS separator.
             json_escape(&f.path.to_string_lossy().replace('\\', "/")),
             f.length,
             off
-        ));
+        )
+        .expect("write to String");
         off += f.length;
     }
     o.push_str("\n  ]\n}\n");
@@ -5174,7 +5085,7 @@ fn build_torrent(info: &[u8], trackers: &[String]) -> Vec<u8> {
     out.push(b'd');
     if let Some(first) = trackers.first() {
         out.extend_from_slice(b"8:announce");
-        out.extend_from_slice(format!("{}:", first.len()).as_bytes());
+        write!(out, "{}:", first.len()).expect("write to Vec");
         out.extend_from_slice(first.as_bytes());
     }
     if !trackers.is_empty() {
@@ -5182,7 +5093,7 @@ fn build_torrent(info: &[u8], trackers: &[String]) -> Vec<u8> {
         out.push(b'l'); // tiers
         for t in trackers {
             out.push(b'l'); // one tracker per tier
-            out.extend_from_slice(format!("{}:", t.len()).as_bytes());
+            write!(out, "{}:", t.len()).expect("write to Vec");
             out.extend_from_slice(t.as_bytes());
             out.push(b'e');
         }
@@ -5760,7 +5671,7 @@ enum SegmentPlan {
 /// finalize). Backs `-C -` and `--parallel-segments`. Returns a curl exit code;
 /// only reached for a concrete output file (not stdout).
 fn run_library_download(
-    req: &rsurl::Request,
+    req: rsurl::Request,
     url: &Url,
     args: &Args,
     name: &str,
@@ -5778,7 +5689,7 @@ fn run_library_download(
 
     // Carry cookie-jar cookies on the request; the library download path streams
     // the raw body and does not consult the jar itself.
-    let mut greq = req.clone();
+    let mut greq = req;
     if let Some(j) = jar.as_deref() {
         if let Some(h) = j.cookie_header(url) {
             greq = greq.header("Cookie", &h);
@@ -5904,18 +5815,7 @@ fn run_http_download(
         };
     let (speed_limit, speed_time) = low_speed_params(args);
     let now = std::time::Instant::now();
-    let mut sink = DownloadSink {
-        inner,
-        written: 0,
-        max: args.max_filesize,
-        rate: args.limit_rate.as_deref().and_then(parse_rate),
-        speed_limit,
-        speed_time,
-        started: now,
-        progress: args.progress_bar,
-        silent: args.silent,
-        last_tick: now,
-    };
+    let mut sink = DownloadSink::new(inner, args, speed_limit, speed_time, now);
     let result = if args.verbose {
         let mut err = io::stderr().lock();
         req.send_download(&mut sink, jar, &mut err)
@@ -5958,9 +5858,9 @@ fn open_download_output(
     args: &Args,
     append: bool,
 ) -> Result<(Box<dyn Write>, Option<std::path::PathBuf>), u8> {
-    let name = if args.remote_name {
+    let name: Cow<'_, str> = if args.remote_name {
         match remote_name_from_url(url) {
-            Ok(n) => n,
+            Ok(n) => n.into(),
             Err(e) => {
                 if show_errors(args) {
                     eprintln!("rsurl: {e}");
@@ -5970,7 +5870,7 @@ fn open_download_output(
         }
     } else {
         match args.output.as_deref() {
-            Some(p) if p != "-" => p.to_string(),
+            Some(p) if p != "-" => Cow::Borrowed(p),
             _ => return Ok((Box::new(io::stdout().lock()), None)),
         }
     };
@@ -5998,13 +5898,14 @@ fn download_error_code(
     speed_limit: Option<u64>,
     speed_time: u64,
 ) -> u8 {
-    if e.to_string().contains(MAX_FILESIZE_SENTINEL) {
+    let msg = e.to_string();
+    if msg.contains(MAX_FILESIZE_SENTINEL) {
         if show_errors(args) {
             eprintln!("rsurl: Maximum file size exceeded");
         }
         return 63;
     }
-    if e.to_string().contains(LOW_SPEED_SENTINEL) {
+    if msg.contains(LOW_SPEED_SENTINEL) {
         if show_errors(args) {
             eprintln!(
                 "rsurl: Operation too slow. Less than {} bytes/sec transferred \
@@ -6048,14 +5949,14 @@ fn resume_offset(url: &Url, args: &Args) -> Option<u64> {
     if !args.continue_resume {
         return None;
     }
-    let name = if args.remote_name {
-        remote_name_from_url(url).ok()?
+    let name: Cow<'_, str> = if args.remote_name {
+        remote_name_from_url(url).ok()?.into()
     } else {
-        args.output.clone().filter(|p| p != "-")?
+        args.output.as_deref().filter(|p| *p != "-")?.into()
     };
     let path = match &args.output_dir {
-        Some(dir) => Path::new(dir).join(&name),
-        None => std::path::PathBuf::from(&name),
+        Some(dir) => Path::new(dir).join(&*name),
+        None => std::path::PathBuf::from(&*name),
     };
     if rsurl::resume::part_path(&path).exists() {
         return None;
@@ -6087,18 +5988,7 @@ fn run_http_resume(
     };
     let (speed_limit, speed_time) = low_speed_params(args);
     let now = std::time::Instant::now();
-    let mut sink = DownloadSink {
-        inner,
-        written: 0,
-        max: args.max_filesize,
-        rate: args.limit_rate.as_deref().and_then(parse_rate),
-        speed_limit,
-        speed_time,
-        started: now,
-        progress: args.progress_bar,
-        silent: args.silent,
-        last_tick: now,
-    };
+    let mut sink = DownloadSink::new(inner, args, speed_limit, speed_time, now);
     let status = std::cell::Cell::new(0u16);
     let result = req.send_streaming_with(
         jar,
@@ -6231,6 +6121,24 @@ fn create_output_file(path: &str, args: &Args) -> io::Result<File> {
     create_output_file_tracked(path, args).map(|(f, _)| f)
 }
 
+/// Where a buffered (non-streaming) transfer writes its payload: the `-o`
+/// file, or stdout. On failure the error is reported and the curl exit code
+/// returned.
+fn open_output(args: &Args) -> Result<Box<dyn Write>, u8> {
+    match &args.output {
+        Some(path) if path != "-" => match create_output_file(path, args) {
+            Ok(f) => Ok(Box::new(f)),
+            Err(e) => {
+                if show_errors(args) {
+                    eprintln!("rsurl: open {path}: {e}");
+                }
+                Err(23)
+            }
+        },
+        _ => Ok(Box::new(io::stdout().lock())),
+    }
+}
+
 /// `-D`/`--dump-header`: write the status line and response headers to `path`
 /// (`-` is stdout), CRLF-terminated, exactly as curl does.
 fn dump_headers(resp: &Response, path: &str) -> io::Result<()> {
@@ -6283,8 +6191,7 @@ fn write_output(resp: &Response, url: &Url, args: &Args) -> io::Result<Option<st
             .remote_header_name
             .then(|| content_disposition_filename(resp))
             .flatten()
-            .map(Ok)
-            .unwrap_or_else(|| remote_name_from_url(url))
+            .map_or_else(|| remote_name_from_url(url), Ok)
             .map_err(|e| io::Error::other(e.to_string()))?;
         to_stdout = false;
         let (file, path) = create_output_file_tracked(&name, args)?;
