@@ -370,10 +370,15 @@ pub(crate) fn build_connect(
         reject_ctl(p, "password")?;
     }
 
-    // Variable header.
-    let mut vh = Vec::new();
-    push_str(&mut vh, "MQTT")?;
-    vh.push(4); // Protocol level: MQTT v3.1.1
+    // Variable header, then payload, in one buffer.
+    let mut body = Vec::with_capacity(
+        10 + 2
+            + client_id.len()
+            + user.map_or(0, |u| 2 + u.len())
+            + pass.map_or(0, |p| 2 + p.len()),
+    );
+    push_str(&mut body, "MQTT")?;
+    body.push(4); // Protocol level: MQTT v3.1.1
     let mut flags: u8 = 0x02; // clean session
     if user.is_some() {
         flags |= 0x80;
@@ -381,35 +386,33 @@ pub(crate) fn build_connect(
     if pass.is_some() {
         flags |= 0x40;
     }
-    vh.push(flags);
-    vh.extend_from_slice(&keep_alive_secs.to_be_bytes());
+    body.push(flags);
+    body.extend_from_slice(&keep_alive_secs.to_be_bytes());
 
     // Payload.
-    let mut pl = Vec::new();
-    push_str(&mut pl, client_id)?;
+    push_str(&mut body, client_id)?;
     if let Some(u) = user {
-        push_str(&mut pl, u)?;
+        push_str(&mut body, u)?;
     }
     if let Some(p) = pass {
-        push_str(&mut pl, p)?;
+        push_str(&mut body, p)?;
     }
 
-    let mut out = Vec::with_capacity(2 + vh.len() + pl.len());
+    let mut out = Vec::with_capacity(5 + body.len());
     out.push(PKT_CONNECT << 4); // 0x10
-    write_remaining_length(&mut out, vh.len() + pl.len())?;
-    out.extend_from_slice(&vh);
-    out.extend_from_slice(&pl);
+    write_remaining_length(&mut out, body.len())?;
+    out.extend_from_slice(&body);
     Ok(out)
 }
 
 /// Build a SUBSCRIBE for a single `topic` at QoS 0.
 pub(crate) fn build_subscribe(packet_id: u16, topic: &str) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
+    let mut body = Vec::with_capacity(2 + 2 + topic.len() + 1);
     body.extend_from_slice(&packet_id.to_be_bytes());
     push_str(&mut body, topic)?;
     body.push(0x00); // QoS 0
 
-    let mut out = Vec::with_capacity(2 + body.len());
+    let mut out = Vec::with_capacity(5 + body.len());
     // SUBSCRIBE requires the lower nibble to be 0b0010 per MQTT v3.1.1 §3.8.1.
     out.push((PKT_SUBSCRIBE << 4) | 0x02); // 0x82
     write_remaining_length(&mut out, body.len())?;
@@ -461,19 +464,20 @@ pub(crate) fn build_publish(
     qos: u8,
     packet_id: u16,
 ) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    push_str(&mut body, topic)?;
-    if qos > 0 {
-        body.extend_from_slice(&packet_id.to_be_bytes());
-    }
-    body.extend_from_slice(payload);
+    // The body length is known up front, so the packet is written straight
+    // into one buffer instead of staging (and copying) the payload.
+    let body_len = 2 + topic.len() + if qos > 0 { 2 } else { 0 } + payload.len();
 
-    let mut out = Vec::with_capacity(2 + body.len());
+    let mut out = Vec::with_capacity(5 + body_len);
     // High nibble = PKT_PUBLISH (3); low nibble carries DUP(8) RETAIN(1) and
     // the 2-bit QoS in bits 1..2. We only ever set QoS.
     out.push((PKT_PUBLISH << 4) | ((qos & 0x03) << 1));
-    write_remaining_length(&mut out, body.len())?;
-    out.extend_from_slice(&body);
+    write_remaining_length(&mut out, body_len)?;
+    push_str(&mut out, topic)?;
+    if qos > 0 {
+        out.extend_from_slice(&packet_id.to_be_bytes());
+    }
+    out.extend_from_slice(payload);
     Ok(out)
 }
 

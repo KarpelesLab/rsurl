@@ -17,10 +17,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Parsed form of the path component of a `dict://` URL.
 ///
-/// The four tuple elements are, in order: the DICT verb to send (`DEFINE`,
-/// `MATCH`, or `SHOW`), the word being looked up (empty for `SHOW`), the
-/// database to query (`*` means "any"), and a strategy name (only used for
-/// `MATCH`, defaults to `.`).
+/// The fields are: the DICT verb to send (`DEFINE`, `MATCH`, or `SHOW`), the
+/// word being looked up (empty for `SHOW`), the database to query (`*` means
+/// "any"), and a strategy name (only used for `MATCH`, defaults to `.`).
 #[derive(Debug, PartialEq, Eq)]
 struct DictRequest {
     verb: Verb,
@@ -211,7 +210,8 @@ fn read_line<R: BufRead>(reader: &mut R) -> Result<String> {
     if buf.len() > MAX_LINE {
         return Err(Error::BadResponse("dict: response line too long".into()));
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// Longest single response line we accept.
@@ -233,18 +233,11 @@ fn read_text_block<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> Result<()> 
         if body == "." {
             return Ok(());
         }
-        // Dot-stuffing: a line beginning with ".." is really "."-prefixed text.
-        let unescaped = body.strip_prefix('.').unwrap_or(body);
-        // Skip the leading-dot only when it was followed by another character
-        // (so that text lines starting with a literal dot survive); a bare "."
-        // was handled above.
-        let to_write = if body.starts_with('.') {
-            unescaped
-        } else {
-            body
-        };
+        // Dot-stuffing: a line beginning with ".." is really "."-prefixed text,
+        // so drop the leading dot (a bare "." was handled above).
+        let to_write = body.strip_prefix('.').unwrap_or(body);
         out.extend_from_slice(to_write.as_bytes());
-        out.extend_from_slice(b"\n");
+        out.push(b'\n');
     }
 }
 

@@ -349,8 +349,8 @@ fn usize_len(n: u64) -> io::Result<usize> {
 /// A no-op if already spilled. The in-memory bytes are only released once the
 /// file holds them all: if creating or filling the file fails, the blob keeps
 /// its memory backing intact instead of losing its contents.
-fn spill_locked(g: &mut RwLockWriteGuard<'_, Backing>, dir: Option<&Path>) -> io::Result<()> {
-    let bytes = match &**g {
+fn spill_locked(backing: &mut Backing, dir: Option<&Path>) -> io::Result<()> {
+    let bytes = match backing {
         Backing::File(_) => return Ok(()),
         Backing::Mem(v) => v,
     };
@@ -358,7 +358,7 @@ fn spill_locked(g: &mut RwLockWriteGuard<'_, Backing>, dir: Option<&Path>) -> io
     if !bytes.is_empty() {
         write_all_at(&file, 0, bytes)?;
     }
-    **g = Backing::File(file);
+    *backing = Backing::File(file);
     Ok(())
 }
 
@@ -466,7 +466,6 @@ fn create_exclusive(path: &Path) -> io::Result<File> {
 /// A name unlikely to collide: pid + monotonically bumped counter + clock. It
 /// exists for at most two syscalls (Unix) or the handle's lifetime (Windows).
 fn unique_name(attempt: u32) -> String {
-    use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

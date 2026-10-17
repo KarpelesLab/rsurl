@@ -8,6 +8,7 @@
 //! userhash is not implemented.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 
 /// Build the `Authorization: Digest ...` value, or `None` if the challenge is
 /// missing required fields. `body` is the request body, hashed only for
@@ -34,15 +35,19 @@ pub(crate) fn authorization(
 /// Whether a `Digest` challenge says the previous nonce merely went stale
 /// (`stale=true`), so the same credentials should be retried with the new one.
 pub(crate) fn is_stale(challenge: &str) -> bool {
-    let body = challenge.trim();
-    let body = body
-        .get(..6)
-        .filter(|s| s.eq_ignore_ascii_case("Digest"))
-        .map(|_| &body[6..])
-        .unwrap_or(body);
+    let body = digest_params(challenge).unwrap_or_else(|| challenge.trim());
     parse_params(body)
         .get("stale")
         .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// The auth-params after a (case-insensitive) `Digest` scheme prefix, or
+/// `None` if the challenge doesn't start with one.
+fn digest_params(challenge: &str) -> Option<&str> {
+    let body = challenge.trim();
+    body.get(..6)
+        .filter(|s| s.eq_ignore_ascii_case("Digest"))
+        .map(|_| &body[6..])
 }
 
 /// Find the `Digest` challenge among a response's `WWW-Authenticate` values. A
@@ -81,7 +86,14 @@ fn quote(v: &str) -> Option<String> {
     if v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
         return None;
     }
-    Some(v.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 fn authorization_with_cnonce(
@@ -93,15 +105,7 @@ fn authorization_with_cnonce(
     challenge: &str,
     cnonce: &str,
 ) -> Option<String> {
-    let body = challenge.trim().strip_prefix("Digest").or_else(|| {
-        // Case-insensitive scheme prefix.
-        challenge
-            .trim()
-            .get(..6)
-            .filter(|s| s.eq_ignore_ascii_case("Digest"))
-            .map(|_| &challenge.trim()[6..])
-    })?;
-    let p = parse_params(body);
+    let p = parse_params(digest_params(challenge)?);
     let realm = p.get("realm")?;
     let nonce = p.get("nonce")?;
     // Fail closed on attacker-controlled challenge values that would break out
@@ -181,15 +185,15 @@ fn authorization_with_cnonce(
         if !is_safe_quoted(opaque) {
             return None;
         }
-        out.push_str(&format!(", opaque=\"{opaque}\""));
+        let _ = write!(out, ", opaque=\"{opaque}\"");
     }
     if raw_alg.is_some() {
         // Echo the algorithm we actually selected (a recognised token), never
         // the raw challenge string.
-        out.push_str(&format!(", algorithm={algorithm}"));
+        let _ = write!(out, ", algorithm={algorithm}");
     }
     if let Some(q) = qop {
-        out.push_str(&format!(", qop={q}, nc={nc}, cnonce=\"{cnonce}\""));
+        let _ = write!(out, ", qop={q}, nc={nc}, cnonce=\"{cnonce}\"");
     }
     Some(out)
 }
@@ -260,7 +264,7 @@ fn is_safe_quoted(v: &str) -> bool {
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }

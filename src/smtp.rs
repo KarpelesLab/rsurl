@@ -209,7 +209,7 @@ fn authenticate<R: Read + Write>(
     let supports = |m: &str| mechs.contains(&m);
     if supports("PLAIN") {
         // AUTH PLAIN: base64("\0user\0pass").
-        let mut raw = Vec::new();
+        let mut raw = Vec::with_capacity(2 + user.len() + pass.len());
         raw.push(0);
         raw.extend_from_slice(user.as_bytes());
         raw.push(0);
@@ -250,6 +250,7 @@ fn read_reply<R: Read + Write>(io: &mut BufReader<R>) -> Result<(u16, String)> {
     const MAX_REPLY_BYTES: usize = 64 * 1024;
     let mut text = String::new();
     let mut total = 0usize;
+    let mut raw = Vec::new();
     loop {
         // Bound each line read: `read_line`/`read_until` are otherwise
         // unbounded, so a server (or MITM on plaintext smtp://) that sends a
@@ -259,7 +260,7 @@ fn read_reply<R: Read + Write>(io: &mut BufReader<R>) -> Result<(u16, String)> {
         // reply budget plus one byte, so we can tell "line is exactly at the
         // limit" from "line overran the limit".
         let line_cap = MAX_REPLY_BYTES - total;
-        let mut raw = Vec::new();
+        raw.clear();
         let n = (&mut *io)
             .take(line_cap as u64 + 1)
             .read_until(b'\n', &mut raw)?;
@@ -302,9 +303,7 @@ fn expect<R: Read + Write>(io: &mut BufReader<R>, want: u16, ctx: &str) -> Resul
 fn dot_stuff(body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 16);
     let mut at_line_start = true;
-    let mut i = 0;
-    while i < body.len() {
-        let b = body[i];
+    for &b in body {
         if at_line_start && b == b'.' {
             out.push(b'.');
         }
@@ -323,7 +322,6 @@ fn dot_stuff(body: &[u8]) -> Vec<u8> {
             out.push(b);
             at_line_start = false;
         }
-        i += 1;
     }
     out
 }

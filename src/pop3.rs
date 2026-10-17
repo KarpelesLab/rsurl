@@ -46,7 +46,25 @@ fn read_status_line<R: BufRead>(io: &mut R) -> Result<String> {
     while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
         buf.pop();
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+/// Interpret a status line: the text after `+OK` (leading space dropped) on
+/// success; `-ERR` and anything else map to `Error::BadResponse`.
+fn parse_status(line: String) -> Result<String> {
+    if let Some(rest) = line.strip_prefix("+OK") {
+        // RFC 1939: "+OK" is followed by optional text, usually after a
+        // single space. Trim that delimiter so callers see only the text.
+        Ok(rest.strip_prefix(' ').unwrap_or(rest).to_string())
+    } else if let Some(rest) = line.strip_prefix("-ERR") {
+        let text = rest.strip_prefix(' ').unwrap_or(rest);
+        Err(Error::BadResponse(format!("pop3: {text}")))
+    } else {
+        Err(Error::BadResponse(format!(
+            "pop3: unexpected status line: {line}"
+        )))
+    }
 }
 
 /// USER + PASS auth, then either LIST mailboxes (if no message number in
@@ -101,17 +119,7 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
 /// the greeting and STLS reply before the `Session` is constructed). Mirrors
 /// [`Session::read_status`].
 fn read_status_buf<R: Read + Write>(io: &mut BufReader<R>) -> Result<String> {
-    let line = read_status_line(io)?;
-    if let Some(rest) = line.strip_prefix("+OK") {
-        Ok(rest.strip_prefix(' ').unwrap_or(rest).to_string())
-    } else if let Some(rest) = line.strip_prefix("-ERR") {
-        let text = rest.strip_prefix(' ').unwrap_or(rest);
-        Err(Error::BadResponse(format!("pop3: {text}")))
-    } else {
-        Err(Error::BadResponse(format!(
-            "pop3: unexpected status line: {line}"
-        )))
-    }
+    parse_status(read_status_line(io)?)
 }
 
 /// Attempt the RFC 2595 `STLS` upgrade on a plaintext connection. Issues
@@ -262,19 +270,7 @@ impl<R: Read + Write> Session<R> {
     /// text after `+OK` (with the leading space dropped) on success, or
     /// maps `-ERR` replies to `Error::BadResponse`.
     fn read_status(&mut self) -> Result<String> {
-        let line = self.read_line()?;
-        if let Some(rest) = line.strip_prefix("+OK") {
-            // RFC 1939: "+OK" is followed by optional text, usually after a
-            // single space. Trim that delimiter so callers see only the text.
-            Ok(rest.strip_prefix(' ').unwrap_or(rest).to_string())
-        } else if let Some(rest) = line.strip_prefix("-ERR") {
-            let text = rest.strip_prefix(' ').unwrap_or(rest);
-            Err(Error::BadResponse(format!("pop3: {text}")))
-        } else {
-            Err(Error::BadResponse(format!(
-                "pop3: unexpected status line: {line}"
-            )))
-        }
+        parse_status(self.read_line()?)
     }
 
     /// Read a multi-line response body terminated by a line containing only
@@ -285,13 +281,14 @@ impl<R: Read + Write> Session<R> {
     /// LIST grammar forbids, so it's a no-op in practice).
     fn read_multiline(&mut self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
+        let mut line = Vec::new();
         loop {
             // Bound each line read: `read_until` is otherwise unbounded, so a
             // server that sends a single line with no `\n` would make us
             // allocate forever. Cap the per-line reader at the remaining
             // response budget plus one byte, so we can distinguish "line is
             // exactly at the limit" from "line overran the limit".
-            let mut line = Vec::new();
+            line.clear();
             let line_cap = MAX_RESPONSE_BYTES - out.len();
             let n = (&mut self.io)
                 .take(line_cap as u64 + 1)

@@ -133,7 +133,7 @@ impl Session {
     /// value)`), read the response, verify its `CSeq` matches the request's,
     /// and reject any non-2xx status. The session's CSeq counter advances by
     /// one on every call.
-    fn request(&mut self, method: &str, extra_headers: &[(&str, String)]) -> Result<RtspResponse> {
+    fn request(&mut self, method: &str, extra_headers: &[(&str, &str)]) -> Result<RtspResponse> {
         let cseq = self.cseq;
         self.cseq += 1;
         let request = build_request(method, &self.uri, cseq, extra_headers);
@@ -181,6 +181,7 @@ impl Session {
             .get_ref()
             .set_read_timeout(Some(INTERLEAVED_IDLE))?;
         let mut total: u64 = 0;
+        let mut payload = Vec::new();
         loop {
             let mut hdr = [0u8; 4];
             if !fill(&mut self.stream, &mut hdr)? {
@@ -190,7 +191,8 @@ impl Session {
                 break; // Not interleaved media; stop.
             }
             let len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-            let mut payload = vec![0u8; len];
+            payload.clear();
+            payload.resize(len, 0);
             if !fill(&mut self.stream, &mut payload)? {
                 break; // Truncated frame — stop.
             }
@@ -210,14 +212,14 @@ impl Session {
 
     /// `DESCRIBE` — fetch the media description (typically SDP).
     pub fn describe(&mut self) -> Result<RtspResponse> {
-        self.request("DESCRIBE", &[("Accept", "application/sdp".to_string())])
+        self.request("DESCRIBE", &[("Accept", "application/sdp")])
     }
 
     /// `SETUP` — establish transport for the stream. Offers
     /// `DEFAULT_TRANSPORT` and captures the `Session` id from the response
     /// (stripping any `;timeout=` parameter) for later requests.
     pub fn setup(&mut self) -> Result<RtspResponse> {
-        let resp = self.request("SETUP", &[("Transport", DEFAULT_TRANSPORT.to_string())])?;
+        let resp = self.request("SETUP", &[("Transport", DEFAULT_TRANSPORT)])?;
         let session = resp
             .header("Session")
             .ok_or_else(|| Error::BadResponse("rtsp: SETUP response missing Session".into()))?;
@@ -232,10 +234,7 @@ impl Session {
         let session = self.session_id.clone().ok_or_else(|| {
             Error::BadResponse("rtsp: PLAY requires a SETUP session first".into())
         })?;
-        self.request(
-            "PLAY",
-            &[("Session", session), ("Range", "npt=0.000-".to_string())],
-        )
+        self.request("PLAY", &[("Session", &session), ("Range", "npt=0.000-")])
     }
 
     /// `TEARDOWN` — release the session. Requires a prior `SETUP`; echoes the
@@ -244,7 +243,7 @@ impl Session {
         let session = self.session_id.clone().ok_or_else(|| {
             Error::BadResponse("rtsp: TEARDOWN requires a SETUP session first".into())
         })?;
-        let resp = self.request("TEARDOWN", &[("Session", session)])?;
+        let resp = self.request("TEARDOWN", &[("Session", &session)])?;
         self.session_id = None;
         Ok(resp)
     }
@@ -363,7 +362,7 @@ fn request_uri(url: &Url) -> String {
 /// `CSeq` and `User-Agent` are always emitted; callers pass method-specific
 /// headers (`Accept`, `Transport`, `Session`, `Range`, ...) via
 /// `extra_headers`.
-fn build_request(method: &str, uri: &str, cseq: u32, extra_headers: &[(&str, String)]) -> String {
+fn build_request(method: &str, uri: &str, cseq: u32, extra_headers: &[(&str, &str)]) -> String {
     let mut req = format!(
         "{method} {uri} RTSP/1.0\r\n\
          CSeq: {cseq}\r\n"
@@ -422,7 +421,8 @@ fn read_capped_line<R: BufRead>(r: &mut R, cap: usize) -> Result<String> {
     if buf.len() > cap {
         return Err(Error::BadResponse("headers exceed 64 KiB".into()));
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
 }
 
 /// Read a full RTSP response from `r`: the status line, the headers (until the
@@ -528,7 +528,7 @@ mod tests {
             "DESCRIBE",
             "rtsp://example.com/foo",
             1,
-            &[("Accept", "application/sdp".to_string())],
+            &[("Accept", "application/sdp")],
         );
         assert!(req.starts_with("DESCRIBE rtsp://example.com/foo RTSP/1.0\r\n"));
         assert!(req.contains("\r\nCSeq: 1\r\n"));
@@ -552,7 +552,7 @@ mod tests {
             "SETUP",
             "rtsp://h/s",
             2,
-            &[("Transport", DEFAULT_TRANSPORT.to_string())],
+            &[("Transport", DEFAULT_TRANSPORT)],
         );
         assert!(req.starts_with("SETUP rtsp://h/s RTSP/1.0\r\n"));
         assert!(req.contains("\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"));
@@ -564,10 +564,7 @@ mod tests {
             "PLAY",
             "rtsp://h/s",
             3,
-            &[
-                ("Session", "ABC123".to_string()),
-                ("Range", "npt=0.000-".to_string()),
-            ],
+            &[("Session", "ABC123"), ("Range", "npt=0.000-")],
         );
         assert!(req.contains("\r\nSession: ABC123\r\n"));
         assert!(req.contains("\r\nRange: npt=0.000-\r\n"));

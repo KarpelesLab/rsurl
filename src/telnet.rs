@@ -121,12 +121,13 @@ pub(crate) fn run(url: &Url, input: &[u8], cfg: &NetConfig) -> Result<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
     let mut parser = Parser::new();
+    let mut replies: Vec<u8> = Vec::new();
     loop {
         let n = sock.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        let mut replies: Vec<u8> = Vec::new();
+        replies.clear();
         parser.feed(&buf[..n], &mut out, &mut replies);
         if !replies.is_empty() {
             sock.write_all(&replies)?;

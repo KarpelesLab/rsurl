@@ -76,12 +76,18 @@ fn build_wrq(filename: &str) -> Vec<u8> {
 }
 
 /// Build a DATA packet: `\x00\x03<2-byte block#><payload>`.
+#[cfg(test)]
 fn build_data(block: u16, payload: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(4 + payload.len());
-    p.extend_from_slice(&OP_DATA.to_be_bytes());
-    p.extend_from_slice(&block.to_be_bytes());
-    p.extend_from_slice(payload);
+    write_data(&mut p, block, payload);
     p
+}
+
+/// Append a DATA packet (`\x00\x03<2-byte block#><payload>`) to `out`.
+fn write_data(out: &mut Vec<u8>, block: u16, payload: &[u8]) {
+    out.extend_from_slice(&OP_DATA.to_be_bytes());
+    out.extend_from_slice(&block.to_be_bytes());
+    out.extend_from_slice(payload);
 }
 
 /// Build an ACK packet: `\x00\x04<2-byte block#>`.
@@ -302,7 +308,8 @@ pub(crate) fn fetch_with(url: &Url, cfg: &crate::net::NetConfig) -> Result<Vec<u
                 }
 
                 // Prepare to retransmit this ACK if the next DATA times out.
-                last_packet = ack.to_vec();
+                last_packet.clear();
+                last_packet.extend_from_slice(&ack);
                 last_dest = from;
                 retries = 0;
 
@@ -458,13 +465,14 @@ pub(crate) fn store_with(url: &Url, data: &[u8], cfg: &crate::net::NetConfig) ->
 
                 let end = (next_offset + BLOCK_SIZE).min(data.len());
                 let payload = &data[next_offset..end];
-                let dgram = build_data(next_block, payload);
-                socket.send_to(&dgram, from)?;
+                // The DATA packet doubles as the retransmit buffer.
+                last_packet.clear();
+                write_data(&mut last_packet, next_block, payload);
+                socket.send_to(&last_packet, from)?;
 
                 block = next_block;
                 blocks_sent += 1;
                 sent_final = payload.len() < BLOCK_SIZE;
-                last_packet = dgram;
                 last_dest = from;
                 retries = 0;
             }

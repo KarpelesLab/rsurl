@@ -10,6 +10,8 @@
 //! `host:port` authority actually sent, the effective method, and each
 //! redirect hop — like curl, which signs every request it sends.
 
+use std::fmt::Write;
+
 use crate::digest::hex;
 use purecrypto::hash::{sha256, HmacSha256};
 
@@ -64,20 +66,11 @@ impl SigV4Spec {
     /// `(region, service)` from the spec, defaulting to the host's 2nd/1st
     /// labels (else `us-east-1`/`s3`), as curl does.
     pub(crate) fn region_service(&self, host: &str) -> (String, String) {
-        let parts: Vec<&str> = self.spec.split(':').collect();
-        let labels: Vec<&str> = host.split('.').collect();
-        let region = parts
-            .get(2)
-            .filter(|s| !s.is_empty())
-            .copied()
-            .or_else(|| labels.get(1).copied())
+        let part = |i| self.spec.split(':').nth(i).filter(|s| !s.is_empty());
+        let region = part(2)
+            .or_else(|| host.split('.').nth(1))
             .unwrap_or("us-east-1");
-        let service = parts
-            .get(3)
-            .filter(|s| !s.is_empty())
-            .copied()
-            .or_else(|| labels.first().copied())
-            .unwrap_or("s3");
+        let service = part(3).or_else(|| host.split('.').next()).unwrap_or("s3");
         (region.to_string(), service.to_string())
     }
 }
@@ -90,8 +83,8 @@ pub(crate) struct SigV4<'a> {
     pub service: &'a str,
 }
 
-fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    HmacSha256::mac(key, data).as_ref().to_vec()
+fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
+    HmacSha256::mac(key, data)
 }
 
 /// AWS `UriEncode`: every byte except the unreserved set `A-Za-z0-9-_.~` is
@@ -104,7 +97,7 @@ fn aws_uri_encode(bytes: &[u8], keep_slash: bool, out: &mut String) {
         {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
     }
 }
@@ -148,11 +141,16 @@ fn canonical_query(query: &str) -> String {
         })
         .collect();
     pairs.sort();
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&")
+    let mut out = String::new();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+    }
+    out
 }
 
 /// Canonical URI path. S3 signs the path as sent (single encoding, no
