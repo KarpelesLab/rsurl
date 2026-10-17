@@ -298,6 +298,14 @@ unsafe fn opt_string(value: usize) -> Option<String> {
     }
 }
 
+unsafe fn opt_write_cb(value: usize) -> Option<WriteCb> {
+    if value == 0 {
+        None
+    } else {
+        Some(std::mem::transmute::<usize, WriteCb>(value))
+    }
+}
+
 /// `CURLcode curl_easy_setopt(CURL*, CURLoption, ...)`.
 ///
 /// Implemented non-variadic: the single third argument is taken as `usize` and
@@ -370,18 +378,14 @@ pub unsafe extern "C" fn curl_easy_setopt(
             }
             CURLOPT_COPYPOSTFIELDS => {
                 let p = value as *const u8;
-                let len = h.post_len.unwrap_or_else(|| {
-                    if p.is_null() {
-                        0
-                    } else {
-                        CStr::from_ptr(p as *const c_char).to_bytes().len()
-                    }
-                });
-                h.post_copy = if p.is_null() {
-                    Some(Vec::new())
+                h.post_copy = Some(if p.is_null() {
+                    Vec::new()
                 } else {
-                    Some(std::slice::from_raw_parts(p, len).to_vec())
-                };
+                    let len = h
+                        .post_len
+                        .unwrap_or_else(|| CStr::from_ptr(p as *const c_char).to_bytes().len());
+                    std::slice::from_raw_parts(p, len).to_vec()
+                });
                 h.post_ptr = ptr::null();
                 h.post = true;
             }
@@ -393,20 +397,8 @@ pub unsafe extern "C" fn curl_easy_setopt(
             CURLOPT_ERRORBUFFER => h.error_buffer = value as *mut c_char,
             CURLOPT_PRIVATE => h.private = value as *mut c_void,
             // --- functions ---
-            CURLOPT_WRITEFUNCTION => {
-                h.write_fn = if value == 0 {
-                    None
-                } else {
-                    Some(std::mem::transmute::<usize, WriteCb>(value))
-                }
-            }
-            CURLOPT_HEADERFUNCTION => {
-                h.header_fn = if value == 0 {
-                    None
-                } else {
-                    Some(std::mem::transmute::<usize, WriteCb>(value))
-                }
-            }
+            CURLOPT_WRITEFUNCTION => h.write_fn = opt_write_cb(value),
+            CURLOPT_HEADERFUNCTION => h.header_fn = opt_write_cb(value),
             // --- longs / enums ---
             CURLOPT_FOLLOWLOCATION => h.follow = lv != 0,
             CURLOPT_MAXREDIRS => h.max_redirs = if lv < 0 { None } else { Some(lv as u32) },
@@ -519,18 +511,18 @@ pub fn build_request(h: &EasyHandle) -> Result<Request, CURLcode> {
     let url = h.url.as_deref().ok_or(CURLE_URL_MALFORMAT)?;
 
     let method = if let Some(m) = &h.custom_request {
-        m.clone()
+        m.as_str()
     } else if h.nobody {
-        "HEAD".to_string()
+        "HEAD"
     } else if h.upload {
-        "PUT".to_string()
+        "PUT"
     } else if h.post || !h.post_ptr.is_null() || h.post_copy.is_some() {
-        "POST".to_string()
+        "POST"
     } else {
-        "GET".to_string()
+        "GET"
     };
 
-    let mut req = Request::new(&method, url).map_err(|e| map_error(&e))?;
+    let mut req = Request::new(method, url).map_err(|e| map_error(&e))?;
     req = req.verify_tls(h.verify_peer);
     if h.follow {
         req = req.follow_redirects(true);
@@ -563,16 +555,16 @@ pub fn build_request(h: &EasyHandle) -> Result<Request, CURLcode> {
     if let Some(up) = &h.userpwd {
         let (u, p) = split_userpwd(up);
         req = if use_digest {
-            req.digest_auth(true).basic_auth(&u, &p)
+            req.digest_auth(true).basic_auth(u, p)
         } else {
-            req.basic_auth(&u, &p)
+            req.basic_auth(u, p)
         };
     } else if let Some(u) = &h.username {
-        let p = h.password.clone().unwrap_or_default();
+        let p = h.password.as_deref().unwrap_or("");
         req = if use_digest {
-            req.digest_auth(true).basic_auth(u, &p)
+            req.digest_auth(true).basic_auth(u, p)
         } else {
-            req.basic_auth(u, &p)
+            req.basic_auth(u, p)
         };
     }
     // libcurl: a CURLOPT_HTTPHEADER entry naming a header libcurl would
@@ -711,12 +703,12 @@ pub fn build_request(h: &EasyHandle) -> Result<Request, CURLcode> {
     // --resolve / --connect-to.
     for line in slist_lines(h.resolve) {
         if let Some((host, port, ip)) = parse_resolve(&line) {
-            req = req.resolve_addr(&host, port, ip);
+            req = req.resolve_addr(host, port, ip);
         }
     }
     for line in slist_lines(h.connect_to) {
         if let Some((fh, fp, th, tp)) = parse_connect_to(&line) {
-            req = req.connect_to(&fh, fp, &th, tp);
+            req = req.connect_to(fh, fp, th, tp);
         }
     }
 
@@ -745,21 +737,24 @@ pub fn build_request(h: &EasyHandle) -> Result<Request, CURLcode> {
 pub fn deliver(h: &mut EasyHandle, resp: Response) -> CURLcode {
     // FAILONERROR: a >= 400 status is an error and the body is not delivered.
     if h.failonerror && resp.status >= 400 {
-        let code = CURLE_HTTP_RETURNED_ERROR;
         set_error_buffer(h, "The requested URL returned error");
         h.last = Some(resp);
-        return code;
+        return CURLE_HTTP_RETURNED_ERROR;
     }
 
     // Header block: status line, each header, terminating CRLF.
     if h.header_fn.is_some() || !h.header_data.is_null() || h.header_in_body {
-        let mut block: Vec<u8> = Vec::new();
-        let status_line = format!("{} {} {}\r\n", resp.version, resp.status, resp.reason);
-        block.extend_from_slice(status_line.as_bytes());
+        use std::fmt::Write;
+        let mut block = String::with_capacity(header_block_len(&resp));
+        let _ = write!(
+            block,
+            "{} {} {}\r\n",
+            resp.version, resp.status, resp.reason
+        );
         for (k, v) in &resp.headers {
-            block.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+            let _ = write!(block, "{k}: {v}\r\n");
         }
-        block.extend_from_slice(b"\r\n");
+        block.push_str("\r\n");
 
         // libcurl delivers headers one line at a time: to HEADERFUNCTION, else
         // (when only HEADERDATA is set) through the write function with
@@ -773,13 +768,13 @@ pub fn deliver(h: &mut EasyHandle, resp: Response) -> CURLcode {
             None => None,
         };
         if let Some((cb, data)) = header_sink {
-            for line in split_keep_crlf(&block) {
+            for line in block.as_bytes().split_inclusive(|&b| b == b'\n') {
                 if !invoke(cb, line, data) {
                     return CURLE_WRITE_ERROR;
                 }
             }
         }
-        if h.header_in_body && !write_body(h, &block) {
+        if h.header_in_body && !write_body(h, block.as_bytes()) {
             return CURLE_WRITE_ERROR;
         }
     }
@@ -838,21 +833,6 @@ fn invoke(cb: WriteCb, data: &[u8], userdata: *mut c_void) -> bool {
     // (ptr, size=1, nmemb=len) per the libcurl callback contract.
     let n = unsafe { cb(data.as_ptr() as *mut c_char, 1, data.len(), userdata) };
     n == data.len()
-}
-
-fn split_keep_crlf(block: &[u8]) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    for i in 0..block.len() {
-        if block[i] == b'\n' {
-            out.push(&block[start..=i]);
-            start = i + 1;
-        }
-    }
-    if start < block.len() {
-        out.push(&block[start..]);
-    }
-    out
 }
 
 fn set_error_buffer(h: &EasyHandle, msg: &str) {
@@ -953,34 +933,24 @@ pub unsafe extern "C" fn curl_easy_getinfo(
             }
             CURLINFO_PRIVATE => *(out as *mut *mut c_void) = h.private,
             CURLINFO_EFFECTIVE_URL => {
-                let s = resp
-                    .map(|r| {
-                        if r.final_url.is_empty() {
-                            h.url.clone().unwrap_or_default()
-                        } else {
-                            r.final_url.clone()
-                        }
-                    })
-                    .unwrap_or_else(|| h.url.clone().unwrap_or_default());
+                let s = match resp {
+                    Some(r) if !r.final_url.is_empty() => r.final_url.as_str(),
+                    _ => h.url.as_deref().unwrap_or_default(),
+                };
                 h.info_effective_url = CString::new(s).ok();
                 *(out as *mut *const c_char) = h
                     .info_effective_url
                     .as_ref()
-                    .map(|c| c.as_ptr())
-                    .unwrap_or(ptr::null());
+                    .map_or(ptr::null(), |c| c.as_ptr());
             }
             CURLINFO_CONTENT_TYPE => {
                 let ct = resp
                     .and_then(|r| r.header("content-type"))
-                    .map(|s| s.to_string());
-                match ct.and_then(|s| CString::new(s).ok()) {
-                    Some(c) => {
-                        h.info_content_type = Some(c);
-                        *(out as *mut *const c_char) =
-                            h.info_content_type.as_ref().unwrap().as_ptr();
-                    }
-                    None => *(out as *mut *const c_char) = ptr::null(),
-                }
+                    .and_then(|s| CString::new(s).ok());
+                *(out as *mut *const c_char) = match ct {
+                    Some(c) => h.info_content_type.insert(c).as_ptr(),
+                    None => ptr::null(),
+                };
             }
             CURLINFO_SIZE_DOWNLOAD => {
                 *(out as *mut f64) = resp.map(|r| r.body.len() as f64).unwrap_or(0.0);
@@ -1067,33 +1037,26 @@ fn http_version_code(version: &str) -> c_long {
 // helpers
 // ---------------------------------------------------------------------------
 
-fn split_userpwd(s: &str) -> (String, String) {
-    match s.split_once(':') {
-        Some((u, p)) => (u.to_string(), p.to_string()),
-        None => (s.to_string(), String::new()),
-    }
+fn split_userpwd(s: &str) -> (&str, &str) {
+    s.split_once(':').unwrap_or((s, ""))
 }
 
-fn parse_resolve(line: &str) -> Option<(String, u16, std::net::IpAddr)> {
+fn parse_resolve(line: &str) -> Option<(&str, u16, std::net::IpAddr)> {
     // "[+]HOST:PORT:ADDR[,ADDR...]" — take the first address.
     let line = line.trim_start_matches(['+', '-']);
     let mut it = line.splitn(3, ':');
-    let host = it.next()?.to_string();
+    let host = it.next()?;
     let port: u16 = it.next()?.parse().ok()?;
     let addr = it.next()?.split(',').next()?.trim_matches(['[', ']']);
     let ip: std::net::IpAddr = addr.parse().ok()?;
     Some((host, port, ip))
 }
 
-fn parse_connect_to(line: &str) -> Option<(String, u16, String, u16)> {
+fn parse_connect_to(line: &str) -> Option<(&str, u16, &str, u16)> {
     // "HOST:PORT:CONNECT-TO-HOST:CONNECT-TO-PORT" (empty fields = wildcard).
-    let parts: Vec<&str> = line.splitn(4, ':').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    let fp = parts[1].parse().unwrap_or(0);
-    let tp = parts[3].parse().unwrap_or(0);
-    Some((parts[0].to_string(), fp, parts[2].to_string(), tp))
+    let mut it = line.splitn(4, ':');
+    let (fh, fp, th, tp) = (it.next()?, it.next()?, it.next()?, it.next()?);
+    Some((fh, fp.parse().unwrap_or(0), th, tp.parse().unwrap_or(0)))
 }
 
 /// Map an `rsurl::Error` to the closest `CURLcode`.

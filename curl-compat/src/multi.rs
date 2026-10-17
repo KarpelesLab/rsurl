@@ -85,13 +85,12 @@ impl MultiState {
     /// Drain finished transfers, firing each easy handle's callbacks here.
     fn drain(&mut self) {
         while let Some((id, result)) = self.inner.next_completed() {
-            if let Some(&easy) = self.id_to_easy.get(&id) {
+            if let Some(easy) = self.id_to_easy.remove(&id) {
                 let code = match result {
                     Ok(resp) => deliver_ptr(easy, resp),
                     Err(e) => map_error(&e),
                 };
                 self.done.push_back((easy, code));
-                self.id_to_easy.remove(&id);
             }
         }
     }
@@ -194,7 +193,7 @@ pub unsafe extern "C" fn curl_multi_poll(
         };
         let ready = st.inner.poll(timeout);
         if !numfds.is_null() {
-            *numfds = if ready { 1 } else { 0 };
+            *numfds = c_int::from(ready);
         }
         CURLM_OK
     })
@@ -224,24 +223,20 @@ pub unsafe extern "C" fn curl_multi_info_read(
         let Some(st) = as_state(multi) else {
             return ptr::null_mut();
         };
-        match st.done.pop_front() {
+        let next = st.done.pop_front();
+        if !msgs_in_queue.is_null() {
+            *msgs_in_queue = st.done.len() as c_int;
+        }
+        match next {
             Some((easy, code)) => {
                 st.msg_slot = CURLMsg {
                     msg: CURLMSG_DONE,
                     easy_handle: easy,
                     data: CURLMsgData { result: code },
                 };
-                if !msgs_in_queue.is_null() {
-                    *msgs_in_queue = st.done.len() as c_int;
-                }
                 &mut st.msg_slot as *mut CURLMsg
             }
-            None => {
-                if !msgs_in_queue.is_null() {
-                    *msgs_in_queue = 0;
-                }
-                ptr::null_mut()
-            }
+            None => ptr::null_mut(),
         }
     })
 }

@@ -146,10 +146,7 @@ pub unsafe extern "C" fn curl_slist_append(
             return list;
         }
         // Duplicate the string with Rust's allocator (freed in free_all).
-        let bytes = CStr::from_ptr(string).to_bytes();
-        let Ok(data) = CString::new(bytes) else {
-            return list; // interior NUL — reject, matching libcurl's strdup
-        };
+        let data = CStr::from_ptr(string).to_owned();
         let node = Box::into_raw(Box::new(curl_slist {
             data: data.into_raw(),
             next: ptr::null_mut(),

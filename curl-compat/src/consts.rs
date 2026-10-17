@@ -4,7 +4,7 @@
 
 #![allow(non_upper_case_globals)]
 
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_long};
 
 /// `CURLcode` — easy-interface result codes (subset; the common ones).
 pub type CURLcode = c_int;
@@ -57,11 +57,11 @@ pub const CURLM_UNKNOWN_OPTION: CURLMcode = 6;
 pub const CURLM_ADDED_ALREADY: CURLMcode = 7;
 
 /// `curl_global_init` flags.
-pub const CURL_GLOBAL_NOTHING: std::os::raw::c_long = 0;
-pub const CURL_GLOBAL_SSL: std::os::raw::c_long = 1 << 0;
-pub const CURL_GLOBAL_WIN32: std::os::raw::c_long = 1 << 1;
-pub const CURL_GLOBAL_ALL: std::os::raw::c_long = CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32;
-pub const CURL_GLOBAL_DEFAULT: std::os::raw::c_long = CURL_GLOBAL_ALL;
+pub const CURL_GLOBAL_NOTHING: c_long = 0;
+pub const CURL_GLOBAL_SSL: c_long = 1 << 0;
+pub const CURL_GLOBAL_WIN32: c_long = 1 << 1;
+pub const CURL_GLOBAL_ALL: c_long = CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32;
+pub const CURL_GLOBAL_DEFAULT: c_long = CURL_GLOBAL_ALL;
 
 /// `curl_version_info` feature bits (the ones we report).
 pub const CURL_VERSION_SSL: c_int = 1 << 2;
@@ -250,5 +250,3 @@ pub const CURLINFO_APPCONNECT_TIME_T: c_int = CURLINFO_OFF_T + 56;
 // CURLAUTH bitmask (for HTTPAUTH); we recognize BASIC and DIGEST.
 pub const CURLAUTH_BASIC: c_long = 1 << 0;
 pub const CURLAUTH_DIGEST: c_long = 1 << 1;
-
-use std::os::raw::c_long;
