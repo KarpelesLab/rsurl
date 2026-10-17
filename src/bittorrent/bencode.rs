@@ -140,10 +140,50 @@ impl<'a> Decoder<'a> {
             }
             let key = self.byte_string()?;
             let start = self.pos;
-            let _ = self.value()?;
-            let end = self.pos;
-            out.push((key, start..end));
+            self.skip_value(0)?;
+            out.push((key, start..self.pos));
         }
+    }
+
+    /// Advance past one complete value without building it, applying the
+    /// same validation as [`value`](Self::value).
+    fn skip_value(&mut self, depth: usize) -> Result<()> {
+        if depth > MAX_DEPTH {
+            return Err(err("nesting too deep"));
+        }
+        match self.peek()? {
+            b'i' => {
+                self.integer()?;
+            }
+            b'l' => {
+                self.pos += 1; // 'l'
+                while self.peek()? != b'e' {
+                    self.skip_value(depth + 1)?;
+                }
+                self.pos += 1;
+            }
+            b'd' => {
+                self.pos += 1; // 'd'
+                let buf = self.buf;
+                let mut keys = std::collections::BTreeSet::new();
+                while self.peek()? != b'e' {
+                    if !self.peek()?.is_ascii_digit() {
+                        return Err(err("dict key is not a byte string"));
+                    }
+                    let key = &buf[self.byte_string_span()?];
+                    self.skip_value(depth + 1)?;
+                    if !keys.insert(key) {
+                        return Err(err("duplicate dict key"));
+                    }
+                }
+                self.pos += 1;
+            }
+            b'0'..=b'9' => {
+                self.byte_string_span()?;
+            }
+            other => return Err(err(&format!("unexpected byte 0x{other:02x}"))),
+        }
+        Ok(())
     }
 
     fn integer(&mut self) -> Result<Value> {
@@ -156,9 +196,8 @@ impl<'a> Decoder<'a> {
         let digits = s.strip_prefix('-').unwrap_or(s);
         if digits.is_empty()
             || !digits.bytes().all(|b| b.is_ascii_digit())
+            || (digits.starts_with('0') && digits.len() > 1)
             || s == "-0"
-            || (s.starts_with('0') && s.len() > 1)
-            || s.starts_with("-0")
         {
             return Err(err("malformed integer"));
         }
@@ -169,6 +208,12 @@ impl<'a> Decoder<'a> {
 
     /// Parse a `<len>:<bytes>` byte string and return its bytes.
     pub fn byte_string(&mut self) -> Result<Vec<u8>> {
+        let span = self.byte_string_span()?;
+        Ok(self.buf[span].to_vec())
+    }
+
+    /// Parse a `<len>:<bytes>` byte string, returning the range of its bytes.
+    fn byte_string_span(&mut self) -> Result<std::ops::Range<usize>> {
         let colon = self.find(b':')?;
         let len_s =
             std::str::from_utf8(&self.buf[self.pos..colon]).map_err(|_| err("bad length"))?;
@@ -192,7 +237,7 @@ impl<'a> Decoder<'a> {
             return Err(err("string runs past end"));
         }
         self.pos = end;
-        Ok(self.buf[start..end].to_vec())
+        Ok(start..end)
     }
 
     fn list(&mut self, depth: usize) -> Result<Value> {
@@ -255,15 +300,14 @@ pub fn encode(v: &Value) -> Vec<u8> {
 }
 
 pub fn encode_into(v: &Value, out: &mut Vec<u8>) {
+    use std::io::Write;
     match v {
+        // Writes to a `Vec` cannot fail.
         Value::Int(i) => {
-            out.push(b'i');
-            out.extend_from_slice(i.to_string().as_bytes());
-            out.push(b'e');
+            let _ = write!(out, "i{i}e");
         }
         Value::Bytes(b) => {
-            out.extend_from_slice(b.len().to_string().as_bytes());
-            out.push(b':');
+            let _ = write!(out, "{}:", b.len());
             out.extend_from_slice(b);
         }
         Value::List(l) => {
@@ -276,8 +320,7 @@ pub fn encode_into(v: &Value, out: &mut Vec<u8>) {
         Value::Dict(d) => {
             out.push(b'd');
             for (k, val) in d {
-                out.extend_from_slice(k.len().to_string().as_bytes());
-                out.push(b':');
+                let _ = write!(out, "{}:", k.len());
                 out.extend_from_slice(k);
                 encode_into(val, out);
             }
@@ -339,6 +382,27 @@ mod tests {
         assert_eq!(v.get(b"a").and_then(Value::as_int), Some(2));
         assert_eq!(v.get(b"b").and_then(Value::as_int), Some(1));
         assert_eq!(encode(&v), b"d1:ai2e1:bi1ee");
+    }
+
+    /// `dict_entry_spans` validates nested values as strictly as `parse`.
+    #[test]
+    fn entry_spans_match_values_and_validate() {
+        let input = b"d1:ad1:xli1e2:abe1:yi-3ee4:infod1:ki1eee";
+        let spans = Decoder::new(input).dict_entry_spans().unwrap();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&input[spans[1].1.clone()], b"d1:ki1ee");
+        for bad in [
+            &b"d1:ad1:ki1e1:ki2eee"[..], // nested duplicate key
+            b"d1:ali01eee",              // nested leading zero
+            b"d1:ai1e",                  // unterminated
+            b"d1:ad1:kee",               // missing value
+        ] {
+            assert!(
+                Decoder::new(bad).dict_entry_spans().is_err(),
+                "should reject {:?}",
+                bad
+            );
+        }
     }
 
     #[test]

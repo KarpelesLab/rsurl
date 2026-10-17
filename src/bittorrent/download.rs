@@ -115,34 +115,35 @@ pub fn download(
         opts.peer_id
     };
     let num_pieces = meta.num_pieces();
-    let single = layout.len() == 1;
+    let layout_len = layout.len();
+    let single = layout_len == 1;
 
     // Where the data is written, where resume state lives, and (single-file)
     // the final name to rename to on completion.
     //  - single-file: data + in-file trailer in `<final>.rsurlpart`.
     //  - multi-file:  data at the final paths; state in `<topdir>/.rsurlpart`.
-    let (final_single, storage_layout, state_path) = if single {
-        let (final_path, len) = layout[0].clone();
-        let part = resume::part_path(&final_path);
-        (Some(final_path), vec![(part.clone(), len)], part)
+    let (final_single, storage_layout, state_path) = if let [(final_path, len)] = &layout[..] {
+        let part = resume::part_path(final_path);
+        (Some(final_path.clone()), vec![(part.clone(), *len)], part)
     } else {
         let sidecar = topdir(&layout, &meta.name).join(".rsurlpart");
         // A torrent file at the sidecar's own path would be clobbered by the
         // resume state and then deleted on completion. Compared
         // case-insensitively (Windows / macOS default filesystems).
         let lower = |p: &Path| p.to_string_lossy().to_ascii_lowercase();
-        if layout.iter().any(|(p, _)| lower(p) == lower(&sidecar)) {
+        let sidecar_lower = lower(&sidecar);
+        if layout.iter().any(|(p, _)| lower(p) == sidecar_lower) {
             return Err(crate::error::Error::BadResponse(
                 "bittorrent: torrent contains a file named like the resume sidecar (.rsurlpart)"
                     .into(),
             ));
         }
-        (None, layout.clone(), sidecar)
+        (None, layout, sidecar)
     };
     let real_size = if single { meta.total_length } else { 0 };
 
     let mut storage = Storage::create(storage_layout, meta.piece_length, meta.pieces.clone())?;
-    mark_padding(&mut storage, meta, layout.len());
+    mark_padding(&mut storage, meta, layout_len);
 
     // Resume: rebuild the completion bitfield. `--recheck` re-hashes the
     // on-disk data; otherwise we trust a matching saved bitfield.
@@ -161,10 +162,9 @@ pub fn download(
 
     // Periodic state persistence (engine calls this on its ~2 s tick).
     let info_hash = meta.info_hash;
-    let save_path = state_path.clone();
     let mut save = |bf: &Bitfield| {
         let _ = resume::write_state(
-            &save_path,
+            &state_path,
             real_size,
             resume::Kind::Torrent,
             &encode_meta(info_hash, bf),

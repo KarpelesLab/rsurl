@@ -60,7 +60,7 @@ pub fn run(
 ) -> Result<Stats> {
     let info_hash = meta.info_hash;
     let num_pieces = meta.num_pieces();
-    let complete_bf = storage.bitfield().as_bytes().to_vec();
+    let complete_bf: Arc<[u8]> = storage.bitfield().as_bytes().into();
     let storage = Arc::new(Mutex::new(storage));
     let uploaded = Arc::new(AtomicU64::new(stats.uploaded));
     let peer_timeout = opts.peer_timeout;
@@ -105,7 +105,7 @@ pub fn run(
                 let _ = stream.set_nonblocking(false);
                 let storage = Arc::clone(&storage);
                 let uploaded = Arc::clone(&uploaded);
-                let bf = complete_bf.clone();
+                let bf = Arc::clone(&complete_bf);
                 std::thread::spawn(move || {
                     let _slot = slot;
                     let _ = serve(

@@ -141,13 +141,12 @@ pub fn fetch_info(
     let mut info = Vec::new();
     for piece in 0..num_pieces {
         peer::write_message(&mut sock, &request_piece(peer_ut_id, piece))?;
-        let data = read_piece_data(&mut sock, piece, Instant::now() + peer_timeout)?;
+        let got = read_piece_data(&mut sock, piece, Instant::now() + peer_timeout, &mut info)?;
         // BEP 9: every piece is exactly 16 KiB except the last.
         let expected = METADATA_PIECE.min(size - piece * METADATA_PIECE);
-        if data.len() != expected {
+        if got != expected {
             return Err(merr("metadata piece has the wrong size"));
         }
-        info.extend_from_slice(&data);
     }
     debug_assert_eq!(info.len(), size);
     if sha1(&info) != info_hash {
@@ -206,15 +205,23 @@ fn read_peer_handshake<R: Read>(r: &mut R, deadline: Instant) -> Result<(u8, usi
             if size < 0 {
                 return Err(merr("negative metadata_size"));
             }
-            return Ok((ut_id as u8, size as usize));
+            // Saturate (rather than truncate on 32-bit) so the caller's
+            // MAX_METADATA check rejects an absurd size.
+            return Ok((ut_id as u8, usize::try_from(size).unwrap_or(usize::MAX)));
         }
         // Bitfield/have/choke and other setup traffic: ignored.
     }
 }
 
-/// Read messages until a `ut_metadata` data reply for `piece`, returning the
-/// raw piece bytes (the part after the bencoded header dict).
-fn read_piece_data<R: Read>(r: &mut R, piece: usize, deadline: Instant) -> Result<Vec<u8>> {
+/// Read messages until a `ut_metadata` data reply for `piece`, appending the
+/// raw piece bytes (the part after the bencoded header dict) to `out` and
+/// returning how many were appended.
+fn read_piece_data<R: Read>(
+    r: &mut R,
+    piece: usize,
+    deadline: Instant,
+    out: &mut Vec<u8>,
+) -> Result<usize> {
     loop {
         if Instant::now() >= deadline {
             return Err(merr("timed out waiting for a metadata piece"));
@@ -238,7 +245,8 @@ fn read_piece_data<R: Read>(r: &mut R, piece: usize, deadline: Instant) -> Resul
                     if pcs != piece as i64 {
                         return Err(merr("peer sent the wrong metadata piece"));
                     }
-                    return Ok(body.to_vec());
+                    out.extend_from_slice(body);
+                    return Ok(body.len());
                 }
                 2 => return Err(merr("peer rejected the metadata request")),
                 _ => {} // 0 (request) or unknown: keep reading
@@ -284,7 +292,9 @@ mod tests {
         };
         let mut buf = Vec::new();
         peer::write_message(&mut buf, &msg).unwrap();
-        let data = read_piece_data(&mut Cursor::new(buf), 0, far()).unwrap();
+        let mut data = Vec::new();
+        let n = read_piece_data(&mut Cursor::new(buf), 0, far(), &mut data).unwrap();
+        assert_eq!(n, 5);
         assert_eq!(data, b"hello");
     }
 
@@ -300,7 +310,13 @@ mod tests {
         for _ in 0..100 {
             peer::write_message(&mut buf, &Message::KeepAlive).unwrap();
         }
-        let e = read_piece_data(&mut Cursor::new(buf.clone()), 0, Instant::now()).unwrap_err();
+        let e = read_piece_data(
+            &mut Cursor::new(buf.clone()),
+            0,
+            Instant::now(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e}");
         let e = read_peer_handshake(&mut Cursor::new(buf), Instant::now()).unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e}");

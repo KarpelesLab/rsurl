@@ -6,7 +6,7 @@
 //! — we do not maintain a persistent routing table or answer incoming queries.
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use purecrypto::rng::{OsRng, RngCore};
@@ -228,11 +228,10 @@ fn parse_response(buf: &[u8], txn: &[u8]) -> Option<Reply> {
     let mut nodes = Vec::new();
     if let Some(b) = r.get(b"nodes").and_then(Value::as_bytes) {
         for c in b.as_chunks::<26>().0 {
-            let mut id = [0u8; 20];
-            id.copy_from_slice(&c[..20]);
-            let ip = Ipv4Addr::new(c[20], c[21], c[22], c[23]);
-            let port = u16::from_be_bytes([c[24], c[25]]);
-            nodes.push((id, SocketAddr::V4(SocketAddrV4::new(ip, port))));
+            let (id, addr) = c.split_at(20);
+            let mut node_id = [0u8; 20];
+            node_id.copy_from_slice(id);
+            nodes.push((node_id, super::compact_v4(addr)));
         }
     }
     Some(Reply { peers, nodes })

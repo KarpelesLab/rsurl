@@ -86,12 +86,14 @@ impl Bitfield {
         }
     }
 
+    /// Spare bits past `len` are always clear (every constructor and setter
+    /// keeps them so), so a popcount over the bytes is exact.
     pub fn count(&self) -> usize {
-        (0..self.len).filter(|&i| self.has(i)).count()
+        self.bits.iter().map(|b| b.count_ones() as usize).sum()
     }
 
     pub fn is_complete(&self) -> bool {
-        (0..self.len).all(|i| self.has(i))
+        self.count() == self.len
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -151,9 +153,8 @@ impl Picker {
                 continue;
             }
             let avail = self.availability[i];
-            match best {
-                Some((b, _)) if b <= avail => {}
-                _ => best = Some((avail, i)),
+            if best.is_none_or(|(b, _)| avail < b) {
+                best = Some((avail, i));
             }
         }
         best.map(|(_, i)| i)

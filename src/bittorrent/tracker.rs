@@ -85,15 +85,17 @@ pub fn announce(
 // ---------------------------------------------------------------------------
 
 fn http_announce(url: &str, p: &AnnounceParams, timeout: Duration) -> Result<AnnounceResponse> {
+    use std::fmt::Write;
     let sep = if url.contains('?') { '&' } else { '?' };
     let mut full = format!("{url}{sep}info_hash=");
     full.push_str(&percent_encode_raw(&p.info_hash));
     full.push_str("&peer_id=");
     full.push_str(&percent_encode_raw(&p.peer_id));
-    full.push_str(&format!(
+    let _ = write!(
+        full,
         "&port={}&uploaded={}&downloaded={}&left={}&compact=1&numwant={}&key={}",
         p.port, p.uploaded, p.downloaded, p.left, p.num_want, p.key,
-    ));
+    );
     if let Some(ev) = p.event.http_str() {
         full.push_str("&event=");
         full.push_str(ev);
@@ -196,7 +198,7 @@ const ACTION_ERROR: u32 = 3;
 
 fn udp_announce(url: &str, p: &AnnounceParams, timeout: Duration) -> Result<AnnounceResponse> {
     let (hostport, url_data) = split_udp_url(url)?;
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(&hostport)
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(hostport)
         .map_err(Error::Io)?
         .next()
         .ok_or_else(|| terr("tracker did not resolve"))?;
@@ -262,7 +264,7 @@ fn udp_announce(url: &str, p: &AnnounceParams, timeout: Duration) -> Result<Anno
 
 /// Split `udp://host:port[/path][?query]` into the `host:port` to resolve and
 /// the path+query (BEP 41 "URL data", e.g. a private tracker's passkey).
-fn split_udp_url(url: &str) -> Result<(String, String)> {
+fn split_udp_url(url: &str) -> Result<(&str, &str)> {
     let rest = url
         .strip_prefix("udp://")
         .ok_or_else(|| terr("malformed udp tracker url"))?;
@@ -272,7 +274,7 @@ fn split_udp_url(url: &str) -> Result<(String, String)> {
     if hostport.is_empty() {
         return Err(terr("malformed udp tracker url"));
     }
-    Ok((hostport.to_string(), data.to_string()))
+    Ok((hostport, data))
 }
 
 /// BEP 41 option type carrying (part of) the announce URL's path and query.
@@ -440,15 +442,15 @@ mod tests {
     fn splits_udp_url_host_from_url_data() {
         assert_eq!(
             split_udp_url("udp://t.example:6969/announce?passkey=abc").unwrap(),
-            ("t.example:6969".into(), "/announce?passkey=abc".into())
+            ("t.example:6969", "/announce?passkey=abc")
         );
         assert_eq!(
             split_udp_url("udp://t.example:6969?passkey=abc").unwrap(),
-            ("t.example:6969".into(), "?passkey=abc".into())
+            ("t.example:6969", "?passkey=abc")
         );
         assert_eq!(
             split_udp_url("udp://[::1]:6969").unwrap(),
-            ("[::1]:6969".into(), String::new())
+            ("[::1]:6969", "")
         );
         assert!(split_udp_url("udp:///x").is_err());
     }

@@ -32,9 +32,8 @@ impl Magnet {
         let mut peers = Vec::new();
 
         for pair in query.split('&') {
-            let (key, val) = match pair.split_once('=') {
-                Some(kv) => kv,
-                None => continue,
+            let Some((key, val)) = pair.split_once('=') else {
+                continue;
             };
             let val = percent_decode(val);
             match key {
@@ -98,22 +97,25 @@ fn hex_val(c: u8) -> Option<u8> {
 fn base32_decode(s: &str) -> Result<[u8; 20]> {
     let mut acc: u64 = 0;
     let mut bits = 0u32;
-    let mut out = Vec::with_capacity(20);
+    let mut out = [0u8; 20];
+    let mut n = 0;
     for c in s.bytes() {
         let v = base32_val(c).ok_or_else(|| merr("bad base32 infohash"))?;
         acc = (acc << 5) | v as u64;
         bits += 5;
         if bits >= 8 {
             bits -= 8;
-            out.push((acc >> bits) as u8);
+            if n == out.len() {
+                return Err(merr("base32 infohash wrong length"));
+            }
+            out[n] = (acc >> bits) as u8;
+            n += 1;
         }
     }
-    if out.len() != 20 {
+    if n != out.len() {
         return Err(merr("base32 infohash wrong length"));
     }
-    let mut arr = [0u8; 20];
-    arr.copy_from_slice(&out);
-    Ok(arr)
+    Ok(out)
 }
 
 fn base32_val(c: u8) -> Option<u8> {

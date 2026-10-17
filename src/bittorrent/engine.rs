@@ -23,6 +23,7 @@
 //! * If no peer is working on anything and nothing useful has happened for a
 //!   while, the download fails instead of waiting forever.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -304,14 +305,13 @@ impl Swarm<'_> {
             ToEngine::PieceDone { peer, index, data } => {
                 self.clear_piece(peer, index);
                 if !self.storage.has(index) {
-                    match self.storage.write_piece(index, &data) {
-                        Ok(true) => {
-                            self.assigned.remove(&index);
-                            self.last_progress = Instant::now();
-                            progress(&snapshot(self.storage, meta));
-                        }
-                        Ok(false) => self.strike(peer, index),
-                        Err(e) => return Err(e),
+                    // A disk error is fatal.
+                    if self.storage.write_piece(index, &data)? {
+                        self.assigned.remove(&index);
+                        self.last_progress = Instant::now();
+                        progress(&snapshot(self.storage, meta));
+                    } else {
+                        self.strike(peer, index);
                     }
                 }
                 // (else: a duplicate copy (endgame) of a piece we have.)
@@ -408,9 +408,9 @@ impl Swarm<'_> {
             return;
         }
         // The peer's pieces, minus any it already corrupted.
-        let mut bf = ps.bf.clone();
+        let mut bf = Cow::Borrowed(&ps.bf);
         for &b in &ps.bad {
-            bf.unset(b);
+            bf.to_mut().unset(b);
         }
 
         // `fresh` means a not-yet-in-flight piece; an endgame duplicate is
@@ -431,12 +431,9 @@ impl Swarm<'_> {
                     .num_pieces()
                     .saturating_sub(complete + self.assigned.len());
                 if unassigned == 0 {
-                    let peer_piece: HashMap<usize, usize> = self
-                        .peers
-                        .iter()
-                        .filter_map(|(&id, p)| p.piece.map(|i| (id, i)))
-                        .collect();
-                    let dup = endgame_pick(self.storage, &bf, &peer_piece, &self.assigned);
+                    let in_flight: Vec<usize> =
+                        self.peers.values().filter_map(|p| p.piece).collect();
+                    let dup = endgame_pick(self.storage, &bf, &in_flight, &self.assigned);
                     if dup.is_some() && self.verbosity >= 1 && !self.endgame_announced {
                         self.endgame_announced = true;
                         eprintln!("* endgame: re-requesting in-flight pieces from idle peers");
@@ -486,23 +483,20 @@ impl Swarm<'_> {
 }
 
 /// Pick an in-flight piece this peer has (and we still lack) to duplicate in
-/// endgame, preferring the one with the fewest peers currently on it so idle
-/// peers spread across the remaining pieces rather than piling on one.
+/// endgame, preferring the one with the fewest peers currently on it (one
+/// entry per busy peer in `in_flight`) so idle peers spread across the
+/// remaining pieces rather than piling on one.
 fn endgame_pick(
     storage: &Storage,
     bf: &Bitfield,
-    peer_piece: &HashMap<usize, usize>,
+    in_flight: &[usize],
     assigned: &HashSet<usize>,
 ) -> Option<usize> {
-    let mut assignees: HashMap<usize, usize> = HashMap::new();
-    for &p in peer_piece.values() {
-        *assignees.entry(p).or_insert(0) += 1;
-    }
     assigned
         .iter()
         .copied()
         .filter(|&idx| bf.has(idx) && !storage.has(idx))
-        .min_by_key(|&idx| (assignees.get(&idx).copied().unwrap_or(0), idx))
+        .min_by_key(|&idx| (in_flight.iter().filter(|&&p| p == idx).count(), idx))
 }
 
 fn snapshot(storage: &Storage, meta: &Metainfo) -> Progress {
@@ -736,19 +730,20 @@ fn run_peer(peer: usize, addr: SocketAddr, cfg: WorkerCfg, tx: &Sender<ToEngine>
                         Some(j) if j.index == index => j.on_block(begin, &block),
                         _ => false,
                     };
-                    if stored && job.as_ref().is_some_and(Job::is_done) {
-                        let j = job.take().expect("job present");
-                        let ev = ToEngine::PieceDone {
-                            peer,
-                            index: j.index as usize,
-                            data: j.buf,
-                        };
-                        if tx.send(ev).is_err() {
-                            return Ok(());
-                        }
-                    } else if stored && !choked {
-                        if let Some(j) = job.as_mut() {
-                            j.pump(&mut sock)?;
+                    if stored {
+                        if let Some(j) = job.take_if(|j| j.is_done()) {
+                            let ev = ToEngine::PieceDone {
+                                peer,
+                                index: j.index as usize,
+                                data: j.buf,
+                            };
+                            if tx.send(ev).is_err() {
+                                return Ok(());
+                            }
+                        } else if !choked {
+                            if let Some(j) = job.as_mut() {
+                                j.pump(&mut sock)?;
+                            }
                         }
                     }
                 }
@@ -812,11 +807,9 @@ struct Job {
 
 impl Job {
     fn new(index: usize, size: u64) -> Result<Job> {
-        if size > u32::MAX as u64 {
-            return Err(eerr("piece larger than 4 GiB is unsupported"));
-        }
+        let size =
+            u32::try_from(size).map_err(|_| eerr("piece larger than 4 GiB is unsupported"))?;
         let index = u32::try_from(index).map_err(|_| eerr("piece index out of range"))?;
-        let size = size as u32;
         let num_blocks = (size as usize).div_ceil(BLOCK_SIZE as usize);
         Ok(Job {
             index,
@@ -922,14 +915,10 @@ mod tests {
         }
         let assigned: HashSet<usize> = [1, 2, 3].into_iter().collect();
         // piece 1 has two assignees, pieces 2 and 3 one each.
-        let mut pp: HashMap<usize, usize> = HashMap::new();
-        pp.insert(10, 1);
-        pp.insert(11, 1);
-        pp.insert(12, 2);
-        pp.insert(13, 3);
+        let in_flight = [1, 1, 2, 3];
         // Should avoid the doubly-assigned piece 1.
         assert!(matches!(
-            endgame_pick(&st, &bf, &pp, &assigned),
+            endgame_pick(&st, &bf, &in_flight, &assigned),
             Some(2) | Some(3)
         ));
     }
@@ -940,9 +929,8 @@ mod tests {
         let mut bf = Bitfield::new(5);
         bf.set(2); // peer only has piece 2
         let assigned: HashSet<usize> = [1, 2].into_iter().collect();
-        let pp: HashMap<usize, usize> = HashMap::new();
         // Piece 1 is in flight but the peer lacks it; only 2 is eligible.
-        assert_eq!(endgame_pick(&st, &bf, &pp, &assigned), Some(2));
+        assert_eq!(endgame_pick(&st, &bf, &[], &assigned), Some(2));
     }
 
     #[test]
@@ -950,8 +938,7 @@ mod tests {
         let st = empty_storage(3);
         let bf = Bitfield::new(3); // peer has nothing
         let assigned: HashSet<usize> = [0, 1, 2].into_iter().collect();
-        let pp: HashMap<usize, usize> = HashMap::new();
-        assert_eq!(endgame_pick(&st, &bf, &pp, &assigned), None);
+        assert_eq!(endgame_pick(&st, &bf, &[], &assigned), None);
     }
 
     fn requests(wire: &[u8]) -> Vec<(u32, u32, u32)> {

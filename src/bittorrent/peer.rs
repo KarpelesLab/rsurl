@@ -155,13 +155,14 @@ pub fn read_message<R: Read>(r: &mut R) -> Result<Message> {
             }
         }
         ID_PIECE => {
-            if payload.len() < 8 {
+            let Some((hdr, block)) = payload.split_first_chunk::<8>() else {
                 return Err(perr("short piece message"));
-            }
+            };
+            let (index, begin) = hdr.split_at(4);
             Message::Piece {
-                index: u32::from_be_bytes(payload[0..4].try_into().unwrap()),
-                begin: u32::from_be_bytes(payload[4..8].try_into().unwrap()),
-                block: payload[8..].to_vec(),
+                index: be32(index)?,
+                begin: be32(begin)?,
+                block: block.to_vec(),
             }
         }
         ID_CANCEL => {
@@ -212,11 +213,10 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<()> {
             begin,
             block,
         } => {
-            let mut p = Vec::with_capacity(8 + block.len());
-            p.extend_from_slice(&index.to_be_bytes());
-            p.extend_from_slice(&begin.to_be_bytes());
-            p.extend_from_slice(block);
-            frame(&mut buf, ID_PIECE, &p);
+            header(&mut buf, ID_PIECE, 8 + block.len());
+            buf.extend_from_slice(&index.to_be_bytes());
+            buf.extend_from_slice(&begin.to_be_bytes());
+            buf.extend_from_slice(block);
         }
         Message::Cancel {
             index,
@@ -225,20 +225,25 @@ pub fn write_message<W: Write>(w: &mut W, msg: &Message) -> Result<()> {
         } => frame(&mut buf, ID_CANCEL, &three(*index, *begin, *length)),
         Message::Port(p) => frame(&mut buf, ID_PORT, &p.to_be_bytes()),
         Message::Extended { ext_id, payload } => {
-            let mut p = Vec::with_capacity(1 + payload.len());
-            p.push(*ext_id);
-            p.extend_from_slice(payload);
-            frame(&mut buf, ID_EXTENDED, &p);
+            header(&mut buf, ID_EXTENDED, 1 + payload.len());
+            buf.push(*ext_id);
+            buf.extend_from_slice(payload);
         }
     }
     w.write_all(&buf).map_err(Error::Io)?;
     w.flush().map_err(Error::Io)
 }
 
-fn frame(buf: &mut Vec<u8>, id: u8, payload: &[u8]) {
-    let len = 1 + payload.len();
-    buf.extend_from_slice(&(len as u32).to_be_bytes());
+/// Length prefix + message id for a `payload_len`-byte payload, which the
+/// caller appends.
+fn header(buf: &mut Vec<u8>, id: u8, payload_len: usize) {
+    buf.reserve(5 + payload_len);
+    buf.extend_from_slice(&((1 + payload_len) as u32).to_be_bytes());
     buf.push(id);
+}
+
+fn frame(buf: &mut Vec<u8>, id: u8, payload: &[u8]) {
+    header(buf, id, payload.len());
     buf.extend_from_slice(payload);
 }
 
@@ -251,21 +256,20 @@ fn three(a: u32, b: u32, c: u32) -> [u8; 12] {
 }
 
 fn be32(p: &[u8]) -> Result<u32> {
-    if p.len() < 4 {
-        return Err(perr("short u32 payload"));
-    }
-    Ok(u32::from_be_bytes(p[0..4].try_into().unwrap()))
+    p.first_chunk::<4>()
+        .map(|c| u32::from_be_bytes(*c))
+        .ok_or_else(|| perr("short u32 payload"))
 }
 
 fn three_be32(p: &[u8]) -> Result<(u32, u32, u32)> {
-    if p.len() < 12 {
-        return Err(perr("short request/cancel payload"));
+    match p.as_chunks::<4>().0 {
+        [a, b, c, ..] => Ok((
+            u32::from_be_bytes(*a),
+            u32::from_be_bytes(*b),
+            u32::from_be_bytes(*c),
+        )),
+        _ => Err(perr("short request/cancel payload")),
     }
-    Ok((
-        u32::from_be_bytes(p[0..4].try_into().unwrap()),
-        u32::from_be_bytes(p[4..8].try_into().unwrap()),
-        u32::from_be_bytes(p[8..12].try_into().unwrap()),
-    ))
 }
 
 fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<()> {
