@@ -244,7 +244,9 @@ jobs:
         with:
           image: ghcr.io/karpeleslab/fullrust:1.95
           command: test
-          args: --release
+          # No doctests: the image ships no rustdoc, and they run in the
+          # host test & lint matrix anyway.
+          args: --release --lib --bins --tests
 
       - name: Prove the binary links no libc
         run: |
