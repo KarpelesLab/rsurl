@@ -1374,11 +1374,17 @@ impl Downloader {
                 .collect();
             Ok((plan_key(&plan), plan))
         } else if let Some(size) = self.opts.segment_size.filter(|s| *s > 0) {
-            let n = total.div_ceil(size) as usize;
+            // Cap the chunk count as the `segments` branch does: `total` comes
+            // from the server's `Content-Range`, so a tiny segment size against
+            // a huge claimed total must not turn into a multi-million-entry
+            // plan (or overflow `usize` on 32-bit). Grow the segment size
+            // instead so the whole file is still covered.
+            let size = size.max(total.div_ceil(MAX_SEGMENT_CHUNKS as u64));
+            let n = total.div_ceil(size).min(MAX_SEGMENT_CHUNKS as u64) as usize;
             let plan: Vec<(u64, u64)> = (0..n)
                 .map(|i| {
                     let start = i as u64 * size;
-                    let end = (start + size).min(total) - 1;
+                    let end = start.saturating_add(size).min(total) - 1;
                     (start, end)
                 })
                 .collect();
@@ -3459,6 +3465,36 @@ mod tests {
         let size = [(0, 2), (3, 5), (6, 8), (9, 9)];
         assert_ne!(plan_key(&seg), plan_key(&size));
         assert_eq!(plan_key(&seg), plan_key(&[(0, 2), (3, 5), (6, 9)]));
+    }
+
+    #[test]
+    fn segment_size_plan_is_capped_and_still_covers_the_file() {
+        // A tiny segment size against a large (server-claimed) total must not
+        // produce an unbounded plan: the chunk count is capped by growing the
+        // segment size, and the chunks still tile `[0, total)` exactly.
+        let out = tmp("plan-cap");
+        let mut opts = no_backoff();
+        opts.segment_size = Some(1);
+        let req = Request::new("GET", "http://127.0.0.1:1/x").unwrap();
+        let dl = Downloader::new(req, Arc::new(FileStore::new(&out)), opts);
+        for total in [1u64, 1_000, 1_000_000, 1 << 40, u64::MAX] {
+            let (_, plan) = dl.chunk_plan(total).ok().unwrap();
+            assert!(plan.len() <= MAX_SEGMENT_CHUNKS, "{total}: {}", plan.len());
+            assert_eq!(plan[0].0, 0);
+            assert_eq!(plan.last().unwrap().1, total - 1);
+            for w in plan.windows(2) {
+                assert_eq!(w[0].1 + 1, w[1].0, "gap or overlap at {total}");
+            }
+        }
+        // Below the cap the requested size is honoured exactly.
+        let mut opts = no_backoff();
+        opts.segment_size = Some(1000);
+        let req = Request::new("GET", "http://127.0.0.1:1/x").unwrap();
+        let dl = Downloader::new(req, Arc::new(FileStore::new(&out)), opts);
+        let (_, plan) = dl.chunk_plan(10_000).ok().unwrap();
+        assert_eq!(plan.len(), 10);
+        assert_eq!(plan[3], (3000, 3999));
+        cleanup(&out);
     }
 
     #[test]
