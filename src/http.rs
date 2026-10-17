@@ -255,15 +255,18 @@ impl ProxyConfig {
     pub fn parse(s: &str) -> Result<Self> {
         const DEFAULT_PROXY_PORT: u16 = 1080;
         let bad = |what: &str| Error::InvalidUrl(format!("proxy: {what} in {s:?}"));
-        let (scheme, rest) = match s.split_once("://") {
-            Some((sch, r)) => (sch.to_ascii_lowercase(), r),
-            None => ("http".to_string(), s),
+        let rest = match s.split_once("://") {
+            Some((sch, r)) => {
+                if !sch.eq_ignore_ascii_case("http") {
+                    let scheme = sch.to_ascii_lowercase();
+                    return Err(Error::UnsupportedScheme(format!(
+                        "proxy scheme {scheme:?} not supported (only http:// at this milestone)"
+                    )));
+                }
+                r
+            }
+            None => s,
         };
-        if scheme != "http" {
-            return Err(Error::UnsupportedScheme(format!(
-                "proxy scheme {scheme:?} not supported (only http:// at this milestone)"
-            )));
-        }
         // Authority ends at the first path / query / fragment delimiter.
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         let (userinfo, hostport) = match authority.rfind('@') {
@@ -571,14 +574,15 @@ impl Request {
     /// [`aws_sigv4`](Self::aws_sigv4) was set. Called on each outgoing hop,
     /// after IDN normalisation and redirect rewriting.
     pub(crate) fn apply_aws_sigv4(&mut self) {
-        let Some(spec) = self.aws_sigv4.clone() else {
+        let Some(spec) = &self.aws_sigv4 else {
             return;
         };
         let (region, service) = spec.region_service(&self.url.host);
-        let (path, query) = match self.url.path.split_once('?') {
-            Some((p, q)) => (p.to_string(), q.to_string()),
-            None => (self.url.path.clone(), String::new()),
-        };
+        let (path, query) = self
+            .url
+            .path
+            .split_once('?')
+            .unwrap_or((&self.url.path, ""));
         // Sign the authority exactly as the `Host:` header will carry it.
         let host = self
             .headers
@@ -594,7 +598,7 @@ impl Request {
         };
         let method = effective_method(self);
         let amz = crate::sigv4::amz_date_now();
-        for (k, v) in crate::sigv4::sign(&cfg, &method, &host, &path, &query, &self.body, &amz) {
+        for (k, v) in crate::sigv4::sign(&cfg, &method, &host, path, query, &self.body, &amz) {
             self.headers.retain(|(hk, _)| !hk.eq_ignore_ascii_case(&k));
             self.headers.push((k, v));
         }
@@ -1115,11 +1119,10 @@ impl Request {
             // Follow a 3xx with a Location when redirects are enabled, draining
             // the (small) intermediate body first so the socket can be dropped.
             if req.follow_redirects && is_redirect_status(head.status) {
-                if let Some(loc) = head
+                if let Some((_, loc)) = head
                     .headers
                     .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("location"))
-                    .map(|(_, v)| v.clone())
                 {
                     let _ = read_body(
                         &mut bufrd,
@@ -1137,7 +1140,7 @@ impl Request {
                         )));
                     }
                     hops_left -= 1;
-                    req = redirect_request(req, head.status, &loc, trace)?;
+                    req = redirect_request(req, head.status, loc, trace)?;
                     continue;
                 }
             }
@@ -1199,12 +1202,7 @@ impl Request {
             req.url.set_idn(req.idn)?;
             // Attach jar cookies to the request, then ingest Set-Cookie below.
             if let Some(j) = jar.as_deref_mut() {
-                j.purge_expired();
-                req.headers
-                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
-                if let Some(val) = j.cookie_header(&req.url) {
-                    req.headers.push(("Cookie".to_string(), val));
-                }
+                attach_jar_cookies(j, &mut req.headers, &req.url);
             }
             req.apply_aws_sigv4();
             let url = req.url.clone();
@@ -1254,12 +1252,7 @@ impl Request {
             let mut req = self;
             req.url.set_idn(req.idn)?;
             if let Some(j) = jar.as_deref_mut() {
-                j.purge_expired();
-                req.headers
-                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
-                if let Some(val) = j.cookie_header(&req.url) {
-                    req.headers.push(("Cookie".to_string(), val));
-                }
+                attach_jar_cookies(j, &mut req.headers, &req.url);
             }
             req.apply_aws_sigv4();
             let url = req.url.clone();
@@ -1374,13 +1367,7 @@ impl Request {
             // Attach a jar-managed Cookie header to a snapshot of the request.
             let mut snapshot = req.clone();
             if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
-                j.purge_expired();
-                snapshot
-                    .headers
-                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
-                if let Some(val) = j.cookie_header(&snapshot.url) {
-                    snapshot.headers.push(("Cookie".to_string(), val));
-                }
+                attach_jar_cookies(j, &mut snapshot.headers, &snapshot.url);
             }
             snapshot.apply_aws_sigv4();
             write_request(
@@ -1403,7 +1390,6 @@ impl Request {
                     .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("location"))
                 {
-                    let location = loc.clone();
                     let _ = read_body(
                         &mut bufrd,
                         &head.headers,
@@ -1418,7 +1404,7 @@ impl Request {
                         )));
                     }
                     hops_left -= 1;
-                    req = redirect_request(req, head.status, &location, trace)?;
+                    req = redirect_request(req, head.status, loc, trace)?;
                     first_hop = false;
                     continue;
                 }
@@ -1478,7 +1464,7 @@ impl Request {
                             body: Vec::new(),
                             timing,
                             final_url: url_to_string(&req.url),
-                            tls: tls_info.clone(),
+                            tls: tls_info,
                         });
                     }
                 }
@@ -1500,7 +1486,7 @@ impl Request {
                     body: Vec::new(),
                     timing,
                     final_url: url_to_string(&req.url),
-                    tls: tls_info.clone(),
+                    tls: tls_info,
                 });
             }
             let n = stream_body(&mut bufrd, sink, &head.headers, head.status, &req.method)?;
@@ -1513,7 +1499,7 @@ impl Request {
                 body: Vec::new(),
                 timing,
                 final_url: url_to_string(&req.url),
-                tls: tls_info.clone(),
+                tls: tls_info,
             });
         }
     }
@@ -1600,13 +1586,7 @@ impl Request {
             // because the previous hop's cookie line is stale once the URL
             // (and thus the matching set) has changed.
             if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
-                j.purge_expired();
-                snapshot
-                    .headers
-                    .retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
-                if let Some(val) = j.cookie_header(&snapshot.url) {
-                    snapshot.headers.push(("Cookie".to_string(), val));
-                }
+                attach_jar_cookies(j, &mut snapshot.headers, &snapshot.url);
             }
             let mut resp = snapshot.send_once(trace)?;
             if let Some(j) = jar.as_deref_mut().filter(|_| use_jar) {
@@ -1650,16 +1630,13 @@ impl Request {
                     req.max_redirs
                 )));
             }
-            let location = match resp.header("location") {
-                Some(l) => l.to_string(),
-                None => {
-                    // 3xx without Location — give it back as the final response.
-                    resp.final_url = url_to_string(&req.url);
-                    return Ok(resp);
-                }
+            let Some(location) = resp.header("location") else {
+                // 3xx without Location — give it back as the final response.
+                resp.final_url = url_to_string(&req.url);
+                return Ok(resp);
             };
             hops_left -= 1;
-            req = redirect_request(req, resp.status, &location, trace)?;
+            req = redirect_request(req, resp.status, location, trace)?;
             first_hop = false;
         }
     }
@@ -1667,6 +1644,21 @@ impl Request {
 
 fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Replace any `Cookie:` header in `headers` with the jar's matching cookies
+/// for `url` (after purging expired entries). A stale `Cookie:` from a previous
+/// hop is always dropped, even when the jar has nothing for this URL.
+fn attach_jar_cookies(
+    jar: &mut crate::cookie::CookieJar,
+    headers: &mut Vec<(String, String)>,
+    url: &Url,
+) {
+    jar.purge_expired();
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("cookie"));
+    if let Some(val) = jar.cookie_header(url) {
+        headers.push(("Cookie".to_string(), val));
+    }
 }
 
 /// Cap on the total decoded header-list size (sum of name+value octets) for
@@ -2117,79 +2109,72 @@ fn build_body_reader(
     bufrd: BufReader<Box<dyn Rw>>,
     cancel: Option<crate::cancel::CancelGuard>,
 ) -> Result<BodyReader> {
-    let rhead = ResponseHead {
-        status: head.status,
-        reason: head.reason.clone(),
-        version: head.version.clone(),
-        headers: head.headers.clone(),
-    };
+    let Head {
+        version,
+        status,
+        reason,
+        headers,
+    } = head;
 
     // RFC 9110: HEAD and these statuses never carry a body.
     let has_body = !(req.method.eq_ignore_ascii_case("HEAD")
-        || (100..200).contains(&head.status)
-        || head.status == 204
-        || head.status == 304);
-    if !has_body {
-        return Ok(BodyReader {
-            head: rhead,
-            inner: BodyInner::Buffered(io::Cursor::new(Vec::new())),
-            _cancel: None,
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304);
+    let (inner, cancel) = if !has_body {
+        (BodyInner::Buffered(io::Cursor::new(Vec::new())), None)
+    } else {
+        // RFC 9112 §6.1: Transfer-Encoding + Content-Length together is a
+        // smuggling vector — reject rather than pick a framing.
+        let has_te = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+        let has_cl = headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+        if has_te && has_cl {
+            return Err(Error::BadResponse(
+                "both Transfer-Encoding and Content-Length present".into(),
+            ));
+        }
+
+        let chunked = headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
         });
-    }
-
-    // RFC 9112 §6.1: Transfer-Encoding + Content-Length together is a smuggling
-    // vector — reject rather than pick a framing.
-    let has_te = head
-        .headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
-    let has_cl = head
-        .headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
-    if has_te && has_cl {
-        return Err(Error::BadResponse(
-            "both Transfer-Encoding and Content-Length present".into(),
-        ));
-    }
-
-    let chunked = head.headers.iter().any(|(k, v)| {
-        k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
-    });
-    if chunked {
-        // De-chunked incrementally off the socket: like the other streaming
-        // framings, not bounded by the in-memory `MAX_BODY_BYTES` cap.
-        return Ok(BodyReader {
-            head: rhead,
-            inner: BodyInner::Chunked(ChunkedBody {
+        // A `BodyReader` streams off the socket; the body is never held in
+        // memory, so it is NOT bounded by `MAX_BODY_BYTES` (the caller — e.g. a
+        // file sink — bounds it). This lets `send_reader` / `download_resumable`
+        // fetch files larger than the in-memory cap that governs the buffered
+        // `send` path.
+        let inner = if chunked {
+            // De-chunked incrementally off the socket.
+            BodyInner::Chunked(ChunkedBody {
                 src: bufrd,
                 remaining: 0,
                 done: false,
-            }),
-            _cancel: cancel,
-        });
-    }
-
-    // A `BodyReader` streams off the socket; the body is never held in memory,
-    // so it is NOT bounded by `MAX_BODY_BYTES` (the caller — e.g. a file sink —
-    // bounds it). This lets `send_reader` / `download_resumable` fetch files
-    // larger than the in-memory cap that governs the buffered `send` path.
-    match parse_content_length(&head.headers)? {
-        Some(len) => Ok(BodyReader {
-            head: rhead,
-            inner: BodyInner::Length(LengthBody {
-                src: bufrd,
-                remaining: len,
-            }),
-            _cancel: cancel,
-        }),
-        // No Content-Length, not chunked — connection-close-delimited.
-        None => Ok(BodyReader {
-            head: rhead,
-            inner: BodyInner::Eof(EofBody { src: bufrd }),
-            _cancel: cancel,
-        }),
-    }
+            })
+        } else {
+            match parse_content_length(&headers)? {
+                Some(len) => BodyInner::Length(LengthBody {
+                    src: bufrd,
+                    remaining: len,
+                }),
+                // No Content-Length, not chunked — connection-close-delimited.
+                None => BodyInner::Eof(EofBody { src: bufrd }),
+            }
+        };
+        (inner, cancel)
+    };
+    Ok(BodyReader {
+        head: ResponseHead {
+            status,
+            reason,
+            version,
+            headers,
+        },
+        inner,
+        _cancel: cancel,
+    })
 }
 
 /// Buffered fallback for [`Request::send_reader`] on transports that don't
@@ -2199,16 +2184,22 @@ fn build_body_reader(
 /// here), and HTTP/2/3 are all handled by `send_to`.
 fn buffered_body_reader(mut req: Request, trace: &mut dyn Write) -> Result<BodyReader> {
     req.decompress = false;
-    let resp = req.send_to(trace, None)?;
-    let head = ResponseHead {
-        status: resp.status,
-        reason: resp.reason.clone(),
-        version: resp.version.clone(),
-        headers: resp.headers.clone(),
-    };
+    let Response {
+        status,
+        reason,
+        version,
+        headers,
+        body,
+        ..
+    } = req.send_to(trace, None)?;
     Ok(BodyReader {
-        head,
-        inner: BodyInner::Buffered(io::Cursor::new(resp.body)),
+        head: ResponseHead {
+            status,
+            reason,
+            version,
+            headers,
+        },
+        inner: BodyInner::Buffered(io::Cursor::new(body)),
         _cancel: None,
     })
 }
@@ -2240,7 +2231,6 @@ fn redirect_request(
     let host_changed = next_url.host != req.url.host
         || next_url.port != req.url.port
         || next_url.scheme != req.url.scheme;
-    let prev_method = req.method.clone();
     let prev_url = url_to_string(&req.url);
 
     let mut next = req;
@@ -2260,13 +2250,13 @@ fn redirect_request(
     // GET (a PUT/DELETE/PATCH is re-sent as-is); 303 means "see other" and
     // turns every method except GET/HEAD into GET. `--post30x` preserves only
     // a POST, never another method on a 303.
-    let is_post = prev_method.eq_ignore_ascii_case("POST");
+    let is_post = next.method.eq_ignore_ascii_case("POST");
     let keep_post = (301..=303).contains(&status) && next.keep_post[(status - 301) as usize];
     let to_get = match status {
         301 | 302 => is_post && !keep_post,
         303 => {
-            !(prev_method.eq_ignore_ascii_case("GET")
-                || prev_method.eq_ignore_ascii_case("HEAD")
+            !(next.method.eq_ignore_ascii_case("GET")
+                || next.method.eq_ignore_ascii_case("HEAD")
                 || (is_post && keep_post))
         }
         _ => false,
@@ -2523,7 +2513,8 @@ fn run_plain_core(
 fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response> {
     // Direct, pool-eligible requests may reuse a warm TLS session.
     let direct = req.proxy.is_none() || proxy_bypassed(req);
-    if direct && tls_pool_eligible(req) {
+    let may_pool = direct && tls_pool_eligible(req);
+    if may_pool {
         if let Some((tcp, engine)) = core_pool_checkout_tls(req) {
             let _ = writeln!(trace, "* Reusing existing TLS connection from pool");
             let mut started = false;
@@ -2548,7 +2539,6 @@ fn send_https_via_core(req: &Request, trace: &mut dyn Write) -> Result<Response>
     let start = std::time::Instant::now();
     let (tcp, _cancel_guard, namelookup) = tcp_connect_cancellable(req, trace)?;
     let connect = start.elapsed();
-    let may_pool = direct && tls_pool_eligible(req);
     run_https_core(
         tcp,
         req,
@@ -2719,8 +2709,7 @@ fn send_plain_via_connector(req: Request, trace: &mut dyn Write) -> Result<Respo
     let stream = connector_connect(&req, trace)?;
     let mut bufrd = BufReader::new(stream);
     write_request(bufrd.get_mut(), &req, false, trace)?;
-    let resp = read_response(&mut bufrd, &req.method, req.decompress, trace)?;
-    Ok(resp)
+    read_response(&mut bufrd, &req.method, req.decompress, trace)
 }
 
 /// HTTPS over a caller-supplied / proxy connector. The connector yields a pipe
@@ -2749,8 +2738,7 @@ fn send_https_via_connector(req: Request, trace: &mut dyn Write) -> Result<Respo
     write_tls_info(&tls, trace);
     let mut bufrd = BufReader::new(tls);
     write_request(bufrd.get_mut(), &req, false, trace)?;
-    let resp = read_response(&mut bufrd, &req.method, req.decompress, trace)?;
-    Ok(resp)
+    read_response(&mut bufrd, &req.method, req.decompress, trace)
 }
 
 /// Why a request attempt over a pooled connection failed. `Stale` means the
@@ -2937,13 +2925,7 @@ fn response_is_reusable(method: &str, resp: &Response) -> bool {
 /// `Proxy-Authorization:` header. HTTPS-via-proxy doesn't qualify because
 /// the proxy only sees a `CONNECT` tunnel; the request inside is normal.
 pub(crate) fn via_plain_http_proxy(req: &Request) -> bool {
-    if req.url.scheme != "http" {
-        return false;
-    }
-    match &req.proxy {
-        Some(_) => !proxy_bypassed(req),
-        None => false,
-    }
+    req.url.scheme == "http" && req.proxy.is_some() && !proxy_bypassed(req)
 }
 
 /// True iff `req.url.host` matches any entry of `req.no_proxy`, with curl's
@@ -2969,13 +2951,10 @@ pub(crate) fn effective_method(req: &Request) -> String {
 /// neither source is set or if the explicit pair is empty.
 pub(crate) fn effective_basic_auth(req: &Request) -> Option<String> {
     let (user, pass) = match &req.basic_auth {
-        Some((u, p)) => (u.clone(), p.clone()),
+        Some((u, p)) => (u.as_str(), p.as_str()),
         None => {
             let info = req.url.userinfo.as_deref()?;
-            match info.split_once(':') {
-                Some((u, p)) => (u.to_string(), p.to_string()),
-                None => (info.to_string(), String::new()),
-            }
+            info.split_once(':').unwrap_or((info, ""))
         }
     };
     if user.is_empty() && pass.is_empty() {
@@ -3315,14 +3294,6 @@ fn send_https_fresh(req: Request, trace: &mut dyn Write) -> Result<Response> {
     Ok(resp)
 }
 
-/// Open a TCP socket pointed at whatever the next-hop endpoint actually
-/// is — either the request URL's authority or, when [`Request::proxy`] is
-/// in play and the host isn't in the no-proxy list, the proxy itself.
-///
-/// For HTTPS-via-proxy requests, the caller is expected to invoke
-/// [`connect_tunnel`] on the returned socket before any TLS handshake.
-/// This function intentionally stops at "TCP connected" so that the
-/// HTTP/1.1 and HTTP/2 paths can share the same tunnel logic.
 /// Apply `--connect-to` remapping to a dial target. An empty from-host or a
 /// zero from-port matches any. An empty to-host / zero to-port keeps the
 /// original. First match wins.
@@ -3343,11 +3314,10 @@ pub(crate) fn apply_connect_to(
     (host.to_string(), port)
 }
 
-/// Resolve `host:port` to a single socket address, honoring `--resolve`
-/// overrides and the `-4`/`-6` address-family preference.
-/// Resolve `host:port`, returning the chosen address and — when an actual DNS
-/// lookup ran — how long it took (for `Timing::namelookup`). A static
-/// `--resolve` pin reports `None` (no lookup happened).
+/// Resolve `host:port`, honoring `--resolve` overrides and the `-4`/`-6`
+/// address-family preference, returning the candidate addresses and — when an
+/// actual DNS lookup ran — how long it took (for `Timing::namelookup`). A
+/// static `--resolve` pin reports `None` (no lookup happened).
 fn resolve_target(
     host: &str,
     port: u16,
@@ -3412,7 +3382,15 @@ pub(crate) fn tcp_connect_cancellable(
     Ok((stream, guard, namelookup))
 }
 
+/// Open a TCP socket pointed at whatever the next-hop endpoint actually
+/// is — either the request URL's authority or, when [`Request::proxy`] is
+/// in play and the host isn't in the no-proxy list, the proxy itself.
 /// Returns the connected socket and, when a DNS lookup ran, its duration.
+///
+/// For HTTPS-via-proxy requests, the caller is expected to invoke
+/// [`connect_tunnel`] on the returned socket before any TLS handshake.
+/// This function intentionally stops at "TCP connected" so that the
+/// HTTP/1.1 and HTTP/2 paths can share the same tunnel logic.
 fn tcp_connect_inner(
     req: &Request,
     trace: &mut dyn Write,
@@ -3515,19 +3493,15 @@ pub(crate) fn connect_tunnel<S: Read + Write>(
         total += 1;
         line_buf.push(byte[0]);
         if byte[0] == b'\n' {
-            let trimmed_owned = String::from_utf8_lossy(
-                line_buf
-                    .strip_suffix(b"\n")
-                    .unwrap_or(&line_buf)
-                    .strip_suffix(b"\r")
-                    .unwrap_or(line_buf.strip_suffix(b"\n").unwrap_or(&line_buf)),
-            )
-            .into_owned();
-            let _ = writeln!(trace, "< {trimmed_owned}");
+            let line = line_buf.strip_suffix(b"\n").unwrap_or(&line_buf);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let trimmed = String::from_utf8_lossy(line);
+            let _ = writeln!(trace, "< {trimmed}");
+            let blank = trimmed.is_empty();
             if status_line.is_none() {
-                status_line = Some(trimmed_owned.clone());
+                status_line = Some(trimmed.into_owned());
             }
-            if trimmed_owned.is_empty() {
+            if blank {
                 break;
             }
             line_buf.clear();
@@ -3876,10 +3850,6 @@ fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut String, max: usize) -> Resu
     Ok(read)
 }
 
-/// Read one HTTP/1.1 response from a buffered stream. The buffer is held by
-/// the caller (rather than created inline) because connection-reuse hands
-/// the same `BufReader` to back-to-back requests, and the buffer's leftover
-/// bytes — even if empty in practice — must travel with the connection.
 /// The status line + headers of a response (everything before the body).
 struct Head {
     version: String,
@@ -3971,6 +3941,10 @@ pub(crate) fn push_header_line(headers: &mut Vec<(String, String)>, line: &str) 
     Ok(())
 }
 
+/// Read one HTTP/1.1 response from a buffered stream. The buffer is held by
+/// the caller (rather than created inline) because connection-reuse hands
+/// the same `BufReader` to back-to-back requests, and the buffer's leftover
+/// bytes — even if empty in practice — must travel with the connection.
 fn read_response<R: Read>(
     r: &mut BufReader<R>,
     method: &str,
@@ -4032,11 +4006,11 @@ where
 /// signature doesn't trip `clippy::type_complexity`.
 pub(crate) type HeadersAndBody = (Vec<(String, String)>, Vec<u8>);
 
-/// If the response carries `Content-Encoding: gzip|deflate|x-gzip|identity`,
-/// decode the body and strip the now-stale `Content-Encoding` and
-/// `Content-Length` headers. Returns the (possibly-modified) headers + body.
-/// Unknown encodings (brotli, zstd, compress, ...) are left intact so a
-/// caller that knows how to handle them can still try.
+/// If the response carries a `Content-Encoding` we can decode (gzip, deflate,
+/// br, zstd, compress, identity — see [`crate::compress`]), decode the body and
+/// strip the now-stale `Content-Encoding` and `Content-Length` headers.
+/// Returns the (possibly-modified) headers + body. Unknown encodings are left
+/// intact so a caller that knows how to handle them can still try.
 ///
 /// Shared by HTTP/1.1, HTTP/2, and HTTP/3 — they all assemble a `(headers,
 /// body)` pair and need identical post-processing.
@@ -4080,11 +4054,11 @@ pub(crate) fn parse_status_line(line: &str) -> Result<(String, u16, String)> {
     let mut parts = line.splitn(3, ' ');
     let version = parts
         .next()
-        .ok_or_else(|| Error::BadResponse(format!("missing version: {line:?}")))?
-        .to_string();
+        .ok_or_else(|| Error::BadResponse(format!("missing version: {line:?}")))?;
     if !version.starts_with("HTTP/") {
         return Err(Error::BadResponse(format!("not HTTP: {version}")));
     }
+    let version = version.to_string();
     let status: u16 = parts
         .next()
         .ok_or_else(|| Error::BadResponse(format!("missing status: {line:?}")))?

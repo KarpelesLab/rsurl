@@ -104,37 +104,18 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
     // may expand the running total only up to what remains.
     let mut budget = MAX_BODY_BYTES as u64;
     for (idx, token) in layers.iter().enumerate().rev() {
-        match Layer::parse(token) {
+        current = match Layer::parse(token) {
             Some(Layer::Identity) => {
                 // No-op; counts as recognised so the loop keeps going if
                 // there are inner layers we can still strip.
                 peeled = true;
+                continue;
             }
-            Some(Layer::Gzip) => {
-                current = gunzip(&current, budget)?;
-                budget = budget.saturating_sub(current.len() as u64);
-                peeled = true;
-            }
-            Some(Layer::Deflate) => {
-                current = inflate_zlib(&current, budget)?;
-                budget = budget.saturating_sub(current.len() as u64);
-                peeled = true;
-            }
-            Some(Layer::Zstd) => {
-                current = unzstd(&current, budget)?;
-                budget = budget.saturating_sub(current.len() as u64);
-                peeled = true;
-            }
-            Some(Layer::Brotli) => {
-                current = unbrotli(&current, budget)?;
-                budget = budget.saturating_sub(current.len() as u64);
-                peeled = true;
-            }
-            Some(Layer::Compress) => {
-                current = uncompress(&current, budget)?;
-                budget = budget.saturating_sub(current.len() as u64);
-                peeled = true;
-            }
+            Some(Layer::Gzip) => gunzip(&current, budget)?,
+            Some(Layer::Deflate) => inflate_zlib(&current, budget)?,
+            Some(Layer::Zstd) => unzstd(&current, budget)?,
+            Some(Layer::Brotli) => unbrotli(&current, budget)?,
+            Some(Layer::Compress) => uncompress(&current, budget)?,
             None => {
                 // Unknown outer layer — return what we have so far with the
                 // body untouched from this point in. We can't safely strip
@@ -146,7 +127,9 @@ pub(crate) fn decode_body(body: Vec<u8>, content_encoding: &str) -> Result<Decod
                     remaining: layers[..=idx].join(", "),
                 });
             }
-        }
+        };
+        budget = budget.saturating_sub(current.len() as u64);
+        peeled = true;
     }
     Ok(Decoded {
         body: current,
@@ -271,14 +254,11 @@ pub(crate) fn single_streamable_layer(content_encoding: &str) -> Option<StreamCo
     if layers.next().is_some() {
         return None; // more than one layer
     }
-    if only.eq_ignore_ascii_case("gzip") || only.eq_ignore_ascii_case("x-gzip") {
-        Some(StreamCodec::Gzip)
-    } else if only.eq_ignore_ascii_case("zstd") {
-        Some(StreamCodec::Zstd)
-    } else if only.eq_ignore_ascii_case("br") {
-        Some(StreamCodec::Brotli)
-    } else {
-        None
+    match Layer::parse(only)? {
+        Layer::Gzip => Some(StreamCodec::Gzip),
+        Layer::Zstd => Some(StreamCodec::Zstd),
+        Layer::Brotli => Some(StreamCodec::Brotli),
+        Layer::Deflate | Layer::Compress | Layer::Identity => None,
     }
 }
 
@@ -308,12 +288,6 @@ pub(crate) fn stream_decode<R: Read, W: std::io::Write + ?Sized>(
     res.map_err(|e| Error::BadResponse(format!("{codec:?} stream decode failed: {e}")))
 }
 
-/// Strip `Content-Encoding` and `Content-Length` from a response header
-/// list after a successful in-place body decode. Returns the new headers.
-///
-/// `Content-Length` is removed (not rewritten) because the decoded length
-/// is trivially `body.len()` and consumers who care can read that off the
-/// body directly; leaving a stale length would be worse than silence.
 /// Rewrite the headers after [`decode_body`] peeled at least one layer: drop the
 /// stale `Content-Length`, and replace `Content-Encoding` with the layers still
 /// applied (`decoded.remaining`), removing it only when nothing is left.
@@ -344,6 +318,12 @@ pub(crate) fn content_encoding(headers: &[(String, String)]) -> Option<String> {
     }
 }
 
+/// Strip `Content-Encoding` and `Content-Length` from a response header
+/// list after a successful in-place body decode. Returns the new headers.
+///
+/// `Content-Length` is removed (not rewritten) because the decoded length
+/// is trivially `body.len()` and consumers who care can read that off the
+/// body directly; leaving a stale length would be worse than silence.
 pub(crate) fn strip_after_decode(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()

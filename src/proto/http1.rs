@@ -193,8 +193,8 @@ impl ClientExchange {
                         }
                         return Ok(()); // need more bytes
                     };
-                    let head_bytes: Vec<u8> = self.rx.drain(..end).collect();
-                    let head = parse_head(&head_bytes)?;
+                    let head = parse_head(&self.rx[..end])?;
+                    self.rx.drain(..end);
                     if is_interim_status(head.status) {
                         // RFC 9110 §15.2: a client must accept and discard
                         // interim responses; the final response follows on the
@@ -210,8 +210,7 @@ impl ClientExchange {
                     let mode = body_mode(&self.method, &head, self.streaming)?;
                     self.head = Some(head);
                     self.state = match mode {
-                        BodyMode::None => self.finish(),
-                        BodyMode::Length(0) => self.finish(),
+                        BodyMode::None | BodyMode::Length(0) => self.finish(),
                         BodyMode::Length(n) => State::Length(n),
                         BodyMode::Chunked => State::Chunked(ChunkState::default()),
                         BodyMode::Eof => State::Eof,
@@ -267,10 +266,10 @@ impl ClientExchange {
                 if self.rx.len() < 2 {
                     return Ok(false);
                 }
-                let crlf: Vec<u8> = self.rx.drain(..2).collect();
-                if crlf != b"\r\n" {
+                if self.rx[..2] != *b"\r\n" {
                     return Err(Error::BadResponse("missing CRLF after chunk".into()));
                 }
+                self.rx.drain(..2);
                 cs.crlf_pending = false;
             }
 
@@ -282,11 +281,12 @@ impl ClientExchange {
                     }
                     return Ok(false);
                 };
-                let line: Vec<u8> = self.rx.drain(..=nl).collect();
-                if trim_eol(&line).is_empty() {
+                let blank = trim_eol(&self.rx[..=nl]).is_empty();
+                self.rx.drain(..=nl);
+                if blank {
                     return Ok(true); // end of trailers => body complete
                 }
-                cs.trailer_bytes = cs.trailer_bytes.saturating_add(line.len());
+                cs.trailer_bytes = cs.trailer_bytes.saturating_add(nl + 1);
                 if cs.trailer_bytes > MAX_HEADER_BYTES {
                     return Err(Error::BadResponse("trailer block too large".into()));
                 }
@@ -314,8 +314,8 @@ impl ClientExchange {
                 }
                 return Ok(false);
             };
-            let line: Vec<u8> = self.rx.drain(..=nl).collect();
-            let size = parse_chunk_size(&line)?;
+            let size = parse_chunk_size(&self.rx[..=nl])?;
+            self.rx.drain(..=nl);
             // Streaming drains `body` to the sink each batch, so a large
             // aggregate is fine there; buffered mode still caps memory.
             if !self.streaming && self.body_total.saturating_add(size) > MAX_BODY_BYTES as u64 {
@@ -369,7 +369,6 @@ impl Machine for ClientExchange {
             return Ok(0);
         }
         self.rx.extend_from_slice(wire);
-        let before = self.rx.len();
         self.advance()?;
         // Streaming mode: surface the head and any body decoded this batch now,
         // so the driver can relay them before the response completes. (A no-op
@@ -379,7 +378,6 @@ impl Machine for ClientExchange {
         }
         // We always take ownership of the offered bytes into `rx`, so report the
         // whole slice as consumed (any unconsumed tail lives in `rx`).
-        let _ = before;
         Ok(wire.len())
     }
 
@@ -419,16 +417,16 @@ impl Machine for ClientExchange {
 /// after the blank line), tolerating bare-LF line endings as the legacy
 /// line-based reader does. Returns `None` if the block is incomplete.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    let crlf = find_sub(buf, b"\r\n\r\n").map(|i| i + 4);
-    let lf = find_sub(buf, b"\n\n").map(|i| i + 2);
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    // One pass: whichever terminator starts first also ends first.
+    buf.windows(2).enumerate().find_map(|(i, w)| {
+        if w == b"\n\n" {
+            Some(i + 2)
+        } else if w == b"\r\n" && buf.get(i + 2..i + 4) == Some(&b"\r\n"[..]) {
+            Some(i + 4)
+        } else {
+            None
+        }
+    })
 }
 
 fn trim_eol(line: &[u8]) -> &[u8] {
