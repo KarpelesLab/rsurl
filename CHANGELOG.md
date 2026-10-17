@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18](https://github.com/KarpelesLab/rsurl/compare/v0.1.17...v0.1.18) - 2026-10-17
+
+### Other
+
+- *(curl-compat)* borrow request fields and build the header block once
+- *(ldap,ftp,cookie,imap,ssh)* borrow parsed fields, drop duplicate helpers
+- *(protocols)* reuse line buffers and cut allocations in the small clients
+- *(bittorrent)* skip-parse the info span, popcount bitfields, borrow more
+- *(net,tls)* borrow PEM blocks and peer chains, dedupe SOCKS and pin checks
+- *(websocket)* share the upgrade request and reuse streaming buffers
+- *(cli)* borrow instead of clone through URL processing and output setup
+- *(download)* scoped worker threads and fewer clones in the segmented path
+- *(http3)* stack datagram buffers and borrowed control-frame payloads
+- *(http2)* write DATA frames from borrowed slices, allocation-free HPACK ints
+- *(http)* drop per-response copies and clones on the HTTP/1.1 paths
+- *(deps)* bump puressh to 0.1.11 and purecrypto to 0.10.1
+- *(deps)* bump compcol to 0.7.2
+
 ## [0.1.17](https://github.com/KarpelesLab/rsurl/compare/v0.1.16...v0.1.17) - 2026-10-17
 
 ### Fixed
