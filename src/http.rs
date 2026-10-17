@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::net::{Connector, DirectConnector, NetStream};
-use crate::proto::http1::{ClientExchange, Event as Http1Event, Http1Head};
+use crate::proto::http1::{ClientExchange, Event as Http1Event};
 use crate::url::Url;
 
 const DEFAULT_USER_AGENT: &str = concat!("rsurl/", env!("CARGO_PKG_VERSION"));
@@ -1119,11 +1119,7 @@ impl Request {
             // Follow a 3xx with a Location when redirects are enabled, draining
             // the (small) intermediate body first so the socket can be dropped.
             if req.follow_redirects && is_redirect_status(head.status) {
-                if let Some((_, loc)) = head
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
-                {
+                if let Some(loc) = head.header("location") {
                     let _ = read_body(
                         &mut bufrd,
                         &head.headers,
@@ -1133,14 +1129,7 @@ impl Request {
                     )?;
                     drop(bufrd);
                     drop(cancel);
-                    if hops_left == 0 {
-                        return Err(Error::BadResponse(format!(
-                            "maximum ({}) redirects followed",
-                            req.max_redirs
-                        )));
-                    }
-                    hops_left -= 1;
-                    req = redirect_request(req, head.status, loc, trace)?;
+                    req = follow_redirect(req, head.status, loc, &mut hops_left, trace)?;
                     continue;
                 }
             }
@@ -1303,12 +1292,7 @@ impl Request {
         // Head before body: the bytes were already received internally, but the
         // caller still sees the head before the first chunk.
         if let Some(obs) = on_head {
-            obs(&ResponseHead {
-                status: resp.status,
-                reason: resp.reason.clone(),
-                version: resp.version.clone(),
-                headers: resp.headers.clone(),
-            });
+            obs(&resp.head());
         }
         sink.write_all(&resp.body)?;
         Ok(Response {
@@ -1385,11 +1369,7 @@ impl Request {
             // Follow a redirect (mirrors `send_to`'s logic, operating on the
             // head; the small redirect body is drained first).
             if req.follow_redirects && is_redirect_status(head.status) {
-                if let Some((_, loc)) = head
-                    .headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("location"))
-                {
+                if let Some(loc) = head.header("location") {
                     let _ = read_body(
                         &mut bufrd,
                         &head.headers,
@@ -1397,14 +1377,7 @@ impl Request {
                         head.status,
                         &req.method,
                     )?;
-                    if hops_left == 0 {
-                        return Err(Error::BadResponse(format!(
-                            "maximum ({}) redirects followed",
-                            req.max_redirs
-                        )));
-                    }
-                    hops_left -= 1;
-                    req = redirect_request(req, head.status, loc, trace)?;
+                    req = follow_redirect(req, head.status, loc, &mut hops_left, trace)?;
                     first_hop = false;
                     continue;
                 }
@@ -1414,12 +1387,7 @@ impl Request {
             // Final response: surface the head before any body byte reaches the
             // sink (the streaming API's head-before-body contract).
             if let Some(obs) = on_head.take() {
-                obs(&ResponseHead {
-                    status: head.status,
-                    reason: head.reason.clone(),
-                    version: head.version.clone(),
-                    headers: head.headers.clone(),
-                });
+                obs(&head);
             }
 
             // Final response. A `Content-Encoding` means we must decode —
@@ -1624,19 +1592,12 @@ impl Request {
                 resp.final_url = url_to_string(&req.url);
                 return Ok(resp);
             }
-            if hops_left == 0 {
-                return Err(Error::BadResponse(format!(
-                    "maximum ({}) redirects followed",
-                    req.max_redirs
-                )));
-            }
             let Some(location) = resp.header("location") else {
                 // 3xx without Location — give it back as the final response.
                 resp.final_url = url_to_string(&req.url);
                 return Ok(resp);
             };
-            hops_left -= 1;
-            req = redirect_request(req, resp.status, location, trace)?;
+            req = follow_redirect(req, resp.status, location, &mut hops_left, trace)?;
             first_hop = false;
         }
     }
@@ -1644,6 +1605,25 @@ impl Request {
 
 fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// Spend one hop of the redirect budget and rewrite `req` for `location` (see
+/// [`redirect_request`]); errors once `max_redirs` hops have been followed.
+fn follow_redirect(
+    req: Request,
+    status: u16,
+    location: &str,
+    hops_left: &mut u32,
+    trace: &mut dyn Write,
+) -> Result<Request> {
+    if *hops_left == 0 {
+        return Err(Error::BadResponse(format!(
+            "maximum ({}) redirects followed",
+            req.max_redirs
+        )));
+    }
+    *hops_left -= 1;
+    redirect_request(req, status, location, trace)
 }
 
 /// Replace any `Cookie:` header in `headers` with the jar's matching cookies
@@ -1807,13 +1787,36 @@ pub struct Timing {
 /// The status line + headers of a response, delivered *before* the body in the
 /// streaming API ([`Request::send_streaming`]). A browser uses this to apply
 /// policy and choose a parser before any body byte arrives.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseHead {
     pub status: u16,
     /// HTTP/1.1 reason phrase; empty for HTTP/2 and HTTP/3 (no reason phrase).
     pub reason: String,
     pub version: String,
     pub headers: Vec<(String, String)>,
+}
+
+impl Response {
+    /// The status line + headers as a [`ResponseHead`] (cloned).
+    pub(crate) fn head(&self) -> ResponseHead {
+        ResponseHead {
+            status: self.status,
+            reason: self.reason.clone(),
+            version: self.version.clone(),
+            headers: self.headers.clone(),
+        }
+    }
+
+    /// Split into the head and the body, dropping the transport metadata.
+    pub(crate) fn into_head_body(self) -> (ResponseHead, Vec<u8>) {
+        let head = ResponseHead {
+            status: self.status,
+            reason: self.reason,
+            version: self.version,
+            headers: self.headers,
+        };
+        (head, self.body)
+    }
 }
 
 impl ResponseHead {
@@ -2071,7 +2074,7 @@ impl Read for LengthBody {
 /// cancellation guard to keep alive while the body streams — what
 /// [`open_h1_for_reader`] hands back to [`Request::send_reader`].
 type OpenedBody = (
-    Head,
+    ResponseHead,
     BufReader<Box<dyn Rw>>,
     Option<crate::cancel::CancelGuard>,
 );
@@ -2105,31 +2108,26 @@ fn open_h1_for_reader(req: &Request, trace: &mut dyn Write) -> Result<OpenedBody
 /// is never touched — the bytes stay raw.
 fn build_body_reader(
     req: &Request,
-    head: Head,
+    head: ResponseHead,
     bufrd: BufReader<Box<dyn Rw>>,
     cancel: Option<crate::cancel::CancelGuard>,
 ) -> Result<BodyReader> {
-    let Head {
-        version,
-        status,
-        reason,
-        headers,
-    } = head;
-
     // RFC 9110: HEAD and these statuses never carry a body.
     let has_body = !(req.method.eq_ignore_ascii_case("HEAD")
-        || (100..200).contains(&status)
-        || status == 204
-        || status == 304);
+        || (100..200).contains(&head.status)
+        || head.status == 204
+        || head.status == 304);
     let (inner, cancel) = if !has_body {
         (BodyInner::Buffered(io::Cursor::new(Vec::new())), None)
     } else {
         // RFC 9112 §6.1: Transfer-Encoding + Content-Length together is a
         // smuggling vector — reject rather than pick a framing.
-        let has_te = headers
+        let has_te = head
+            .headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
-        let has_cl = headers
+        let has_cl = head
+            .headers
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
         if has_te && has_cl {
@@ -2138,7 +2136,7 @@ fn build_body_reader(
             ));
         }
 
-        let chunked = headers.iter().any(|(k, v)| {
+        let chunked = head.headers.iter().any(|(k, v)| {
             k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked")
         });
         // A `BodyReader` streams off the socket; the body is never held in
@@ -2154,7 +2152,7 @@ fn build_body_reader(
                 done: false,
             })
         } else {
-            match parse_content_length(&headers)? {
+            match parse_content_length(&head.headers)? {
                 Some(len) => BodyInner::Length(LengthBody {
                     src: bufrd,
                     remaining: len,
@@ -2166,12 +2164,7 @@ fn build_body_reader(
         (inner, cancel)
     };
     Ok(BodyReader {
-        head: ResponseHead {
-            status,
-            reason,
-            version,
-            headers,
-        },
+        head,
         inner,
         _cancel: cancel,
     })
@@ -2184,21 +2177,9 @@ fn build_body_reader(
 /// here), and HTTP/2/3 are all handled by `send_to`.
 fn buffered_body_reader(mut req: Request, trace: &mut dyn Write) -> Result<BodyReader> {
     req.decompress = false;
-    let Response {
-        status,
-        reason,
-        version,
-        headers,
-        body,
-        ..
-    } = req.send_to(trace, None)?;
+    let (head, body) = req.send_to(trace, None)?.into_head_body();
     Ok(BodyReader {
-        head: ResponseHead {
-            status,
-            reason,
-            version,
-            headers,
-        },
+        head,
         inner: BodyInner::Buffered(io::Cursor::new(body)),
         _cancel: None,
     })
@@ -2370,7 +2351,7 @@ struct CoreTiming {
 /// Emit the response head to `trace` in the curl-style `< ` form, matching the
 /// legacy [`read_head`] output (status line, each header, terminating blank
 /// line) so `-v` traces are identical on the sans-IO path.
-fn trace_response_head(trace: &mut dyn Write, head: &Http1Head) {
+fn trace_response_head(trace: &mut dyn Write, head: &ResponseHead) {
     let _ = writeln!(trace, "< {} {} {}", head.version, head.status, head.reason);
     for (k, v) in &head.headers {
         let _ = writeln!(trace, "< {k}: {v}");
@@ -2395,12 +2376,12 @@ fn drive_collect<M, S>(
     track_appconnect: bool,
     started: &mut bool,
     trace: &mut dyn Write,
-) -> Result<(Http1Head, Vec<u8>, CoreTiming)>
+) -> Result<(ResponseHead, Vec<u8>, CoreTiming)>
 where
     M: crate::io::Machine<Event = Http1Event>,
     S: crate::net::NetStream + ?Sized,
 {
-    let mut head: Option<Http1Head> = None;
+    let mut head: Option<ResponseHead> = None;
     let mut body = Vec::new();
     let mut timing = CoreTiming::default();
     crate::io::blocking::drive_streaming_observed(
@@ -3850,19 +3831,11 @@ fn read_line_capped<R: BufRead>(r: &mut R, buf: &mut String, max: usize) -> Resu
     Ok(read)
 }
 
-/// The status line + headers of a response (everything before the body).
-struct Head {
-    version: String,
-    status: u16,
-    reason: String,
-    headers: Vec<(String, String)>,
-}
-
 /// Read the final response's status line and header block (up to the blank
 /// line), skipping any interim `1xx` heads (`100 Continue`, `103 Early Hints`)
 /// as RFC 9110 §15.2 requires. The reader is left positioned at the first body
 /// byte.
-fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Head> {
+fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<ResponseHead> {
     for _ in 0..=crate::proto::http1::MAX_INTERIM_RESPONSES {
         let head = read_one_head(r, trace)?;
         if !crate::proto::http1::is_interim_status(head.status) {
@@ -3875,7 +3848,7 @@ fn read_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Hea
 }
 
 /// Read a single status line + header block, interim or final.
-fn read_one_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<Head> {
+fn read_one_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result<ResponseHead> {
     let mut status_line = String::new();
     let n = read_line_capped(r, &mut status_line, MAX_HEADER_BYTES)?;
     if n == 0 {
@@ -3904,7 +3877,7 @@ fn read_one_head<R: Read>(r: &mut BufReader<R>, trace: &mut dyn Write) -> Result
         }
         push_header_line(&mut headers, trimmed)?;
     }
-    Ok(Head {
+    Ok(ResponseHead {
         version,
         status,
         reason,
@@ -3969,7 +3942,7 @@ fn read_response_timed<R: Read>(
 where
     BufReader<R>: TruncationAware,
 {
-    let Head {
+    let ResponseHead {
         version,
         status,
         reason,

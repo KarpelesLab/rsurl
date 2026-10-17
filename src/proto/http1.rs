@@ -17,15 +17,10 @@ use crate::error::{Error, Result};
 use crate::http::{parse_content_length, parse_status_line, MAX_BODY_BYTES, MAX_HEADER_BYTES};
 use crate::io::Machine;
 
-/// A decoded response head (status line + headers), matching the field shape the
-/// legacy path assembles before publishing a `Response`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Http1Head {
-    pub version: String,
-    pub status: u16,
-    pub reason: String,
-    pub headers: Vec<(String, String)>,
-}
+/// A decoded response head (status line + headers): the crate-wide
+/// [`ResponseHead`](crate::http::ResponseHead), so the sans-IO and legacy
+/// paths publish the same type.
+pub(crate) type Http1Head = crate::http::ResponseHead;
 
 /// Application-level outputs of a [`ClientExchange`].
 ///
