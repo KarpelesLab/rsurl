@@ -10,9 +10,11 @@ for TLS — no OpenSSL, no system libcurl, no C dependencies. Optional first-par
 pure-Rust stacks, on by default, add SSH ([puressh](https://crates.io/crates/puressh),
 the `ssh` feature) and BitTorrent (the `bittorrent` feature); IDN host
 normalization uses [intl](https://crates.io/crates/intl). An HTTP-only build
-drops the lot with `--no-default-features`. Even with everything enabled the
-only extra is `libc` on unix — pure-Rust FFI *bindings*, no compiled C and no
-`*-sys`/cmake/bindgen.
+drops the lot with `--no-default-features`. With the default features the only
+extra is `libc` on unix — pure-Rust FFI *bindings*, no compiled C and no
+`*-sys`/cmake/bindgen. The opt-in `rustls-tls` backend is the exception: it
+pulls in `ring`, which compiles C and assembly (`tokio-rt` adds only pure-Rust
+crates such as `mio`/`socket2`).
 
 `rsurl` ships in three forms:
 
