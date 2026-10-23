@@ -11,8 +11,8 @@ pure-Rust stacks, on by default, add SSH ([puressh](https://crates.io/crates/pur
 the `ssh` feature) and BitTorrent (the `bittorrent` feature); IDN host
 normalization uses [intl](https://crates.io/crates/intl). An HTTP-only build
 drops the lot with `--no-default-features`. Even with everything enabled the
-only extra is `libc`/`nix` on unix — pure-Rust FFI *bindings*, no compiled C and
-no `*-sys`/cmake/bindgen.
+only extra is `libc` on unix — pure-Rust FFI *bindings*, no compiled C and no
+`*-sys`/cmake/bindgen.
 
 `rsurl` ships in three forms:
 
@@ -392,7 +392,7 @@ linked in can drop both:
 cargo build --release --no-default-features --features purecrypto-tls,idn
 ```
 
-Dropping `ssh` also stops the `puressh` dependency (and its `libc`/`nix`
+Dropping `ssh` also stops the `puressh` dependency (and its `libc`
 bindings) from being compiled at all. With either feature off, the
 corresponding URL schemes are rejected with `Error::UnsupportedScheme` (the CLI
 prints `this build has no … support`).

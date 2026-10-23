@@ -36,7 +36,7 @@ default = ["purecrypto-tls", "idn", "bittorrent", "ssh"]
 bittorrent = []
 # SSH transports — `sftp://` and `scp://`, download and upload — built on the
 # pure-Rust `puressh` crate. On by default; drop it (and the `puressh`
-# dependency, plus its `libc`/`nix` bindings) with `--no-default-features` for an
+# dependency, plus its `libc` bindings) with `--no-default-features` for an
 # HTTP-only build that doesn't want a full SSH client linked in. With the
 # feature off, `sftp`/`scp` URLs are rejected with `Error::UnsupportedScheme`.
 ssh = ["dep:puressh"]
@@ -142,9 +142,10 @@ rustls-pemfile = { version = "2", optional = true }
 # `known_hosts`, `key`) plus `compress` (zlib@openssh.com). We deliberately do
 # NOT enable `server`, `multichannel`, `ffi`, or — critically — `pam`: the `pam`
 # feature pulls `pam-client2`, a C/FFI crate that would break the no-C-toolchain
-# guarantee. On unix, puressh unconditionally depends on `libc`/`nix`, but those
-# are pure-Rust FFI *binding* crates (extern decls against the libc that std
-# already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
+# guarantee. On unix, puressh unconditionally depends on `libc` (since 0.2,
+# `nix` only comes in with its `server`/`agent` features, which the library
+# build doesn't enable), but that is a pure-Rust FFI *binding* crate (extern
+# decls against the libc that std already links) — no build-time C compiler, cmake, bindgen, or `*-sys` crate —
 # so the default purecrypto build stays free of any compiled-C dependency.
 # 0.1.7 is a security-hardening release (client-side: bounded inbound
 # buffering, sanitised remote scp stderr, known_hosts failing closed on
