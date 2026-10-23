@@ -151,7 +151,7 @@ rustls-pemfile = { version = "2", optional = true }
 # `@revoked`); it also marks the caller-built structs `#[non_exhaustive]`, so
 # `src/ssh.rs` builds `Config` / `KnownHostsPolicy` / `ScpRecvOptions` through
 # their constructors instead of struct literals.
-puressh = { version = "0.1.11", optional = true, default-features = false, features = ["client", "compress"] }
+puressh = { version = "0.2.0", optional = true, default-features = false, features = ["client", "compress"] }
 # Real Mozilla Public Suffix List for cookie eTLD scoping — rejects over-broad
 # `Domain=co.uk`/`Domain=github.io` "supercookie" attributes that a dot-count
 # heuristic can't catch (see `src/cookie.rs`). Taken with `default-features =
@@ -168,7 +168,7 @@ puressh = { version = "0.1.11", optional = true, default-features = false, featu
 # stays intact. `intl::unicode::idna::to_ascii` applies stricter UTS-46/IDNA2008
 # validation than the old `idna` crate (bidi, CONTEXTJ, hyphen, leading-mark and
 # trailing-dot rules) — see `src/idn.rs`.
-intl = { version = "0.6.3", optional = true, default-features = false, features = ["idna"] }
+intl = { version = "0.6.4", optional = true, default-features = false, features = ["idna"] }
 # Optional Tokio adapter for the async sans-IO driver, behind the `tokio-rt`
 # feature. Off by default — the base/http-only builds pull in no async runtime.
 # Only the `src/io/tokio.rs` adapter references it; the async core stays
@@ -184,9 +184,9 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 # these out of the wasm dependency graph is what lets the crate build for the
 # browser at all. All pure Rust, no C toolchain — see the per-crate notes above.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-purecrypto = "0.10.1"
+purecrypto = "0.10.2"
 zeroize = "1"
-compcol = { version = "0.7.2", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
+compcol = { version = "0.7.6", default-features = false, features = ["std", "gzip", "zlib", "zstd", "brotli", "lzw", "qpack"] }
 psl2 = { version = "0.1", default-features = false }
 
 # ── Browser (wasm32) backend ────────────────────────────────────────────────
@@ -230,7 +230,7 @@ web-sys = { version = "0.3", features = [
 [dev-dependencies]
 # Used only by the WebSocket integration test's in-process echo server to
 # compute the `Sec-WebSocket-Accept` SHA-1 (already a normal dependency).
-purecrypto = "0.10.1"
+purecrypto = "0.10.2"
 # Async combinators (FuturesUnordered) for the `tokio-rt` adapter tests that
 # demonstrate concurrent transfer fan-out. Dev-only — never in the library.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -239,7 +239,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # In-process SSH/SFTP server for the SSH host-key end-to-end tests
 # (tests/integration_ssh.rs). Dev-only (the `server` feature never reaches the
 # library build, which stays client-only); no `pam`, so still no C toolchain.
-puressh = { version = "0.1.11", default-features = false, features = ["client", "compress", "server"] }
+puressh = { version = "0.2.0", default-features = false, features = ["client", "compress", "server"] }
 
 [profile.release]
 lto = "thin"

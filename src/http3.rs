@@ -243,9 +243,14 @@ type Fields = Vec<(String, String)>;
 /// list against a decompression bomb. Values must also be UTF-8 (the rest of
 /// the crate models headers as `String`).
 fn decode_header_block(decoder: &mut QpackDecoder, block: &[u8]) -> Result<Fields> {
-    let decoded = decoder
-        .decode_field_section(block)
-        .map_err(|e| Error::BadResponse(format!("qpack: decode failed: {e}")))?;
+    let decoded = decoder.decode_field_section(block).map_err(|e| match e {
+        // The decoder charges the same RFC 9204 §3.2.1 size as we do below,
+        // as each field is decoded, so a bomb stops before it is materialised.
+        compcol::Error::OutputLimitExceeded => {
+            Error::BadResponse("qpack: decoded header list exceeds limit".into())
+        }
+        e => Error::BadResponse(format!("qpack: decode failed: {e}")),
+    })?;
     let mut out: Fields = Vec::with_capacity(decoded.len());
     let mut list_size: usize = 0;
     for f in decoded {
@@ -494,7 +499,10 @@ const MAX_UNI_BUFFER: usize = 64 * 1024;
 impl Http3State {
     fn new(decoder_stream: Option<StreamId>) -> Self {
         Http3State {
-            decoder: QpackDecoder::with_max_table_capacity(QPACK_MAX_TABLE_CAPACITY as usize),
+            decoder: QpackDecoder::with_limits(
+                QPACK_MAX_TABLE_CAPACITY as usize,
+                MAX_DECODED_HEADER_LIST,
+            ),
             decoder_stream,
             uni: std::collections::HashMap::new(),
             peer_control: None,
@@ -2109,9 +2117,10 @@ mod tests {
 
     // ---- QPACK glue over compcol -----------------------------------------
 
-    /// A decoder bounded by the table capacity we advertise.
+    /// A decoder bounded by the table capacity we advertise and the decoded
+    /// header-list cap.
     fn decoder() -> QpackDecoder {
-        QpackDecoder::with_max_table_capacity(QPACK_MAX_TABLE_CAPACITY as usize)
+        QpackDecoder::with_limits(QPACK_MAX_TABLE_CAPACITY as usize, MAX_DECODED_HEADER_LIST)
     }
 
     /// Encode a field-section prefix (§4.5.1): Required Insert Count and Base.
