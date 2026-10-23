@@ -1,6 +1,6 @@
 [package]
 name = "rsurl"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
 rust-version = "1.95"
 authors = ["Karpelès Lab Inc."]
