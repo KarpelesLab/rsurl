@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21](https://github.com/KarpelesLab/rsurl/compare/v0.1.20...v0.1.21) - 2026-10-23
+
+### Other
+
+- scope the README's no-C claim to the default features
+- puressh 0.2 only adds libc on unix, no longer nix
+
 ## [0.1.20](https://github.com/KarpelesLab/rsurl/compare/v0.1.19...v0.1.20) - 2026-10-23
 
 ### Other
