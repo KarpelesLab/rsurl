@@ -513,7 +513,8 @@ impl Request {
     ///
     /// The request's method/headers/auth are preserved; the download layer adds
     /// range/validator handling, forces raw (undecoded) bytes so offsets stay
-    /// byte-aligned, and follows redirects. See the [module docs](mod@crate::download).
+    /// byte-aligned — sending `Accept-Encoding: identity` unless the request
+    /// already sets an `Accept-Encoding` — and follows redirects. See the [module docs](mod@crate::download).
     pub fn download_resumable(self, path: &Path, opts: DownloadOptions) -> Result<DownloadOutcome> {
         Downloader::new(self, Arc::new(FileStore::new(path)), opts).run()
     }
@@ -773,6 +774,17 @@ impl Downloader {
         // follow redirects. Force HTTP/1.1 when asked, to dodge H2 RST_STREAM
         // and keep the body streaming to disk.
         let mut base = req.follow_redirects(true).decompress(false);
+        // Ask for the identity representation unless the caller chose an
+        // encoding: the writers otherwise default to `gzip, deflate`, and with
+        // decoding off the compressed stream would land on disk verbatim (and
+        // its size would not match the resource's).
+        if !base
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+        {
+            base = base.header("Accept-Encoding", "identity");
+        }
         if opts.prefer_http11 {
             base = base.http11_only();
         }
@@ -2223,6 +2235,8 @@ mod tests {
         /// Answer (once) a ranged request starting here with the bytes and
         /// `Content-Range` of offset 0 instead — a buggy server/CDN.
         misrange_start: Option<u64>,
+        /// `Accept-Encoding` header value of every request received, in order.
+        accept_encodings: Vec<String>,
     }
 
     impl Origin {
@@ -2239,6 +2253,7 @@ mod tests {
                 slow_range_start: None,
                 ranges: Vec::new(),
                 misrange_start: None,
+                accept_encodings: Vec::new(),
             }))
         }
     }
@@ -2306,6 +2321,11 @@ mod tests {
         let range = header_val(&head, "range").map(|s| s.to_string());
         let if_range = header_val(&head, "if-range").map(|s| s.to_string());
         o.ranges.push(range.clone().unwrap_or_default());
+        o.accept_encodings.push(
+            header_val(&head, "accept-encoding")
+                .unwrap_or_default()
+                .to_string(),
+        );
 
         let len = o.body.len() as u64;
 
@@ -2795,6 +2815,30 @@ mod tests {
         assert_eq!(outcome.resumed_from, 0);
         assert_eq!(std::fs::read(&out).unwrap(), body);
         cleanup(&out);
+    }
+
+    #[test]
+    fn requests_identity_encoding_unless_caller_sets_one() {
+        let body = make_body(3_000, 0x1d);
+        let origin = Origin::shared(body.clone(), "e");
+        let port = start(origin.clone());
+        let url = format!("http://127.0.0.1:{port}/file");
+
+        let out = tmp("identity");
+        download(&url, &out, no_backoff()).expect("dl");
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        cleanup(&out);
+
+        let out = tmp("caller_ae");
+        Request::get(&url)
+            .unwrap()
+            .header("Accept-Encoding", "br")
+            .download_resumable(&out, no_backoff())
+            .expect("dl");
+        cleanup(&out);
+
+        let seen = origin.lock().unwrap().accept_encodings.clone();
+        assert_eq!(seen, ["identity", "br"]);
     }
 
     #[test]
