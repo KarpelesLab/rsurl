@@ -81,8 +81,8 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
           cargo build --release --bin rsurl --target ${{ matrix.target }}
-          cargo rustc --lib --release --crate-type staticlib --target ${{ matrix.target }}
-          cargo rustc --lib --release --crate-type cdylib --target ${{ matrix.target }}
+          cargo rustc --lib --release --crate-type staticlib --features ffi --target ${{ matrix.target }}
+          cargo rustc --lib --release --crate-type cdylib --features ffi --target ${{ matrix.target }}
 
       - name: Stage archive contents
         shell: bash
@@ -103,6 +103,18 @@ jobs:
             cp "$td"/librsurl.dylib staging/lib/ 2>/dev/null || true # macOS
           fi
           ls -R staging
+
+      # The rsurl_* C ABI is gated behind the `ffi` feature; without it the
+      # libraries still build, just with nothing in them that rsurl.h declares.
+      # Refuse to ship that. Checked on the Linux slices — the build flags are
+      # shared with the Windows entries, so this covers them too.
+      - name: Check C library exports
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          n=$(nm -D --defined-only staging/lib/librsurl.so | grep -c ' rsurl_' || true)
+          echo "librsurl.so exports $n rsurl_* symbols"
+          test "$n" -gt 0
 
       - name: Pack archive
         id: pack
@@ -143,8 +155,8 @@ jobs:
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
             cargo build --release --bin rsurl --target "$t"
-            cargo rustc --lib --release --crate-type staticlib --target "$t"
-            cargo rustc --lib --release --crate-type cdylib --target "$t"
+            cargo rustc --lib --release --crate-type staticlib --features ffi --target "$t"
+            cargo rustc --lib --release --crate-type cdylib --features ffi --target "$t"
           done
 
       - name: Lipo into universal artifacts
@@ -162,6 +174,11 @@ jobs:
           cp include/rsurl.h staging/include/
           cp README.md LICENSE staging/
           file staging/bin/rsurl staging/lib/librsurl.*
+          # Same guard as the Linux job: the dylib must carry the rsurl_* C ABI
+          # (Mach-O prefixes C symbols with `_`).
+          n=$(nm -gU staging/lib/librsurl.dylib | grep -c ' _rsurl_' || true)
+          echo "librsurl.dylib exports $n rsurl_* symbols"
+          test "$n" -gt 0
 
       - name: Pack archive
         id: pack
