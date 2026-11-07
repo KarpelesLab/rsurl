@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.22](https://github.com/KarpelesLab/rsurl/compare/v0.1.21...v0.1.22) - 2026-10-25
+
+### Fixed
+
+- release C libraries are built with the ffi feature
+
+### Other
+
+- *(deps)* bump purecrypto 0.10.3, puressh 0.2.4, intl 0.6.5
+
 ## [0.1.21](https://github.com/KarpelesLab/rsurl/compare/v0.1.20...v0.1.21) - 2026-10-23
 
 ### Other
